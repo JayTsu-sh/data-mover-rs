@@ -82,6 +82,9 @@ pub(crate) trait NfsReadCursor: Send + Sync {
 
 #[async_trait]
 pub(crate) trait NfsSourceProtocol: Send + Sync {
+    fn read_concurrency(&self) -> usize {
+        4
+    }
     fn maximum_read_chunk_bytes(&self) -> usize {
         MAX_ROLE_READ
     }
@@ -140,6 +143,9 @@ impl NfsReadSourceAdapter {
 
 #[async_trait]
 impl ReadSource for NfsReadSourceAdapter {
+    fn read_concurrency(&self) -> usize {
+        self.protocol.read_concurrency().max(1)
+    }
     fn supports_read_budget(&self) -> bool {
         true
     }
@@ -251,7 +257,7 @@ impl NfsReadSourceAdapter {
             maximum_chunk_bytes: request
                 .maximum_chunk_bytes
                 .min(self.protocol.maximum_read_chunk_bytes().max(1)),
-            read_concurrency: request.read_inflight,
+            read_concurrency: request.read_inflight.min(self.read_concurrency()),
             inflight: if unordered {
                 Either::Right(FuturesUnordered::new())
             } else {

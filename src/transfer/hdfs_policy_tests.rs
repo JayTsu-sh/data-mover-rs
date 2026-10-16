@@ -10,8 +10,7 @@ use crate::model::{SourceVersion, StoragePath};
 use crate::storage::backends::hdfs::{connect, contract_tests::MemoryHdfs, test_identity};
 use crate::storage::{InflightConfig, InflightRuntime, PrepareFact, ReadBudget, ReadRequest};
 use crate::transfer::{
-    InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
-    transfer,
+    ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest, transfer,
 };
 
 type Result = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -29,6 +28,8 @@ async fn local_metadata_copies_mode_and_mtime_to_hdfs_without_replacing_principa
     )?;
     let source = crate::storage::connect_backend(crate::storage::BackendConfig::Local(
         crate::storage::LocalBackendConfig {
+            read_chunk_bytes: None,
+            write_chunk_bytes: None,
             root: root.path().into(),
             read_concurrency: NonZeroUsize::new(2).ok_or("invalid read concurrency")?,
             write_concurrency: NonZeroUsize::new(2).ok_or("invalid write concurrency")?,
@@ -51,7 +52,6 @@ async fn local_metadata_copies_mode_and_mtime_to_hdfs_without_replacing_principa
                 source.clone(),
                 StoragePath::new("source")?,
                 destination,
-                InflightLimits::new(2, 128, 2)?,
                 CancellationToken::new(),
             )
             .with_final_path(StoragePath::new("final")?)
@@ -93,7 +93,6 @@ async fn direct_failure_never_exposes_stage_cleanup() -> Result {
         storage.clone(),
         StoragePath::new("source")?,
         storage,
-        InflightLimits::new(2, 128, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("final")?)
@@ -133,7 +132,6 @@ async fn checkpointed_registers_only_after_hsync_and_resumes_durable_prefix() ->
                 source.clone(),
                 StoragePath::new("source")?,
                 destination.clone(),
-                InflightLimits::new(4, 8 * 1024 * 1024, 4)?,
                 CancellationToken::new(),
             )
             .with_final_path(StoragePath::new("final")?)
@@ -202,7 +200,6 @@ async fn a_failed_first_pointer_leaves_nothing_to_resume() -> Result {
             storage.clone(),
             StoragePath::new("source")?,
             storage.clone(),
-            InflightLimits::new(4, 8 * 1024 * 1024, 4)?,
             CancellationToken::new(),
         )
         .with_final_path(StoragePath::new("final")?)
@@ -262,7 +259,6 @@ async fn all_policies_copy_with_independent_read_and_write_limits() -> Result {
                 connect(protocol.clone(), test_identity("source-policy")?)?,
                 StoragePath::new("source")?,
                 connect(protocol.clone(), test_identity("target-policy")?)?,
-                InflightLimits::new(8, 128, 8)?,
                 CancellationToken::new(),
             )
             .with_final_path(StoragePath::new("final")?)
@@ -347,7 +343,6 @@ async fn direct_refuses_same_source_and_target() -> Result {
         storage.clone(),
         StoragePath::new("file")?,
         storage,
-        InflightLimits::new(2, 128, 2)?,
         CancellationToken::new(),
     )
     .with_identity_override(TransferIdentity::from_label("same-hdfs")?)
@@ -380,6 +375,8 @@ async fn hdfs_to_local_copies_mode_mtime_and_verifies_positioned_content() -> Re
         let owner = std::fs::metadata(&baseline)?;
         let destination = crate::storage::connect_backend(crate::storage::BackendConfig::Local(
             crate::storage::LocalBackendConfig {
+                read_chunk_bytes: None,
+                write_chunk_bytes: None,
                 root: root.path().into(),
                 read_concurrency: NonZeroUsize::new(4).ok_or("read depth")?,
                 write_concurrency: NonZeroUsize::new(4).ok_or("write depth")?,
@@ -391,7 +388,6 @@ async fn hdfs_to_local_copies_mode_mtime_and_verifies_positioned_content() -> Re
                 source.clone(),
                 StoragePath::new("source")?,
                 destination,
-                InflightLimits::new(4, 512, 4)?,
                 CancellationToken::new(),
             )
             .with_final_path(StoragePath::new("final")?)

@@ -14,8 +14,7 @@ use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect_a
 use crate::storage::{PrepareFact, Storage};
 use crate::transfer::{
     EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest,
-    ExpertSourceSession, InflightLimits, TransferOutcome, TransferPolicy, TransferRequest,
-    transfer,
+    ExpertSourceSession, TransferOutcome, TransferPolicy, TransferRequest, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -40,7 +39,6 @@ fn checkpointed_every(
         storage()?,
         StoragePath::new("source")?,
         storage()?,
-        InflightLimits::new(4, 4 * MIB, 4)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new(final_key)?)
@@ -253,11 +251,9 @@ async fn expert_run(
     let storage = || connect_at_destination(protocol.clone(), identity(), interval);
     let source = storage()?;
     let observation = observed(&source).await?;
-    let limits = InflightLimits::new(4, 4 * MIB, 4)?;
     let source_half = ExpertSourceSession::open(ExpertSourceRequest::new(
         source,
         observation.clone(),
-        limits,
         CancellationToken::new(),
     ))
     .await?;
@@ -267,7 +263,6 @@ async fn expert_run(
             source_half.offer().maximum_chunk_bytes,
             storage()?,
             StoragePath::new(final_key)?,
-            limits,
             CancellationToken::new(),
         )
         .with_transfer_policy(TransferPolicy::Checkpointed),

@@ -17,8 +17,7 @@ use crate::storage::backends::s3::{
 };
 use crate::storage::{SourceQosStats, Storage, WriteProgress, WriteProgressObserver};
 use crate::transfer::{
-    ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, InflightLimits,
-    TransferPolicy,
+    ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, TransferPolicy,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -77,7 +76,6 @@ async fn local_notifies_before_input_finishes_and_distinguishes_checkpoints() ->
                 3,
                 destination,
                 StoragePath::new("final")?,
-                InflightLimits::new(2, 6, 2)?,
                 CancellationToken::new(),
             )
             .with_transfer_policy(policy)
@@ -134,7 +132,6 @@ async fn s3_single_put_reports_nothing_while_only_buffered() -> TestResult {
             12,
             storage,
             StoragePath::new("final")?,
-            InflightLimits::new(1, 12, 1)?,
             CancellationToken::new(),
         )
         .with_write_observer(observer(&events, None)),
@@ -193,7 +190,6 @@ async fn multipart_progress(checkpoint_interval: u64) -> TestResult {
             1024 * 1024,
             storage,
             StoragePath::new("final")?,
-            InflightLimits::new(2, 2 * 1024 * 1024, 2)?,
             CancellationToken::new(),
         )
         .with_write_observer(observer(&events, None)),

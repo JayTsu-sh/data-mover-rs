@@ -12,6 +12,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let slots = NonZeroUsize::new(4).ok_or("nonzero")?;
     let storage = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.path().to_owned(),
         read_concurrency: slots,
         write_concurrency: slots,

@@ -24,6 +24,8 @@ fn nonzero(value: usize) -> Result<NonZeroUsize> {
 
 async fn connect(root: &Path) -> Result<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.to_path_buf(),
         read_concurrency: nonzero(2)?,
         write_concurrency: nonzero(2)?,

@@ -53,7 +53,9 @@ struct Measurement {
 async fn main() -> Result {
     let args = Args::parse();
     // Validate before connection, even for scan, so the recorded chunk condition is meaningful.
-    copy_support::limits(args.chunk_bytes)?;
+    if args.chunk_bytes == 0 {
+        return Err("chunk size must be non-zero".into());
+    }
     let source = connect_with_options(&args.source, false, Some(args.chunk_bytes)).await?;
     let started = Instant::now();
     let measurement = match args.operation {
@@ -116,7 +118,7 @@ async fn scan(source: &Storage) -> Result<Measurement> {
     measurement(latencies)
 }
 
-async fn copy(source: &Storage, destination: &Storage, chunk_bytes: u64) -> Result<Measurement> {
+async fn copy(source: &Storage, destination: &Storage, _chunk_bytes: u64) -> Result<Measurement> {
     let traversal = StorageTraversalSource::new(source)?;
     let mut session = traversal.traverse(TraversalRequest::new(StoragePath::root()));
     let mut pending = Vec::new();
@@ -135,7 +137,6 @@ async fn copy(source: &Storage, destination: &Storage, chunk_bytes: u64) -> Resu
         }
     }
     require_complete(session.finish().await?)?;
-    let limits = copy_support::limits(chunk_bytes)?;
     let mut latencies = Vec::with_capacity(pending.len());
     let queued_at = Instant::now();
     for path in pending {
@@ -145,7 +146,6 @@ async fn copy(source: &Storage, destination: &Storage, chunk_bytes: u64) -> Resu
                 source.clone(),
                 path.clone(),
                 destination.clone(),
-                limits,
                 CancellationToken::new(),
             )
             .with_read_back_verification(ReadBackVerification::Enabled),

@@ -2,7 +2,7 @@
 
 use data_mover::model::{SourceVersion, StoragePath};
 use data_mover::storage::ReadRequest;
-use data_mover::transfer::{InflightLimits, TransferRequest, transfer};
+use data_mover::transfer::{TransferRequest, transfer};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
@@ -38,7 +38,6 @@ async fn local_transfer_beyond_write_queue_reopens_with_identical_digest()
         source,
         path.clone(),
         destination,
-        InflightLimits::new(4, 4 * 64 * 1024, 8)?,
         CancellationToken::new(),
     ))
     .await?;

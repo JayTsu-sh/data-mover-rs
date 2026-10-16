@@ -6,8 +6,7 @@ use std::time::Duration;
 use data_mover::model::StoragePath;
 use data_mover::storage::{BackendConfig, LocalBackendConfig, Storage, connect_backend};
 use data_mover::transfer::{
-    InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
-    transfer,
+    ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest, transfer,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -15,6 +14,8 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn local(root: &Path) -> TestResult<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.to_owned(),
         read_concurrency: NonZeroUsize::new(8).ok_or("invalid concurrency")?,
         write_concurrency: NonZeroUsize::new(8).ok_or("invalid concurrency")?,
@@ -27,7 +28,6 @@ async fn request(source: &Path, destination: &Path) -> TestResult<TransferReques
         local(source).await?,
         StoragePath::new("file.bin")?,
         local(destination).await?,
-        InflightLimits::new(8, 8 * 1024 * 1024, 8)?,
         CancellationToken::new(),
     ))
 }
@@ -93,7 +93,6 @@ async fn precancelled_copy_preserves_existing_destination() -> TestResult {
             local(source.path()).await?,
             StoragePath::new("file.bin")?,
             local(destination.path()).await?,
-            InflightLimits::new(1, 1024 * 1024, 128)?,
             cancel,
         )
         .with_identity_override(TransferIdentity::from_label("native-cancel")?)
@@ -143,7 +142,6 @@ async fn checkpointed_syncs_new_parent_directories() -> TestResult {
         local(source.path()).await?,
         StoragePath::new("file.bin")?,
         local(destination.path()).await?,
-        InflightLimits::new(1, 1024 * 1024, 1)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("new/child/file.bin")?)

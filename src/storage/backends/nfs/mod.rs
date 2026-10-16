@@ -30,9 +30,14 @@ pub use client::list_exports;
 pub(crate) async fn connect_backend(
     config: crate::storage::NfsBackendConfig,
 ) -> Result<Storage, crate::storage::BackendConnectError> {
-    client::create_nfs_role_storage(&config.url, config.block_size, config.ensure_dir)
-        .await
-        .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::Nfs, error))
+    client::create_nfs_role_storage(
+        &config.url,
+        config.block_size,
+        config.ensure_dir,
+        config.transfer_concurrency,
+    )
+    .await
+    .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::Nfs, error))
 }
 
 #[allow(dead_code)]

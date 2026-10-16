@@ -185,6 +185,8 @@ fn configure_compatibility(
 /// Connected SDK client and bucket configuration used only by the storage roles.
 #[derive(Clone, Debug)]
 pub(crate) struct S3Storage {
+    transfer_concurrency: crate::transfer_concurrency::TransferConcurrency,
+    read_chunk_bytes: usize,
     /// What the URL stated besides its credentials and location.
     options: S3UrlOptions,
     pub(crate) endpoint: String,
@@ -392,7 +394,23 @@ impl S3Storage {
     /// # Errors
     ///
     /// Returns an error when the requested storage operation cannot be completed.
-    pub async fn new(url: &str, _block_size: Option<u64>) -> Result<Self> {
+    pub async fn new(url: &str, block_size: Option<u64>) -> Result<Self> {
+        if block_size == Some(0) {
+            return Err(StorageError::ConfigError(
+                "S3 read chunk must be non-zero".into(),
+            ));
+        }
+        let read_chunk_bytes = usize::try_from(
+            block_size.unwrap_or(8 * 1024 * 1024).min(8 * 1024 * 1024),
+        )
+        .map_err(|_| StorageError::ConfigError("S3 read chunk exceeds address space".into()))?;
+        let transfer_concurrency = crate::transfer_concurrency::TransferConcurrency::from_env(
+            crate::model::BackendKind::S3,
+            crate::transfer_concurrency::TransferConcurrency::defaults(
+                super::DEFAULT_READ_CONCURRENCY,
+                super::DEFAULT_WRITE_CONCURRENCY,
+            ),
+        )?;
         // 解析URL
         let ParsedS3Url {
             access_key,
@@ -466,6 +484,8 @@ impl S3Storage {
         let versioning_suspended = versioning == S3VersioningAtConnect::Suspended;
 
         Ok(Self {
+            transfer_concurrency,
+            read_chunk_bytes,
             options,
             endpoint,
             bucket_name,
@@ -525,6 +545,8 @@ mod tests {
                 .build(),
         );
         S3Storage {
+            read_chunk_bytes: 8 * 1024 * 1024,
+            transfer_concurrency: crate::transfer_concurrency::TransferConcurrency::defaults(4, 4),
             options: S3UrlOptions::default(),
             endpoint: "http://localhost:9000".to_string(),
             bucket_name: "test-bucket".to_string(),

@@ -42,7 +42,7 @@ pub(super) fn request() -> TraversalRequest {
 pub(super) async fn put(protocol: &MemoryS3, key: &str, body: &'static [u8]) -> TestResult {
     let bytes = Bytes::from_static(body);
     protocol
-        .put_object(key, bytes.clone(), &content_md5(&bytes))
+        .put_object(key, bytes.clone().into(), &content_md5(&bytes))
         .await
         .map_err(|e| format!("{e:?}"))?;
     Ok(())

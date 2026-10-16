@@ -2,9 +2,7 @@
 //! completion reports what it wrote, and the uploads in progress on one key can be listed.
 
 use aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput;
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::CompletedMultipartUpload;
-use bytes::Bytes;
 
 use super::hints;
 use super::{
@@ -23,7 +21,7 @@ impl S3Storage {
         key: &str,
         upload_id: &str,
         part_number: i32,
-        bytes: Bytes,
+        bytes: crate::storage::backends::s3::S3Body,
         content_md5_base64: &str,
     ) -> S3Result<String> {
         self.client
@@ -33,7 +31,11 @@ impl S3Storage {
             .upload_id(upload_id)
             .part_number(part_number)
             .content_md5(content_md5_base64)
-            .body(ByteStream::from(bytes))
+            .content_length(
+                i64::try_from(bytes.len())
+                    .map_err(|_| S3ProtocolFailure::protocol("S3 part exceeds address space"))?,
+            )
+            .body(bytes.into_stream())
             .send()
             .await
             .map_err(|error| classify_sdk!(error, "S3 UploadPart request failed"))?

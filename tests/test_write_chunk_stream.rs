@@ -7,7 +7,7 @@ use data_mover::model::StoragePath;
 use data_mover::storage::ByteStream;
 use data_mover::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession,
-    InflightLimits, TransferPhase, TransferPolicy,
+    TransferPhase, TransferPolicy,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -26,11 +26,9 @@ async fn expert_destination_refuses_corrupt_transport_payload_before_publish()
     let source_storage = common::connect_local(source_root.path(), 4).await?;
     let destination_storage = common::connect_local(destination_root.path(), 4).await?;
     let observation = common::observe_file(&source_storage, "blob.bin").await?;
-    let limits = InflightLimits::new(2, 128 * 1024, 2)?;
     let source = ExpertSourceSession::open(ExpertSourceRequest::new(
         source_storage,
         observation.clone(),
-        limits,
         CancellationToken::new(),
     ))
     .await?;
@@ -40,7 +38,6 @@ async fn expert_destination_refuses_corrupt_transport_payload_before_publish()
             source.offer().maximum_chunk_bytes,
             destination_storage,
             StoragePath::new("published.bin")?,
-            limits,
             CancellationToken::new(),
         )
         .with_transfer_policy(TransferPolicy::AtomicReplace),

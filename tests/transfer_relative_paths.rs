@@ -4,7 +4,7 @@ use std::path::Path;
 
 use data_mover::model::{EntryKind, StoragePath};
 use data_mover::storage::{BackendConfig, LocalBackendConfig, Storage, connect_backend};
-use data_mover::transfer::{InflightLimits, TransferPolicy, TransferRequest, transfer};
+use data_mover::transfer::{TransferPolicy, TransferRequest, transfer};
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSource as _,
 };
@@ -14,6 +14,8 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 async fn local(root: &Path) -> TestResult<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.to_owned(),
         read_concurrency: NonZeroUsize::MIN,
         write_concurrency: NonZeroUsize::MIN,
@@ -46,13 +48,11 @@ async fn scanned_files_keep_their_relative_paths_between_different_roots() -> Te
                     continue;
                 }
                 copied.push(entry.path().as_str().to_owned());
-                let limits = InflightLimits::new(2, 64 * 1024, 2)?;
                 let request = if observed {
                     TransferRequest::from_observation(
                         source.clone(),
                         *entry,
                         destination.clone(),
-                        limits,
                         CancellationToken::new(),
                     )?
                 } else {
@@ -60,7 +60,6 @@ async fn scanned_files_keep_their_relative_paths_between_different_roots() -> Te
                         source.clone(),
                         entry.path().clone(),
                         destination.clone(),
-                        limits,
                         CancellationToken::new(),
                     )
                 }

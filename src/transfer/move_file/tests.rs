@@ -8,15 +8,15 @@ use crate::storage::backends::local::connect_backend;
 use crate::storage::{
     ListRequest, ListingStream, LocalBackendConfig, Namespace, Storage, StorageRoleFailure,
 };
-use crate::transfer::{
-    InflightLimits, MoveError, ReadBackVerification, SourceVersion, TransferRequest, move_file,
-};
+use crate::transfer::{MoveError, ReadBackVerification, SourceVersion, TransferRequest, move_file};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn connect(root: &Path) -> TestResult<Storage> {
     let slots = NonZeroUsize::new(2).ok_or("nonzero")?;
     Ok(connect_backend(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.to_path_buf(),
         read_concurrency: slots,
         write_concurrency: slots,
@@ -28,7 +28,6 @@ fn request(source: Storage, destination: Storage) -> TestResult<TransferRequest>
         source,
         StoragePath::new("source")?,
         destination,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("final")?))

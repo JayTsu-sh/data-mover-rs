@@ -18,8 +18,7 @@ use crate::storage::backends::s3::{
     connect_native_at_destination,
 };
 use crate::transfer::{
-    InflightLimits, SourceVersion, TransferOutcome, TransferPolicy, TransferRequest, TransferRoute,
-    transfer,
+    SourceVersion, TransferOutcome, TransferPolicy, TransferRequest, TransferRoute, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -60,7 +59,6 @@ fn request(
         storage()?,
         StoragePath::new("source")?,
         storage()?,
-        InflightLimits::new(4, 4 * MIB, 4)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new(final_key)?)
@@ -162,7 +160,6 @@ fn native(protocol: &Arc<MemoryS3>, final_key: &str) -> TestResult<TransferReque
         storage()?,
         StoragePath::new("source")?,
         storage()?,
-        InflightLimits::new(4, 4 * MIB, 4)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new(final_key)?))

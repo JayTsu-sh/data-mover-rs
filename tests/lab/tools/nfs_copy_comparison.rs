@@ -8,7 +8,7 @@ use data_mover::storage::{
     connect_backend, delete_tree,
 };
 use data_mover::transfer::TransferPolicy;
-use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
+use data_mover::transfer::{TransferIdentity, TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -69,39 +69,36 @@ struct CopyArgs {
 
 async fn optimized_copy(args: &CopyArgs) -> Result<(u64, u128), Box<dyn std::error::Error>> {
     let source = connect_backend(BackendConfig::Nfs(NfsBackendConfig {
+        transfer_concurrency: Some(data_mover::TransferConcurrency::new(
+            args.read_inflight,
+            args.write_inflight,
+        )?),
         url: args.source.clone(),
         block_size: Some(u64::try_from(args.chunk_bytes)?),
         ensure_dir: false,
     }))
     .await?;
     let destination = connect_backend(BackendConfig::Nfs(NfsBackendConfig {
+        transfer_concurrency: Some(data_mover::TransferConcurrency::new(
+            args.read_inflight,
+            args.write_inflight,
+        )?),
         url: args.destination.clone(),
         block_size: Some(u64::try_from(args.chunk_bytes)?),
         ensure_dir: true,
     }))
     .await?;
     let path = StoragePath::new(args.path.clone())?;
-    let inflight = args.read_inflight.max(args.write_inflight);
-    let inflight_bytes = args
-        .chunk_bytes
-        .checked_mul(inflight)
-        .ok_or("inflight byte budget overflowed")?;
-    let request = TransferRequest::new(
-        source,
-        path.clone(),
-        destination,
-        InflightLimits::new(inflight, inflight_bytes, inflight)?,
-        CancellationToken::new(),
-    )
-    .with_identity_override(TransferIdentity::from_label(format!(
-        "nfs-comparison-{}-{}",
-        std::process::id(),
-        args.path
-    ))?)
-    .with_transfer_policy(match args.transfer_policy {
-        TransferMode::Checkpointed => TransferPolicy::Checkpointed,
-        TransferMode::AtomicReplace => TransferPolicy::AtomicReplace,
-    });
+    let request = TransferRequest::new(source, path.clone(), destination, CancellationToken::new())
+        .with_identity_override(TransferIdentity::from_label(format!(
+            "nfs-comparison-{}-{}",
+            std::process::id(),
+            args.path
+        ))?)
+        .with_transfer_policy(match args.transfer_policy {
+            TransferMode::Checkpointed => TransferPolicy::Checkpointed,
+            TransferMode::AtomicReplace => TransferPolicy::AtomicReplace,
+        });
 
     let started = Instant::now();
     let outcome = transfer(request).await?;
@@ -110,6 +107,7 @@ async fn optimized_copy(args: &CopyArgs) -> Result<(u64, u128), Box<dyn std::err
 
 async fn cleanup(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let storage = connect_backend(BackendConfig::Nfs(NfsBackendConfig {
+        transfer_concurrency: None,
         url: url.to_owned(),
         block_size: None,
         ensure_dir: false,

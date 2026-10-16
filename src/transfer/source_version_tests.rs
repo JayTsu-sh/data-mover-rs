@@ -11,8 +11,8 @@ use crate::storage::StorageRoleFailure;
 use crate::storage::backends::s3::connect;
 use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context};
 use crate::transfer::{
-    InflightLimits, PayloadShapingPolicy, SourceVersion, TransferIdentity, TransferPhase,
-    TransferRequest, TransferRoute, TransferSide, transfer,
+    PayloadShapingPolicy, SourceVersion, TransferIdentity, TransferPhase, TransferRequest,
+    TransferRoute, TransferSide, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -47,7 +47,6 @@ fn request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
         source,
         StoragePath::new("source")?,
         destination,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("final")?))

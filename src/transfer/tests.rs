@@ -5,8 +5,7 @@ use std::time::Duration;
 use super::engine::{TransferDataPath, TransferPhase, TransferSide, run_until_transferred};
 use super::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession,
-    InflightLimits, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy,
-    TransferRequest, transfer,
+    SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy, TransferRequest, transfer,
 };
 use crate::metadata::{
     AclTarget, ApplicationOutcome, MetadataPlanRequest, MetadataPolicies, MetadataPolicy,
@@ -88,12 +87,9 @@ async fn complete_expert_transfer(
     final_path: &str,
     policy: TransferPolicy,
 ) -> Result<super::TransferOutcome, super::TransferFailure> {
-    let limits = InflightLimits::new(2, 128 * 1024, 2)
-        .unwrap_or_else(|error| panic!("valid test inflight limits: {error}"));
     let source = ExpertSourceSession::open(ExpertSourceRequest::new(
         source,
         observation.clone(),
-        limits,
         tokio_util::sync::CancellationToken::new(),
     ))
     .await?;
@@ -104,7 +100,6 @@ async fn complete_expert_transfer(
             destination,
             StoragePath::new(final_path)
                 .unwrap_or_else(|error| panic!("valid test destination: {error}")),
-            limits,
             tokio_util::sync::CancellationToken::new(),
         )
         .with_identity_override(
@@ -221,13 +216,9 @@ async fn expert_metadata_failure_does_not_publish_and_retains_the_stage()
 }
 
 #[test]
-fn transfer_inputs_reject_ambiguous_identity_and_unbounded_limits() {
+fn transfer_inputs_reject_ambiguous_identity() {
     assert!(TransferIdentity::from_label("").is_err());
     assert!(TransferIdentity::from_label("logical-copy-7").is_ok());
-    assert!(InflightLimits::new(0, 64 * 1024, 1).is_err());
-    assert!(InflightLimits::new(2, 0, 1).is_err());
-    assert!(InflightLimits::new(2, 64 * 1024, 0).is_err());
-    assert!(InflightLimits::new(2, 64 * 1024, 1).is_ok());
 }
 
 #[tokio::test]
@@ -481,7 +472,6 @@ async fn streaming_transfer_uses_one_source_stream_with_inflight_reads()
         source,
         StoragePath::new("source.bin")?,
         local_destination(destination_root.path())?,
-        InflightLimits::new(4, CHUNK_BYTES, 4)?,
         tokio_util::sync::CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("final.bin")?)
@@ -1019,7 +1009,6 @@ async fn local_transfer_reaches_durable_unpublished_state() -> Result<(), Box<dy
             source,
             StoragePath::new("source.bin")?,
             destination,
-            InflightLimits::new(2, 64 * 1024, 2)?,
             tokio_util::sync::CancellationToken::new(),
         )
         .with_final_path(StoragePath::new("final.bin")?)
@@ -1052,7 +1041,6 @@ async fn cancellation_before_prepare_leaves_no_staged_or_final_mutation()
         local_source(source_root.path())?,
         StoragePath::new("source.bin")?,
         local_destination(destination_root.path())?,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         cancel,
     )
     .with_final_path(StoragePath::new("final.bin")?)
@@ -1082,7 +1070,6 @@ async fn preflight_refusal_happens_before_destination_mutation()
         local_source(source_root.path())?,
         StoragePath::new("source.bin")?,
         destination,
-        InflightLimits::new(1, 4096, 1)?,
         tokio_util::sync::CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("final.bin")?)
@@ -1243,16 +1230,11 @@ fn derived_transfer_request(
     destination: Storage,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<TransferRequest, Box<dyn std::error::Error>> {
-    Ok(TransferRequest::new(
-        source,
-        StoragePath::new("source.bin")?,
-        destination,
-        // Two 64 KiB reads may be resident together, so the byte budget covers both chunks.
-        InflightLimits::new(2, 2 * 64 * 1024, 2)?,
-        cancel,
+    Ok(
+        TransferRequest::new(source, StoragePath::new("source.bin")?, destination, cancel)
+            .with_final_path(StoragePath::new("final.bin")?)
+            .with_transfer_policy(TransferPolicy::AtomicReplace),
     )
-    .with_final_path(StoragePath::new("final.bin")?)
-    .with_transfer_policy(TransferPolicy::AtomicReplace))
 }
 
 fn recoverable_request(request: TransferRequest, _resume_marker: Option<()>) -> TransferRequest {

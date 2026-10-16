@@ -112,6 +112,7 @@ pub(crate) struct LocalStagedDestination {
     root_dir: Arc<Dir>,
     identity: BackendIdentity,
     write_concurrency: usize,
+    write_chunk_bytes: usize,
     write_probe: Arc<WriteProbe>,
     directory_sync: Arc<directory_sync::DirectorySync>,
     #[cfg(unix)]
@@ -160,11 +161,17 @@ impl LocalStagedDestination {
             root_dir: Arc::new(root_dir),
             identity,
             write_concurrency,
+            write_chunk_bytes: LOCAL_MAX_WRITE_CHUNK_BYTES,
             write_probe: Arc::new(WriteProbe::default()),
             directory_sync: Arc::new(directory_sync::DirectorySync::default()),
             #[cfg(unix)]
             owner_privilege: OwnerPrivilege::current(),
         })
+    }
+
+    pub(crate) fn with_write_chunk_bytes(mut self, bytes: std::num::NonZeroUsize) -> Self {
+        self.write_chunk_bytes = bytes.get().min(LOCAL_MAX_WRITE_CHUNK_BYTES);
+        self
     }
 
     async fn stage_directory(
@@ -569,7 +576,7 @@ impl LocalStagedDestination {
             let mut piece_start = 0usize;
             while piece_start < data.len() {
                 let piece_end = piece_start
-                    .saturating_add(LOCAL_MAX_WRITE_CHUNK_BYTES)
+                    .saturating_add(self.write_chunk_bytes)
                     .min(data.len());
                 let piece = data.slice(piece_start..piece_end);
                 let offset = issued;
@@ -855,7 +862,7 @@ impl StagedDestination for LocalStagedDestination {
         stage: &PreparedStage,
         data: Bytes,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
-        if data.len() > LOCAL_MAX_WRITE_CHUNK_BYTES || stage.recovery_enabled() {
+        if data.len() > self.write_chunk_bytes || stage.recovery_enabled() {
             return self
                 .write(
                     stage,

@@ -7,8 +7,7 @@ use data_mover::TransferConcurrency;
 use data_mover::model::{BackendKind, StoragePath};
 use data_mover::storage::{BackendConfig, LocalBackendConfig, NfsBackendConfig, connect_backend};
 use data_mover::transfer::{
-    InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
-    transfer,
+    ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest, transfer,
 };
 use futures::{StreamExt, TryStreamExt, stream};
 use tokio_util::sync::CancellationToken;
@@ -62,12 +61,15 @@ async fn endpoint(
 ) -> Result<data_mover::storage::Storage, Error> {
     let config = match transport {
         Transport::Mounted => BackendConfig::Local(LocalBackendConfig {
+            read_chunk_bytes: NonZeroUsize::new(args.chunk_bytes),
+            write_chunk_bytes: None,
             root: root.into(),
             read_concurrency: NonZeroUsize::new(concurrency.read()).ok_or("invalid concurrency")?,
             write_concurrency: NonZeroUsize::new(concurrency.write())
                 .ok_or("invalid concurrency")?,
         }),
         Transport::Client => BackendConfig::Nfs(NfsBackendConfig {
+            transfer_concurrency: Some(concurrency),
             url: root.into(),
             block_size: Some(u64::try_from(args.chunk_bytes)?),
             ensure_dir: side == "destination",
@@ -103,14 +105,6 @@ async fn main() -> Result<(), Error> {
         destination_concurrency,
     )
     .await?;
-    let slots = concurrency.read().max(concurrency.write());
-    let inflight = InflightLimits::new(
-        slots,
-        args.chunk_bytes
-            .checked_mul(concurrency.read())
-            .ok_or("byte budget overflow")?,
-        concurrency.read(),
-    )?;
     let policy = match args.policy {
         Policy::Checkpointed => TransferPolicy::Checkpointed,
         Policy::AtomicReplace => TransferPolicy::AtomicReplace,
@@ -132,7 +126,6 @@ async fn main() -> Result<(), Error> {
                     source,
                     path.clone(),
                     destination,
-                    inflight,
                     CancellationToken::new(),
                 )
                 .with_identity_override(TransferIdentity::from_label(format!(

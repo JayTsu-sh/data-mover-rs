@@ -4,7 +4,7 @@ use std::path::Path;
 
 use data_mover::model::StoragePath;
 use data_mover::storage::Storage;
-use data_mover::transfer::{InflightLimits, TransferPolicy, TransferRequest, transfer};
+use data_mover::transfer::{TransferPolicy, TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
 
 mod common;
@@ -32,7 +32,6 @@ async fn copy(source: &Storage, destination: &Storage) -> Result<(), Box<dyn std
             source.clone(),
             path.clone(),
             destination.clone(),
-            InflightLimits::new(8, 8 * 1024 * 1024, 8)?,
             CancellationToken::new(),
         )
         .with_transfer_policy(TransferPolicy::AtomicReplace),

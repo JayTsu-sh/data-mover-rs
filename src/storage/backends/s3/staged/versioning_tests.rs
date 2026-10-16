@@ -35,7 +35,7 @@ async fn put_pointer(protocol: &MemoryS3, binding: [u8; 32], extension: Bytes) -
     );
     let md5 = content_md5(&bytes);
     protocol
-        .put_object(&pointer_key(), bytes, &md5)
+        .put_object(&pointer_key(), bytes.into(), &md5)
         .await
         .map_err(|failure| format!("{failure:?}"))?;
     Ok(())

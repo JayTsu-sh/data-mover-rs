@@ -4,7 +4,7 @@ use bytes::Bytes;
 use futures::stream;
 use tokio_util::sync::CancellationToken;
 
-use super::{InflightLimits, TransferIdentity, TransferPolicy, TransferRequest, transfer};
+use super::{TransferIdentity, TransferPolicy, TransferRequest, transfer};
 use crate::model::{
     MappedOwnership, ObservationMode, ObservationPlan, Operation, StoragePath, StorageTimestamp,
     TimePrecision, TimestampMetadata,
@@ -28,7 +28,6 @@ fn request(source: Storage, destination: Storage) -> TestResult<TransferRequest>
         source,
         StoragePath::new("source")?,
         destination,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("final")?)

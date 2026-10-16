@@ -170,7 +170,7 @@ fn put_failure(
 pub(super) async fn put_object(
     storage: &S3Storage,
     key: &str,
-    body: Bytes,
+    body: crate::storage::backends::s3::S3Body,
     content_md5_base64: &str,
 ) -> S3Result<S3WriteFacts> {
     let response = storage
@@ -178,7 +178,11 @@ pub(super) async fn put_object(
         .put_object()
         .bucket(&storage.bucket_name)
         .key(storage.build_full_key(key))
-        .body(ByteStream::from(body))
+        .content_length(
+            i64::try_from(body.len())
+                .map_err(|_| S3ProtocolFailure::protocol("S3 object exceeds address space"))?,
+        )
+        .body(body.into_stream())
         .content_md5(content_md5_base64)
         .send()
         .await

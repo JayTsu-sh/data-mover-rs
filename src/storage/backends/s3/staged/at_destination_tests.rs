@@ -158,7 +158,7 @@ async fn seed_upload(protocol: &MemoryS3, parts: &[(i32, &[u8])]) -> TestResult<
         let bytes = Bytes::copy_from_slice(bytes);
         let md5 = content_md5(&bytes);
         protocol
-            .upload_part(FINAL, &id, *number, bytes, &md5)
+            .upload_part(FINAL, &id, *number, bytes.into(), &md5)
             .await
             .map_err(|failure| format!("{failure:?}"))?;
     }

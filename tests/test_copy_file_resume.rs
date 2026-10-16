@@ -5,7 +5,7 @@
 //! request shape and data-mover decides whether a durable stage can be resumed.
 
 use data_mover::model::StoragePath;
-use data_mover::transfer::{InflightLimits, TransferRequest, transfer};
+use data_mover::transfer::{TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
 
 mod common;
@@ -28,13 +28,11 @@ async fn repeated_role_transfers_derive_the_same_identity_and_publish_exact_cont
     let source = common::connect_local(source_root.path(), 4).await?;
     let destination = common::connect_local(destination_root.path(), 4).await?;
     let path = StoragePath::new("blob.bin")?;
-    let limits = InflightLimits::new(4, 128 * 1024, 4)?;
 
     let first = transfer(TransferRequest::new(
         source.clone(),
         path.clone(),
         destination.clone(),
-        limits,
         CancellationToken::new(),
     ))
     .await?;
@@ -42,7 +40,6 @@ async fn repeated_role_transfers_derive_the_same_identity_and_publish_exact_cont
         source,
         path.clone(),
         destination,
-        limits,
         CancellationToken::new(),
     ))
     .await?;

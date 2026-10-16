@@ -9,10 +9,7 @@ use futures::{
 };
 use tokio::task::{JoinError, JoinSet};
 
-use super::{
-    LOCAL_DURABLE_CHECKPOINT_INTERVAL_BYTES, LOCAL_MAX_WRITE_CHUNK_BYTES, LocalStagedDestination,
-    failure, io_failure,
-};
+use super::{LOCAL_DURABLE_CHECKPOINT_INTERVAL_BYTES, LocalStagedDestination, failure, io_failure};
 use crate::model::{FailureClass, Operation, StoragePath};
 use crate::storage::{
     PositionedByteStream, PositionedChunk, PreparedStage, StorageRoleFailure, WriteEvidence,
@@ -252,7 +249,7 @@ impl<'a> Writer<'a> {
         let offset = chunk.offset;
         let data = chunk
             .data
-            .split_to(chunk.data.len().min(LOCAL_MAX_WRITE_CHUNK_BYTES));
+            .split_to(chunk.data.len().min(self.adapter.write_chunk_bytes));
         let length = data.len();
         chunk.offset += length as u64;
         // Keep earlier eligible boundaries even when draining ACKs jumps directly to EOF.

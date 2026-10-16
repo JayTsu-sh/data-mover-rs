@@ -12,8 +12,8 @@ use crate::model::StoragePath;
 use crate::storage::backends::s3::connect;
 use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, etag_of, native_context};
 use crate::transfer::{
-    EffectiveRecovery, InflightLimits, PayloadShapingPolicy, TransferPolicy, TransferRequest,
-    TransferRoute, transfer,
+    EffectiveRecovery, PayloadShapingPolicy, TransferPolicy, TransferRequest, TransferRoute,
+    transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -33,7 +33,6 @@ fn request(protocol: &Arc<MemoryS3>, final_path: &str) -> TestResult<TransferReq
         source,
         StoragePath::new("source")?,
         destination,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new(final_path)?)
@@ -104,7 +103,7 @@ async fn a_checkpointed_small_object_keeps_no_recovery_state() -> TestResult {
     let outcome = transfer(checkpointed()?).await?;
     assert_eq!(
         outcome.recovery,
-        EffectiveRecovery::SkippedBelowCheckpointThreshold
+        EffectiveRecovery::SkippedSingleSourceChunk
     );
     assert_eq!(outcome.destination_version, None);
     assert_eq!(

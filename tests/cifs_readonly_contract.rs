@@ -25,8 +25,8 @@ use data_mover::storage::{
     connect_backend, create_directory_all,
 };
 use data_mover::transfer::{
-    InflightLimits, ReadBackVerification, TransferFailure, TransferIdentity, TransferOutcome,
-    TransferPhase, TransferRequest, TransferSide, transfer,
+    ReadBackVerification, TransferFailure, TransferIdentity, TransferOutcome, TransferPhase,
+    TransferRequest, TransferSide, transfer,
 };
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSource as _,
@@ -276,7 +276,6 @@ async fn copy(
             source.clone(),
             StoragePath::new(from)?,
             destination.clone(),
-            InflightLimits::new(8, 16 * 1024 * 1024, 8)?,
             CancellationToken::new(),
         )
         .with_final_path(StoragePath::new(to)?)
@@ -352,6 +351,8 @@ async fn connect_readonly() -> Result<Storage> {
 async fn connect_local(root: &Path) -> Result<Storage> {
     let slots = NonZeroUsize::new(8).ok_or("zero slots")?;
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.to_path_buf(),
         read_concurrency: slots,
         write_concurrency: slots,

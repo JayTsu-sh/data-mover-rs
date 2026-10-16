@@ -127,6 +127,11 @@ impl Error for StorageRoleFailure {
 /// Source streaming role. Protocol handles and retry details remain behind this interface.
 #[async_trait]
 pub trait ReadSource: Send + Sync {
+    /// Backend-owned read window. Ordered streams must also bound completed reads waiting
+    /// for a predecessor by this window; stopping consumption must stop further prefetch.
+    fn read_concurrency(&self) -> usize {
+        1
+    }
     /// Whether reads can retain offsets and be delivered as each operation completes.
     fn supports_positioned_read(&self) -> bool {
         false
@@ -156,9 +161,9 @@ pub trait ReadSource: Send + Sync {
     }
 
     /// Largest payload the connected backend can return from one source read operation.
-    /// The transfer planner combines this backend limit with the caller's inflight budget.
+    /// The transfer uses this ceiling independently of the destination's write sizing.
     fn maximum_read_chunk_bytes(&self) -> usize {
-        usize::MAX
+        1024 * 1024
     }
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure>;
     /// Whether this source keeps versions a transfer can select ([`SourceVersion::Id`]).

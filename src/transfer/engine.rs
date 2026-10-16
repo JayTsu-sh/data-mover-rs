@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use futures::StreamExt as _;
 
 use super::{ReadBackVerification, TransferPolicy, TransferRequest};
@@ -14,12 +13,12 @@ use crate::storage::{
 };
 use failure::source_failure;
 use negotiation::{CopiedMetadataPlan, apply_copied_metadata, copied_metadata_plan};
-use payload::{TransferEvidence, inflight_channel, settle_transfer, transfer_stage};
+use payload::{TransferEvidence, transfer_stage};
 use plan::{
     TransferRoles, describe_source, final_recovery, lend_transfer_roles, plan_request,
     recovery_binding, recovery_binding_for,
 };
-use producer::{ProducerRequest, inflight_role_failure, produce, read_exact_range};
+use producer::{ProducerRequest, produce, read_exact_range};
 use publication::{
     content_mismatch, discard_stale_stage, publish_transferred, verify_published,
     verify_transferred,
@@ -36,8 +35,9 @@ mod negotiation;
 mod observation;
 mod payload;
 mod plan;
-mod positioned;
 mod producer;
+#[cfg(test)]
+mod producer_tests;
 mod publication;
 mod single;
 mod version;
@@ -397,7 +397,6 @@ mod plan_tests {
         test_destination_storage_with_role, test_source_storage,
     };
     use crate::storage::{PublishRequest, RestartReason};
-    use crate::transfer::InflightLimits;
 
     fn descriptor(size: u64) -> Result<SourceDescriptor, Box<dyn std::error::Error>> {
         let backend = BackendIdentity::new("local".parse()?, "source-chunk-plan")?;
@@ -415,13 +414,7 @@ mod plan_tests {
     fn single_chunk_is_decided_only_from_the_effective_source_read_size()
     -> Result<(), Box<dyn std::error::Error>> {
         const SOURCE_CHUNK: usize = 6 * 1024 * 1024;
-        let plan = plan_transfer(
-            &descriptor(SOURCE_CHUNK as u64)?,
-            InflightLimits::new(1, SOURCE_CHUNK, 1)?,
-            SOURCE_CHUNK,
-            false,
-            true,
-        )?;
+        let plan = plan_transfer(&descriptor(SOURCE_CHUNK as u64)?, SOURCE_CHUNK, false, true)?;
 
         assert_eq!(plan.chunk_bytes, SOURCE_CHUNK);
         assert!(!plan.recovery_enabled);
@@ -439,7 +432,6 @@ mod plan_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = plan_transfer(
             &descriptor(6 * 1024 * 1024 * 1024)?,
-            InflightLimits::new(2, 2 * 1024 * 1024, 2)?,
             5 * 1024 * 1024,
             true,
             true,
@@ -471,7 +463,6 @@ mod plan_tests {
             source,
             StoragePath::new("source.bin")?,
             destination,
-            InflightLimits::new(2, 2 * 64 * 1024, 2)?,
             tokio_util::sync::CancellationToken::new(),
         )
         .with_final_path(StoragePath::new("final.bin")?)

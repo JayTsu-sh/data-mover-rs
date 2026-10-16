@@ -41,7 +41,11 @@ fn parent_pointer() -> String {
 async fn plant_pointer(protocol: &MemoryS3) -> TestResult {
     let stale = Bytes::from_static(b"stale pointer");
     protocol
-        .put_object(&parent_pointer(), stale.clone(), &content_md5(&stale))
+        .put_object(
+            &parent_pointer(),
+            stale.clone().into(),
+            &content_md5(&stale),
+        )
         .await
         .map_err(|e| format!("{e:?}"))?;
     Ok(())
@@ -218,7 +222,7 @@ async fn a_directory_object_is_copied_natively_by_one_copy_object() -> TestResul
             .await?;
         assert_eq!(stored(&protocol).await, [FILE], "{label}: no pointer");
         destination
-            .fill_native(&stage, source, CancellationToken::new(), 4)
+            .fill_native(&stage, source, CancellationToken::new())
             .await
             .map_err(|failure| format!("{:?}", failure.error))?;
         publish(&destination, &stage, &bytes).await?;

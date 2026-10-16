@@ -199,7 +199,7 @@ pub(super) async fn put<P: S3Protocol>(
     let digest = BASE64_STANDARD.encode(Md5::digest(&bytes));
     let limit = bytes.len() + 1;
     let error = match protocol
-        .put_object(pointer.as_str(), Bytes::from(bytes.clone()), &digest)
+        .put_object(pointer.as_str(), Bytes::from(bytes.clone()).into(), &digest)
         .await
     {
         Ok(facts) => return Ok(facts.reported_version),

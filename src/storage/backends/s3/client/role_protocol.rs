@@ -167,6 +167,17 @@ impl S3Storage {
 
 #[async_trait::async_trait]
 impl crate::storage::backends::s3::S3Protocol for S3Storage {
+    fn read_concurrency(&self) -> usize {
+        self.transfer_concurrency.read()
+    }
+
+    fn write_concurrency(&self) -> usize {
+        self.transfer_concurrency.write()
+    }
+
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        self.read_chunk_bytes
+    }
     fn versioning_enabled(&self) -> bool {
         self.is_bucket_versioned
     }
@@ -258,7 +269,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
     async fn put_object(
         &self,
         key: &str,
-        body: Bytes,
+        body: crate::storage::backends::s3::S3Body,
         content_md5_base64: &str,
     ) -> S3Result<S3WriteFacts> {
         streaming_put::put_object(self, key, body, content_md5_base64).await
@@ -317,7 +328,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         key: &str,
         upload_id: &str,
         part_number: i32,
-        bytes: Bytes,
+        bytes: crate::storage::backends::s3::S3Body,
         content_md5_base64: &str,
     ) -> S3Result<String> {
         self.role_upload_part(key, upload_id, part_number, bytes, content_md5_base64)
@@ -867,7 +878,7 @@ mod tests {
         let body = Bytes::from_static(b"c14a single put payload");
         let digest = Md5::digest(&body);
         let wrong = STANDARD.encode(Md5::digest(b"something else"));
-        let refused = backend.put_object(&key, body.clone(), &wrong).await;
+        let refused = backend.put_object(&key, body.clone().into(), &wrong).await;
         assert!(
             matches!(
                 refused,
@@ -884,7 +895,7 @@ mod tests {
             "a refused PUT stores nothing"
         );
         let written = backend
-            .put_object(&key, body, &STANDARD.encode(digest))
+            .put_object(&key, body.into(), &STANDARD.encode(digest))
             .await
             .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
         let deleted = backend.delete_object(&key).await;

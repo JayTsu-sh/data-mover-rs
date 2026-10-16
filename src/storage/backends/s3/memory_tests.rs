@@ -16,7 +16,7 @@ async fn memory_put_object_reports_md5_etag_and_no_version() {
     let s3 = MemoryS3::default();
     let body = Bytes::from_static(b"payload");
     let facts = s3
-        .put_object("key", body.clone(), &content_md5(&body))
+        .put_object("key", body.clone().into(), &content_md5(&body))
         .await
         .expect("put succeeds");
     assert_eq!(facts.etag, "\"321c3cf486ed509164edec1e1981fec8\"");
@@ -33,7 +33,7 @@ async fn memory_put_object_on_a_versioned_fake_reports_a_new_version() {
         .await;
     let body = Bytes::from_static(b"new");
     let facts = s3
-        .put_object("key", body.clone(), &content_md5(&body))
+        .put_object("key", body.clone().into(), &content_md5(&body))
         .await
         .expect("put succeeds");
     let version = facts
@@ -51,16 +51,16 @@ async fn memory_put_object_refuses_a_bad_digest() {
     let body = Bytes::from_static(b"payload");
     let expected = S3ProtocolFailure::corrupted_upload("S3 PutObject request failed");
     let wrong = s3
-        .put_object("key", body.clone(), &content_md5(b"other"))
+        .put_object("key", body.clone().into(), &content_md5(b"other"))
         .await;
     assert_eq!(wrong, Err(expected.clone()));
     *s3.bad_digest_next_put.lock().await = true;
     let injected = s3
-        .put_object("key", body.clone(), &content_md5(&body))
+        .put_object("key", body.clone().into(), &content_md5(&body))
         .await;
     assert_eq!(injected, Err(expected));
     assert!(s3.objects.lock().await.is_empty());
-    s3.put_object("key", body.clone(), &content_md5(&body))
+    s3.put_object("key", body.clone().into(), &content_md5(&body))
         .await
         .expect("the injection covers one PUT");
 }

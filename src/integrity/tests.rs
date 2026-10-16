@@ -17,6 +17,8 @@ fn storage(root: &Path) -> Result<Storage> {
     let depth = NonZeroUsize::new(2).ok_or("constant is nonzero")?;
     Ok(crate::storage::backends::local::connect_backend(
         LocalBackendConfig {
+            read_chunk_bytes: None,
+            write_chunk_bytes: None,
             root: root.to_path_buf(),
             read_concurrency: depth,
             write_concurrency: depth,

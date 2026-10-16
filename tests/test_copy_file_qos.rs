@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use data_mover::model::StoragePath;
 use data_mover::storage::{SourceQosGroup, SourceQosPolicy};
-use data_mover::transfer::{InflightLimits, TransferRequest, transfer};
+use data_mover::transfer::{TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
 
 mod common;
@@ -25,7 +25,6 @@ async fn source_qos_caps_reads_and_reports_payload_once() -> Result<(), Box<dyn 
             common::connect_local(source_root.path(), 8).await?,
             StoragePath::new("blob.bin")?,
             common::connect_local(destination_root.path(), 8).await?,
-            InflightLimits::new(8, 1024 * 1024, 8)?,
             CancellationToken::new(),
         )
         .with_source_qos(qos),
@@ -64,7 +63,6 @@ async fn hard_source_bandwidth_limit_shapes_a_public_transfer()
         common::connect_local(source_root.path(), 4).await?,
         StoragePath::new("blob.bin")?,
         common::connect_local(destination_root.path(), 4).await?,
-        InflightLimits::new(4, 256 * 1024, 4)?,
         CancellationToken::new(),
     )
     .with_source_qos(qos);

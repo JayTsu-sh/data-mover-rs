@@ -241,7 +241,7 @@ async fn a_nas_name_clash_on_a_buffered_put_is_a_permanent_conflict() {
         let reply = put_object(
             &nas,
             "key",
-            Bytes::from_static(b"x"),
+            Bytes::from_static(b"x").into(),
             "LYPNsHeaiHdHPRi0lN+BWA==",
         )
         .await;

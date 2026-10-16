@@ -25,12 +25,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         stage: &PreparedStage,
         source: S3NativeCopySource,
         cancel: CancellationToken,
-        operations: usize,
     ) -> Result<NativeStageEvidence, NativeStageFailure> {
-        match self
-            .fill_native_stage(stage, &source, (&cancel, operations))
-            .await
-        {
+        match self.fill_native_stage(stage, &source, &cancel).await {
             // A resumed upload already held `write_offset` bytes; `bytes` is what this copy added.
             Ok(copy) => Ok(NativeStageEvidence {
                 write: WriteEvidence {
@@ -53,14 +49,12 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         &self,
         stage: &PreparedStage,
         source: &S3NativeCopySource,
-        (cancel, operations): (&CancellationToken, usize),
+        cancel: &CancellationToken,
     ) -> Result<S3NativeCopyEvidence, NativeFillFailure> {
         self.validate(stage)
             .map_err(|error| native_role_failure(error, 0))?;
         if let Some(upload) = at_destination::of(stage) {
-            return self
-                .fill_native_upload(stage, upload, source, (cancel, operations))
-                .await;
+            return self.fill_native_upload(stage, upload, source, cancel).await;
         }
         match single::of(stage) {
             Some(single) if stage.at_destination => fill_native_single(stage, single, source),

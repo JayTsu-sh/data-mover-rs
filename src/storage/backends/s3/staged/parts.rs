@@ -7,14 +7,12 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use md5::{Digest as _, Md5};
 use tokio::task;
 
 use super::super::source::{entry, role_failure};
-use super::super::{S3Protocol, S3ProtocolFailure};
+use super::super::{S3Body, S3Protocol, S3ProtocolFailure};
 use super::{S3StagedDestination, single};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{ByteStream, PreparedStage, StorageRoleFailure};
@@ -69,7 +67,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         mut input: ByteStream,
     ) -> Result<UploadedParts, StorageRoleFailure> {
         let mut progress = Progress::new(target, parts);
-        let mut buffered = BytesMut::with_capacity(target.part_size);
+        let mut buffered = Vec::new();
+        let mut buffered_bytes = 0;
         let mut number = progress
             .sent
             .parts
@@ -79,8 +78,18 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             .unwrap_or(0)
             + 1;
         let mut inflight = FuturesUnordered::new();
-        while let Some(chunk) = input.next().await {
-            let chunk = match chunk {
+        loop {
+            let chunk = loop {
+                tokio::select! {
+                    biased;
+                    completed = inflight.next(), if !inflight.is_empty() => {
+                        if let Some(completed) = completed { progress.record(completed).await?; }
+                    }
+                    chunk = input.next() => break chunk,
+                }
+            };
+            let Some(chunk) = chunk else { break };
+            let mut chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(input_failure) => {
                     while inflight.next().await.is_some() {}
@@ -88,9 +97,15 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 }
             };
             progress.sent.bytes += chunk.len() as u64;
-            buffered.extend_from_slice(&chunk);
-            while buffered.len() >= target.part_size {
-                let part = buffered.split_to(target.part_size).freeze();
+            while !chunk.is_empty() {
+                let take = chunk.len().min(target.part_size - buffered_bytes);
+                buffered.push(chunk.split_to(take));
+                buffered_bytes += take;
+                if buffered_bytes < target.part_size {
+                    continue;
+                }
+                let part = S3Body::new(std::mem::take(&mut buffered));
+                buffered_bytes = 0;
                 inflight.push(self.upload_part_to(target, number, part));
                 number += 1;
                 if inflight.len() >= target.max_inflight.max(1) {
@@ -106,7 +121,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             }
         }
         if !buffered.is_empty() || (progress.sent.parts.is_empty() && inflight.is_empty()) {
-            inflight.push(self.upload_part_to(target, number, buffered.freeze()));
+            inflight.push(self.upload_part_to(target, number, S3Body::new(buffered)));
         }
         while let Some(part) = inflight.next().await {
             progress.record(part).await?;
@@ -119,7 +134,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         &self,
         target: &PartTarget<'_>,
         number: i32,
-        part: Bytes,
+        part: S3Body,
     ) -> impl Future<Output = (Result<SentPart, S3ProtocolFailure>, u64)> + use<P> {
         let length = part.len() as u64;
         let observer = target.stage.and_then(|stage| stage.write_observer.clone());
@@ -221,7 +236,7 @@ pub(super) async fn upload<P: S3Protocol>(
     key: String,
     upload_id: String,
     number: i32,
-    bytes: Bytes,
+    bytes: S3Body,
 ) -> Result<SentPart, S3ProtocolFailure> {
     if !(1..=10_000).contains(&number) {
         return Err(S3ProtocolFailure::entry(
@@ -232,7 +247,7 @@ pub(super) async fn upload<P: S3Protocol>(
     }
     // A part may be hundreds of MiB: hash it off the async workers.
     let hashed = bytes.clone();
-    let digest = task::spawn_blocking(move || Md5::digest(&hashed))
+    let digest = task::spawn_blocking(move || hashed.md5())
         .await
         .map_err(|_| S3ProtocolFailure::protocol("S3 part digest task stopped"))?;
     let etag = protocol

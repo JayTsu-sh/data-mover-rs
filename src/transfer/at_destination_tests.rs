@@ -27,8 +27,8 @@ use crate::storage::{
     UnsupportedReason, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 use crate::transfer::{
-    InflightLimits, PrepareFact, RestartReason, TransferIdentity, TransferPhase, TransferPolicy,
-    TransferRequest, transfer,
+    PrepareFact, RestartReason, TransferIdentity, TransferPhase, TransferPolicy, TransferRequest,
+    transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -368,7 +368,6 @@ fn request(
         source,
         StoragePath::new("source.bin")?,
         destination.storage()?,
-        InflightLimits::new(2, 2 * 64 * 1024, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("out/final.bin")?)
@@ -593,11 +592,9 @@ async fn expert_run(
         None,
         described.source_identity,
     )?;
-    let limits = InflightLimits::new(2, 2 * 64 * 1024, 2)?;
     let source_half = ExpertSourceSession::open(ExpertSourceRequest::new(
         source,
         observation.clone(),
-        limits,
         CancellationToken::new(),
     ))
     .await?;
@@ -607,7 +604,6 @@ async fn expert_run(
             source_half.offer().maximum_chunk_bytes,
             destination.storage()?,
             StoragePath::new("out/final.bin")?,
-            limits,
             CancellationToken::new(),
         )
         .with_transfer_policy(TransferPolicy::Checkpointed),

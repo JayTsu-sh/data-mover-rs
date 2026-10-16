@@ -1,9 +1,10 @@
-//! Shared admission for backend prefetch and the ordered producer queue.
+//! Optional admission retained for low-level source requests.
 use super::inflight::{InflightAdmission, InflightFailure, InflightRuntime};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-/// Transfer-owned admission context for sources that prefetch payloads.
+/// Explicit admission context for low-level sources that prefetch payloads.
+/// Ordinary transfers use backend windows and a bounded channel instead.
 /// Reservations survive source completion until the ordered consumer takes the chunk.
 #[derive(Clone)]
 pub struct ReadBudget {
@@ -18,6 +19,7 @@ impl std::fmt::Debug for ReadBudget {
 }
 
 impl ReadBudget {
+    #[cfg(test)]
     pub(crate) fn new(runtime: InflightRuntime) -> Self {
         Self {
             runtime,
@@ -40,6 +42,7 @@ impl ReadBudget {
             .insert(offset, admission);
     }
 
+    #[cfg(test)]
     pub(crate) fn take(&self, offset: u64) -> Option<InflightAdmission> {
         self.ready
             .lock()

@@ -6,8 +6,7 @@ use clap::{Parser, ValueEnum};
 use data_mover::model::StoragePath;
 use data_mover::storage::{BackendConfig, LocalBackendConfig, connect_backend};
 use data_mover::transfer::{
-    InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
-    transfer,
+    ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest, transfer,
 };
 use futures::{StreamExt, TryStreamExt, stream};
 use tokio_util::sync::CancellationToken;
@@ -66,22 +65,21 @@ async fn optimized_copy(args: &Args) -> Result<(u64, u128), Box<dyn std::error::
     let read_concurrency = non_zero(args.read_inflight, "read inflight")?;
     let write_concurrency = non_zero(args.write_inflight, "write inflight")?;
     let source = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: Some(non_zero(args.chunk_bytes, "read chunk")?),
+        write_chunk_bytes: None,
         root: args.source.clone(),
         read_concurrency,
         write_concurrency,
     }))
     .await?;
     let destination = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: args.destination.clone(),
         read_concurrency,
         write_concurrency,
     }))
     .await?;
-    let inflight = args.read_inflight.max(args.write_inflight);
-    let inflight_bytes = args
-        .chunk_bytes
-        .checked_mul(inflight)
-        .ok_or("inflight byte budget overflowed")?;
     let started = Instant::now();
     let bytes = stream::iter(0..args.file_count)
         .map(|index| {
@@ -93,7 +91,6 @@ async fn optimized_copy(args: &Args) -> Result<(u64, u128), Box<dyn std::error::
                     source,
                     path.clone(),
                     destination,
-                    InflightLimits::new(inflight, inflight_bytes, inflight)?,
                     CancellationToken::new(),
                 )
                 .with_identity_override(TransferIdentity::from_label(format!(

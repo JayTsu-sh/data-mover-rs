@@ -42,6 +42,9 @@ impl HdfsReadSource {
 
 #[async_trait]
 impl ReadSource for HdfsReadSource {
+    fn read_concurrency(&self) -> usize {
+        self.protocol.read_concurrency().max(1)
+    }
     fn supports_read_budget(&self) -> bool {
         true
     }

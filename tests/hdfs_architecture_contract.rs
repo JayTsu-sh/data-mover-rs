@@ -14,7 +14,7 @@ use data_mover::storage::{
     StorageRoleFailure, VerifyRequest, connect_backend,
 };
 use data_mover::storage::{HdfsConfig, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client};
-use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
+use data_mover::transfer::{TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
     Checkpoint, Resumable, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome,
     TraversalRequest, TraversalSource as _,
@@ -142,7 +142,6 @@ async fn architecture_roles_traverse_stream_verify_and_overwrite() -> TestResult
             source.clone(),
             StoragePath::new("nested/source.bin")?,
             destination.clone(),
-            InflightLimits::new(2, 128 * 1024, 2)?,
             CancellationToken::new(),
         )
         .with_final_path(StoragePath::new("published/final.bin")?)
@@ -184,7 +183,6 @@ async fn native_writer_crosses_block_boundary_through_bounded_transfer() -> Test
             source.clone(),
             StoragePath::new("source.bin")?,
             destination.clone(),
-            InflightLimits::new(2, 1024 * 1024, 3)?,
             CancellationToken::new(),
         )
         .with_final_path(StoragePath::new("reordered.bin")?),

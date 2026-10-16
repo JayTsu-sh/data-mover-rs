@@ -4,7 +4,7 @@ use data_mover::model::{ObservedEntry, StoragePath};
 use data_mover::storage::{BackendConfig, LocalBackendConfig, Storage, connect_backend};
 use data_mover::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession,
-    InflightLimits, TransferIdentity, TransferPolicy,
+    TransferIdentity, TransferPolicy,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -12,6 +12,8 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn local_storage(root: &std::path::Path) -> TestResult<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.to_path_buf(),
         read_concurrency: NonZeroUsize::new(2).ok_or("non-zero read concurrency")?,
         write_concurrency: NonZeroUsize::new(2).ok_or("non-zero write concurrency")?,
@@ -43,7 +45,6 @@ async fn expert_source_hashes_the_whole_file_but_emits_only_after_durable_prefix
     let session = ExpertSourceSession::open(ExpertSourceRequest::new(
         storage,
         observation,
-        InflightLimits::new(2, 128 * 1024, 2)?,
         CancellationToken::new(),
     ))
     .await?;
@@ -74,11 +75,9 @@ async fn expert_source_and_destination_share_verified_publication_lifecycle() ->
     let destination_storage = local_storage(destination_root.path()).await?;
     let observation = observe(&source_storage, "payload.bin").await?;
     let identity = TransferIdentity::from_label("expert-e2e")?;
-    let limits = InflightLimits::new(2, 128 * 1024, 2)?;
     let source = ExpertSourceSession::open(ExpertSourceRequest::new(
         source_storage,
         observation.clone(),
-        limits,
         CancellationToken::new(),
     ))
     .await?;
@@ -88,7 +87,6 @@ async fn expert_source_and_destination_share_verified_publication_lifecycle() ->
             source.offer().maximum_chunk_bytes,
             destination_storage,
             StoragePath::new("published.bin")?,
-            limits,
             CancellationToken::new(),
         )
         .with_identity_override(identity)
@@ -134,7 +132,6 @@ async fn expert_destination_checkpoints_only_multi_source_chunk_payloads() -> Te
     tokio::fs::write(source_root.path().join("small.bin"), vec![4; 4 * 1024]).await?;
     let source_storage = local_storage(source_root.path()).await?;
     let destination_storage = local_storage(destination_root.path()).await?;
-    let limits = InflightLimits::new(2, 128 * 1024, 2)?;
 
     let large = ExpertDestinationSession::prepare(
         ExpertDestinationRequest::new(
@@ -142,7 +139,6 @@ async fn expert_destination_checkpoints_only_multi_source_chunk_payloads() -> Te
             64 * 1024,
             destination_storage.clone(),
             StoragePath::new("large.bin")?,
-            limits,
             CancellationToken::new(),
         )
         .with_identity_override(TransferIdentity::from_label("expert-recoverable")?)
@@ -158,7 +154,6 @@ async fn expert_destination_checkpoints_only_multi_source_chunk_payloads() -> Te
             64 * 1024,
             destination_storage,
             StoragePath::new("small.bin")?,
-            limits,
             CancellationToken::new(),
         )
         .with_identity_override(TransferIdentity::from_label("expert-ephemeral")?)

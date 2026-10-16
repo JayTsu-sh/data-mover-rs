@@ -100,6 +100,10 @@ unimplemented = "warn"
 # Lab executables retain their cargo target names; source lives with the harnesses.
 
 [[example]]
+name = "backend_pipeline_benchmark"
+path = "tests/lab/tools/backend_pipeline_benchmark.rs"
+
+[[example]]
 name = "storage_small_benchmark"
 path = "tests/lab/tools/storage_small_benchmark.rs"
 

@@ -102,7 +102,6 @@ async fn main() -> Result {
         source.clone(),
         path.clone(),
         destination.clone(),
-        copy_support::limits(CHUNK)?,
         cancel.clone(),
     )
     .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);

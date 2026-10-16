@@ -55,7 +55,7 @@ async fn bucket(keys: impl IntoIterator<Item = String>) -> TestResult<Arc<Memory
     for key in keys {
         let body = Bytes::from_static(b"x");
         protocol
-            .put_object(&key, body.clone(), &content_md5(&body))
+            .put_object(&key, body.clone().into(), &content_md5(&body))
             .await
             .map_err(|e| format!("{e:?}"))?;
     }
@@ -705,7 +705,7 @@ async fn an_unordered_store_lists_every_child_and_each_subdirectory_once() -> Te
 async fn absence_is_decided_at_the_end_and_before_any_page() -> TestResult {
     let protocol = bucket(["h/.data-mover-x".to_owned(), "d/e".to_owned()]).await?;
     protocol
-        .put_object("m/", Bytes::new(), &content_md5(&Bytes::new()))
+        .put_object("m/", Bytes::new().into(), &content_md5(&Bytes::new()))
         .await
         .map_err(|e| format!("{e:?}"))?;
     let namespace = quick(&protocol);
