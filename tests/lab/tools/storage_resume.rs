@@ -117,7 +117,7 @@ async fn main() -> Result {
         reused_bytes: None,
     };
     match args.phase {
-        Phase::Interrupt => interrupt(&args, request, cancel, &mut state).await?,
+        Phase::Interrupt => interrupt(&args, &source, &destination, &path, &mut state).await?,
         Phase::Resume => resume(&args, &source, &destination, &path, request, &mut state).await?,
     }
     Ok(())
@@ -163,8 +163,9 @@ async fn resume(
 
 async fn interrupt(
     args: &Args,
-    request: TransferRequest,
-    cancel: CancellationToken,
+    source: &Storage,
+    destination: &Storage,
+    path: &StoragePath,
     state: &mut ResumeState,
 ) -> Result {
     // Automatic checkpoints start after 64 MiB. Leave room for a durable checkpoint and
@@ -172,42 +173,64 @@ async fn interrupt(
     if state.size < 96 << 20 {
         return Err("resume fixture must be at least 96 MiB for automatic checkpoints".into());
     }
-    let stop_after_bytes = (state.size / 2).saturating_add(32 << 20);
-    let delay = Duration::from_millis(stop_after_bytes.saturating_mul(1000) / BANDWIDTH);
-    let timer_cancel = cancel.clone();
-    let timer = tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        timer_cancel.cancel();
-    });
-    let qos = SourceQosGroup::new(SourceQosPolicy::new(
-        Some((BANDWIDTH, BANDWIDTH, Duration::ZERO)),
-        CHUNK,
-        None,
-    )?);
-    let result = transfer(request.with_source_qos(qos)).await;
-    timer.abort();
-    let _ = timer.await;
-    let failure = result
-        .err()
-        .ok_or("transfer completed before interruption")?;
-    if !cancel.is_cancelled()
-        || !failure.has_recoverable_stage()
-        || failure.final_destination_changed()
-    {
-        return Err(failure.into());
+    // Throughput varies substantially between real backends. A cancellation before the first
+    // durable checkpoint is valid, but it cannot produce the recovery state this tool is meant
+    // to hand to the next process. Retry those attempts with a longer window instead of turning
+    // a below-threshold interruption into a lab failure.
+    for attempt in 0..6 {
+        let cancel = CancellationToken::new();
+        let request = TransferRequest::new(
+            source.clone(),
+            path.clone(),
+            destination.clone(),
+            cancel.clone(),
+        )
+        .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
+        let stop_after_bytes = (state.size / 2)
+            .saturating_add(32 << 20)
+            .saturating_add((attempt as u64) * (32 << 20));
+        let delay = Duration::from_millis(stop_after_bytes.saturating_mul(1000) / BANDWIDTH);
+        let timer_cancel = cancel.clone();
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            timer_cancel.cancel();
+        });
+        let qos = SourceQosGroup::new(SourceQosPolicy::new(
+            Some((BANDWIDTH, BANDWIDTH, Duration::ZERO)),
+            CHUNK,
+            None,
+        )?);
+        let result = transfer(request.with_source_qos(qos)).await;
+        timer.abort();
+        let _ = timer.await;
+        let failure = result
+            .err()
+            .ok_or("transfer completed before interruption")?;
+        if !cancel.is_cancelled() || failure.final_destination_changed() {
+            return Err(failure.into());
+        }
+        if !failure.has_recoverable_stage() {
+            eprintln!(
+                "interruption attempt {} stopped before a durable checkpoint; retrying",
+                attempt + 1
+            );
+            drop(failure); // The next prepare cleans or resumes the below-threshold stage.
+            continue;
+        }
+        state.recovery_at_destination = true;
+        state.source_streamed_bytes = failure.source_qos().client_streamed_shaped_bytes;
+        drop(failure); // Release the destination lease; the retained recovery state stays there.
+        write_state(args.state_file.as_deref(), state)?;
+        println!(
+            "interrupted after {} streamed bytes; recoverable state retained at destination",
+            state.source_streamed_bytes
+        );
+        if args.hold_after_interrupt {
+            std::future::pending::<()>().await;
+        }
+        return Ok(());
     }
-    state.recovery_at_destination = true;
-    state.source_streamed_bytes = failure.source_qos().client_streamed_shaped_bytes;
-    drop(failure); // Release the destination lease; the retained recovery state stays there.
-    write_state(args.state_file.as_deref(), state)?;
-    println!(
-        "interrupted after {} streamed bytes; recoverable state retained at destination",
-        state.source_streamed_bytes
-    );
-    if args.hold_after_interrupt {
-        std::future::pending::<()>().await;
-    }
-    Ok(())
+    Err("unable to establish a durable recovery checkpoint after repeated interruptions".into())
 }
 
 #[cfg(test)]
