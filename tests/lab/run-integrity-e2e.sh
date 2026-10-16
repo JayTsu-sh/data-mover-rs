@@ -254,7 +254,7 @@ for backend in "${nas_backends[@]}"; do
   printf 'source-file' > "$edge_fixture_root/$type_key"
   copy_local_fixture "$edge_fixture_root" source "$backend" "$type_key"
   create_nas_directory destination "$backend" "$type_key"
-  expect_mismatch 'EntryKind.*File.*Directory' "$backend-entry-kind" \
+  expect_mismatch 'Kind.*source: File.*destination: Directory' "$backend-entry-kind" \
     "$backend" "$backend" "$type_key" quick
 done
 

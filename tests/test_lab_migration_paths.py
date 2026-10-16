@@ -103,6 +103,14 @@ class MigrationHarnessPaths(unittest.TestCase):
             source,
         )
 
+    def test_integrity_entry_kind_mismatch_accepts_structured_difference(self):
+        script = ROOT / "tests/lab/run-integrity-e2e.sh"
+        source = script.read_text()
+        self.assertIn(
+            "Kind.*source: File.*destination: Directory",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
