@@ -212,7 +212,7 @@ done
 check_path nfs41 nfs41 "nfs41-large-copy.bin"
 
 # Empty objects exercise the zero-size fast path through real metadata readers.
-# Missing destinations verify that each backend preserves its not-found error.
+# Missing destinations verify that each backend reports a typed absence difference.
 edge_fixture_root="$local_root/integrity-edge-fixtures"
 mkdir -p "$edge_fixture_root"
 for backend in "${backends[@]}"; do
@@ -226,7 +226,7 @@ for backend in "${backends[@]}"; do
   missing_key="integrity-missing-destination-$backend.bin"
   printf 'source-only' > "$edge_fixture_root/$missing_key"
   copy_local_fixture "$edge_fixture_root" source "$backend" "$missing_key"
-  expect_mismatch '(File not found|IO error:.*not found|NoSuchKey|NotFound)' \
+  expect_mismatch '(Missing.*Destination|File not found|IO error:.*not found|NoSuchKey|NotFound)' \
     "$backend-missing-destination" \
     "$backend" "$backend" "$missing_key" quick
 done

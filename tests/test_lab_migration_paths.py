@@ -87,6 +87,14 @@ class MigrationHarnessPaths(unittest.TestCase):
                 checked += 1
         self.assertGreater(checked, 3)
 
+    def test_integrity_missing_destination_accepts_typed_difference(self):
+        script = ROOT / "tests/lab/run-integrity-e2e.sh"
+        source = script.read_text()
+        self.assertIn(
+            "(Missing.*Destination|File not found|IO error:.*not found|NoSuchKey|NotFound)",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
