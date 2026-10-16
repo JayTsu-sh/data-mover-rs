@@ -269,7 +269,9 @@ expect_mismatch 'Modified.*source:.*destination:' "local-mtime-exact-default" \
   local local "$mtime_key" quick
 check_path_with_mtime_options local local "$mtime_key" 5
 
-touch -m -d '@1700000400.500000000' "$local_root/destination/$mtime_key"
+# Both local endpoints report nanosecond precision, so automatic precision remains
+# exact for this pair. Coarser-precision behavior is covered by integrity unit tests.
+touch -m -d '@1700000400.000000000' "$local_root/destination/$mtime_key"
 check_path_with_mtime_options local local "$mtime_key" 0 --mtime-auto-precision
 echo "mtime precision and tolerance options verified"
 
