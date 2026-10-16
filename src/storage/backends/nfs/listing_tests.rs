@@ -395,7 +395,7 @@ async fn cancelling_during_a_backoff_ends_the_listing_with_a_cancelled_signal() 
         Some(StorageRoleFailure::Entry(ref failure)) if failure.class() == FailureClass::Cancelled
     ));
     let reads = FakeNfs::count(&fake.reads_started);
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    tokio::time::sleep(Duration::from_mins(1)).await;
     assert_eq!(
         FakeNfs::count(&fake.reads_started),
         reads,

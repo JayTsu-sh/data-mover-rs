@@ -441,7 +441,7 @@ async fn checkpoints_come_once_per_period_and_never_when_off() {
         let (items, _) = run(&setup.source, request(order, 2, 1), None).await;
         assert!(checkpoints(&items).is_empty());
         assert_eq!(setup.clock.reads(), 0, "{order:?}: Off read the clock");
-        let every = Duration::from_secs(60);
+        let every = Duration::from_mins(1);
         let on = || request(order, 2, 1).resumable(Resumable::On { every });
         let (items, _) = run(&setup.source, on(), None).await;
         assert!(

@@ -99,7 +99,7 @@ fn resume(request: &TraversalRequest, clock: &Arc<ManualClock>) -> Resume {
 #[test]
 fn one_caller_claims_each_period() {
     let clock = Arc::new(ManualClock::default());
-    let every = Duration::from_secs(60);
+    let every = Duration::from_mins(1);
     let request = TraversalRequest::new(StoragePath::root()).resumable(Resumable::On { every });
     let resume = resume(&request, &clock);
     assert!(!resume.claim_due());

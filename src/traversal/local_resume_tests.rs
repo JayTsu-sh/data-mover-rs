@@ -43,7 +43,7 @@ async fn run(
 ) -> io::Result<(Vec<TraversalItem>, Outcome)> {
     let cancel = request.cancel.clone();
     let mut session = source.traverse(request);
-    let ran = tokio::time::timeout(Duration::from_secs(60), async {
+    let ran = tokio::time::timeout(Duration::from_mins(1), async {
         let mut items = Vec::new();
         let mut entries = 0;
         while let Some(item) = session.next_item().await {

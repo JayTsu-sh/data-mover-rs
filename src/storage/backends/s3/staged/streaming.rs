@@ -51,7 +51,7 @@ use crate::storage::{
 /// How long the last byte may wait for publication before the upload is given up: well within
 /// the 900 s an ONTAP NAS bucket was seen to wait (N0), and long enough for metadata and the
 /// expert source's evidence between `write` and `publish`.
-pub(super) const HOLD_LIMIT: Duration = Duration::from_secs(300);
+pub(super) const HOLD_LIMIT: Duration = Duration::from_mins(5);
 
 /// The upload-id half of a streaming stage's token; a real upload id is printable.
 const STREAMING_MARKER: &str = "\u{1}streamed-put";

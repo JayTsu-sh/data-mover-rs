@@ -142,13 +142,6 @@ pub(crate) fn directory_object_artifact(
 /// A deterministic artifact name, taken apart. A listing-based sweep must match a digest of `d/`
 /// found in `p/` against the prefix `p/d/` (a directory object's artifacts, P7 F5), not against a
 /// sibling object, or it would take a live pointer for an orphan.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "for a listing-based sweep of other files' leftovers (backlog)"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ParsedArtifact<'a> {
     pub(crate) digest: &'a str,

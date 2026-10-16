@@ -392,7 +392,16 @@ impl MetadataRole for LocalObservationAdapter {
         }
         #[cfg(windows)]
         {
-            Some(ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly))
+            // Ask explicitly so the observation records `NotApplicable` for
+            // Windows' non-numeric ownership model. Leaving this omitted
+            // would produce `NotRequested`, which AllowKnownLoss correctly
+            // refuses because it cannot distinguish unsupported ownership
+            // from an observation bug.
+            Some(
+                ObservationPlan::default()
+                    .with_ownership_mode(ObservationMode::InlineOnly)
+                    .with_timestamps(ObservationMode::InlineOnly),
+            )
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -598,7 +607,11 @@ fn inline_ownership(
     mode: ObservationMode,
     _metadata: &Metadata,
 ) -> MetadataObservation<OwnershipMode> {
-    additional_only(mode)
+    // Windows has no numeric uid/gid ownership model. Report the family as not
+    // applicable when it is requested, rather than unsupported/not observed;
+    // the latter makes the normal AllowKnownLoss transfer policy fail before
+    // any data is copied.
+    optional_not_applicable(mode)
 }
 
 fn inline_timestamps(

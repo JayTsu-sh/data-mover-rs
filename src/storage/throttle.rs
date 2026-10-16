@@ -28,7 +28,7 @@ impl ThrottleBackoff {
     pub(crate) const LISTING: Self = Self {
         first: Duration::from_millis(250),
         max_delay: Duration::from_secs(15),
-        budget: Duration::from_secs(120),
+        budget: Duration::from_mins(2),
     };
 
     /// A fresh budget for one operation.
