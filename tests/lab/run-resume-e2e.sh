@@ -50,7 +50,7 @@ seed_source() {
   python3 -c '
 import pathlib
 import sys
-size = 12 * 1024 * 1024 + 123
+size = 96 * 1024 * 1024 + 123
 chunk = bytes(range(251)) * 4096
 path = pathlib.Path(sys.argv[1])
 with path.open("wb") as output:
@@ -105,20 +105,20 @@ for source_backend in "${backends[@]}"; do
       --state-file "$state_file" --hold-after-interrupt >"$log_file" 2>&1 &
     interrupt_pid=$!
     state_ready=false
-    for _ in {1..120}; do
+    for _ in {1..600}; do
       if python3 - "$state_file" <<'PY' 2>/dev/null
 import json
 import pathlib
 import sys
 state = json.loads(pathlib.Path(sys.argv[1]).read_text())
 size = state["size"]
-missing = state["missing"]
-assert size > 0 and missing
-assert all(0 <= start < end <= size for start, end in missing)
-assert 0 < sum(end - start for start, end in missing) < size
-assert isinstance(state["handle"], dict) and len(state["handle"]) == 1
-if "Hdfs" in state["handle"]:
-    assert len(missing) == 1 and 0 < missing[0][0] < missing[0][1] == size
+assert state["schema"] == 2 and size >= 96 * 1024 * 1024
+assert state["recovery_at_destination"] is True
+assert isinstance(state["identity"], str) and state["identity"]
+assert len(state["source_observation"]) == 64
+assert 0 < state["source_streamed_bytes"] < size
+# Only the subsequent resumed outcome can attest the receiver's durable prefix.
+assert state["reused_bytes"] is None
 PY
       then
         state_ready=true
@@ -144,6 +144,12 @@ PY
     "$resume_binary" "${common_args[@]}" "${delete_args[@]}" --phase resume \
       --prior-state-file "$state_file" \
       --state-file "$local_root/resume-$source_backend-$destination_backend.json"
+    python3 - "$local_root/resume-$source_backend-$destination_backend.json" <<'PY'
+import json, pathlib, sys
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert state["schema"] == 2
+assert 0 < state["reused_bytes"] < state["size"]
+PY
     expected_probe="$("$inspect_binary" --storage "$local_root/seed" --path "$key")"
     destination_probe="$("$inspect_binary" \
       --storage "$(storage_url destination "$destination_backend")" --path "$key")"

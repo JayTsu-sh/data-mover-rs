@@ -13,7 +13,7 @@
 | 元 | 含义 | 影响 |
 |---|---|---|
 | `should_skip: bool` | 当前条目是否跳过 | 单条目级别 |
-| `continue_scan: bool` | 是否继续扫这一层 | 同级兄弟节点 |
+| `continue_scan: bool` | 该目录是否继续往下扫 | 子目录递归 (仅对目录有意义) |
 | `check_children: bool` | 子项是否还需要过滤 | 子目录递归 |
 
 **三个分量独立**，不能互相推导。
@@ -25,6 +25,54 @@
 - `(false, false, false)` — 收当前条目，停止扫描，子项不过滤。
 
 **改 `should_skip` 前必须想清三个语义独立性**，并在 PR 描述中说明每种组合的预期行为。
+
+> `continue_scan` 是"要不要把这个目录排进待扫队列"，不是"要不要继续扫同级兄弟"。
+> 四个 legacy backend 的用法都是 `if is_dir && continue_scan { subdirs.push(..) }`；
+> 默认返回值 `(false, is_dir, true)` 对文件给 `false`，若解释成"同级"则每个文件都会终止本层扫描。
+
+### role-based traversal 的映射
+
+`crate::DslTraversalFilter` (`src/filter_traversal.rs`) 把三元组映射到
+`traversal::TraversalDecision`：
+
+| 三元组 | `TraversalDecision` |
+|---|---|
+| `should_skip` | `emit = !should_skip` |
+| `continue_scan` | `descend` |
+| `check_children` | `filter_children` |
+
+`filter_children = false` 是**传递性**的：整棵子树都不再调 `should_skip`，连 exclude 也绕过
+(legacy `dir_tree.rs` 的 `need_filter` 同语义)。
+
+被 filter 拦下的目录在遍历输出里是**可观测**的，`(emit, descend)` 两个分量各自对应不同的证据：
+
+| `(emit, descend)` | 遍历输出 |
+|---|---|
+| `(false, true)` 隐藏但下钻 | 没有自己的 `Entry`，但有自己的 `DirectoryListed`；父目录块的 `counts.filtered` 加一 |
+| `(true, false)` 发出但不下钻 | 有 `Entry`，没有 `DirectoryListed`；只进父目录块的 `counts.pruned_dirs`，**不算** `filtered` |
+| `(false, false)` 两者皆无 | 既无 `Entry` 也无 `DirectoryListed`；父目录块同时计 `filtered` 和 `pruned_dirs` |
+
+所以 `filtered` 只意味着"有子项没被输出"，与"有子树没被下钻"是两件事，别把它们合起来读
+(P7 C2 起计数见 `src/traversal/counts.rs`，`listed == emitted + filtered + failed_children + vanished`)。
+下游判断"能不能安全删除目的端多余条目"按 `ScanFailure` 文档上的删除安全规则 (P7 §4.1)：有 filter
+或 `max_depth` 时，旧代条目用同一个 filter / 深度判定，被排除或截断的不参与删除。
+
+`FilterInput` 各字段的取值口径：
+
+| 字段 | 取值 |
+|---|---|
+| `file_path` | **相对遍历根**，`/` 分隔、无前导 `/`；Local 的 `./` 前缀会被剥掉。不是条目最终发布的 backend 相对路径 |
+| `file_name` | 最后一段 |
+| `file_type` | `file` / `dir` / `symlink` / `special` |
+| `extension` | 与 `Path::extension` 一致：最后一个 `.` 之后，且该 `.` 前必须有内容，所以 `.bashrc` 没有扩展名。永不为 `None` |
+| `size` | 目录取 `Some(0)`，否则 `size` 条件会退化成放行的 `LazyMatch`。S3 版本化桶上一个 key 一项（P7 C11b）：`size` = 当前版本的大小，`modified` = 最新一条记录的时间；当前已删的 key（最新是删除标记）`size` 取 `None`、`modified` 是删除标记的时间（会命中“最近修改”类条件），**有意保留**这个 `LazyMatch`（用户决定 2026-09-25）：`size` 条件本身从不滤掉标记（表达式里的其他条件照常判断），这样历史迁移会带上大文件的删除记录 —— 标记不带数据；目的端该 key 上没有对象时，重放一个从没拷过的 key 的删除不改任何数据（有对象时重放会把它藏到新标记后面，是否重放由调用方判断） |
+
+**`modified` 缺失时不能先评估**：缺 `modified` 的 `Modified` 条件返回 `LazyMatch`，而
+`LazyMatch` 会被组合子吸收 (`Match & Lazy = Match`、`MisMatch | Lazy = MisMatch`)，
+结果既不是上界也不是下界 — 可能误剪枝，也可能误收。因此
+`FilterExpression::referenced_fields().modified` 为真时，traversal 先做元数据观察再决策
+(`TraversalFilter::needs_modified`)，绝不用缺 `modified` 的评估结果。列举已带 `modified`、观察不需要 I/O 时
+(NFS / CIFS / Local / S3 / HDFS 的列举都带 `modified`，默认计划下都是)，这次观察就在列举任务里当场完成、当场决策 (P7 C0b)，值与 deferred 路径完全相同。
 
 ## 表达式形式
 
@@ -85,23 +133,29 @@ enum ModifiedValue {
 
 修改这个函数前先看现有 4-5 种命名模式的处理。
 
-## 与 walkdir 的关系
+## 与遍历的关系
 
-```
-walkdir 流水线
-  │
-  ├──> enumerate next entry
-  │       │
-  │       ▼
-  │   filter.should_skip(entry)
-  │       │
-  │       ├──> (skip=t, scan=f, children=*) → 剪枝整个分支
-  │       ├──> (skip=t, scan=t, children=t) → 跳过但继续
-  │       ├──> (skip=f, ..., children=t) → 收集 + 子项过滤
-  │       └──> (skip=f, ..., children=f) → 收集 + 子项全收
-```
+`DslTraversalFilter` 把 DSL 三元组适配为 `TraversalDecision`；backend 只描述条目。
+列举可回答的判断按页执行；需要 modified 的条件等时间戳观察完成后再决定。
+过滤隐藏条目仍计入 totals；是否下钻、是否继续对子项过滤由同一 decision 决定。
 
-walk_scheduler 不感知 filter — filter 是 walkdir 实现层调的，走 enum dispatch 后由各 backend 注入。
+## S3 目录对象（P7 F5）
+
+S3 的键 `p/d/`（目录 `p/d` 自己的对象，有没有内容都算）是 `p/d` 块里的一个 **File** 条目：filter 看到
+`type == "file"`、`name` = 目录名 `d`（最后一个非空段，不是空串）、`path` = `p/d/`（带尾 `/`，相对扫描根）、
+`size` / `modified` 来自列举，扩展名按 `d` 算（`x.tar/` 的扩展名是 `tar`）。所以：
+
+- `type == "file"` 会匹配到文件夹标记；`size > 0` 把有内容的目录对象与纯标记分开；`type == "dir"` 不匹配它。
+- `name == "d"` 同时命中目录 `p/d` 与它的对象 `p/d/`；`path` 的 glob（如 `p/d/*`）可能也命中 `p/d/` 本身
+  （`*` 可以匹配空串）—— 写路径条件时注意。
+- filter 剪掉 `p/d`（不下钻）时 `p/d/` 跟着不列；`p/d` 被隐藏但仍下钻时，`p/d/` 按它自己的条件判定。
+- 三元组本身没变（规则 F1 不触发）。
+
+## 传输 artifact 不进三元组
+
+所有列举（legacy 与 role-based，全部后端）在调用 `should_skip` **之前**就丢掉相对根任一段以 `.data-mover-`
+开头的条目 (ADR-0006 C3b)。放在后面的话，「跳过但继续下探」分支会走进 `.data-mover-stage/` 把里面名字普通的
+子项报出来。三元组语义本身不变。
 
 ## 已知陷阱
 

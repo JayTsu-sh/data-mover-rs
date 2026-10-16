@@ -1,6 +1,11 @@
 # data-mover-rs
 
-Storage abstraction layer supporting Local, NFS, S3, and SMB/CIFS backends.
+Storage abstraction layer supporting Local, NFS, S3, HDFS, and SMB/CIFS backends.
+All backends use `storage::connect_backend` and typed storage roles.
+SMB/CIFS uses explicit configuration and has no URL form.
+
+For replacements for the removed legacy APIs, see the
+[migration inventory](docs/design/legacy-api-removal.md).
 
 ## Storage URL Formats
 
@@ -10,11 +15,29 @@ Storage abstraction layer supporting Local, NFS, S3, and SMB/CIFS backends.
 | NFS v3 | `nfs://server:port/export/path:/prefix?uid=1000&gid=1000` |
 | S3 | `s3://access_key:secret_key@bucket.host:port/prefix` |
 | S3 (TLS) | `s3+https://access_key:secret_key@bucket.host/prefix` |
-| StorageGRID | `s3+sg://access_key:secret_key@bucket.host:port/prefix` |
-| StorageGRID (TLS) | `s3+sg+https://access_key:secret_key@bucket.host/prefix` |
-| DXN | `s3+dxn://access_key:secret_key@bucket.host:port/prefix` |
-| DXN (TLS) | `s3+dxn+https://access_key:secret_key@bucket.host/prefix` |
-| SMB/CIFS | `smb://user:password@host[:port]/share[/sub/path][?smb2_only=false]` |
+| StorageGRID | `s3://access_key:secret_key@bucket.host:port/prefix?compat=sg` |
+| DXN | `s3://access_key:secret_key@bucket.host:port/prefix?compat=dxn` |
+| ONTAP S3 | `s3://access_key:secret_key@bucket.host/prefix?compat=ontap` |
+| SMB/CIFS | No URL. Use `connect_backend(BackendConfig::Cifs(CifsBackendConfig { .. }))` |
+
+S3 URL options (the query; leave one out for its default):
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `compat` | `sg`, `dxn`, `ontap` | standard S3 |
+| `tls_verify` | `false` (only on `s3+https://`) | certificates verified |
+| `bucket_type` | `nas` (only with `compat=ontap`; not implemented yet, refused at connect) | object bucket |
+
+Writing a default (`compat=standard`, `tls_verify=true`, `bucket_type=object`), an unknown,
+repeated or empty option, `tls_verify` on `s3://` or `bucket_type=nas` without `compat=ontap`
+is a `UrlParseError`. The schemes `s3+http://`, `s3+sg[+https]://`, `s3+dxn[+https]://` and
+`s3+hcp://` were removed; their error names the new spelling. HCP support (`compat=hcp`,
+tags from the HCP REST annotation) was removed: an HCP namespace is used as standard S3.
+Options are not part of the endpoint identity.
+
+`s3+https://` verifies the server certificate against the system roots, which honour
+`SSL_CERT_FILE` / `SSL_CERT_DIR` (trust a private CA there). For a self-signed endpoint add
+`tls_verify=false`: the certificate is then not verified, and every connection logs a warning.
 
 ### S3 Timeout Environment Variables
 
@@ -31,37 +54,44 @@ Unset, invalid, or zero values use the documented defaults.
 ### Transfer concurrency
 
 Read and write pipelines are configured independently. Every value must be an
-integer in `1..=16`; an invalid value fails storage creation with a configuration
+integer in `1..=24`; an invalid value fails storage creation with a configuration
 error instead of being silently ignored.
 
 | Backend | Read default | Write default |
 |---------|--------------|---------------|
 | Local | `4` | `8` |
 | NFS | `4` | `8` |
-| SMB/CIFS | `4` | `4` |
+| SMB/CIFS | `8` | `8` |
 | S3 | `4` | `5` |
 
-`DATA_MOVER_READ_INFLIGHT` and `DATA_MOVER_WRITE_INFLIGHT` set global values.
+`DATA_MOVER_INFLIGHT=8`, `16`, or `24` sets both read and write depths.
+`DATA_MOVER_READ_INFLIGHT` and `DATA_MOVER_WRITE_INFLIGHT` override each direction.
 Use `DATA_MOVER_<BACKEND>_READ_INFLIGHT` or
 `DATA_MOVER_<BACKEND>_WRITE_INFLIGHT` for a backend-specific override, where
 `<BACKEND>` is `LOCAL`, `NFS`, `CIFS`, or `S3`. Each direction is resolved
-independently: backend-specific variable, global variable, then protocol
-default. The Rust API can override the resolved pair with
-`TransferConcurrency` and `StorageEnum::with_transfer_concurrency` (or the
-corresponding concrete-adapter builder).
+independently: backend-specific direction, global direction, shared
+`DATA_MOVER_INFLIGHT`, then protocol default. Use `TransferConcurrency::from_env`
+to resolve the pair, then apply it to backend configuration and transfer `InflightLimits`.
 
 The upper bound is intentional: lab measurements across the complete Local,
 NFSv3, NFSv4.1, and S3 copy matrix showed that increasing inflight from 8 to 16
 provided only a small aggregate throughput gain while CPU and peak memory grew
-substantially. Values above 16 are rejected rather than clamped so the effective
+substantially. The configurable limit is now 24 for targeted single-stream measurements;
+protocol defaults remain unchanged. Values above 24 are rejected rather than clamped so the effective
 configuration never differs silently from what the operator requested.
+
+Role-based callers can resolve the same environment rules with
+`TransferConcurrency::from_env(BackendKind::Nfs, defaults)` and use that pair
+for their backend configuration and `InflightLimits`. Explicitly supplied
+transfer limits are not silently overwritten by environment settings.
+The `nfs_mount_comparison` example does this for both transport paths.
 
 The defaults are the recommended general-purpose settings. For a high-latency
 NFS path with sufficient server session capacity, `read=8` and `write=16` can
 improve throughput. S3 normally reaches its throughput knee around 4 to 8, and
 Local reads normally reach it around 4; raising them to 16 is generally not a
-good CPU/memory tradeoff. CIFS keeps its conservative 4/4 default because the
-shared lab does not yet provide a real SMB endpoint for performance tuning.
+good CPU/memory tradeoff. The role-based CIFS backend defaults to 8/8 and reads
+the same `DATA_MOVER_CIFS_*` variables through `TransferConcurrency::from_env`.
 
 ### QoS semantics
 
@@ -143,36 +173,36 @@ Some StorageGRID versions reject the AWS SDK's informational `x-id` query
 parameter. Select StorageGRID compatibility per endpoint with its storage URL:
 
 ```text
-s3+sg://access_key:secret_key@bucket.host:port/prefix
-s3+sg+https://access_key:secret_key@bucket.host/prefix
+s3://access_key:secret_key@bucket.host:port/prefix?compat=sg
+s3+https://access_key:secret_key@bucket.host/prefix?compat=sg
 ```
 
-`s3+sg://` uses HTTP. `s3+sg+https://` uses HTTPS and, like the existing
-`s3+https://` scheme, skips certificate verification for trusted private
-deployments with self-signed certificates.
-
-For clients created from either StorageGRID scheme, data-mover removes the
+For clients created with `compat=sg`, data-mover removes the
 exact `x-id` query parameter immediately before SigV4 signing. Other query
-parameters and their encoded bytes are preserved. The scheme applies to both
+parameters and their encoded bytes are preserved. The option applies to both
 bucket listing and normal S3 data operations and does not change credentials,
-path-style addressing, or general checksum configuration. For multi-object
-delete, it also supplies the legacy signed `Content-MD5` required by older
-StorageGRID releases.
+path-style addressing, or general checksum configuration.
 
-Standard `s3://`, `s3+http://`, and `s3+https://` clients never enable this
-workaround, so standard S3 and StorageGRID endpoints can safely coexist in one
-process. There is no environment-variable override.
+Clients without `compat=sg` never remove `x-id`,
+so standard S3 and StorageGRID endpoints can safely coexist in one process.
+There is no environment-variable override.
+
+Every profile, standard included, adds a body-matching, SigV4-signed
+`Content-MD5` to multi-object delete requests. The AWS SDK's own checksum for
+that request is `x-amz-checksum-crc32`, which older S3 implementations ignore
+and then reject the request: older StorageGRID releases, MinIO
+`RELEASE.2023-03-20` and Ceph RGW Octopus (DXN) all answer `MissingContentMD5`.
+Every S3 implementation accepts `Content-MD5`.
 
 ### DXN compatibility
 
-Select DXN compatibility per endpoint with `s3+dxn://` for HTTP or
-`s3+dxn+https://` for HTTPS. DXN clients add a body-matching, SigV4-signed
+Select DXN compatibility per endpoint with `?compat=dxn` (on `s3://` or
+`s3+https://`). Like every profile, DXN clients add the signed
 `Content-MD5` to multi-object delete requests. Unlike StorageGRID compatibility,
 DXN compatibility does not remove the AWS SDK's `x-id` query parameter.
 
-Standard S3 clients remain unchanged. The HTTPS form skips certificate
-verification and is intended only for trusted private deployments with
-self-signed certificates.
+DXN's HTTPS endpoint presents a self-signed certificate: trust its CA through
+`SSL_CERT_FILE`, or add `tls_verify=false` on a trusted network.
 
 #### Known DXN limitations
 
@@ -186,6 +216,13 @@ self-signed certificates.
   content type, and user metadata while losing object tags. Callers that
   require tag preservation should not use multipart rename on DXN until a
   verified `PutObjectTagging` compatibility path is implemented.
+
+The ArchitectureReady DXN adapter therefore reports tags as unsupported
+without issuing an extra storage request. It still exposes conditional native
+transfer for a connected DXN pair. Multipart recovery always re-observes the
+service manifest after reconnect; callers resume from that latest durable
+prefix because already-issued inflight requests may settle after an earlier
+checkpoint observation.
 
 These limitations have been reproduced against the current DXN lab endpoint.
 They do not change standard S3 or StorageGRID behavior.
@@ -201,24 +238,39 @@ that need to accommodate endpoints with coarser timestamp resolution can use
 The `storage_integrity_check` example exposes the same behavior through
 `--mtime-auto-precision` and `--mtime-tolerance-ms`.
 
-### SMB/CIFS URL Parameters
+### SMB/CIFS connection
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `smb2_only` | `true` | `true`：直接发 SMB2 NegotiateRequest，跳过 SMB1 多协议探测帧，速度更快。`false`：先发 SMB1 探测帧再升级到 SMB2/3，兼容不接受直接 SMB2 握手的老设备或防火墙。 |
+SMB/CIFS has no URL form. Connect it explicitly through the role-based factory:
 
-**示例：**
+```rust
+use data_mover::storage::{
+    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, connect_backend,
+};
 
+let storage = connect_backend(BackendConfig::Cifs(CifsBackendConfig {
+    signing_policy: CifsSigningPolicy::default(), // WhenRequired
+    guest_policy: CifsGuestPolicy::default(),     // Deny; AllowUnsigned for guest/anonymous shares
+    server: "nas01".into(),
+    share: "shared".into(),
+    username: "admin".into(),
+    password: "password".into(),
+    root: Some("data/2024".into()),
+    ensure_dir: false,
+})).await?;
+// storage.identity().stable_id() == "smb://nas01/shared/data/2024"
 ```
-# 默认（modern server，直接 SMB2 协商）
-smb://admin:password@nas01/shared
-smb://admin:password@nas01:445/shared/data
 
-# 显式关闭（兼容老设备，走 SMB1 多协议探测帧）
-smb://admin:password@nas01/shared?smb2_only=false
+Every connected storage's identity is its canonical endpoint, derived by data-mover — protocol,
+address, share or bucket and prefix, never credentials (`nfs://…`, `smb://…`, `s3://…`, `hdfs://…`,
+`file:///…`). `data_mover::storage::endpoint_identity(&config)` derives the same value without
+connecting. See `docs/adr/0006-destination-resident-recovery.md`.
 
-# 匿名访问（空密码）
-smb://guest:@nas01/public
-```
-
-> 路径中的反斜杠 `\` 需 percent-encode 为 `%5C`。
+Credentials are NTLM only. Anonymous or guest shares need
+`guest_policy: CifsGuestPolicy::AllowUnsigned`: servers map unknown or password-less users
+to a guest session that cannot be signed, so `Deny` (the default) refuses it. With
+`AllowUnsigned` an empty `username` sends a placeholder identity for the server's guest
+mapping. The legacy `smb://` URL and `smb2_only` option were removed together with the
+legacy `CifsStorage` path (#150).
+`tests/lab/tools/cifs_mount_comparison.rs` and `tests/cifs_policy_contract.rs` read
+`CIFS_REAL_SERVER`, `CIFS_REAL_SECOND_SERVER`, `CIFS_REAL_SHARE`, `CIFS_REAL_USER`,
+and `CIFS_REAL_PASS`.

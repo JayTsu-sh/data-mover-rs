@@ -42,8 +42,6 @@ impl Clone for StorageError {
             StorageError::CifsError(value) => StorageError::CifsError(value.clone()),
             StorageError::ReadError(value) => StorageError::ReadError(value.clone()),
             StorageError::WriteError(value) => StorageError::WriteError(value.clone()),
-            StorageError::MismatchData(value) => StorageError::MismatchData(value.clone()),
-            StorageError::MismatchMeta(value) => StorageError::MismatchMeta(value.clone()),
         }
     }
 }

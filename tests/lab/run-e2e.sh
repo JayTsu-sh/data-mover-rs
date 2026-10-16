@@ -71,7 +71,7 @@ storagegrid_url() {
   local role="$1"
   local standard_url
   standard_url="$(storage_url "$role" s3)"
-  printf 's3+sg%s' "${standard_url#s3}"
+  printf '%s?compat=sg' "$standard_url"
 }
 
 seed_source() {
@@ -285,8 +285,8 @@ for source_backend in "${backends[@]}"; do
 done
 
 # The lab has no real StorageGRID endpoint, so retain the standard s3:// matrix
-# above and add focused s3+sg:// smoke cases against the compatible test
-# service. Request-capture unit tests separately prove that only this scheme
+# above and add focused ?compat=sg smoke cases against the compatible test
+# service. Request-capture unit tests separately prove that only this profile
 # removes x-id before signing.
 sg_read_key="storagegrid-scheme-read.txt"
 sg_read_value="data-mover-$run_id-storagegrid-scheme-read"
@@ -418,7 +418,7 @@ if python3 "$(dirname "$0")/s3_helper.py" exists \
 fi
 echo "S3 small-object rename verified: $actual_hash"
 
-# Exercise the same CopyObject/DeleteObject rename path through s3+sg://.
+# Exercise the same CopyObject/DeleteObject rename path through ?compat=sg.
 sg_rename_source="storagegrid rename source.txt"
 sg_rename_destination="storagegrid rename destination.txt"
 sg_rename_value="data-mover-$run_id-storagegrid-scheme-rename"
@@ -449,7 +449,7 @@ echo "StorageGRID scheme rename verified: $actual_hash"
 # object bytes, user and system metadata, tags, special-character CopySource
 # encoding, and deletion of the source object.
 DM_S3_RENAME_TEST_URL="$(storage_url source s3)" \
-  cargo test --quiet --locked \
-    s3::tests::multipart_rename_preserves_content_and_metadata_when_lab_is_configured \
-    -- --exact
+  python3 tests/run_cargo_test.py \
+    storage::backends::s3::client::role_protocol::rename::tests::multipart_rename_preserves_content_and_metadata_on_lab \
+    --ignored --exact
 echo "S3 multipart rename verified"

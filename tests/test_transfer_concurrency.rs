@@ -1,28 +1,32 @@
-use data_mover::{LocalStorage, StorageEnum, TransferConcurrency};
-mod common;
-use common::AssertTestValue;
+use std::num::NonZeroUsize;
 
-#[test]
-fn transfer_concurrency_keeps_read_and_write_independent() {
-    let concurrency = TransferConcurrency::new(2, 8).assert_value("valid concurrency");
-    assert_eq!(concurrency.read(), 2);
-    assert_eq!(concurrency.write(), 8);
+use data_mover::storage::{BackendConfig, LocalBackendConfig, connect_backend};
+use data_mover::transfer::InflightLimits;
+
+#[tokio::test]
+async fn local_backend_config_keeps_read_and_write_limits_independent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let config = LocalBackendConfig {
+        root: root.path().to_path_buf(),
+        read_concurrency: NonZeroUsize::new(2).ok_or("non-zero read limit")?,
+        write_concurrency: NonZeroUsize::new(8).ok_or("non-zero write limit")?,
+    };
+    assert_eq!(config.read_concurrency.get(), 2);
+    assert_eq!(config.write_concurrency.get(), 8);
+
+    let storage = connect_backend(BackendConfig::Local(config)).await?;
+    assert_eq!(storage.kind(), data_mover::model::BackendKind::Local);
+    Ok(())
 }
 
 #[test]
-fn explicit_storage_configuration_is_observable_through_the_shared_interface() {
-    let concurrency = TransferConcurrency::new(3, 11).assert_value("valid concurrency");
-    let storage = StorageEnum::Local(
-        LocalStorage::new(std::env::temp_dir(), None).with_transfer_concurrency(concurrency),
-    );
-    assert_eq!(storage.transfer_concurrency(), concurrency);
-}
-
-#[test]
-fn transfer_concurrency_rejects_zero_and_values_above_the_safe_limit() {
-    assert!(TransferConcurrency::new(16, 16).is_ok());
-    assert!(TransferConcurrency::new(0, 1).is_err());
-    assert!(TransferConcurrency::new(1, 0).is_err());
-    assert!(TransferConcurrency::new(17, 1).is_err());
-    assert!(TransferConcurrency::new(1, 17).is_err());
+fn transfer_inflight_limits_reject_zero_and_unsafe_values() {
+    assert!(InflightLimits::new(0, 1, 1).is_err());
+    assert!(InflightLimits::new(1, 0, 1).is_err());
+    assert!(InflightLimits::new(1, 1, 0).is_err());
+    assert!(InflightLimits::new(1, 1024, 1).is_ok());
+    if usize::BITS > u32::BITS {
+        assert!(InflightLimits::new(u32::MAX as usize + 1, 1, 1).is_err());
+    }
 }

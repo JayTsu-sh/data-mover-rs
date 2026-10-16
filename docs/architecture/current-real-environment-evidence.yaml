@@ -1,0 +1,194 @@
+schema_version: 1
+captured_at: "2026-08-31T11:20:19+08:00"
+policy:
+  normative: false
+  does_not_create_compatibility_requirement: true
+  meaning: Historical observations describe only the named commit and environment. Target support remains governed by the capability and directed-transfer matrices.
+
+shared_success: &nightly_success
+  evidence_kind: gate_result
+  repository: JayTsu-sh/data-mover-rs
+  exact_commit: cedd275dd3ee3de69cf41611467d508b84f124e5
+  dependency_commits: {}
+  run_id: "33214953626"
+  mode: real-nightly
+  fixture_set: nightly-existing-contracts-v1
+  started_at: "2026-08-29T05:59:58+08:00"
+  completed_at: "2026-08-29T06:43:04+08:00"
+  outcome: passed
+  artifact_links:
+    - https://github.com/JayTsu-sh/data-mover-rs/actions/runs/33214953626
+
+profiles:
+  local:
+    status: passed
+    environment_fingerprint: vm102-data-mover-rs/local-filesystem
+    evidence:
+      - <<: *nightly_success
+        gate_id: DM-CURRENT-LOCAL
+        source_profile: local
+        destination_profile: local
+        environment_fingerprint: vm102-data-mover-rs/local-filesystem
+    verified_scope: [connectivity, traversal, copy, integrity, resume, qos, overwrite]
+    gaps: [target ACL/xattr architecture contract not yet implemented]
+
+  nfs3:
+    status: passed
+    environment_fingerprint: shared-nfs3/10.10.1.12-to-10.10.1.13
+    evidence:
+      - evidence_kind: gate_result
+        gate_id: DM-NFS3-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: e91d3f22b09f97d8bf9670be17c3688a630790a3
+        dependency_commits: {}
+        run_id: release-e91d3f2-nfs3-20260829
+        mode: real-release
+        fixture_set: architecture-ready-nfs3-contract-v1
+        started_at: "2026-08-29T14:56:57+08:00"
+        completed_at: "2026-08-29T14:57:01+08:00"
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/126#issuecomment-5460934176
+        source_profile: nfs3
+        destination_profile: nfs3
+        environment_fingerprint: shared-nfs3/10.10.1.12-to-10.10.1.13
+    verified_scope: [mount, traversal, streaming_copy, integrity, reconnect_recovery, concurrent_claim, stale_handle_retry, source_qos, metadata_unsupported_truth]
+    gaps: [terrasync single-process and remote-process gates remain independently required]
+
+  nfs40:
+    status: passed
+    environment_fingerprint: dxn-nfs40/10.131.7.201/jay_nfs
+    evidence:
+      - evidence_kind: gate_result
+        gate_id: DM-NFS40-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: 737d73c54c7aac5924150fbc9328d050b195857c
+        dependency_commits: {}
+        run_id: release-737d73c-nfs40-20260829
+        mode: real-release
+        fixture_set: architecture-ready-nfs40-contract-v3
+        started_at: "2026-08-29T16:02:35+08:00"
+        completed_at: "2026-08-29T16:02:37+08:00"
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/127#issuecomment-5461196866
+        source_profile: nfs40
+        destination_profile: nfs40
+        environment_fingerprint: dxn-nfs40/10.131.7.201/jay_nfs
+    verified_scope: [mount, traversal, file_handle, stale_handle_retry, streaming_copy, integrity, cancellation, restart_upload, reconnect_recovery, concurrent_claim, source_qos, acl_get, acl_set_unsupported, xattr_unsupported]
+    gaps: [terrasync single-process and remote-process gates remain independently required, DXN SETACL remains unsupported while FAS2750 ACL behavior is independently environment-specific]
+
+  nfs41:
+    status: passed
+    environment_fingerprint: shared-nfs41/10.10.1.12-to-10.10.1.13
+    evidence:
+      - evidence_kind: gate_result
+        gate_id: DM-NFS41-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: 40cd5a5d676d413e96b34ae4b3a0a9149d1b19a9
+        dependency_commits: {}
+        run_id: release-40cd5a5-nfs41-20260829
+        mode: real-release
+        fixture_set: architecture-ready-nfs41-contract-v1
+        started_at: "2026-08-29T16:10:56+08:00"
+        completed_at: "2026-08-29T16:11:11+08:00"
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/129#issuecomment-5461231922
+        source_profile: nfs41
+        destination_profile: nfs41
+        environment_fingerprint: shared-nfs41/10.10.1.12-to-10.10.1.13
+    verified_scope: [mount, session_state, traversal, file_handle, stale_handle_retry, streaming_copy, integrity, cancellation, restart_upload, reconnect_recovery, concurrent_claim, source_qos, acl_get, acl_set, xattr_unsupported]
+    gaps: [terrasync single-process and remote-process gates remain independently required]
+
+  cifs_fas2750:
+    status: passed
+    environment_fingerprint: fas2750/10.128.61.200+10.128.61.201/data_mover_e2e
+    evidence:
+      - evidence_kind: gate_result
+        gate_id: DM-CIFS-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: 0a4be15f3509b1d4c816cac75ec6b354209e2eb0
+        dependency_commits:
+          smb-rs: 44cad000cf596a473b20f890506c9522fa665fd0
+        run_id: fas2750-cifs-recovery-20260831
+        started_at: "2026-08-31T11:19:00+08:00"
+        completed_at: "2026-08-31T11:20:00+08:00"
+        source_profile: cifs_fas2750
+        destination_profile: cifs_fas2750
+        mode: real-device
+        fixture_set: architecture-ready-cifs-recovery-v1
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/141#issuecomment-5473277635
+        environment_fingerprint: fas2750/10.128.61.200+10.128.61.201/data_mover_e2e
+    verified_scope: [smb311_negotiate, authentication, dual_lif, traversal, sequential_read, staged_inflight_write, flush, durable_checkpoint, reconnect_recovery, resume, blake3_verify, atomic_publication, readback, acl_get, acl_set, failure_isolation, fixture_cleanup]
+    gaps: [terrasync single-process and remote-process gates remain independently required, full directed matrix remains required by issue 151]
+
+  s3_standard:
+    status: passed
+    environment_fingerprint: shared-standard-s3/10.10.1.12-to-10.10.1.13
+    evidence:
+      - <<: *nightly_success
+        gate_id: DM-CURRENT-S3-STANDARD
+        source_profile: s3_standard
+        destination_profile: s3_standard
+        environment_fingerprint: shared-standard-s3/10.10.1.12-to-10.10.1.13
+      - evidence_kind: gate_result
+        gate_id: DM-S3-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: 0ed01934c8004e7ad07abf965ecdce42d5744ddd
+        dependency_commits: {}
+        run_id: release-0ed0193-s3-native-20260829
+        mode: real-release
+        fixture_set: architecture-ready-standard-s3-contract-v4
+        started_at: "2026-08-29T19:17:54+08:00"
+        completed_at: "2026-08-29T19:18:10+08:00"
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/132#issuecomment-5462042601
+        source_profile: s3_standard
+        destination_profile: s3_standard
+        environment_fingerprint: shared-standard-s3/10.10.1.12-to-10.10.1.13
+    verified_scope: [connectivity, traversal, copy, integrity, resume, qos, multipart_interruption, reconnect_recovery, invalid_manifest_restart, safe_cleanup_retry, claim_release, publication, tags, range_read, cancellation, native_transfer, multipart_copy, shaped_fallback, native_qos]
+    gaps: []
+
+  s3_dxn:
+    status: passed
+    environment_fingerprint: shared-real-dxn/http://10.131.7.201:8184
+    evidence:
+      - evidence_kind: gate_result
+        gate_id: DM-DXN-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: ce0a6128a6296d89101d1fdbc835c337a1800e8f
+        dependency_commits: {}
+        run_id: release-ce0a612-dxn
+        mode: real-release
+        fixture_set: architecture-ready-dxn-s3-contract-v1
+        started_at: "2026-08-30T17:13:25+08:00"
+        completed_at: "2026-08-30T17:14:09+08:00"
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/137#issuecomment-5467829058
+        source_profile: s3_dxn
+        destination_profile: s3_dxn
+        environment_fingerprint: shared-real-dxn/http://10.131.7.201:8184
+    verified_scope: [connectivity, multipart_interruption, bounded_inflight_settlement, reconnect_recovery, service_enumerated_checkpoint, restart_upload, publication, content_readback, range_read, cancellation, native_transfer, shaped_fallback, tags_unsupported_without_call, multipart_rename_negative_source_preserved, delete_checksum, standard_s3_isolation]
+    gaps: [TS-DXN-SINGLE and TS-DXN-REMOTE remain independently required]
+
+  hdfs:
+    status: passed
+    environment_fingerprint: hdfs-ha-kerberos/10.131.9.30+10.131.9.33
+    evidence:
+      - <<: *nightly_success
+        gate_id: DM-CURRENT-HDFS
+        source_profile: hdfs
+        destination_profile: hdfs
+        fixture_set: nightly-hdfs-contracts-memory-fault-ha-v1
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/actions/runs/33214953626
+          - artifact:hdfs-memory-33214953626
+          - artifact:hdfs-fault-33214953626
+        environment_fingerprint: hdfs-ha-kerberos/10.131.9.30+10.131.9.33
+    verified_scope: [kerberos, copy, resume, bounded-memory, datanode-faults, namenode-faults, ha]
+    gaps: [target neutral observation and metadata architecture contracts not yet implemented]

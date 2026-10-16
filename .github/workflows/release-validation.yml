@@ -28,6 +28,7 @@ jobs:
       LAB_HDFS_CONFIG_DIR: /var/lib/data-mover-lab/hadoop
       LAB_HDFS_KEYTAB: /var/lib/data-mover-lab/terrasync-runner.keytab
       LAB_HDFS_HA_LOCATION: hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@hdfs-ha/tmp/data-mover-release/release-${{ github.run_id }}-${{ github.run_attempt }}/hdfs/ha
+      LAB_HDFS_MEMORY_LOCATION: hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@hdfs-ha/tmp/data-mover-release/release-${{ github.run_id }}-${{ github.run_attempt }}/hdfs
       LAB_HDFS_HA_CONFIG_DIR: /var/lib/data-mover-lab/hadoop
       LAB_HDFS_HA_NAMENODE1_ID: nn1
       LAB_HDFS_HA_NAMENODE1_HOST: 10.131.9.30
@@ -47,8 +48,22 @@ jobs:
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --locked --no-fail-fast
+      - name: DM-STORAGEGRID-REQUEST-CONTRACT
+        run: python3 tests/run_cargo_test.py storage::backends::s3::client::storagegrid::tests
       - name: Rolling hdfs-native contract and real HDFS lab
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock python3 tests/hdfs_upstream_contract.py --nightly --run-id "$RUN_ID"
+      - name: ArchitectureReady standard S3 contract
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-s3-architecture-contract.sh "$RUN_ID"
+      - name: DM-DXN-CONTRACT
+        env:
+          LAB_DXN_S3_ACCESS_KEY: ${{ secrets.LAB_DXN_S3_ACCESS_KEY }}
+          LAB_DXN_S3_SECRET_KEY: ${{ secrets.LAB_DXN_S3_SECRET_KEY }}
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-dxn-s3-contract.sh "$RUN_ID"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: dxn-s3-evidence-${{ github.run_id }}
+          path: dxn-s3-evidence.json
       - name: Storage matrix E2E (protocol defaults)
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: Storage matrix E2E (high transfer concurrency)
@@ -88,7 +103,7 @@ jobs:
         with:
           name: qos-e2e-release-${{ github.run_id }}
           path: qos-*.csv
-      - name: HDFS multi-GiB bounded-memory gate
+      - name: HDFS 1 GiB to 100 GiB bounded-memory gate
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-memory-e2e.sh "$RUN_ID" hdfs-memory.csv
       - name: HDFS service fault recovery
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-fault-e2e.sh "$RUN_ID" hdfs-fault.log

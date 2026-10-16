@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use filetime::FileTime;
 
+use crate::model::{StorageTimestamp, TimePrecision};
+
 pub(crate) const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// Windows FILETIME 纪元 (1601-01-01) 与 Unix 纪元 (1970-01-01) 之间的差，
@@ -26,6 +28,17 @@ pub fn nanos_to_secs(nanos: i64) -> i64 {
     nanos.div_euclid(NANOS_PER_SEC)
 }
 
+/// Floors signed 128-bit Unix nanoseconds (the `StorageTimestamp` representation) to whole
+/// seconds, saturating at the `i64` range.
+#[must_use]
+pub fn unix_nanos_to_secs(nanos: i128) -> i64 {
+    i64::try_from(nanos.div_euclid(1_000_000_000)).unwrap_or(if nanos < 0 {
+        i64::MIN
+    } else {
+        i64::MAX
+    })
+}
+
 #[inline]
 #[must_use]
 pub fn nanos_subsec(nanos: i64) -> u32 {
@@ -40,6 +53,30 @@ pub fn system_time_to_nanos(st: SystemTime) -> i64 {
         Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
         Err(error) => i64::try_from(error.duration().as_nanos()).map_or(i64::MIN, |nanos| -nanos),
     }
+}
+
+/// An object's `Last-Modified` as a timestamp. HTTP dates carry whole seconds, so the precision
+/// is `Seconds` and any fraction a client library reports is dropped rather than invented.
+/// `None` only for a time outside the representable range — never "now" in its place.
+#[must_use]
+pub(crate) fn http_last_modified(secs: i64) -> Option<StorageTimestamp> {
+    StorageTimestamp::new(
+        i128::from(secs) * i128::from(NANOS_PER_SEC),
+        TimePrecision::Seconds,
+    )
+    .ok()
+}
+
+/// An S3 listing's `LastModified` (`ListObjectsV2` / `ListObjectVersions`): an ISO 8601 time with
+/// milliseconds, where a HEAD's `Last-Modified` header has whole seconds. Anything finer than a
+/// millisecond is dropped rather than reported as precision the store does not have.
+pub(crate) fn s3_listing_time(secs: i64, subsec_nanos: u32) -> Option<StorageTimestamp> {
+    let millis = i128::from(subsec_nanos / 1_000_000);
+    StorageTimestamp::new(
+        i128::from(secs) * i128::from(NANOS_PER_SEC) + millis * 1_000_000,
+        TimePrecision::Milliseconds,
+    )
+    .ok()
 }
 
 #[inline]
@@ -148,5 +185,29 @@ mod tests {
         // nanos_to_secs(nanos) must fall within [before, after] (same-second or adjacent second)
         let secs_from_nanos = nanos_to_secs(nanos);
         assert!(secs_from_nanos >= before && secs_from_nanos <= after + 1);
+    }
+
+    /// A listing's time keeps its milliseconds and drops anything finer.
+    #[test]
+    fn s3_listing_time_keeps_milliseconds_only() {
+        let Some(value) = s3_listing_time(1_700_000_000, 123_456_789) else {
+            panic!("a representable time");
+        };
+        assert_eq!(value.unix_nanos(), 1_700_000_000_123_000_000);
+        assert_eq!(value.precision(), TimePrecision::Milliseconds);
+    }
+
+    /// Whole seconds at `Seconds` precision; pre-epoch objects keep their time.
+    #[test]
+    fn http_last_modified_is_whole_seconds() {
+        let Some(value) = http_last_modified(1_700_000_000) else {
+            panic!("a representable time");
+        };
+        assert_eq!(value.unix_nanos(), 1_700_000_000_000_000_000);
+        assert_eq!(value.precision(), TimePrecision::Seconds);
+        assert_eq!(
+            http_last_modified(-1).map(StorageTimestamp::unix_nanos),
+            Some(-1_000_000_000)
+        );
     }
 }

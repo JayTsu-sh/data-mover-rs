@@ -9,7 +9,7 @@ COMMON = (ROOT / "tests/lab/common.sh").read_text()
 HEALTH_CHECK = (ROOT / "tests/lab/health-check.sh").read_text()
 SMOKE = (ROOT / "tests/lab/run-hdfs-smoke.sh").read_text()
 S3_METADATA = (ROOT / "tests/lab/run-hdfs-s3-metadata.sh").read_text()
-SUPPORT = (ROOT / "examples/hdfs_support/mod.rs").read_text()
+SUPPORT = (ROOT / "tests/lab/tools/support/hdfs.rs").read_text()
 
 
 def test_keytab_is_required_and_process_cache_is_poisoned() -> None:

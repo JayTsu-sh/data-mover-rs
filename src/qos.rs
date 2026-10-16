@@ -535,7 +535,7 @@ impl QosManager {
 
     /// 获取带宽限流（异步等待直到令牌可用）
     ///
-    /// 每个 `DataChunk` 在读取前调用，bytes 为 chunk 大小
+    /// 每次读取前调用，bytes 为本次读取的字节数
     pub async fn acquire_bandwidth(&self, bytes: u64) {
         let mut remaining = bytes;
         while remaining > 0 {
@@ -1228,13 +1228,19 @@ mod tests {
 
     #[tokio::test]
     async fn soft_iops_credit_bursts_only_up_to_the_governor_hard_limit() {
+        // The soft pacer's schedule starts when the manager is created, so measure from
+        // there: under CPU pressure the gap between creation and the first acquire is what
+        // used to make this assertion flake (the wait got *shorter*, not longer).
+        let cold_started = Instant::now();
         let qos = QosManager::try_new_with_iops_limits(20, 100, Duration::from_millis(100))
             .assert_value("create dual-rate IOPS qos");
 
         // Initial credit is zero, so the first operation is paced by soft IOPS.
-        let cold_started = Instant::now();
         qos.acquire_iops().await;
-        assert!(cold_started.elapsed() >= Duration::from_millis(45));
+        assert!(
+            cold_started.elapsed() >= Duration::from_millis(45),
+            "first operation at 20 soft IOPS must wait about 50 ms from creation"
+        );
 
         // Idle time fills at most eight operation credits. Those operations
         // must still traverse governor's 100 IOPS hard leaky bucket.
@@ -1248,11 +1254,22 @@ mod tests {
         assert!(burst_elapsed < Duration::from_millis(180));
 
         // Once credit is consumed, the schedule returns to the 20 IOPS soft rate.
+        //
+        // The bound is derived from the credit ceiling rather than from the credit the burst
+        // happens to leave behind. Credit never exceeds `credit_capacity` (8 here), so of these
+        // 16 operations at most 8 can be released against credit; the other 8 are paced by the
+        // 20 IOPS soft rate at 50 ms each, which is 400 ms even in the worst case. Measuring
+        // only 4 operations made the assertion depend on how long the burst above took: every
+        // extra millisecond there regenerates 0.02 credit, and the nominal total sat exactly on
+        // the 120 ms bound, so a loaded machine drove it under.
         let sustained_started = Instant::now();
-        for _ in 0..4 {
+        for _ in 0..16 {
             qos.acquire_iops().await;
         }
-        assert!(sustained_started.elapsed() >= Duration::from_millis(120));
+        assert!(
+            sustained_started.elapsed() >= Duration::from_millis(400),
+            "at most `credit_capacity` of 16 operations may skip the soft rate"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@
 **how to apply**: PR 描述必须列：
 - 新的三元组语义。
 - 变化前后的组合表对比。
-- 谁会受影响 (walkdir / walkdir_2 / 哪个 backend)。
+- 谁会受影响 (Unordered / Blocks / 哪个 backend)。
 
 ## F2 · 新增 lexer token 必须加单测
 
@@ -49,10 +49,10 @@ grep -nE 'glob::MatchOptions\s*\{' src/filter.rs | grep -v GLOB_MATCH_OPTIONS
 
 ## F6 · DSL 解析错误必须返回精确变体
 
-**verify**: 错误必须是 `InvalidFilterExpression` / `MismatchedParentheses` / `InvalidToken` / `UnexpectedEofToken` 之一，不要 `OperationError`。
+**verify**: 错误必须是 `InvalidFilterExpression` / `MismatchedParentheses` / `InvalidToken` / `UnexpectedEndOfToken` 之一，不要 `OperationError`。
 
 **why**: 上游 (CLI / API) 能给用户清晰的错误提示。
-**how to apply**: lexer 错 → `InvalidToken` 或 `UnexpectedEofToken`。parser 错 → `MismatchedParentheses` 或 `InvalidFilterExpression`。语义错 (例如类型不匹配) → `InvalidFilterExpression`。
+**how to apply**: lexer 错 → `InvalidToken` 或 `UnexpectedEndOfToken`。parser 错 → `MismatchedParentheses` 或 `InvalidFilterExpression`。语义错 (例如类型不匹配) → `InvalidFilterExpression`。
 
 ## F7 · 拆分 filter.rs 前调 `architect`
 

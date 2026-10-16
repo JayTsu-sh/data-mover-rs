@@ -28,6 +28,10 @@ target
 
 # coverage 输出
 target/llvm-cov-target/
+
+# 本地调试 scratch 与 benchmark 产物，不进 git
+.scratch/
+benchmarks/
 *.profraw
 
 # Python skill cache

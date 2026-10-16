@@ -38,12 +38,6 @@ export LAB_HDFS_RUN_ROOT
 LAB_HDFS_RUN_ROOT="$(hdfs_run_root "$run_id")"
 require_s3_credentials
 
-# The self-hosted runner may use an outbound HTTP proxy. S3-compatible lab
-# traffic is private data-plane traffic and must connect directly.
-lab_no_proxy="$LAB_SOURCE_DATA,$LAB_DEST_DATA,$LAB_WORKER_DATA"
-export no_proxy="${no_proxy:+$no_proxy,}$lab_no_proxy"
-export NO_PROXY="${NO_PROXY:+$NO_PROXY,}$lab_no_proxy"
-
 local_root="/tmp/data-mover-lab/$run_id"
 fixture="$local_root/seed/qos-e2e.bin"
 target_directory="$(cargo metadata --locked --no-deps --format-version 1 | \

@@ -1,209 +1,96 @@
-//! issue #58 — `copy_file` 写端字节计数断言 + mismatch 清理的截断注入测试。
-//!
-//! 注入方式：`get_metadata` 取 entry（记录原 size）后截断源文件，模拟扫描与
-//! 拷贝之间源被并发截断/变更——读端提前 EOF，旧行为写端静默少写、拷贝
-//! "成功"。新行为：无论 `enable_integrity_check` 开关，写端本地计数断言
-//! 拦截并保证目标端无残留坏文件。
-//!
-//! Local-only — no S3/NFS server required. S3 multipart 续传的会话字节断言
-//! （Complete 前不提交）需要真实 S3 环境，未在本地覆盖。NAS 续传路径回归
-//! 由 `tests/test_copy_file_resume.rs` 既有用例保障。
+//! A stale enumeration observation cannot be streamed after the Local source is truncated.
+//! The expert source session revalidates the observed size before transfer payload or destination
+//! I/O, so the old optional-integrity switch is no longer a size-guard prerequisite.
+
+use std::fs::OpenOptions;
 use std::path::Path;
 
-use data_mover::{StorageEnum, create_storage};
+use data_mover::model::StoragePath;
+use data_mover::transfer::{
+    ExpertSourceRequest, ExpertSourceSession, InflightLimits, TransferPhase, TransferRequest,
+    transfer,
+};
+use tokio_util::sync::CancellationToken;
+
 mod common;
-use common::AssertTestValue;
 
-const BLOCK: u64 = 64 * 1024;
-const SINGLE_SIZE: usize = 8 * 1024; // < BLOCK → 单块路径
-const MULTI_SIZE: usize = 256 * 1024; // 4 blocks → 多块 pipeline
-
-async fn reset_dirs(src: &str, dst: &str) {
-    let _ = tokio::fs::remove_dir_all(src).await;
-    let _ = tokio::fs::remove_dir_all(dst).await;
-    tokio::fs::create_dir_all(src)
-        .await
-        .assert_value("test value should be present");
-    tokio::fs::create_dir_all(dst)
-        .await
-        .assert_value("test value should be present");
-}
-
-/// 写一个内容可验证的 blob：byte i = (i % 251)。
-async fn write_pattern(path: &str, size: usize) {
-    use tokio::io::AsyncWriteExt;
-    let mut f = tokio::fs::File::create(path)
-        .await
-        .assert_value("test value should be present");
-    let buf: Vec<u8> = (0..size)
-        .map(|i| u8::try_from(i % 251).unwrap_or_default())
-        .collect();
-    f.write_all(&buf)
-        .await
-        .assert_value("test value should be present");
-    f.flush().await.assert_value("test value should be present");
-}
-
-fn pattern_vec(size: usize) -> Vec<u8> {
+fn pattern(size: usize) -> Vec<u8> {
     (0..size)
-        .map(|i| u8::try_from(i % 251).unwrap_or_default())
+        .map(|index| u8::try_from(index % 251).unwrap_or_default())
         .collect()
 }
 
-fn truncate_file(path: &str, len: u64) {
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .assert_value("test value should be present");
-    f.set_len(len).assert_value("test value should be present");
+fn truncate(path: &Path, len: u64) -> Result<(), std::io::Error> {
+    OpenOptions::new().write(true).open(path)?.set_len(len)
 }
 
-/// 取 entry 后截断源文件再 `copy_file`，断言 Err + 目标端无残留。
-async fn assert_truncated_copy_guarded(
-    tag: &str,
+async fn stale_observation_is_refused(
     size: usize,
     truncated: u64,
-    enable_integrity_check: bool,
-) {
-    let src_dir = format!("/tmp/dm-sizeguard-{tag}-src");
-    let dst_dir = format!("/tmp/dm-sizeguard-{tag}-dst");
-    reset_dirs(&src_dir, &dst_dir).await;
-    write_pattern(&format!("{src_dir}/blob.bin"), size).await;
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let source_root = tempfile::tempdir()?;
+    let destination_root = tempfile::tempdir()?;
+    let source_path = source_root.path().join("blob.bin");
+    std::fs::write(&source_path, pattern(size))?;
 
-    let src = create_storage(
-        &src_dir,
-        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
-    )
+    let source = common::connect_local(source_root.path(), 4).await?;
+    let observation = common::observe_file(&source, "blob.bin").await?;
+    truncate(&source_path, truncated)?;
+
+    let Err(failure) = ExpertSourceSession::open(ExpertSourceRequest::new(
+        source,
+        observation,
+        InflightLimits::new(2, 128 * 1024, 2)?,
+        CancellationToken::new(),
+    ))
     .await
-    .assert_value("test value should be present");
-    let dst = create_storage(
-        &dst_dir,
-        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
-    )
-    .await
-    .assert_value("test value should be present");
-    let entry = Box::pin(src.get_metadata(Path::new("blob.bin")))
-        .await
-        .assert_value("test value should be present");
-
-    // 注入：entry 已带原 size，此时截断源文件（模拟扫描后源被并发变更）
-    truncate_file(&format!("{src_dir}/blob.bin"), truncated);
-
-    let copy_result = StorageEnum::copy_file(
-        &src,
-        &dst,
-        &entry,
-        data_mover::CopyOptions {
-            enable_integrity_check,
-            is_source_reserved: true,
-            ..Default::default()
-        },
-    )
-    .await;
-    let Err(err) = copy_result else {
-        panic!("truncated source must fail the copy");
+    else {
+        panic!("source size changed after observation");
     };
-    assert!(
-        err.to_string().contains("size check failed"),
-        "unexpected error: {err}"
+
+    assert_eq!(failure.phase(), TransferPhase::Describe);
+    assert_eq!(
+        std::fs::read_dir(destination_root.path())?.count(),
+        0,
+        "failed source revalidation must happen before destination preparation"
     );
-    // 目标端无残留坏文件（单块：写前拦截未落地；多块：落地后被清理）
-    assert!(
-        tokio::fs::metadata(format!("{dst_dir}/blob.bin"))
-            .await
-            .is_err(),
-        "destination must have no residual bad file"
-    );
+    Ok(())
 }
 
-/// 单块路径 + integrity 关闭：写前本地计数断言拦截，目标无残留。
-#[tokio::test(flavor = "multi_thread")]
-async fn single_chunk_truncated_source_no_integrity() {
-    Box::pin(assert_truncated_copy_guarded(
-        "single-noint",
-        SINGLE_SIZE,
-        5 * 1024,
-        false,
-    ))
-    .await;
+#[tokio::test]
+async fn small_stale_source_observation_is_refused_before_destination_io()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stale_observation_is_refused(8 * 1024, 5 * 1024).await
 }
 
-/// 单块路径 + integrity 开启：同样在写前拦截（断言不依赖开关）。
-#[tokio::test(flavor = "multi_thread")]
-async fn single_chunk_truncated_source_with_integrity() {
-    Box::pin(assert_truncated_copy_guarded(
-        "single-int",
-        SINGLE_SIZE,
-        5 * 1024,
-        true,
-    ))
-    .await;
+#[tokio::test]
+async fn multi_chunk_stale_source_observation_is_refused_before_destination_io()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stale_observation_is_refused(256 * 1024, 150 * 1024).await
 }
 
-/// 多块 pipeline + integrity 关闭：写端累计计数断言拦截并清理已落地坏文件。
-#[tokio::test(flavor = "multi_thread")]
-async fn multi_chunk_truncated_source_no_integrity() {
-    Box::pin(assert_truncated_copy_guarded(
-        "multi-noint",
-        MULTI_SIZE,
-        150 * 1024,
-        false,
-    ))
-    .await;
-}
-
-/// 多块 pipeline + integrity 开启：计数断言先于 hash 读回拦截，目标被清理。
-#[tokio::test(flavor = "multi_thread")]
-async fn multi_chunk_truncated_source_with_integrity() {
-    Box::pin(assert_truncated_copy_guarded(
-        "multi-int",
-        MULTI_SIZE,
-        150 * 1024,
-        true,
-    ))
-    .await;
-}
-
-/// happy path 回归：新断言不影响正常拷贝（单块 + 多块，integrity 开启）。
-#[tokio::test(flavor = "multi_thread")]
-async fn intact_copy_still_succeeds() {
-    for (tag, size) in [("happy-single", SINGLE_SIZE), ("happy-multi", MULTI_SIZE)] {
-        let src_dir = format!("/tmp/dm-sizeguard-{tag}-src");
-        let dst_dir = format!("/tmp/dm-sizeguard-{tag}-dst");
-        reset_dirs(&src_dir, &dst_dir).await;
-        write_pattern(&format!("{src_dir}/blob.bin"), size).await;
-
-        let src = create_storage(
-            &src_dir,
-            data_mover::CreateStorageOptions::new(Some(BLOCK), false),
-        )
-        .await
-        .assert_value("test value should be present");
-        let dst = create_storage(
-            &dst_dir,
-            data_mover::CreateStorageOptions::new(Some(BLOCK), true),
-        )
-        .await
-        .assert_value("test value should be present");
-        let entry = Box::pin(src.get_metadata(Path::new("blob.bin")))
-            .await
-            .assert_value("test value should be present");
-
-        StorageEnum::copy_file(
-            &src,
-            &dst,
-            &entry,
-            data_mover::CopyOptions {
-                enable_integrity_check: true,
-                is_source_reserved: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .assert_value("intact copy must succeed");
-        let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
-            .await
-            .assert_value("test value should be present");
-        assert_eq!(out, pattern_vec(size), "content mismatch for {tag}");
+#[tokio::test]
+async fn intact_small_and_multi_chunk_transfers_still_match_the_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    for size in [8 * 1024, 256 * 1024] {
+        let source_root = tempfile::tempdir()?;
+        let destination_root = tempfile::tempdir()?;
+        let expected = pattern(size);
+        std::fs::write(source_root.path().join("blob.bin"), &expected)?;
+        let path = StoragePath::new("blob.bin")?;
+        let outcome = transfer(TransferRequest::new(
+            common::connect_local(source_root.path(), 4).await?,
+            path.clone(),
+            common::connect_local(destination_root.path(), 4).await?,
+            InflightLimits::new(2, 128 * 1024, 2)?,
+            CancellationToken::new(),
+        ))
+        .await?;
+        assert_eq!(outcome.transferred_bytes, size as u64);
+        assert_eq!(
+            std::fs::read(destination_root.path().join(path.as_str()))?,
+            expected
+        );
     }
+    Ok(())
 }

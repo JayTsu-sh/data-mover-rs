@@ -30,13 +30,21 @@ Root lifecycle cases use `LAB_HDFS_ADMIN_USER` (default
 `hdfs/hdfs-namenode@HDFS.LOCAL`) only to create
 and remove their isolated `/tmp/data-mover-nightly` namespace; read-only smoke
 coverage continues to use the user embedded in `LAB_HDFS_LOCATION`.
+The `Windows native runtime` workflow runs filesystem tests on GitHub-hosted Windows,
+using the native Rust MSVC target. Its `local_transfer_runtime` target covers Local
+AtomicReplace/Checkpointed copy and overwrite, read-back enabled/disabled, cancellation,
+and handle cleanup, alongside the existing positional-I/O and cluster-free contracts.
+It runs for pull requests, manual dispatch, and `test/windows-native-*` branch pushes.
+A successful cross-compile alone is not a native runtime result. This workflow does not
+exercise real NFS/CIFS/HDFS servers or assert POSIX metadata support on Windows.
+
 Regular CI also runs a native `windows-latest` compile gate for the library,
 the cluster-free HDFS contract target, and all examples. This establishes
 Windows build support for explicit Simple mode without silently skipping a
 missing cross target. It does not claim real Windows-to-HDFS runtime support;
 that requires a separately provisioned Windows lab before becoming a gate.
-`tests/hdfs_upstream_contract.py` is the acceptance entry point for the rolling
-`hdfs-native` Git dependency. It verifies that `Cargo.toml` remains unpinned,
+`tests/hdfs_upstream_contract.py` is the acceptance entry point for the hsync-enabled
+`hdfs-native` Git dependency. It verifies the pinned fork revision,
 prints the full `Cargo.lock`-resolved commit (and the previous commit when it
 changed), then runs the cluster-free API/config/error contracts. Nightly invokes
 the same entry point with `--nightly --run-id "$RUN_ID"`, which additionally
@@ -73,6 +81,26 @@ separate payload larger than 12 MiB is copied from NFSv4.1 to NFSv4.1 so normal
 copy exercises multiple negotiated read and write requests, including the
 session-limited effective `wsize`.
 
+`run-nfs3-contract.sh <run-id>` is the dedicated `DM-NFS3-CONTRACT` gate. It bypasses
+the legacy storage enum and validates the public NFS role handle, protocol-neutral traversal,
+typed unsupported NFSv3 ACL/xattr observations, streaming overwrite publication, and recovery
+of a remotely re-observed durable prefix after a fresh mount.
+
+`run-nfs40-contract.sh <run-id>` is the independent `DM-NFS40-CONTRACT` gate against the
+DXN `10.131.7.201:/jay_nfs` fixture using the exact `version=4.0` selector. It seeds an isolated
+run root through NFSv4.0, then validates the production role seam for traversal, stateful file
+handles, streaming copy, source-only QoS accounting, reconnect recovery, and atomic recovery
+claims. ACL operations are exercised rather than inferred from a capability bit: DXN GETACL is
+observed and SETACL must fail as typed permanent `Unsupported`; named attributes are also typed
+`Unsupported`.
+
+`run-nfs41-contract.sh <run-id>` is the independent `DM-NFS41-CONTRACT` gate across the source
+and destination Linux NFS servers using exact `version=4.1` URLs. It replaces a source directory
+after the role has cached its old file handle, then covers ACL operation results, traversal,
+streaming integrity, in-flight cancellation, restart upload, reconnect recovery, and competing
+recovery claims. Named attributes must return typed `Unsupported` until the adapter implements
+that operation.
+
 The nightly workflow runs this matrix three times: with protocol defaults,
 strictly serial read/write pipelines, and higher read/write concurrency. Release
 validation runs the defaults and higher-concurrency profiles. The integrity and
@@ -86,6 +114,63 @@ runs each case twice in opposite depth order and records elapsed time,
 throughput, user/system CPU time, process CPU percentage, and peak RSS. The
 timed command includes the production copy integrity check, so the CSV reports
 end-to-end copy-and-verify cost rather than an unchecked microbenchmark.
+
+`run-local-copy-comparison.sh <run-id> [output.csv]` compares three Local-to-Local
+paths on the runner's real filesystem: raw legacy `StorageEnum`, the same legacy
+path plus its missing `fdatasync` durability barrier, and the role-based Local
+backend with the unified staged lifecycle. It measures exact 4 KiB, 40 MiB, and
+1 GiB files three times by default, rotating implementation order. All paths run
+their content verification inside the timed copy; the runner additionally checks
+SHA-256 and flushes each sample outside the timed interval so the next sample does
+not inherit dirty-page debt. Raw legacy remains a historical reference, while the
+role-based path uses an ephemeral, non-resumable stage when the payload fits the
+backend-negotiated source chunk; it retains verification and atomic publication but
+does not persist a checkpoint. The larger payloads retain resumable staging. The
+optional `LOCAL_COPY_PERF_MAX_REGRESSION_PERCENT` guard compares Optimized against
+`legacy-durable`, the baseline with matching durability. Bulk payloads use that
+percentage guard; 4 KiB uses the absolute
+`LOCAL_COPY_PERF_MAX_FIXED_OVERHEAD_MS` budget (5 ms by default) because staged
+lifecycle setup is a fixed cost. Use
+`LOCAL_COPY_PERF_PAYLOADS` for a tight subset, `LOCAL_COPY_PERF_ROOT` to select the
+filesystem, and `LOCAL_COPY_PERF_REPEATS` to increase the sample count.
+
+`run-local-write-benchmark.sh` isolates the role-based Local destination write shape from source
+reads, hashing, channels, verification, and publication. Each sample opens one new scratch file,
+issues full-size positional `write_at` pieces through bounded `spawn_blocking` inflight work,
+records write submission and `sync_all` separately, validates syscall and short-write counts, and
+then deletes that file. Defaults cover 64 KiB through 8 MiB chunks, inflight 1/2/4/8, three rounds,
+and 256 MiB per sample on `/tmp` (ext4), `/work` (XFS), and `/dev/shm` (tmpfs). Override
+`LOCAL_WRITE_BENCHMARK_ROOTS`, `LOCAL_WRITE_BENCHMARK_CHUNKS`,
+`LOCAL_WRITE_BENCHMARK_INFLIGHT`, `LOCAL_WRITE_BENCHMARK_TOTAL_BYTES`, or
+`LOCAL_WRITE_BENCHMARK_ROUNDS` for a focused confirmation. This is a destination capability
+benchmark; it deliberately reuses one immutable payload so source allocation is outside the
+measurement, and production inflight memory must still be budgeted as distinct upstream pieces.
+
+`run-performance-baseline.sh` freezes the pre-refactor performance evidence.
+It requires a stable `PERF_HARDWARE_ID`, records the exact Git commit, dataset,
+single-file concurrency, requested 2 MiB chunk and inflight depth 8, and emits
+both raw CSV samples and a SHA-256-bound JSON summary. The baseline contains
+the depth-8 4-by-4 large-copy matrix plus five public-seam Local scan and copy
+runs over 100 fixed small files. Its report includes throughput, entries/s,
+p95 entry scheduling latency and peak RSS; mixed hardware or incomplete measurements
+are rejected instead of being summarized. Nightly uploads the CSV and JSON as
+one artifact and signs their SLSA provenance with GitHub artifact attestations,
+so later architecture gates can compare like-for-like evidence. Verify a
+downloaded baseline with `gh attestation verify performance-baseline.csv
+--repo JayTsu-sh/data-mover-rs` (and repeat for the JSON file).
+
+At this public batch seam, scan scheduling latency is the interval between
+successive entry delivery events. Copy scheduling latency is the time from
+admitting the fixed batch to the bounded, concurrency-one queue until each
+entry starts `transfer`; copy service time remains represented in
+entries/s and end-to-end elapsed time rather than being mislabeled as queueing.
+Scheduling latency is deliberately null for the single-entry large-copy rows,
+where throughput and elapsed time are the applicable metrics.
+The self-hosted lab uploads raw evidence before the remaining HDFS gates. A
+dependent GitHub-hosted job downloads those exact files and signs them, keeping
+Fulcio traffic away from the lab proxy. Signing failure still fails the overall
+workflow, while uploaded raw evidence remains available for diagnosis. Unsigned
+evidence does not satisfy the release gate.
 
 `run-qos-e2e.sh <run-id> [output.csv]` is the real-backend source-QoS gate for
 Local, NFSv3, NFSv4.1, S3, and HDFS. It first measures each unthrottled source
@@ -117,10 +202,19 @@ windows, chunk/channel/file concurrency, duration, throughput and peak RSS.
 The budget is `(3×read + write + channel[4] + active[2]) × 2 MiB × concurrent
 files + 96 MiB`; it accounts for DataNode packet storage, `hdfs-native` range
 aggregation, published chunks, the copy channel and destination write window.
-The HDFS file block size remains independently configured at 8 MiB. The 2 GiB
+The HDFS file block size remains independently configured at 128 MiB. The 2 GiB
 sample may grow by at most 72 MiB
 over its 256 MiB peer. Nightly and release validation upload the CSV artifact and fail on either
 an absolute-budget or size-dependent-growth violation.
+The same run also preloads sparse deterministic zero fixtures into HDFS, then
+measures six independent `high` HDFS→HDFS transfers at `1 GiB + 137 bytes`
+and one at `100 GiB + 137 bytes`. Every transfer uses identical inflight, chunk,
+channel and file-concurrency settings, reopens and hashes the complete destination,
+and the 100 GiB peak RSS may not exceed the conservative 1 GiB peak by more than
+10%. Repeated short transfers avoid treating a missed transient allocator peak as
+size-dependent growth. The CSV binds every row to one run id and
+full candidate commit; the validator rejects a missing or approximate 100 GiB
+sample.
 
 `run-resume-e2e.sh` exercises the complete 5-by-5 Local/NFSv3/NFSv4.1/S3/HDFS
 directed matrix in independent processes. The first process writes a durable
@@ -189,12 +283,49 @@ and destination use the same credentials, and exports them only to the current
 test process. A partially supplied pair is rejected. Credentials must not be
 committed, printed, or written to artifacts.
 
+`run-s3-architecture-contract.sh` is the `DM-S3-CONTRACT` gate for the
+ArchitectureReady roles. It exercises multipart staging, interruption and
+reconnect resume, stale-upload restart, verification, publication, tags,
+cancellation, range readback, connected-pair native CopyObject into an unpublished stage,
+copy-time BLAKE3 verification, unshaped native QoS reporting, and strict client-shaped streaming
+fallback through standard `s3://` requests. Automated request contracts fix the 5 GiB strategy
+boundary, and the real gate forces multi-part `UploadPartCopy` over the contract fixture with a
+5 MiB test part size while retaining the production 1 GiB part size. The gate removes
+both published objects and unfinished multipart uploads on exit. A successful
+legacy S3 copy run does not certify this gate: the configured service must
+accept CreateMultipartUpload and the complete multipart lifecycle.
+
+`run-dxn-s3-contract.sh` is the independent `DM-DXN-CONTRACT` gate. It uses
+the `?compat=dxn` profile and requires `LAB_DXN_S3_ACCESS_KEY` plus
+`LAB_DXN_S3_SECRET_KEY`; the endpoint and bucket default to the shared DXN lab
+but can be overridden with `LAB_DXN_S3_ENDPOINT` and `LAB_DXN_S3_BUCKET`.
+Credentials remain process-local. The gate covers multipart interruption,
+service-enumerated recovery after outstanding requests settle, restart,
+readback, cancellation, conditional native transfer, client-shaped fallback,
+the explicit tag-unsupported result, the DXN delete checksum contract, and a
+standard-S3 isolation control.
+Every run writes `dxn-s3-evidence.json`, including the exact candidate SHA,
+run ID, environment fingerprint, timestamps, gate ID, and outcome. Nightly and
+release workflows upload this report even when the gate fails.
+
 The lab does not currently contain a real StorageGRID system. Request-level
 tests use a capturing Smithy connector to verify that standard S3 requests
 retain the SDK-generated `x-id` and StorageGRID requests remove it from the
 transmitted URI. They also verify that StorageGRID multi-object delete carries
-a body-matching, SigV4-signed `Content-MD5`. Dedicated `s3+sg://` smoke cases run against the
+a body-matching, SigV4-signed `Content-MD5`. Dedicated `?compat=sg` smoke cases run against the
 configured S3-compatible endpoints while the main S3 matrix continues using
-standard `s3://`. These checks validate scheme selection, copy, rename, and
+standard `s3://`. These checks validate profile selection, copy, rename, and
 non-regression behavior, but they are not a substitute for a smoke test on the
 target StorageGRID version.
+
+### Optional FAS2750 CIFS policy contracts
+
+`tests/cifs_policy_contract.rs` uses an explicitly configured writable share through
+`CIFS_REAL_SERVER`, `CIFS_REAL_SECOND_SERVER`, `CIFS_REAL_SHARE`, `CIFS_REAL_USER`,
+and `CIFS_REAL_PASS`. Run with
+`cargo test --release --test cifs_policy_contract -- --ignored --nocapture`; recovery state lives
+beside the final file on the share, nothing is recorded where the test runs (ADR-0006).
+`CIFS_POLICY_TEST_BYTES` optionally supplies comma-separated file sizes. The test
+uses unique names, exercises both policies with read-back enabled, and cleans up
+its own final/stage/checkpoint files. See the [FAS2750 validation report](../../docs/reports/2026-09-16-cifs-policy-validation.md)
+for tested sizes, recovery coverage and debug-runtime limitations.

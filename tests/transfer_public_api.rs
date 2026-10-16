@@ -1,0 +1,52 @@
+use data_mover::transfer::{
+    EffectiveRecovery, PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, SourceQosStats,
+    SourceQosValueError, TransferFailure, TransferPolicy, TransferRoute,
+};
+
+#[allow(dead_code)]
+fn public_failure_state(error: &TransferFailure) -> (bool, bool, bool, bool) {
+    (
+        error.final_destination_changed(),
+        error.has_recoverable_stage(),
+        error.has_unpublished_stage(),
+        error.has_pending_cleanup(),
+    )
+}
+
+#[allow(dead_code)]
+fn public_qos_state(error: &TransferFailure) -> SourceQosStats {
+    error.source_qos()
+}
+
+#[allow(dead_code)]
+async fn public_recoverable_cleanup(error: TransferFailure) {
+    let _result = error.discard_stage().await;
+}
+
+#[allow(dead_code)]
+async fn public_committed_cleanup(error: TransferFailure) {
+    let _result = error.cleanup_published_stage().await;
+}
+
+#[test]
+fn transfer_failure_cleanup_contract_is_public() {
+    let state: fn(&TransferFailure) -> (bool, bool, bool, bool) = public_failure_state;
+    let _ = state;
+    assert_eq!(TransferPolicy::default(), TransferPolicy::Checkpointed);
+    let effective = [
+        EffectiveRecovery::Disabled,
+        EffectiveRecovery::SkippedSingleSourceChunk,
+        EffectiveRecovery::Checkpointed,
+        EffectiveRecovery::NotApplicableNative,
+        EffectiveRecovery::UnsupportedByDestination,
+    ];
+    assert_eq!(effective.len(), 5);
+    assert_ne!(TransferRoute::Streaming, TransferRoute::Native);
+    assert_eq!(
+        PayloadShapingPolicy::default(),
+        PayloadShapingPolicy::AllowUnshapedNative
+    );
+    let policy: Result<SourceQosPolicy, SourceQosValueError> =
+        SourceQosPolicy::new(None, 64 * 1024, None);
+    assert!(policy.map(SourceQosGroup::new).is_ok());
+}

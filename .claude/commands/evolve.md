@@ -28,7 +28,7 @@ description: 评审 .claude/memory/corrections.jsonl，建议升级到 learned-r
    - 合并：两条 corrections 描述同一规则的不同表达。
 
 4. **data-mover-rs 特化判据**：
-   - 涉及 `StorageEnum` 操作同步 → 优先升级 (高 ROI 防回归)。
+   - 涉及 storage role 契约和能力同步 → 优先升级 (高 ROI 防回归)。
    - 涉及 backend 特定陷阱 → 写到 `.claude/docs/storage-<backend>.md`。
    - 涉及 retry 决策 → 写到 `.claude/docs/error-taxonomy.md`。
    - 涉及 filter DSL 三元组 → 写到 `.claude/docs/filter-dsl.md`。
@@ -104,8 +104,8 @@ $ /evolve
 - L2-L7 仍在观察期
 
 ### 升级到 CI grep (新建议)
-- L4 (NFS EACCES → deny_list): 加 CI grep 检查 src/nfs.rs 是否把 EACCES 走 retry
-  verify: `grep -nE 'EACCES.*retry|retry.*EACCES' src/nfs.rs` 应空
+- L4 (NFS EACCES → deny_list): 加 CI grep 检查 src/storage/backends/nfs/client.rs 是否把 EACCES 走 retry
+  verify: `grep -nE 'EACCES.*retry|retry.*EACCES' src/storage/backends/nfs/client.rs` 应空
 
 ### 丢弃 (无)
 ### 合并 (无)

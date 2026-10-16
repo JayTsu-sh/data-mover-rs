@@ -1,91 +1,47 @@
-//! Regression: `LocalStorage::write()` 全量写路径（`copy_file` → `write_data`）
-//! 最后一个 chunk 写完后未 flush，后台阻塞写任务可能在句柄 drop 前尚未落盘，
-//! 概率性（约 1/10~1/50）丢失文件尾字节且无报错。
-//!
-//! 这是压力式复现：单次全量拷贝一个「尾块很小」的文件、逐字节校验,循环多次以
-//! 稳定暴露该 race（修复前多次迭代内几乎必现；修复后恒过、确定性通过）。
-//! Local-only — 无需任何外部存储服务。
-use std::path::Path;
+//! Repeated role-based transfers preserve the small final block of a multi-chunk Local file.
+//! Local-only — no external storage service is required.
 
-use data_mover::{StorageEnum, create_storage};
+use data_mover::model::StoragePath;
+use data_mover::transfer::{InflightLimits, TransferRequest, transfer};
+use tokio_util::sync::CancellationToken;
+
 mod common;
-use common::AssertTestValue;
 
-const BLOCK: u64 = 64 * 1024;
-// 4 个整块 + 一个 137B 小尾块 → 最后一次 write() 写小 chunk、其后无 seek,正是暴露点。
-const SIZE: usize = 4 * 64 * 1024 + 137;
+const BLOCK: usize = 64 * 1024;
+const SIZE: usize = 4 * BLOCK + 137;
 const ITERS: usize = 256;
 
-async fn write_pattern(path: &str, size: usize) {
-    use tokio::io::AsyncWriteExt;
-    let mut f = tokio::fs::File::create(path)
-        .await
-        .assert_value("test value should be present");
-    let buf: Vec<u8> = (0..size)
-        .map(|i| u8::try_from(i % 251).unwrap_or_default())
-        .collect();
-    f.write_all(&buf)
-        .await
-        .assert_value("test value should be present");
-    f.flush().await.assert_value("test value should be present");
-}
-
 #[tokio::test(flavor = "multi_thread")]
-async fn full_copy_no_tail_loss_under_repetition() {
-    let src_dir = "/tmp/dm-flush-src";
-    let dst_dir = "/tmp/dm-flush-dst";
+async fn full_role_transfer_has_no_tail_loss_under_repetition()
+-> Result<(), Box<dyn std::error::Error>> {
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let source = common::connect_local(src.path(), 8).await?;
+    let destination = common::connect_local(dst.path(), 8).await?;
     let expected: Vec<u8> = (0..SIZE)
-        .map(|i| u8::try_from(i % 251).unwrap_or_default())
+        .map(|index| u8::try_from(index % 251).unwrap_or_default())
         .collect();
+    let path = StoragePath::new("blob.bin")?;
 
-    for iter in 0..ITERS {
-        let _ = tokio::fs::remove_dir_all(src_dir).await;
-        let _ = tokio::fs::remove_dir_all(dst_dir).await;
-        tokio::fs::create_dir_all(src_dir)
-            .await
-            .assert_value("test value should be present");
-        tokio::fs::create_dir_all(dst_dir)
-            .await
-            .assert_value("test value should be present");
-        write_pattern(&format!("{src_dir}/blob.bin"), SIZE).await;
-
-        let src = create_storage(
-            src_dir,
-            data_mover::CreateStorageOptions::new(Some(BLOCK), false),
-        )
-        .await
-        .assert_value("test value should be present");
-        let dst = create_storage(
-            dst_dir,
-            data_mover::CreateStorageOptions::new(Some(BLOCK), true),
-        )
-        .await
-        .assert_value("test value should be present");
-        let entry = src
-            .get_metadata(Path::new("blob.bin"))
-            .await
-            .assert_value("test value should be present");
-
-        StorageEnum::copy_file(
-            &src,
-            &dst,
-            &entry,
-            data_mover::CopyOptions {
-                is_source_reserved: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .assert_value("test value should be present");
-
-        let got = tokio::fs::read(format!("{dst_dir}/blob.bin"))
-            .await
-            .assert_value("test value should be present");
-        assert_eq!(
-            got.len(),
-            expected.len(),
-            "iter {iter}: 目标文件长度不符（尾字节丢失）"
+    for iteration in 0..ITERS {
+        tokio::fs::write(src.path().join(path.as_str()), &expected).await?;
+        let request = TransferRequest::new(
+            source.clone(),
+            path.clone(),
+            destination.clone(),
+            InflightLimits::new(8, 8 * BLOCK, 8)?,
+            CancellationToken::new(),
         );
-        assert_eq!(got, expected, "iter {iter}: 目标内容与源逐字节不符");
+        transfer(request).await?;
+
+        let actual = tokio::fs::read(dst.path().join(path.as_str())).await?;
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "iteration {iteration}: destination length changed"
+        );
+        assert_eq!(actual, expected, "iteration {iteration}: payload changed");
+        tokio::fs::remove_file(dst.path().join(path.as_str())).await?;
     }
+    Ok(())
 }

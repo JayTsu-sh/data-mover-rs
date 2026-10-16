@@ -7,13 +7,23 @@ output="${2:-hdfs-memory.csv}"
 validate_run_id "$run_id"
 prepare_hdfs_kerberos "$run_id"
 export LAB_HDFS_RUN_ROOT
-LAB_HDFS_RUN_ROOT="$(hdfs_run_root "$run_id")"
+LAB_HDFS_RUN_ROOT="${LAB_HDFS_MEMORY_LOCATION:-$(hdfs_run_root "$run_id")}"
 
-local_root="/tmp/data-mover-lab/$run_id/hdfs-memory"
+cleanup_memory_run() {
+  local original_status="$1" cleanup_status=0
+  cargo test --test hdfs_native_contract nightly_lab_cleanup_confined_run_root -- \
+    --ignored --exact --test-threads=1 || cleanup_status=1
+  if (( original_status != 0 )); then exit "$original_status"; fi
+  exit "$cleanup_status"
+}
+trap 'cleanup_memory_run $?' EXIT
+
+local_root="${RUNNER_TEMP:-/tmp}/data-mover-lab/$run_id/hdfs-memory"
 source_root="$local_root/source"
 destination_root="$local_root/destination"
 target_directory="$(cargo metadata --locked --no-deps --format-version 1 | \
   python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+commit="$(git rev-parse HEAD)"
 binary="$target_directory/release/examples/storage_copy"
 inspector="$target_directory/release/examples/storage_inspect"
 mkdir -p "$source_root" "$destination_root"
@@ -21,6 +31,8 @@ cargo build --release --locked --example storage_copy --example storage_inspect
 
 small_size=$((256 * 1024 * 1024 + 137))
 large_size=$((2 * 1024 * 1024 * 1024 + 137))
+scale_small_size=$((1024 * 1024 * 1024 + 137))
+scale_large_size=$((100 * 1024 * 1024 * 1024 + 137))
 
 generate_fixture() {
   local path="$1"
@@ -46,33 +58,53 @@ with path.open("wb") as output:
 PY
 }
 
+preload_fixture() {
+  local label="$1" attempt
+  for attempt in 1 2 3 4 5 6 7 8; do
+    if "$binary" --source "$source_root" \
+      --destination "$LAB_HDFS_RUN_ROOT/memory/source" --path "$label.bin"; then
+      return 0
+    fi
+    echo "HDFS fixture preload $label failed on attempt $attempt; resuming durable partial" >&2
+    sleep "$attempt"
+  done
+  return 1
+}
+
 for specification in "small:$small_size" "large:$large_size"; do
   label="${specification%%:*}"
   size="${specification#*:}"
   generate_fixture "$source_root/$label.bin" "$size"
-  "$binary" --source "$source_root" \
-    --destination "$LAB_HDFS_RUN_ROOT/memory/source" --path "$label.bin"
+  preload_fixture "$label"
+done
+
+for specification in "scale-1g:$scale_small_size" "scale-100g:$scale_large_size"; do
+  label="${specification%%:*}"
+  size="${specification#*:}"
+  truncate -s "$size" "$source_root/$label.bin"
+  preload_fixture "$label"
 done
 
 printf '%s\n' \
-  'profile,direction,payload,bytes,read_inflight,write_inflight,chunk_mib,channel_chunks,file_concurrency,budget_mib,elapsed_s,max_rss_kib,throughput_mib_s' \
+  'run_id,commit,sample_set,profile,direction,payload,bytes,read_inflight,write_inflight,chunk_mib,channel_chunks,file_concurrency,budget_mib,elapsed_s,max_rss_kib,throughput_mib_s' \
   > "$output"
 
 run_case() {
-  local profile="$1" direction="$2" payload="$3" size="$4" read="$5" write="$6"
+  local sample_set="$1" profile="$2" direction="$3" payload="$4" size="$5" read="$6" write="$7"
+  local destination_label="${8:-$payload}"
   local source destination destination_probe expected_probe metrics log elapsed rss throughput budget
   case "$direction" in
     local-hdfs)
       source="$source_root"
-      destination="$LAB_HDFS_RUN_ROOT/memory/$profile/local-hdfs-$payload"
+      destination="$LAB_HDFS_RUN_ROOT/memory/$profile/local-hdfs-$destination_label"
       ;;
     hdfs-hdfs)
       source="$LAB_HDFS_RUN_ROOT/memory/source"
-      destination="$LAB_HDFS_RUN_ROOT/memory/$profile/hdfs-hdfs-$payload"
+      destination="$LAB_HDFS_RUN_ROOT/memory/$profile/hdfs-hdfs-$destination_label"
       ;;
     hdfs-local)
       source="$LAB_HDFS_RUN_ROOT/memory/source"
-      destination="$destination_root/$profile/hdfs-local-$payload"
+      destination="$destination_root/$profile/hdfs-local-$destination_label"
       ;;
   esac
   if [[ "$direction" == "hdfs-local" ]]; then
@@ -97,17 +129,22 @@ run_case() {
   budget="$(python3 -c \
     'import sys; sys.path.insert(0, "tests"); from hdfs_memory_budget import budget_mib; print(budget_mib(1, 2, int(sys.argv[1]), int(sys.argv[2])))' \
     "$read" "$write")"
-  printf '%s,%s,%s,%s,%s,%s,2,4,1,%s,%s,%s,%s\n' \
-    "$profile" "$direction" "$payload" "$size" "$read" "$write" \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,2,4,1,%s,%s,%s,%s\n' \
+    "$run_id" "$commit" "$sample_set" "$profile" "$direction" "$payload" "$size" "$read" "$write" \
     "$budget" "$elapsed" "$rss" "$throughput" | tee -a "$output"
 }
 
 for profile_spec in serial:1:1 default:4:1 high:8:16; do
   IFS=: read -r profile read_inflight write_inflight <<< "$profile_spec"
   for direction in local-hdfs hdfs-hdfs hdfs-local; do
-    run_case "$profile" "$direction" small "$small_size" "$read_inflight" "$write_inflight"
-    run_case "$profile" "$direction" large "$large_size" "$read_inflight" "$write_inflight"
+    run_case baseline "$profile" "$direction" small "$small_size" "$read_inflight" "$write_inflight"
+    run_case baseline "$profile" "$direction" large "$large_size" "$read_inflight" "$write_inflight"
   done
 done
 
-python3 tests/hdfs_memory_budget.py "$output"
+for scale_attempt in {1..6}; do
+  run_case scale high hdfs-hdfs scale-1g "$scale_small_size" 8 16 "scale-1g-$scale_attempt"
+done
+run_case scale high hdfs-hdfs scale-100g "$scale_large_size" 8 16
+
+python3 tests/hdfs_memory_budget.py --require-100-gib "$output"

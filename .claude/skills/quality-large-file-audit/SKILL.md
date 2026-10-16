@@ -13,7 +13,7 @@ description: 报告 src/*.rs 相对 baseline 的规模趋势；仅新文件超�
 filter.rs        5303
 s3.rs            4329
 nfs.rs           3853
-cifs.rs          3152
+cifs.rs            36  (#150 后只剩 factory bridge)
 storage_enum.rs  2246
 local.rs         1423
 integrity_check.rs 1372
@@ -38,4 +38,3 @@ CI 硬门禁；`integrity_check.rs` 等内联测试模块也遵循这一规则�
 - 拆分候选 #1: filter.rs (调 filter-expert + architect)
 - 拆分候选 #2: s3.rs (按 GetObject / PutObject / Multipart / List 拆)
 - 拆分候选 #3: nfs.rs (按 v3 / v4 / Mount / Auth 拆)
-- 拆分候选 #4: cifs.rs (按 Connection / FileOps / DirOps 拆)

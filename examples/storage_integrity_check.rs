@@ -3,10 +3,14 @@ use std::path::PathBuf;
 use clap::{Parser, ValueEnum};
 use std::time::Duration;
 
-use data_mover::{
-    IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, MtimePrecision, Result,
-    create_storage,
+#[allow(dead_code)]
+#[path = "support/endpoint.rs"]
+mod endpoint_support;
+use data_mover::integrity::{
+    IntegrityMode, IntegrityOptions, IntegrityRequest, MtimePrecision, compare,
 };
+use data_mover::model::StoragePath;
+use endpoint_support::Result;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Mode {
@@ -14,11 +18,11 @@ enum Mode {
     Full,
 }
 
-impl From<Mode> for IntegrityCheckMode {
+impl From<Mode> for IntegrityMode {
     fn from(value: Mode) -> Self {
         match value {
-            Mode::Quick => Self::Quick,
-            Mode::Full => Self::Full,
+            Mode::Quick => Self::Metadata,
+            Mode::Full => Self::Content,
         }
     }
 }
@@ -54,28 +58,35 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let source = create_storage(&args.source, data_mover::CreateStorageOptions::default()).await?;
-    let destination = create_storage(
-        &args.destination,
-        data_mover::CreateStorageOptions::default(),
-    )
+    let source = endpoint_support::connect(&args.source).await?;
+    let destination = endpoint_support::connect(&args.destination).await?;
+    let path = StoragePath::new(args.path.to_str().ok_or("path must be UTF-8")?)?;
+    let report = compare(IntegrityRequest {
+        source,
+        source_path: path.clone(),
+        destination,
+        destination_path: path,
+        options: IntegrityOptions {
+            mode: args.mode.into(),
+            mtime_precision: if args.mtime_auto_precision {
+                MtimePrecision::Coarsest
+            } else {
+                MtimePrecision::Exact
+            },
+            mtime_tolerance: Duration::from_millis(args.mtime_tolerance_ms),
+            permissions: true,
+            ..IntegrityOptions::default()
+        },
+        cancel: tokio_util::sync::CancellationToken::new(),
+    })
     .await?;
-    let precision = if args.mtime_auto_precision {
-        MtimePrecision::Auto
-    } else {
-        MtimePrecision::Exact
-    };
-    let options = IntegrityCheckOptions::new(args.mode.into())
-        .with_mtime_precision(precision)
-        .with_mtime_tolerance(Duration::from_millis(args.mtime_tolerance_ms));
-    let entry =
-        IntegrityCheck::check_path_with_options(&source, &destination, &args.path, options, None)
-            .await?;
-
+    if !report.matches() {
+        return Err(format!("integrity differences: {:?}", report.differences()).into());
+    }
     println!(
         "integrity {:?} verified {} bytes: {}",
         args.mode,
-        entry.get_size(),
+        report.compared_bytes(),
         args.path.display()
     );
     Ok(())

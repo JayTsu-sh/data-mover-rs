@@ -11,6 +11,8 @@ LAB_SOURCE_DATA="${LAB_SOURCE_DATA:-10.10.1.12}"
 LAB_DEST_DATA="${LAB_DEST_DATA:-10.10.1.13}"
 LAB_WORKER_DATA="${LAB_WORKER_DATA:-10.10.1.14}"
 LAB_NFS3_EXPORT="${LAB_NFS3_EXPORT:-/srv/nfs/v3}"
+LAB_NFS40_DATA="${LAB_NFS40_DATA:-10.131.7.201}"
+LAB_NFS40_EXPORT="${LAB_NFS40_EXPORT:-/jay_nfs}"
 LAB_NFS41_EXPORT="${LAB_NFS41_EXPORT:-/srv/nfs/v4}"
 LAB_S3_BUCKET="${LAB_S3_BUCKET:-terrasync-ci}"
 LAB_HDFS_LOCATION="${LAB_HDFS_LOCATION:-hdfs://root@10.131.9.30:9000/}"
@@ -57,6 +59,12 @@ require_s3_credentials() {
   load_s3_credentials_from_rustfs
   : "${LAB_S3_ACCESS_KEY:?LAB_S3_ACCESS_KEY is required}"
   : "${LAB_S3_SECRET_KEY:?LAB_S3_SECRET_KEY is required}"
+
+  # S3 lab traffic uses private data-plane addresses and must not traverse the
+  # runner's optional outbound HTTP proxy.
+  local lab_no_proxy="$LAB_SOURCE_DATA,$LAB_DEST_DATA,$LAB_WORKER_DATA"
+  export no_proxy="${no_proxy:+$no_proxy,}$lab_no_proxy"
+  export NO_PROXY="${NO_PROXY:+$NO_PROXY,}$lab_no_proxy"
 }
 
 require_hdfs_kerberos_credentials() {
@@ -88,7 +96,9 @@ prepare_hdfs_kerberos() {
 ssh_lab() {
   local host="$1"
   shift
-  ssh -i "$LAB_SSH_KEY" \
+  local -a identity=()
+  [[ -r "$LAB_SSH_KEY" ]] && identity=(-i "$LAB_SSH_KEY")
+  ssh "${identity[@]}" \
     -o BatchMode=yes \
     -o ConnectTimeout=10 \
     -o StrictHostKeyChecking=accept-new \
@@ -98,7 +108,9 @@ ssh_lab() {
 ssh_lab_root() {
   local host="$1"
   shift
-  ssh -i "$LAB_SSH_KEY" \
+  local -a identity=()
+  [[ -r "$LAB_SSH_KEY" ]] && identity=(-i "$LAB_SSH_KEY")
+  ssh "${identity[@]}" \
     -o BatchMode=yes \
     -o ConnectTimeout=10 \
     -o StrictHostKeyChecking=accept-new \
@@ -108,7 +120,9 @@ ssh_lab_root() {
 ssh_hdfs() {
   local host="$1"
   shift
-  ssh -i "$LAB_SSH_KEY" \
+  local -a identity=()
+  [[ -r "$LAB_SSH_KEY" ]] && identity=(-i "$LAB_SSH_KEY")
+  ssh "${identity[@]}" \
     -o BatchMode=yes \
     -o ConnectTimeout=10 \
     -o StrictHostKeyChecking=accept-new \

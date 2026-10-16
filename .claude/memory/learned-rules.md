@@ -28,14 +28,13 @@
 - source: corrected 1x in S100 commit 7eb3046
 - graduation: → `.claude/docs/error-taxonomy.md` (已写)
 
-## L6 · CIFS smb2_only 默认 true
-- verify: 在 src/cifs.rs URL 参数默认值检查
+## L6 · (已移除) CIFS smb2_only 默认 true
+- status: 2026-09-16 随 legacy `CifsStorage` / `smb://` URL 删除 (#150)；role-based backend 直接 SMB 3.1.1 协商，无此参数
 - source: corrected 1x in S103 commit af0e017
-- graduation: 已写到 `.claude/docs/storage-cifs.md`，观察
 
-## L7 · CIFS 匿名 share 必须 anon=true + 空密码 + 无签名
-- verify: 改 cifs auth 路径时人工 review
-- source: corrected 1x in S103 commit 9b332aa
+## L7 · CIFS 匿名 share：guest 会话不能签名
+- verify: `CifsBackendConfig.guest_policy` 必须是 `AllowUnsigned` 才接受服务端映射的 guest 会话；空用户名走占位身份
+- source: corrected 1x in S103 commit 9b332aa；2026-09-16 FAS2750 实测 (`.claude/docs/storage-cifs.md` "真实环境证据")
 - graduation: 已写到 `.claude/docs/storage-cifs.md`
 
 (规则余量：当前 7 条 / 上限 50 行近半，下次 /evolve 时考虑哪些已稳定升级到 rules/)

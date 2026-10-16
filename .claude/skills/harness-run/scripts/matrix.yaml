@@ -8,7 +8,6 @@ no_network:
   - quality-clippy
   - quality-coverage
   - quality-large-file-audit
-  - quality-dispatch-coverage
 
 network:
   - e2e-cifs

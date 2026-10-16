@@ -1,270 +1,59 @@
-//! Tests for `StorageEnum::copy_file_resumable` (byte-level resume).
+//! Public role-transfer retry identity and output verification.
 //!
-//! Local-only — no S3/NFS server required.
+//! The retired caller-built `ResumeContext` and `.part` layout are covered at the adapter and
+//! engine boundaries by role-level checkpoint tests; callers now resubmit the same transfer
+//! request shape and data-mover decides whether a durable stage can be resumed.
 
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use data_mover::model::StoragePath;
+use data_mover::transfer::{InflightLimits, TransferRequest, transfer};
+use tokio_util::sync::CancellationToken;
 
-use data_mover::{CommitCallback, ResumeContext, StorageEnum, create_storage};
+mod common;
 
-trait AssertTestValue {
-    type Value;
-    fn assert_value(self, context: &str) -> Self::Value;
-}
+const SIZE: usize = 256 * 1024;
 
-impl<T, E: std::fmt::Debug> AssertTestValue for Result<T, E> {
-    type Value = T;
-
-    fn assert_value(self, context: &str) -> T {
-        match self {
-            Ok(value) => value,
-            Err(error) => panic!("{context}: {error:?}"),
-        }
-    }
-}
-
-const BLOCK: u64 = 64 * 1024;
-const SIZE: usize = 256 * 1024; // 4 blocks → multi-chunk
-type CommittedRanges = Arc<Mutex<Vec<(u64, u64)>>>;
-
-async fn reset_dirs(src: &str, dst: &str) {
-    let _ = tokio::fs::remove_dir_all(src).await;
-    let _ = tokio::fs::remove_dir_all(dst).await;
-    tokio::fs::create_dir_all(src)
-        .await
-        .assert_value("test value should be present");
-    tokio::fs::create_dir_all(dst)
-        .await
-        .assert_value("test value should be present");
-}
-
-/// 写一个内容可验证的 blob：byte i = (i % 251)。
-async fn write_pattern(path: &str, size: usize) {
-    use tokio::io::AsyncWriteExt;
-    let mut f = tokio::fs::File::create(path)
-        .await
-        .assert_value("test value should be present");
-    let buf: Vec<u8> = (0..size)
-        .map(|i| u8::try_from(i % 251).unwrap_or_default())
-        .collect();
-    f.write_all(&buf)
-        .await
-        .assert_value("test value should be present");
-    f.flush().await.assert_value("test value should be present");
-}
-
-fn pattern_vec(size: usize) -> Vec<u8> {
-    (0..size)
-        .map(|i| u8::try_from(i % 251).unwrap_or_default())
+fn payload() -> Vec<u8> {
+    (0..SIZE)
+        .map(|index| u8::try_from(index % 251).unwrap_or_default())
         .collect()
 }
 
-fn collecting_callback() -> (CommitCallback, CommittedRanges) {
-    let committed: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
-    let c = committed.clone();
-    let cb: CommitCallback = Arc::new(move |offset, len| {
-        c.lock()
-            .assert_value("test value should be present")
-            .push((offset, len));
-    });
-    (cb, committed)
-}
+#[tokio::test]
+async fn repeated_role_transfers_derive_the_same_identity_and_publish_exact_content()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = tempfile::tempdir()?;
+    let destination_root = tempfile::tempdir()?;
+    let expected = payload();
+    std::fs::write(source_root.path().join("blob.bin"), &expected)?;
+    let source = common::connect_local(source_root.path(), 4).await?;
+    let destination = common::connect_local(destination_root.path(), 4).await?;
+    let path = StoragePath::new("blob.bin")?;
+    let limits = InflightLimits::new(4, 128 * 1024, 4)?;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn resumable_fresh_full_copy() {
-    let src_dir = "/tmp/dm-resume-fresh-src";
-    let dst_dir = "/tmp/dm-resume-fresh-dst";
-    reset_dirs(src_dir, dst_dir).await;
-    write_pattern(&format!("{src_dir}/blob.bin"), SIZE).await;
+    let first = transfer(TransferRequest::new(
+        source.clone(),
+        path.clone(),
+        destination.clone(),
+        limits,
+        CancellationToken::new(),
+    ))
+    .await?;
+    let second = transfer(TransferRequest::new(
+        source,
+        path.clone(),
+        destination,
+        limits,
+        CancellationToken::new(),
+    ))
+    .await?;
 
-    let src = create_storage(
-        src_dir,
-        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
-    )
-    .await
-    .assert_value("test value should be present");
-    let dst = create_storage(
-        dst_dir,
-        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
-    )
-    .await
-    .assert_value("test value should be present");
-    let entry = src
-        .get_metadata(Path::new("blob.bin"))
-        .await
-        .assert_value("test value should be present");
-
-    let (cb, committed) = collecting_callback();
-    let counter = Arc::new(AtomicU64::new(0));
-    let resume = ResumeContext {
-        part_relative_path: Path::new("blob.bin.terrasync-part").to_path_buf(),
-        missing_intervals: vec![(0, SIZE as u64)],
-        on_committed: cb,
-    };
-
-    StorageEnum::copy_file_resumable(
-        &src,
-        &dst,
-        &entry,
-        data_mover::CopyOptions {
-            is_source_reserved: true,
-            bytes_counter: Some(counter.clone()),
-            ..Default::default()
-        },
-        resume,
-    )
-    .await
-    .assert_value("resumable full copy");
-
-    // 最终文件存在且内容正确
-    let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
-        .await
-        .assert_value("test value should be present");
-    assert_eq!(out, pattern_vec(SIZE), "final content mismatch");
-    // .part 已 rename 消失
-    assert!(
-        tokio::fs::metadata(format!("{dst_dir}/blob.bin.terrasync-part"))
-            .await
-            .is_err(),
-        ".part should be renamed away"
-    );
-    // 回调上报 (offset, len)，累计 len == 文件大小
-    let total: u64 = committed
-        .lock()
-        .assert_value("test value should be present")
-        .iter()
-        .map(|(_offset, len)| len)
-        .sum();
-    assert_eq!(total, SIZE as u64, "committed coverage should equal size");
-    assert_eq!(counter.load(Ordering::Relaxed), SIZE as u64);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn resumable_continues_from_partial_part() {
-    let src_dir = "/tmp/dm-resume-cont-src";
-    let dst_dir = "/tmp/dm-resume-cont-dst";
-    reset_dirs(src_dir, dst_dir).await;
-    write_pattern(&format!("{src_dir}/blob.bin"), SIZE).await;
-
-    // 预置 .part：已写正确的前半段（模拟上次中断）
-    let half = SIZE / 2;
-    let full = pattern_vec(SIZE);
-    tokio::fs::write(format!("{dst_dir}/blob.bin.terrasync-part"), &full[..half])
-        .await
-        .assert_value("test value should be present");
-
-    let src = create_storage(
-        src_dir,
-        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
-    )
-    .await
-    .assert_value("test value should be present");
-    let dst = create_storage(
-        dst_dir,
-        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
-    )
-    .await
-    .assert_value("test value should be present");
-    let entry = src
-        .get_metadata(Path::new("blob.bin"))
-        .await
-        .assert_value("test value should be present");
-
-    let (cb, _committed) = collecting_callback();
-    let counter = Arc::new(AtomicU64::new(0));
-    let resume = ResumeContext {
-        part_relative_path: Path::new("blob.bin.terrasync-part").to_path_buf(),
-        // 只补后半段
-        missing_intervals: vec![(half as u64, SIZE as u64)],
-        on_committed: cb,
-    };
-
-    StorageEnum::copy_file_resumable(
-        &src,
-        &dst,
-        &entry,
-        data_mover::CopyOptions {
-            is_source_reserved: true,
-            bytes_counter: Some(counter.clone()),
-            ..Default::default()
-        },
-        resume,
-    )
-    .await
-    .assert_value("resumable continue copy");
-
-    // 最终文件 = 完整内容（前半保留 + 后半续写）
-    let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
-        .await
-        .assert_value("test value should be present");
-    assert_eq!(out, full, "resumed file content mismatch");
-    // 只写了后半段
+    assert_eq!(first.identity, second.identity);
+    assert_eq!(second.transferred_bytes, SIZE as u64);
+    assert_eq!(second.blake3, Some(*blake3::hash(&expected).as_bytes()));
     assert_eq!(
-        counter.load(Ordering::Relaxed),
-        (SIZE - half) as u64,
-        "should only write missing half"
+        std::fs::read(destination_root.path().join(path.as_str()))?,
+        expected
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn resumable_truncates_leftover_tail() {
-    let src_dir = "/tmp/dm-resume-trunc-src";
-    let dst_dir = "/tmp/dm-resume-trunc-dst";
-    reset_dirs(src_dir, dst_dir).await;
-    write_pattern(&format!("{src_dir}/blob.bin"), SIZE).await;
-
-    // 预置一个比目标更长的 .part（遗留尾部垃圾），missing=full → 全量重写 + set_len 规整
-    let mut longer = pattern_vec(SIZE);
-    longer.extend(std::iter::repeat_n(0xFFu8, 4096));
-    tokio::fs::write(format!("{dst_dir}/blob.bin.terrasync-part"), &longer)
-        .await
-        .assert_value("test value should be present");
-
-    let src = create_storage(
-        src_dir,
-        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
-    )
-    .await
-    .assert_value("test value should be present");
-    let dst = create_storage(
-        dst_dir,
-        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
-    )
-    .await
-    .assert_value("test value should be present");
-    let entry = src
-        .get_metadata(Path::new("blob.bin"))
-        .await
-        .assert_value("test value should be present");
-
-    let (cb, _committed) = collecting_callback();
-    let resume = ResumeContext {
-        part_relative_path: Path::new("blob.bin.terrasync-part").to_path_buf(),
-        missing_intervals: vec![(0, SIZE as u64)],
-        on_committed: cb,
-    };
-
-    StorageEnum::copy_file_resumable(
-        &src,
-        &dst,
-        &entry,
-        data_mover::CopyOptions {
-            is_source_reserved: true,
-            ..Default::default()
-        },
-        resume,
-    )
-    .await
-    .assert_value("resumable truncate copy");
-
-    let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
-        .await
-        .assert_value("test value should be present");
-    assert_eq!(
-        out.len(),
-        SIZE,
-        "leftover tail must be truncated to exact size"
-    );
-    assert_eq!(out, pattern_vec(SIZE), "content mismatch after truncate");
+    assert_eq!(std::fs::read_dir(destination_root.path())?.count(), 1);
+    Ok(())
 }

@@ -1,13 +1,9 @@
 [package]
 name = "data-mover"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
-[patch.crates-io]
-smb = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
-
 [dependencies]
-async-channel = "2"
 arc-swap = "1.9.1"
 async-trait = "0.1"
 aws-config = "1.8.15"
@@ -20,12 +16,15 @@ base64 = "0.22"
 binrw = "0.15"
 blake3 = "1.8.4"
 bytes = { version = "1", features = ["serde"] }
+cap-std = "4.0.3"
+# Same version cap-std already builds; used directly only for `open_dir_nofollow`.
+cap-primitives = "4.0.3"
 chrono = "0.4.44"
 filetime = "0.2.27"
 futures = "0.3.32"
 glob = "0.3.3"
 governor = "0.10.4"
-hdfs-native = { git = "https://github.com/Kimahriman/hdfs-native", branch = "master" }
+hdfs-native = { git = "https://github.com/kimahriman/hdfs-native", rev = "695fc47e9f88804e39bba1d30bf128e66da9b8d6" }
 http-body = "1.0.1"
 dashmap = "6.1.0"
 parking_lot = "0.12"
@@ -33,26 +32,25 @@ percent-encoding = "2"
 tracing = "0.1.44"
 moka = { version = "0.12.15", features = ["sync"] }
 md-5 = "0.10"
-nfs-rs = "0.3.1"
+nfs-rs = "0.8.6"
 num-traits = "0.2.19"
 path-clean = "1.0.1"
 quick-xml = { version = "0.39.2", features = ["serialize"] }
-rayon = "1"
-remove_dir_all = { version = "1.0.0", features = ["parallel"] }
 hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
-reqwest = { version = "0.13.2", default-features = false, features = [
-    "cookies",
-    "rustls",
-] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive", "rc"] }
-smb = "0.12"
-soft-canonicalize = "0.5.5"
+smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "2649a0bbd615c23d64faca0053e969288694e034" }
 thiserror = "2.0.18"
 tokio = { version = "1.51.1", features = ["full"] }
 tokio-util = "0.7"
 url = "2.5.8"
+uuid = { version = "1.18.1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { version = "1.1", features = ["process", "thread"] }
+xattr = "1.6"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
@@ -61,19 +59,32 @@ windows = { version = "0.62.2", features = [
     "Win32_Security_Authorization",
 ] }
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_System_SystemServices",
     "Win32",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Foundation",
     "Win32_System_SystemServices",
     "Win32_System_Memory",
+    "Win32_Storage_FileSystem",
 ] }
 
 [dev-dependencies]
 clap = { version = "4.6.0", features = ["derive"] }
 indicatif = "0.18.4"
 serde_json = "1"
+tempfile = "3"
+# Local TLS endpoint for the certificate-verification tests (tests/s3_tls_verify.rs).
+tokio-rustls = { version = "0.26.4", default-features = false }
 tokio = { version = "1.51.1", features = ["test-util"] }
+# Real-server tests turn protocol tracing on through RUST_LOG; see tests/common/mod.rs.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 546 个依赖里几乎不会去单步调试，本 crate 自己的代码不受影响。
+# 这是 dev 产物体积的大头，且完全可移植。
+# 调试信息不再复制进每个产物，见 .cargo/config.toml (只对 unix 生效)。
+[profile.dev.package."*"]
+debug = 0
 
 [lints.rust]
 unsafe_code = "deny"
@@ -85,3 +96,77 @@ expect_used = "deny"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+
+# Lab executables retain their cargo target names; source lives with the harnesses.
+
+[[example]]
+name = "storage_small_benchmark"
+path = "tests/lab/tools/storage_small_benchmark.rs"
+
+[[example]]
+name = "local_write_benchmark"
+path = "tests/lab/tools/local_write_benchmark.rs"
+
+[[example]]
+name = "storage_resume"
+path = "tests/lab/tools/storage_resume.rs"
+
+[[example]]
+name = "nfs_metadata_copy"
+path = "tests/lab/tools/nfs_metadata_copy.rs"
+
+[[example]]
+name = "hdfs_fault_mutation"
+path = "tests/lab/tools/hdfs_fault_mutation.rs"
+
+[[example]]
+name = "nfs_copy_comparison"
+path = "tests/lab/tools/nfs_copy_comparison.rs"
+
+[[example]]
+name = "local_copy_comparison"
+path = "tests/lab/tools/local_copy_comparison.rs"
+
+[[example]]
+name = "storage_delete_contract"
+path = "tests/lab/tools/storage_delete_contract.rs"
+
+[[example]]
+name = "nfs_opt_dir"
+path = "tests/lab/tools/nfs_opt_dir.rs"
+
+[[example]]
+name = "cifs_mount_comparison"
+path = "tests/lab/tools/cifs_mount_comparison.rs"
+
+[[example]]
+name = "nfs_mount_comparison"
+path = "tests/lab/tools/nfs_mount_comparison.rs"
+
+[[example]]
+name = "s3_history_replay"
+path = "tests/lab/tools/s3_history_replay.rs"
+
+[[example]]
+name = "transfer_resume"
+path = "tests/lab/tools/transfer_resume.rs"
+
+[[example]]
+name = "nfs3_contract"
+path = "tests/lab/tools/nfs3_contract.rs"
+
+[[example]]
+name = "hdfs_kerberos_copy"
+path = "tests/lab/tools/hdfs_kerberos_copy.rs"
+
+[[example]]
+name = "hdfs_ha_probe"
+path = "tests/lab/tools/hdfs_ha_probe.rs"
+
+[[example]]
+name = "storage_inspect"
+path = "tests/lab/tools/storage_inspect.rs"
+
+[[example]]
+name = "storage_role_operations"
+path = "tests/lab/tools/storage_role_operations/main.rs"

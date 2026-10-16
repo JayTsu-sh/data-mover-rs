@@ -19,7 +19,7 @@ BASELINE = {
     "filter.rs": 5303,
     "s3.rs": 4329,
     "nfs.rs": 3853,
-    "cifs.rs": 3152,
+    "cifs.rs": 36,  # #150 后只剩 factory bridge
     "storage_enum.rs": 2246,
     "local.rs": 1423,
     # Integrity tests intentionally stay next to the implementation so private
@@ -28,14 +28,11 @@ BASELINE = {
     "acl.rs": 985,
     "qos.rs": 672,
     "lib.rs": 565,
-    "dir_tree.rs": 474,
     "tar_pack.rs": 286,
     "error.rs": 166,
-    "walk_scheduler.rs": 157,
     "time_util.rs": 130,
     "checksum.rs": 71,
     "url_redact.rs": 66,
-    "async_receiver.rs": 33,
     "write_pipeline.rs": 226,
 }
 NEW_FILE_LIMIT = 1000
