@@ -4,7 +4,10 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:-missing-run-id}"
 endpoint="${LAB_DXN_S3_ENDPOINT:-http://10.131.7.201:8184}"
-bucket="${LAB_DXN_S3_BUCKET:-test-agent-s3-bucket-202608301331}"
+# The DXN RGW zonegroup rejects CreateBucket on the shared fixture. Keep the
+# contract inside the pre-provisioned account-owned test bucket and isolate
+# every run by its unique prefix.
+bucket="${LAB_DXN_S3_BUCKET:-data-mover-test}"
 prefix=""
 evidence_path="${DXN_EVIDENCE_PATH:-dxn-s3-evidence.json}"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
