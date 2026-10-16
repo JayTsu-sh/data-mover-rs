@@ -392,7 +392,16 @@ impl MetadataRole for LocalObservationAdapter {
         }
         #[cfg(windows)]
         {
-            Some(ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly))
+            // Ask explicitly so the observation records `NotApplicable` for
+            // Windows' non-numeric ownership model. Leaving this omitted
+            // would produce `NotRequested`, which AllowKnownLoss correctly
+            // refuses because it cannot distinguish unsupported ownership
+            // from an observation bug.
+            Some(
+                ObservationPlan::default()
+                    .with_ownership_mode(ObservationMode::InlineOnly)
+                    .with_timestamps(ObservationMode::InlineOnly),
+            )
         }
         #[cfg(not(any(unix, windows)))]
         {
