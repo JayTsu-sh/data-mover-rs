@@ -37,7 +37,7 @@ touch "$go_file"
 wait "$contract_pid"
 
 expected_fixture="$(printf '%s' 'architecture-ready-nfs3-fixture' | sha256sum | cut -d' ' -f1)"
-actual_fixture="$(ssh_lab_root "$LAB_DEST_MGMT" "sha256sum '$destination_root/copied.bin' | cut -d' ' -f1")"
+actual_fixture="$(ssh_lab_root "$LAB_DEST_MGMT" "sha256sum '$destination_root/fixture.bin' | cut -d' ' -f1")"
 [[ "$actual_fixture" == "$expected_fixture" ]]
 expected_recovery="$(printf '%s' 'nfs3 durable recovery contract' | sha256sum | cut -d' ' -f1)"
 actual_recovery="$(ssh_lab_root "$LAB_DEST_MGMT" "sha256sum '$destination_root/recovered.bin' | cut -d' ' -f1")"

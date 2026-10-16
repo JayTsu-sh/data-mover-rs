@@ -128,10 +128,10 @@ async fn expert_metadata_is_applied_to_the_stage_before_publication()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("expert-metadata-source")?;
     let destination_root = TestRoot::new("expert-metadata-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"metadata payload")?;
+    std::fs::write(source_root.path().join("final.bin"), b"metadata payload")?;
     let source = local_source(source_root.path())?;
     let destination = local_destination(destination_root.path())?;
-    let observation = expert_observation(&source, "source.bin").await?;
+    let observation = expert_observation(&source, "final.bin").await?;
     let plan = local_xattr_plan()?;
 
     let outcome = complete_expert_transfer(
@@ -166,10 +166,10 @@ async fn expert_metadata_failure_does_not_publish_and_retains_the_stage()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("expert-metadata-failure-source")?;
     let destination_root = TestRoot::new("expert-metadata-failure-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"metadata payload")?;
+    std::fs::write(source_root.path().join("final.bin"), b"metadata payload")?;
     let source = local_source(source_root.path())?;
     let destination = local_destination(destination_root.path())?;
-    let observation = expert_observation(&source, "source.bin").await?;
+    let observation = expert_observation(&source, "final.bin").await?;
     let observations = MetadataObservations::new(
         MetadataObservation::NotRequested,
         MetadataObservation::NotRequested,
@@ -227,7 +227,7 @@ async fn source_qos_shapes_local_reads_once_and_reports_truthful_work()
     let source_root = TestRoot::new("qos-source")?;
     let destination_root = TestRoot::new("qos-destination")?;
     let payload = vec![0x5a; 100 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 16 * 1024, None)?);
 
     let outcome = transfer(
@@ -261,7 +261,7 @@ async fn source_qos_cancellation_wait_is_fast_and_does_not_charge_an_unissued_re
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("qos-cancel-source")?;
     let destination_root = TestRoot::new("qos-cancel-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"payload")?;
+    std::fs::write(source_root.path().join("final.bin"), b"payload")?;
     let qos = SourceQosGroup::new(SourceQosPolicy::new(Some((1, 1, Duration::ZERO)), 1, None)?);
     let cancel = tokio_util::sync::CancellationToken::new();
     let request = transfer_request(
@@ -301,7 +301,7 @@ async fn concurrent_public_transfers_share_one_source_qos_group_without_starvati
     let source_root = TestRoot::new("qos-shared-source")?;
     let first_destination = TestRoot::new("qos-shared-first")?;
     let second_destination = TestRoot::new("qos-shared-second")?;
-    std::fs::write(source_root.path().join("source.bin"), b"x")?;
+    std::fs::write(source_root.path().join("final.bin"), b"x")?;
     let group = SourceQosGroup::new(SourceQosPolicy::new(
         None,
         1,
@@ -338,7 +338,7 @@ async fn local_transfer_verifies_blake3_then_atomically_overwrites_final()
     let source_root = TestRoot::new("publish-source")?;
     let destination_root = TestRoot::new("publish-destination")?;
     let payload = vec![0x37; 192 * 1024 + 11];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     std::fs::write(destination_root.path().join("final.bin"), b"old-final")?;
 
     let outcome = transfer(transfer_request(
@@ -365,7 +365,7 @@ async fn single_chunk_local_transfer_omits_recovery_checkpoint()
     let source_root = TestRoot::new("single-chunk-source")?;
     let destination_root = TestRoot::new("single-chunk-destination")?;
     let payload = vec![0x4b; 4 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (destination, destination_role) =
         test_destination_storage_with_role(destination_root.path(), "single-chunk-destination")?;
     destination_role.fail_checkpoint_at(1);
@@ -398,7 +398,7 @@ async fn checkpointed_multichunk_below_threshold_skips_checkpoint_setup()
     let source_root = TestRoot::new("multi-chunk-source")?;
     let destination_root = TestRoot::new("multi-chunk-destination")?;
     let payload = vec![0x6d; 128 * 1024 + 1];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (destination, destination_role) =
         test_destination_storage_with_role(destination_root.path(), "multi-chunk-destination")?;
     destination_role.fail_checkpoint_at(1);
@@ -432,7 +432,7 @@ async fn disabled_multi_chunk_transfer_omits_recovery_checkpoint()
     let source_root = TestRoot::new("disabled-multi-chunk-source")?;
     let destination_root = TestRoot::new("disabled-multi-chunk-destination")?;
     let payload = vec![0x71; 128 * 1024 + 1];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (destination, destination_role) = test_destination_storage_with_role(
         destination_root.path(),
         "disabled-multi-chunk-destination",
@@ -465,16 +465,15 @@ async fn streaming_transfer_uses_one_source_stream_with_inflight_reads()
     let source_root = TestRoot::new("source-range-inflight")?;
     let destination_root = TestRoot::new("destination-range-inflight")?;
     let payload = vec![0x6d; 4 * CHUNK_BYTES];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (source, source_role) = test_source_storage(source_root.path(), "inflight-source")?;
     source_role.delay_reads(Duration::from_millis(30));
     let request = TransferRequest::new(
         source,
-        StoragePath::new("source.bin")?,
+        StoragePath::new("final.bin")?,
         local_destination(destination_root.path())?,
         tokio_util::sync::CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new("final.bin")?)
     .with_identity_override(TransferIdentity::from_label("source-range-inflight")?)
     .with_transfer_policy(TransferPolicy::AtomicReplace);
 
@@ -501,7 +500,7 @@ async fn verification_mismatch_fast_fails_without_changing_final()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("verify-failure-source")?;
     let destination_root = TestRoot::new("verify-failure-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), vec![0x22; 64 * 1024])?;
+    std::fs::write(source_root.path().join("final.bin"), vec![0x22; 64 * 1024])?;
     std::fs::write(destination_root.path().join("final.bin"), b"old-final")?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "verify-failure-destination")?;
@@ -539,7 +538,7 @@ async fn failure_after_atomic_publication_reports_changed_final_not_recoverable_
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("post-commit-source")?;
     let destination_root = TestRoot::new("post-commit-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"new-final")?;
+    std::fs::write(source_root.path().join("final.bin"), b"new-final")?;
     std::fs::write(destination_root.path().join("final.bin"), b"old-final")?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "post-commit-destination")?;
@@ -572,7 +571,7 @@ async fn enabled_identity_reuses_a_reobserved_complete_local_prefix()
     let source_root = TestRoot::new("resume-source")?;
     let destination_root = TestRoot::new("resume-destination")?;
     let payload = vec![0x61; 192 * 1024 + 7];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     std::fs::write(destination_root.path().join("final.bin"), b"existing")?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "transfer-destination")?;
@@ -622,7 +621,7 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     let source_root = TestRoot::new("partial-resume-source")?;
     let destination_root = TestRoot::new("partial-resume-destination")?;
     let payload = vec![0x73; 3 * 64 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (source, source_role) = test_source_storage(source_root.path(), "transfer-source")?;
     let second_read = source_role.gate_read_at(64 * 1024);
     let (destination, destination_role) =
@@ -691,7 +690,7 @@ async fn recovery_restarts_after_same_size_source_edit() -> Result<(), Box<dyn s
     ] {
         let source_root = TestRoot::new("changed-resume-source")?;
         let destination_root = TestRoot::new("changed-resume-destination")?;
-        let path = source_root.path().join("source.bin");
+        let path = source_root.path().join("final.bin");
         let payload = vec![0x73; 3 * 64 * 1024];
         std::fs::write(&path, &payload)?;
         let original_mtime = std::fs::metadata(&path)?.modified()?;
@@ -774,7 +773,7 @@ async fn quick_discards_persisted_stage_before_reupload() -> Result<(), Box<dyn 
     let source_root = TestRoot::new("restart-cleans-source")?;
     let destination_root = TestRoot::new("restart-cleans-destination")?;
     let payload = vec![0x39; 2 * 64 * 1024 + 1];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let source = local_source(source_root.path())?;
     let destination = local_destination(destination_root.path())?;
     let checkpointed = recoverable_request(
@@ -821,7 +820,7 @@ async fn a_second_concurrent_transfer_is_refused_at_prepare()
     let source_root = TestRoot::new("claim-source")?;
     let destination_root = TestRoot::new("claim-destination")?;
     let payload = vec![0x52; 1024 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     std::fs::write(destination_root.path().join("final.bin"), b"existing")?;
     let first = run_until_transferred(recoverable_request(
         transfer_request(
@@ -885,7 +884,7 @@ async fn a_direct_transfer_reports_the_stage_it_cleaned_up()
     let source_root = TestRoot::new("direct-clean-source")?;
     let destination_root = TestRoot::new("direct-clean-destination")?;
     let payload = vec![0x45; 3 * 64 * 1024 + 5];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "direct-clean-destination")?;
     role.set_automatic_checkpoint_interval(64 * 1024);
@@ -923,7 +922,7 @@ async fn a_resumed_stage_that_fails_verification_is_not_resumed_again()
     let source_root = TestRoot::new("stale-resume-source")?;
     let destination_root = TestRoot::new("stale-resume-destination")?;
     let payload = vec![0x46; 3 * 64 * 1024 + 5];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "stale-resume-destination")?;
     role.set_automatic_checkpoint_interval(64 * 1024);
@@ -973,7 +972,7 @@ async fn a_dropped_local_transfer_resumes_from_the_destination()
     let source_root = TestRoot::new("no-store-source")?;
     let destination_root = TestRoot::new("no-store-destination")?;
     let payload = vec![0x44; 3 * 64 * 1024 + 5];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "no-store-destination")?;
     role.set_automatic_checkpoint_interval(64 * 1024);
@@ -1000,18 +999,17 @@ async fn local_transfer_reaches_durable_unpublished_state() -> Result<(), Box<dy
     let source_root = TestRoot::new("source")?;
     let destination_root = TestRoot::new("destination")?;
     let payload = vec![0x5a; 160 * 1024 + 17];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     std::fs::write(destination_root.path().join("final.bin"), b"old-final")?;
     let source = local_source(source_root.path())?;
     let destination = local_destination(destination_root.path())?;
     let request = recoverable_request(
         TransferRequest::new(
             source,
-            StoragePath::new("source.bin")?,
+            StoragePath::new("final.bin")?,
             destination,
             tokio_util::sync::CancellationToken::new(),
         )
-        .with_final_path(StoragePath::new("final.bin")?)
         .with_identity_override(TransferIdentity::from_label("local-copy")?),
         None,
     );
@@ -1033,17 +1031,16 @@ async fn cancellation_before_prepare_leaves_no_staged_or_final_mutation()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("cancel-source")?;
     let destination_root = TestRoot::new("cancel-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"payload")?;
+    std::fs::write(source_root.path().join("final.bin"), b"payload")?;
     std::fs::write(destination_root.path().join("final.bin"), b"old-final")?;
     let cancel = tokio_util::sync::CancellationToken::new();
     cancel.cancel();
     let request = TransferRequest::new(
         local_source(source_root.path())?,
-        StoragePath::new("source.bin")?,
+        StoragePath::new("final.bin")?,
         local_destination(destination_root.path())?,
         cancel,
     )
-    .with_final_path(StoragePath::new("final.bin")?)
     .with_identity_override(TransferIdentity::from_label("cancelled-copy")?);
 
     let Err(error) = run_until_transferred(request).await else {
@@ -1064,15 +1061,14 @@ async fn preflight_refusal_happens_before_destination_mutation()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("preflight-source")?;
     let destination_root = TestRoot::new("preflight-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"payload")?;
+    std::fs::write(source_root.path().join("final.bin"), b"payload")?;
     let destination = test_unsupported_storage("unsupported-destination")?;
     let request = TransferRequest::new(
         local_source(source_root.path())?,
-        StoragePath::new("source.bin")?,
+        StoragePath::new("final.bin")?,
         destination,
         tokio_util::sync::CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new("final.bin")?)
     .with_identity_override(TransferIdentity::from_label("preflight-copy")?);
 
     let Err(error) = run_until_transferred(request).await else {
@@ -1090,9 +1086,9 @@ async fn cancellation_during_describe_stops_before_prepare()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("describe-cancel-source")?;
     let destination_root = TestRoot::new("describe-cancel-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"payload")?;
+    std::fs::write(source_root.path().join("final.bin"), b"payload")?;
     let (source, source_role) = test_source_storage(source_root.path(), "describe-source")?;
-    source_role.delay_description("source.bin", std::time::Duration::from_millis(200));
+    source_role.delay_description("final.bin", std::time::Duration::from_millis(200));
     let cancel = tokio_util::sync::CancellationToken::new();
     let request = transfer_request(
         source,
@@ -1124,7 +1120,7 @@ async fn copied_metadata_follows_the_described_source_identity()
 
     let source_root = TestRoot::new("metadata-identity-source")?;
     let destination_root = TestRoot::new("metadata-identity-destination")?;
-    let source_path = source_root.path().join("source.bin");
+    let source_path = source_root.path().join("final.bin");
     let replacement_path = source_root.path().join("replacement.bin");
     std::fs::write(&source_path, b"old source")?;
     std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(OLD_MODE))?;
@@ -1140,7 +1136,7 @@ async fn copied_metadata_follows_the_described_source_identity()
 
     let (source, source_role) =
         test_source_storage(source_root.path(), "metadata-identity-source")?;
-    source_role.delay_description("source.bin", std::time::Duration::from_millis(200));
+    source_role.delay_description("final.bin", std::time::Duration::from_millis(200));
     let request = transfer_request(
         source,
         local_destination(destination_root.path())?,
@@ -1165,10 +1161,7 @@ async fn cancellation_during_source_read_preserves_unpublished_stage()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("active-cancel-source")?;
     let destination_root = TestRoot::new("active-cancel-destination")?;
-    std::fs::write(
-        source_root.path().join("source.bin"),
-        vec![7_u8; 128 * 1024],
-    )?;
+    std::fs::write(source_root.path().join("final.bin"), vec![7_u8; 128 * 1024])?;
     std::fs::write(destination_root.path().join("final.bin"), b"old-final")?;
     let (source, source_role) = test_source_storage(source_root.path(), "delayed-source")?;
     source_role.delay_reads(std::time::Duration::from_millis(200));
@@ -1224,15 +1217,14 @@ fn transfer_request(
         .with_identity_override(TransferIdentity::from_label("active-cancel-copy")?))
 }
 
-/// `source.bin` → `final.bin` under the identity data-mover derives from the two endpoints.
+/// The same relative path at each root, under the identity derived from the two endpoints.
 fn derived_transfer_request(
     source: Storage,
     destination: Storage,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<TransferRequest, Box<dyn std::error::Error>> {
     Ok(
-        TransferRequest::new(source, StoragePath::new("source.bin")?, destination, cancel)
-            .with_final_path(StoragePath::new("final.bin")?)
+        TransferRequest::new(source, StoragePath::new("final.bin")?, destination, cancel)
             .with_transfer_policy(TransferPolicy::AtomicReplace),
     )
 }

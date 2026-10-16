@@ -41,7 +41,7 @@ async fn standard_s3_architecture_roles_stage_publish_and_read_back() -> TestRes
     let (storage, stage) = stage_with_reconnect(&url, &path, &identity, &payload).await?;
     verify_publish_and_metadata(&storage, &stage, &path, &payload, true).await?;
     verify_range_and_cancellation(&storage, &path, &payload).await?;
-    verify_native_and_shaped_fallback(&storage, &path, &payload).await?;
+    verify_native_and_shaped_fallback(&url, &storage, &path, &payload).await?;
     verify_stale_upload_restart(&url, &path, &identity, payload.len()).await
 }
 
@@ -55,17 +55,23 @@ async fn dxn_s3_architecture_roles_and_known_limits() -> TestResult {
     let (storage, stage) = stage_with_reconnect(&url, &path, &identity, &payload).await?;
     verify_publish_and_metadata(&storage, &stage, &path, &payload, false).await?;
     verify_range_and_cancellation(&storage, &path, &payload).await?;
-    verify_native_and_shaped_fallback(&storage, &path, &payload).await?;
+    verify_native_and_shaped_fallback(&url, &storage, &path, &payload).await?;
     verify_stale_upload_restart(&url, &path, &identity, payload.len()).await
 }
 
 async fn verify_native_and_shaped_fallback(
+    url: &str,
     storage: &Storage,
     source: &StoragePath,
     payload: &Bytes,
 ) -> TestResult {
-    let native_path = StoragePath::new(format!("{}.native", source.as_str()))?;
-    let request = transfer_request(storage, source, native_path, "native")?;
+    let mut destination_url = url::Url::parse(url)?;
+    destination_url.set_path(&format!(
+        "{}/copy-target",
+        destination_url.path().trim_end_matches('/')
+    ));
+    let destination = connected(destination_url.as_str()).await?;
+    let request = transfer_request(storage, &destination, source, "native")?;
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, u64::try_from(PART_SIZE)?, None)?);
     let native = transfer(request.with_source_qos(qos)).await?;
     assert_eq!(native.blake3, Some(*blake3::hash(payload).as_bytes()));
@@ -79,9 +85,8 @@ async fn verify_native_and_shaped_fallback(
     );
     assert!(!native.source_qos.native_payload_shaped);
 
-    let shaped_path = StoragePath::new(format!("{}.shaped", source.as_str()))?;
     let shaped = transfer(
-        transfer_request(storage, source, shaped_path, "shaped")?
+        transfer_request(storage, &destination, source, "shaped")?
             .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped),
     )
     .await?;
@@ -91,17 +96,16 @@ async fn verify_native_and_shaped_fallback(
 
 fn transfer_request(
     storage: &Storage,
+    destination: &Storage,
     source: &StoragePath,
-    final_path: StoragePath,
     identity: &str,
 ) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
         storage.clone(),
         source.clone(),
-        storage.clone(),
+        destination.clone(),
         CancellationToken::new(),
     )
-    .with_final_path(final_path)
     .with_identity_override(TransferIdentity::from_label(format!(
         "s3-contract-{identity}"
     ))?))

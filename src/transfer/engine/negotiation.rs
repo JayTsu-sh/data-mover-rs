@@ -54,13 +54,36 @@ pub(super) async fn copied_metadata_plan(
     else {
         return Ok(None);
     };
-    if target.stores_nothing() {
+    // Unrequested optional capabilities must not trigger source metadata I/O (notably a
+    // HEAD per object for ordinary S3 copies whose destination only stores tags).
+    let requested_target = CopiedMetadataTarget {
+        acl: if requested.acl() {
+            target.acl
+        } else {
+            CopiedAclTarget::Unsupported
+        },
+        xattrs: if requested.xattrs() {
+            target.xattrs
+        } else {
+            CopiedValueTarget::Unsupported
+        },
+        tags: if requested.tags() {
+            target.tags
+        } else {
+            CopiedValueTarget::Unsupported
+        },
+        ..target
+    };
+    if requested_target.stores_nothing() {
         return Ok(Some(nothing_stored(requested)));
     }
     let timestamps_stored = matches!(target.timestamps, CopiedTimestampTarget::Stored(_));
     let observation_plan = baseline
         .with_acl(observation_mode(requested.acl()))
-        .with_xattrs(observation_mode(requested.xattrs()));
+        .with_xattrs(observation_mode(requested.xattrs()))
+        .with_tags(observation_mode(
+            requested.tags() && target.tags == CopiedValueTarget::Supported,
+        ));
     let observations = metadata
         .observe_copy_bound_version(
             request.source_path(),
@@ -109,7 +132,8 @@ fn nothing_stored(requested: CopiedMetadataRequest) -> CopiedMetadataPlan {
         .with_ownership_mode(MetadataPolicy::AllowKnownLoss)
         .with_timestamps(MetadataPolicy::AllowKnownLoss)
         .with_acl(optional_policy(requested.acl()))
-        .with_xattrs(optional_policy(requested.xattrs()));
+        .with_xattrs(optional_policy(requested.xattrs()))
+        .with_tags(optional_policy(requested.tags()));
     CopiedMetadataPlan {
         plan: compile_nothing_stored_plan(policies),
     }
@@ -185,7 +209,10 @@ fn metadata_target(
             CopiedValueTarget::Supported => ValueTarget::Supported,
             CopiedValueTarget::Unsupported => ValueTarget::Unsupported,
         },
-        tags: ValueTarget::NotApplicable,
+        tags: match target.tags {
+            CopiedValueTarget::Supported => ValueTarget::Supported,
+            CopiedValueTarget::Unsupported => ValueTarget::Unsupported,
+        },
         ownership_mode,
         timestamps: match target.timestamps {
             CopiedTimestampTarget::Stored(precision) => {
@@ -225,6 +252,7 @@ fn copied_policies(
         })
         .with_acl(optional_policy(requested.acl()))
         .with_xattrs(optional_policy(requested.xattrs()))
+        .with_tags(optional_policy(requested.tags()))
 }
 
 /// How an optional feature is planned: not asked for, it is not even read; asked for, it is
@@ -308,6 +336,7 @@ mod tests {
             ownership: CopiedOwnershipTarget::Numeric,
             acl: CopiedAclTarget::Unsupported,
             xattrs: CopiedValueTarget::Unsupported,
+            tags: CopiedValueTarget::Unsupported,
         }
     }
 

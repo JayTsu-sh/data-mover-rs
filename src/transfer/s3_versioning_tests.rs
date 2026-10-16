@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::model::{FailureClass, StoragePath, Transience};
 use crate::storage::PrepareFact;
 use crate::storage::artifacts::{ArtifactKind, is_artifact_path, sibling_artifact};
-use crate::storage::backends::s3::tests::{MemoryS3, Versioning, endpoint_of};
+use crate::storage::backends::s3::tests::{MemoryS3, Versioning, endpoint_of, source_storage};
 use crate::storage::backends::s3::{
     S3Protocol as _, S3ProtocolFailure, S3VersionFacts, connect_at_destination,
     connect_native_at_destination,
@@ -39,11 +39,15 @@ fn payload(size: usize, salt: u8) -> Bytes {
 }
 
 /// A bucket with `mode` versioning whose `source` holds `versions` (id, bytes), oldest first.
-async fn bucket(mode: Versioning, versions: &[(&str, &Bytes)]) -> Arc<MemoryS3> {
+async fn bucket(mode: Versioning, versions: &[(&str, &Bytes)], paths: &[&str]) -> Arc<MemoryS3> {
     let protocol = Arc::new(MemoryS3::default());
     protocol.set_versioning(mode);
     for (id, bytes) in versions {
-        protocol.put_version("source", id, (*bytes).clone()).await;
+        for path in paths {
+            protocol
+                .put_version(&format!("src/{path}"), id, (*bytes).clone())
+                .await;
+        }
     }
     protocol
 }
@@ -56,12 +60,11 @@ fn request(
     let storage =
         || connect_at_destination(protocol.clone(), endpoint_of(protocol), INTERVAL as u64);
     Ok(TransferRequest::new(
-        storage()?,
-        StoragePath::new("source")?,
+        source_storage(protocol, "src")?,
+        StoragePath::new(final_key)?,
         storage()?,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new(final_key)?)
     .with_transfer_policy(policy))
 }
 
@@ -131,7 +134,7 @@ async fn every_write_path_reports_the_version_it_made() -> TestResult {
         ("direct-large", 3 * PART, TransferPolicy::Direct),
     ] {
         let data = payload(size, 1);
-        let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
+        let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &[final_key]).await;
         let outcome = transfer(request(&protocol, final_key, policy)?).await?;
         assert_eq!(outcome.blake3, Some(*blake3::hash(&data).as_bytes()));
         clean_versions(&protocol, final_key, 1, Some(version(&outcome)?)).await?;
@@ -157,12 +160,11 @@ fn native(protocol: &Arc<MemoryS3>, final_key: &str) -> TestResult<TransferReque
         )
     };
     Ok(TransferRequest::new(
-        storage()?,
-        StoragePath::new("source")?,
+        source_storage(protocol, "src")?,
+        StoragePath::new(final_key)?,
         storage()?,
         CancellationToken::new(),
-    )
-    .with_final_path(StoragePath::new(final_key)?))
+    ))
 }
 
 /// A native S3→S3 copy goes to the final key (ADR-0006 C18) — one `CopyObject`, or an upload
@@ -172,7 +174,7 @@ fn native(protocol: &Arc<MemoryS3>, final_key: &str) -> TestResult<TransferReque
 async fn a_native_copy_reports_its_version_and_leaves_no_temp_version() -> TestResult {
     for size in [1024, 3 * PART] {
         let data = payload(size, 11);
-        let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
+        let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["native"]).await;
         let outcome = transfer(native(&protocol, "native")?).await?;
         assert_eq!(outcome.route, TransferRoute::Native, "{size}");
         let (copies, parts) = if size > PART { (0, 3) } else { (1, 0) };
@@ -189,7 +191,12 @@ async fn a_native_copy_reports_its_version_and_leaves_no_temp_version() -> TestR
 #[tokio::test]
 async fn native_copies_by_id_arrive_in_order_and_resume_into_one_version() -> TestResult {
     let (v1, v2) = (payload(3 * PART, 12), payload(PART / 2, 13));
-    let protocol = bucket(Versioning::Enabled, &[("s1", &v1), ("s2", &v2)]).await;
+    let protocol = bucket(
+        Versioning::Enabled,
+        &[("s1", &v1), ("s2", &v2)],
+        &["history", "cut", "history-cut"],
+    )
+    .await;
     let by_id = |key: &str, id: &str| {
         native(&protocol, key)
             .map(|request| request.with_source_version(SourceVersion::Id(id.into())))
@@ -229,7 +236,7 @@ async fn stored(protocol: &MemoryS3, key: &str, id: &str) -> Option<Bytes> {
 #[tokio::test]
 async fn an_ambiguous_native_completion_claims_the_version_it_made() -> TestResult {
     let data = payload(3 * PART, 14);
-    let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
+    let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["ambiguous-native"]).await;
     *protocol.complete_commits_then_fails.lock().await = true;
     let outcome = transfer(native(&protocol, "ambiguous-native")?).await?;
     assert_eq!(outcome.route, TransferRoute::Native);
@@ -275,7 +282,7 @@ async fn cut_then_resume(
 #[tokio::test]
 async fn an_interrupted_and_resumed_copy_adds_one_version() -> TestResult {
     let data = payload(3 * PART, 2);
-    let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
+    let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["resumed"]).await;
     let policy = TransferPolicy::Checkpointed;
     let outcome = cut_then_resume(
         &protocol,
@@ -294,7 +301,7 @@ async fn an_interrupted_and_resumed_copy_adds_one_version() -> TestResult {
 #[tokio::test]
 async fn a_discarded_failure_leaves_the_bucket_as_it_was() -> TestResult {
     let data = payload(3 * PART, 3);
-    let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
+    let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["kept"]).await;
     protocol
         .put_version("kept", "old", Bytes::from_static(b"previous"))
         .await;
@@ -316,7 +323,12 @@ async fn a_discarded_failure_leaves_the_bucket_as_it_was() -> TestResult {
 #[tokio::test]
 async fn versions_copied_by_id_arrive_in_order() -> TestResult {
     let (v1, v2) = (payload(3 * PART, 4), payload(PART / 2, 5));
-    let protocol = bucket(Versioning::Enabled, &[("s1", &v1), ("s2", &v2)]).await;
+    let protocol = bucket(
+        Versioning::Enabled,
+        &[("s1", &v1), ("s2", &v2)],
+        &["history", "cut", "history-cut"],
+    )
+    .await;
     let mut made = Vec::new();
     for id in ["s1", "s2"] {
         let request = request(&protocol, "history", TransferPolicy::Checkpointed)?
@@ -343,7 +355,12 @@ async fn versions_copied_by_id_arrive_in_order() -> TestResult {
 #[tokio::test]
 async fn an_interrupted_id_copy_resumes_into_one_version() -> TestResult {
     let (v1, v2) = (payload(3 * PART, 6), payload(3 * PART, 7));
-    let protocol = bucket(Versioning::Enabled, &[("s1", &v1), ("s2", &v2)]).await;
+    let protocol = bucket(
+        Versioning::Enabled,
+        &[("s1", &v1), ("s2", &v2)],
+        &["history", "cut", "history-cut"],
+    )
+    .await;
     let by_id = || {
         request(&protocol, "history-cut", TransferPolicy::Checkpointed)
             .map(|request| request.with_source_version(SourceVersion::Id("s1".into())))
@@ -372,7 +389,7 @@ async fn suspended_versioning_reports_no_version() -> TestResult {
         ("direct-large", 3 * PART, TransferPolicy::Direct),
     ] {
         let data = payload(size, 8);
-        let protocol = bucket(Versioning::Suspended, &[("null", &data)]).await;
+        let protocol = bucket(Versioning::Suspended, &[("null", &data)], &[final_key]).await;
         let outcome = transfer(request(&protocol, final_key, policy)?).await?;
         assert_eq!(outcome.destination_version, None, "{final_key}");
         clean_versions(&protocol, final_key, 1, Some("null")).await?;
@@ -385,7 +402,7 @@ async fn suspended_versioning_reports_no_version() -> TestResult {
 #[tokio::test]
 async fn a_locked_pointer_does_not_fail_the_transfer() -> TestResult {
     let data = payload(3 * PART, 9);
-    let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
+    let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["locked"]).await;
     let pointer = pointer_of("locked")?;
     protocol.lock_versions(&pointer);
     let outcome = transfer(request(&protocol, "locked", TransferPolicy::Checkpointed)?).await?;
@@ -412,7 +429,7 @@ async fn a_locked_pointer_does_not_fail_the_transfer() -> TestResult {
 #[tokio::test]
 async fn a_pointer_held_against_markers_does_not_fail_the_transfer() -> TestResult {
     let data = payload(3 * PART, 16);
-    let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
+    let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["held"]).await;
     protocol.lock_refuses_delete_markers();
     let pointer = pointer_of("held")?;
     protocol.lock_versions(&pointer);
@@ -449,7 +466,7 @@ async fn a_copy_reply_without_a_version_claims_the_latest_version() -> TestResul
         (Versioning::Off, true, 0),
     ] {
         let data = payload(1024, 17);
-        let protocol = bucket(mode, &[("s1", &data)]).await;
+        let protocol = bucket(mode, &[("s1", &data)], &["copied"]).await;
         *protocol.copy_omits_version.lock().await = omitted;
         let outcome = transfer(native(&protocol, "copied")?).await?;
         assert_eq!(outcome.route, TransferRoute::Native);
@@ -475,7 +492,7 @@ async fn an_ambiguous_completion_claims_the_version_it_made() -> TestResult {
         ("ambiguous-direct", TransferPolicy::Direct),
     ] {
         let data = payload(3 * PART, 10);
-        let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
+        let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &[final_key]).await;
         *protocol.complete_commits_then_fails.lock().await = true;
         let outcome = transfer(request(&protocol, final_key, policy)?).await?;
         assert_eq!(*protocol.completes.lock().await, 1, "{final_key}");

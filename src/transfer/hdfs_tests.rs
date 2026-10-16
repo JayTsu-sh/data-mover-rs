@@ -26,11 +26,10 @@ fn recoverable_request(request: TransferRequest, _resume_marker: Option<()>) -> 
 fn request(source: Storage, destination: Storage) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
         source,
-        StoragePath::new("source")?,
+        StoragePath::new("final")?,
         destination,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new("final")?)
     .with_identity_override(TransferIdentity::from_label("hdfs-role-contract")?))
 }
 
@@ -44,9 +43,10 @@ async fn staged_roles(
     label: &str,
 ) -> TestResult<(Arc<dyn StagedDestination>, SourceDescriptor)> {
     let storage = connect(Arc::clone(protocol), test_identity(label)?)?;
-    let descriptor = storage
+    let source = connect(protocol.source_root("src"), test_identity(label)?)?;
+    let descriptor = source
         .read_source()?
-        .describe(&StoragePath::new("source")?)
+        .describe(&StoragePath::new("final")?)
         .await?;
     Ok((storage.staged_destination()?, descriptor))
 }
@@ -78,9 +78,9 @@ fn publish_request(payload: &[u8]) -> PublishRequest {
 async fn architecture_roles_transfer_verify_and_publish() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
-        .insert("source", Bytes::from_static(b"hdfs payload"))
+        .insert("src/final", Bytes::from_static(b"hdfs payload"))
         .await;
-    let source = connect(protocol.clone(), test_identity("source")?)?;
+    let source = connect(protocol.source_root("src"), test_identity("source")?)?;
     let destination = connect(protocol.clone(), test_identity("destination")?)?;
     let outcome = transfer(request(source, destination)?).await?;
     assert_eq!(outcome.transferred_bytes, 12);
@@ -95,10 +95,13 @@ async fn architecture_roles_transfer_verify_and_publish() -> TestResult {
 async fn write_failure_retains_discard_authority_and_final_is_unchanged() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
-        .insert("source", Bytes::from_static(b"failure"))
+        .insert("src/final", Bytes::from_static(b"failure"))
         .await;
     protocol.fail_writes();
-    let source = connect(protocol.clone(), test_identity("source-failure")?)?;
+    let source = connect(
+        protocol.source_root("src"),
+        test_identity("source-failure")?,
+    )?;
     let destination = connect(protocol.clone(), test_identity("destination-failure")?)?;
     let Err(failure) = transfer(request(source, destination)?).await else {
         return Err("injected HDFS write failure succeeded".into());
@@ -116,9 +119,9 @@ async fn write_failure_retains_discard_authority_and_final_is_unchanged() -> Tes
 async fn cancelled_transfer_stops_before_hdfs_stage_creation() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
-        .insert("source", Bytes::from_static(b"cancelled"))
+        .insert("src/final", Bytes::from_static(b"cancelled"))
         .await;
-    let source = connect(protocol.clone(), test_identity("source-cancel")?)?;
+    let source = connect(protocol.source_root("src"), test_identity("source-cancel")?)?;
     let destination = connect(protocol.clone(), test_identity("destination-cancel")?)?;
     let request = request(source, destination)?;
     request.cancel.cancel();
@@ -135,7 +138,7 @@ async fn cancelled_transfer_stops_before_hdfs_stage_creation() -> TestResult {
 async fn hdfs_stage_resumes_an_observed_prefix_from_the_destination() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
-        .insert("source", Bytes::from_static(b"restart"))
+        .insert("src/final", Bytes::from_static(b"restart"))
         .await;
     let (staged, descriptor) = staged_roles(&protocol, "resume").await?;
     let stage = staged
@@ -166,7 +169,7 @@ async fn hdfs_stage_resumes_an_observed_prefix_from_the_destination() -> TestRes
 async fn interrupted_hdfs_stage_resumes_only_the_durable_tail() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
-        .insert("source", Bytes::from_static(b"abcdef"))
+        .insert("src/final", Bytes::from_static(b"abcdef"))
         .await;
     let (staged, descriptor) = staged_roles(&protocol, "partial").await?;
     let stage = staged
@@ -210,7 +213,7 @@ async fn interrupted_hdfs_stage_resumes_only_the_durable_tail() -> TestResult {
 async fn hdfs_resume_stabilizes_the_lease_before_choosing_the_resume_offset() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
-        .insert("source", Bytes::from_static(b"abcdef"))
+        .insert("src/final", Bytes::from_static(b"abcdef"))
         .await;
     let (staged, descriptor) = staged_roles(&protocol, "lease").await?;
     drop(
@@ -244,7 +247,7 @@ async fn hdfs_resume_stabilizes_the_lease_before_choosing_the_resume_offset() ->
 async fn complete_resumed_hdfs_stage_does_not_poll_an_ended_stream_twice() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
-        .insert("source", Bytes::from_static(b"abcdef"))
+        .insert("src/final", Bytes::from_static(b"abcdef"))
         .await;
     let (staged, descriptor) = staged_roles(&protocol, "complete").await?;
     drop(
@@ -275,9 +278,12 @@ async fn complete_resumed_hdfs_stage_does_not_poll_an_ended_stream_twice() -> Te
 async fn require_resume_reclaims_hdfs_stage_before_reupload() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     let payload = Bytes::from(vec![0x72; 64 * 1024]);
-    protocol.insert("source", payload.clone()).await;
+    protocol.insert("src/final", payload.clone()).await;
     protocol.fail_writes();
-    let source = connect(protocol.clone(), test_identity("require-source")?)?;
+    let source = connect(
+        protocol.source_root("src"),
+        test_identity("require-source")?,
+    )?;
     let destination = connect(protocol.clone(), test_identity("require-destination")?)?;
     let failure = transfer(recoverable_request(request(source, destination)?, None))
         .await
@@ -285,7 +291,10 @@ async fn require_resume_reclaims_hdfs_stage_before_reupload() -> TestResult {
         .ok_or("injected HDFS failure succeeded")?;
     drop(failure);
     protocol.allow_writes();
-    let source = connect(protocol.clone(), test_identity("require-source")?)?;
+    let source = connect(
+        protocol.source_root("src"),
+        test_identity("require-source")?,
+    )?;
     let destination = connect(protocol.clone(), test_identity("require-destination")?)?;
     let outcome = transfer(recoverable_request(request(source, destination)?, None)).await?;
     assert_eq!(outcome.transferred_bytes, payload.len() as u64);
@@ -368,7 +377,7 @@ async fn hdfs_metadata_observation_is_plan_scoped() -> TestResult {
 async fn hdfs_publication_settles_a_lost_rename_reply_by_content() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     let payload = Bytes::from_static(b"replacement");
-    protocol.insert("source", payload.clone()).await;
+    protocol.insert("src/final", payload.clone()).await;
     protocol
         .insert("final", Bytes::from_static(b"original"))
         .await;

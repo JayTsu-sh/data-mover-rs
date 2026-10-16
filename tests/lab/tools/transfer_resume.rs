@@ -182,9 +182,13 @@ fn request(
     cancel: CancellationToken,
 ) -> Result<TransferRequest> {
     let source_path = args.source_path.as_deref().ok_or("--source-path")?;
+    if source_path != destination_path {
+        return Err(
+            "migration requires equal relative paths; configure endpoint roots instead".into(),
+        );
+    }
     let mut request =
         TransferRequest::new(source, StoragePath::new(source_path)?, destination, cancel)
-            .with_final_path(StoragePath::new(destination_path)?)
             .with_transfer_policy(match args.policy {
                 Policy::Checkpointed => TransferPolicy::Checkpointed,
                 Policy::Atomic => TransferPolicy::AtomicReplace,
@@ -318,6 +322,11 @@ async fn main() -> Result {
             .as_deref()
             .ok_or("--destination-path")?,
     );
+    if args.source_path.as_deref().ok_or("--source-path")? != destination_path {
+        return Err(
+            "migration requires equal relative paths; configure endpoint roots instead".into(),
+        );
+    }
     if let Some(bytes) = args.seed_bytes {
         seed(
             source_root,

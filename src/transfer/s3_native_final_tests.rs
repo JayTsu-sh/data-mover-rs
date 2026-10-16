@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, StoragePath, Transience};
-use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of};
+use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, source_storage};
 use crate::storage::backends::s3::{
     S3Protocol as _, S3ProtocolFailure, connect_native_at_destination,
 };
@@ -29,7 +29,7 @@ const PART: usize = 5 * MIB;
 const STREAMED_PART: usize = 8 * MIB;
 const INTERVAL: usize = 2 * PART;
 
-async fn seeded(sources: &[(&str, usize)]) -> (Arc<MemoryS3>, Vec<Bytes>) {
+async fn seeded(sources: &[(&str, usize)], path: &str) -> (Arc<MemoryS3>, Vec<Bytes>) {
     let protocol = Arc::new(MemoryS3::default());
     let mut payloads = Vec::new();
     for (index, (key, size)) in sources.iter().enumerate() {
@@ -39,7 +39,7 @@ async fn seeded(sources: &[(&str, usize)]) -> (Arc<MemoryS3>, Vec<Bytes>) {
             .objects
             .lock()
             .await
-            .insert((*key).to_string(), payload.clone());
+            .insert(format!("{key}/{path}"), payload.clone());
         payloads.push(payload);
     }
     (protocol, payloads)
@@ -62,12 +62,11 @@ fn request_with(
     cancel: CancellationToken,
 ) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
-        storage(protocol)?,
-        StoragePath::new(source)?,
+        source_storage(protocol, source)?,
+        StoragePath::new(final_key)?,
         storage(protocol)?,
         cancel,
     )
-    .with_final_path(StoragePath::new(final_key)?)
     .with_transfer_policy(policy))
 }
 
@@ -127,7 +126,7 @@ async fn cut_at_part_three(protocol: &MemoryS3, request: TransferRequest) -> Tes
 /// checkpointed one reports `NotApplicableNative`.
 #[tokio::test]
 async fn a_small_native_copy_is_one_copy_object_to_the_final_key() -> TestResult {
-    let (protocol, payloads) = seeded(&[("source", 4 * MIB)]).await;
+    let (protocol, payloads) = seeded(&[("source", 4 * MIB)], "small").await;
     for (policy, recovery) in [
         (
             TransferPolicy::Checkpointed,
@@ -165,7 +164,7 @@ async fn a_small_native_copy_is_one_copy_object_to_the_final_key() -> TestResult
 #[tokio::test]
 async fn a_large_native_copy_fills_an_upload_on_the_final_key() -> TestResult {
     let size = 4 * PART + 3 * MIB;
-    let (protocol, payloads) = seeded(&[("source", size)]).await;
+    let (protocol, payloads) = seeded(&[("source", size)], "large").await;
     for (policy, pointers, recovery) in [
         (
             TransferPolicy::Checkpointed,
@@ -209,7 +208,7 @@ async fn a_large_native_copy_fills_an_upload_on_the_final_key() -> TestResult {
 /// data-mover runs: the two listed parts are reused and only parts 3–5 are copied again.
 #[tokio::test]
 async fn an_interrupted_native_copy_resumes_from_the_parts_it_copied() -> TestResult {
-    let (protocol, payloads) = seeded(&[("source", 4 * PART + 3 * MIB)]).await;
+    let (protocol, payloads) = seeded(&[("source", 4 * PART + 3 * MIB)], "cut").await;
     cut_at_part_three(&protocol, native(&protocol, "cut")?).await?;
     assert_eq!(*protocol.puts.lock().await, 1, "one pointer");
     assert!(!protocol.objects.lock().await.contains_key("cut"));
@@ -232,7 +231,7 @@ async fn an_interrupted_native_copy_resumes_from_the_parts_it_copied() -> TestRe
 /// report `SkippedSingleSourceChunk`.
 #[tokio::test]
 async fn a_native_upload_below_the_interval_reports_what_a_streamed_copy_does() -> TestResult {
-    let (protocol, payloads) = seeded(&[("source", PART + 3 * MIB)]).await;
+    let (protocol, payloads) = seeded(&[("source", PART + 3 * MIB)], "below").await;
     for (request, route) in [
         (native(&protocol, "below")?, TransferRoute::Native),
         (streamed(&protocol, "below")?, TransferRoute::Streaming),
@@ -264,7 +263,7 @@ async fn a_native_upload_below_the_interval_reports_what_a_streamed_copy_does() 
 #[tokio::test]
 async fn a_cancelled_native_copy_keeps_the_parts_in_flight() -> TestResult {
     let size = 10 * PART + 2 * MIB;
-    let (protocol, payloads) = seeded(&[("source", size)]).await;
+    let (protocol, payloads) = seeded(&[("source", size)], "cancelled").await;
     let cancel = CancellationToken::new();
     protocol.cancel_after_part_copy(2, cancel.clone()).await;
     let request = request_with(
@@ -306,7 +305,7 @@ async fn a_cancelled_native_copy_keeps_the_parts_in_flight() -> TestResult {
 #[tokio::test]
 async fn a_native_copy_resumes_a_streamed_upload_at_its_part_size() -> TestResult {
     let size = 3 * STREAMED_PART + 2 * MIB;
-    let (protocol, payloads) = seeded(&[("source", size)]).await;
+    let (protocol, payloads) = seeded(&[("source", size)], "mixed").await;
     cut_at_part_three(&protocol, streamed(&protocol, "mixed")?).await?;
 
     let outcome = transfer(native(&protocol, "mixed")?).await?;
@@ -326,7 +325,7 @@ async fn a_native_copy_resumes_a_streamed_upload_at_its_part_size() -> TestResul
 /// And a native copy's upload (5 MiB parts here) is resumed by a streamed attempt at that size.
 #[tokio::test]
 async fn a_streamed_attempt_resumes_a_native_upload_at_its_part_size() -> TestResult {
-    let (protocol, payloads) = seeded(&[("source", 4 * PART + 3 * MIB)]).await;
+    let (protocol, payloads) = seeded(&[("source", 4 * PART + 3 * MIB)], "back").await;
     cut_at_part_three(&protocol, native(&protocol, "back")?).await?;
 
     let outcome = transfer(streamed(&protocol, "back")?).await?;
@@ -368,8 +367,11 @@ async fn a_native_copy_cleans_up_what_it_cannot_resume() -> TestResult {
             RestartReason::Requested,
         ),
     ] {
-        let (protocol, payloads) =
-            seeded(&[("big", big), ("small", 4 * MIB), ("other", big + MIB)]).await;
+        let (protocol, payloads) = seeded(
+            &[("big", big), ("small", 4 * MIB), ("other", big + MIB)],
+            "key",
+        )
+        .await;
         let leftover = request_with(
             &protocol,
             ("big", "key"),
@@ -404,7 +406,7 @@ async fn a_native_copy_cleans_up_what_it_cannot_resume() -> TestResult {
 /// key as it was; discarding the failure removes the pointer and aborts the upload.
 #[tokio::test]
 async fn a_native_copy_cancelled_before_publication_leaves_the_final_key() -> TestResult {
-    let (protocol, _) = seeded(&[("source", 4 * PART + 3 * MIB)]).await;
+    let (protocol, _) = seeded(&[("source", 4 * PART + 3 * MIB)], "kept").await;
     let previous = Bytes::from_static(b"previous");
     protocol
         .objects
@@ -436,14 +438,13 @@ async fn a_native_copy_cancelled_before_publication_leaves_the_final_key() -> Te
 /// Native copy owns its request window independently of source reads and streamed writes.
 #[tokio::test]
 async fn native_part_copies_stay_within_the_backend_window() -> TestResult {
-    let (protocol, payloads) = seeded(&[("source", 10 * PART)]).await;
+    let (protocol, payloads) = seeded(&[("source", 10 * PART)], "bounded").await;
     let request = TransferRequest::new(
-        storage(&protocol)?,
-        StoragePath::new("source")?,
+        source_storage(&protocol, "source")?,
+        StoragePath::new("bounded")?,
         storage(&protocol)?,
         CancellationToken::new(),
-    )
-    .with_final_path(StoragePath::new("bounded")?);
+    );
     let outcome = transfer(request).await?;
     assert_eq!(outcome.route, TransferRoute::Native);
     assert_eq!(*protocol.part_copies.lock().await, 10);
@@ -461,14 +462,14 @@ async fn native_part_copies_stay_within_the_backend_window() -> TestResult {
 #[tokio::test]
 async fn a_native_copy_restarts_over_a_streamed_upload_of_a_changed_source() -> TestResult {
     let size = 3 * STREAMED_PART + 2 * MIB;
-    let (protocol, _) = seeded(&[("source", size)]).await;
+    let (protocol, _) = seeded(&[("source", size)], "changed").await;
     cut_at_part_three(&protocol, streamed(&protocol, "changed")?).await?;
     let replaced = Bytes::from(vec![0x42; size]);
     protocol
         .objects
         .lock()
         .await
-        .insert("source".into(), replaced.clone());
+        .insert("source/changed".into(), replaced.clone());
 
     let outcome = transfer(native(&protocol, "changed")?).await?;
     assert_eq!(outcome.route, TransferRoute::Native);

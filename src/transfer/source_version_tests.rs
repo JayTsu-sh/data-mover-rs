@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::model::{FailureClass, StoragePath};
 use crate::storage::StorageRoleFailure;
 use crate::storage::backends::s3::connect;
-use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context};
+use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context, source_storage};
 use crate::transfer::{
     PayloadShapingPolicy, SourceVersion, TransferIdentity, TransferPhase, TransferRequest,
     TransferRoute, TransferSide, transfer,
@@ -20,11 +20,11 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 async fn versioned() -> Arc<MemoryS3> {
     let protocol = Arc::new(MemoryS3::default());
     protocol
-        .put_version("source", "v1", Bytes::from_static(b"first version"))
+        .put_version("src/final", "v1", Bytes::from_static(b"first version"))
         .await;
     protocol
         .put_version(
-            "source",
+            "src/final",
             "v2",
             Bytes::from_static(b"second, the current one"),
         )
@@ -33,11 +33,7 @@ async fn versioned() -> Arc<MemoryS3> {
 }
 
 fn request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(protocol),
-        Some(native_context()),
-    )?;
+    let source = source_storage(protocol, "src")?;
     let destination = connect(
         protocol.clone(),
         endpoint_of(protocol),
@@ -45,11 +41,10 @@ fn request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
     )?;
     Ok(TransferRequest::new(
         source,
-        StoragePath::new("source")?,
+        StoragePath::new("final")?,
         destination,
         CancellationToken::new(),
-    )
-    .with_final_path(StoragePath::new("final")?))
+    ))
 }
 
 /// A named version is copied as it is — streamed or by native copy — although it is not current.
@@ -84,7 +79,7 @@ async fn a_named_version_is_copied_streaming_and_native() -> TestResult {
 #[tokio::test]
 async fn a_deleted_version_fails_the_entry_at_describe() -> TestResult {
     let protocol = versioned().await;
-    protocol.put_delete_marker("source", "marker").await;
+    protocol.put_delete_marker("src/final", "marker").await;
     let Err(failure) =
         transfer(request(&protocol)?.with_source_version(SourceVersion::Id("marker".into()))).await
     else {

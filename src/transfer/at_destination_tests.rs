@@ -370,7 +370,6 @@ fn request(
         destination.storage()?,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new("out/final.bin")?)
     .with_transfer_policy(TransferPolicy::Checkpointed))
 }
 
@@ -383,7 +382,7 @@ fn source_root(seed: u8) -> TestResult<tempfile::TempDir> {
 fn final_bytes(destination: &MemoryDestination) -> TestResult<Vec<u8>> {
     Ok(destination
         .files()
-        .get(&StoragePath::new("out/final.bin")?)
+        .get(&StoragePath::new("source.bin")?)
         .cloned()
         .unwrap_or_default())
 }
@@ -513,7 +512,7 @@ async fn a_resumed_stage_that_fails_verification_is_cleaned_up() -> TestResult {
     let source = source_root(7)?;
     let destination = MemoryDestination::new("stale")?;
     interrupt(source.path(), &destination, 2 * CHECKPOINT).await?;
-    let stage = sibling_artifact(&StoragePath::new("out/final.bin")?, ArtifactKind::Stage)
+    let stage = sibling_artifact(&StoragePath::new("source.bin")?, ArtifactKind::Stage)
         .ok_or("stage path")?;
     if let Some(bytes) = destination.files().get_mut(&stage) {
         bytes[0] ^= 0xff;
@@ -603,7 +602,7 @@ async fn expert_run(
             observation,
             source_half.offer().maximum_chunk_bytes,
             destination.storage()?,
-            StoragePath::new("out/final.bin")?,
+            StoragePath::new("source.bin")?,
             CancellationToken::new(),
         )
         .with_transfer_policy(TransferPolicy::Checkpointed),
@@ -647,7 +646,7 @@ async fn the_expert_half_also_cleans_up_a_stale_resumed_stage() -> TestResult {
         .fail_at
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = None;
-    let stage = sibling_artifact(&StoragePath::new("out/final.bin")?, ArtifactKind::Stage)
+    let stage = sibling_artifact(&StoragePath::new("source.bin")?, ArtifactKind::Stage)
         .ok_or("stage path")?;
     if let Some(bytes) = destination.files().get_mut(&stage) {
         bytes[0] ^= 0xff;

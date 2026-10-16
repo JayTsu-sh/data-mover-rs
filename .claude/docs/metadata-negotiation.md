@@ -1,6 +1,6 @@
 # 元数据协商（拷贝带什么、谁能否决）
 
-> 场景：要打开或关闭 ACL / xattr 的拷贝、排查「请求了却没带上」、给新 backend 声明能力。
+> 场景：要打开或关闭 ACL / xattr / object tags 的拷贝、排查「请求了却没带上」、给新 backend 声明能力。
 > 代码：`src/transfer/model.rs`（请求）· `src/transfer/engine/negotiation.rs`（协商）·
 > `src/metadata/compile.rs`（规划）· `src/metadata/mod.rs`（应用）· `src/storage/roles.rs`（目的端能力）。
 
@@ -22,10 +22,16 @@
 | | 谁决定 | 在哪 |
 |---|---|---|
 | **基线**：ownership、mode、timestamps(mtime) | backend 声明，调用方**关不掉** | `Metadata::copied_metadata_observation_plan()` |
-| **可选功能**：ACL、xattrs | 调用方开口才带 | `CopiedMetadataRequest::with_acl()` / `with_xattrs()` |
+| **可选功能**：ACL、xattrs、object tags | 调用方开口才带 | `CopiedMetadataRequest::with_acl()` / `with_xattrs()` / `with_tags()` |
 
 **`CopiedMetadataRequest` 里没有的，就是关不掉的。** 加一个可选功能 = 给这个结构加字段。
 atime / ctime 任何情况下都不拷。
+
+Object tags 是独立的元数据族，不等同于 S3 `x-amz-meta-*` 用户自定义元数据，也不映射为文件系统 xattrs。
+默认不读取、不写入；请求后，S3 源用本次传输选定的版本读取 `GetObjectTagging`，目的端按兼容配置声明
+能否存储。目的端不支持 tags 时，即使它仍存储 mtime 等基线，也不读取源 tags，报告 `DestinationCannotStore`。
+空标签集也需要应用，用来清除目标旧标签；读写失败仍使文件失败。single PUT / native single copy
+先缓冲标签，在对象发布后写入，因此此时的标签写失败发生于 Publish，并报告目标可能已改变。
 
 ## 要了一个可选功能之后
 
@@ -65,18 +71,20 @@ Display 如 `ACL skipped: the source cannot read it`。不变式：outcome 为 `
    S3 源（K8）：拷贝基线是 mtime（对象自己的 `Last-Modified`，秒精度，与 ETag / version 出自同一个 HEAD
    并校验仍是被描述的那个对象，换了就 `Conflict`；服务端没给就 `modified: None`，**绝不用拷贝时刻**；
    不看 legacy `x-amz-meta-last-modified`）；owner/mode 是 `NotApplicable`（对象没有，无损失）；
-   要了 ACL / xattr 是 `Unsupported`（`skipped()` 记 `SourceCannotObserve`）。
+   要了 ACL / xattr 是 `Unsupported`（`skipped()` 记 `SourceCannotObserve`）；tags 按兼容配置支持，
+   读取时携带选定的 version id。
 3. **目的端能不能存** —— `CopiedMetadataTarget`：`timestamps`（`Stored(精度)` / `NotStored`）、`ownership`、
-   `acl`、`xattrs`。
+   `acl`、`xattrs`、`tags`。
 4. **规划期交叉** —— `compile_copied_metadata_plan` 按上表裁决。
 5. **应用期** —— 服务端可以在能力位说 yes 之后仍然拒绝：该文件失败（先应用完其余族）。
 
-**目的端什么都不存**（`CopiedMetadataTarget::stores_nothing()`，今天就是 S3 目的端，K6）：不读源端 ——
+**目的端不存本次请求涉及的任何族**：先把未请求的可选能力排除，再检查 `stores_nothing()`；不读源端 ——
 没有哪个源端的值能改变结果，省掉每文件一次 stat —— 直接由 `compile_nothing_stored_plan` 把每个要的族
-（基线的 owner/group/mode、mtime，以及调用方要的 ACL / xattr）记成 `skipped()`，原因
+（基线的 owner/group/mode、mtime，以及调用方要的 ACL / xattr / tags）记成 `skipped()`，原因
 `DestinationCannotStore`。报告如 `timestamps skipped: the destination cannot store it`。此前 S3 目的端没声明
 target，整段元数据无声跳过、连报告都没有。只存一部分的目的端若 `NotStored` mtime，走正常观测路径，
 mtime 按 `BestEffort` 规划 → 同样记跳过，不让文件失败。
+S3 目的端支持 tags 时，未请求 tags 仍走上述无源端 I/O 的快捷路径；请求了 tags 才进入绑定版本的观测与应用。
 源端没有拷贝基线时整段跳过、没有报告 —— K8 之后只剩非 unix 的 Local 源。
 
 **已知不一致**（后续单独 commit，需 FAS2750）：同样声明 `CopiedOwnershipTarget::Unsupported`，CIFS 目的端的
@@ -92,7 +100,9 @@ owner/group/mode 记成**损失** `OwnershipModeDropped`（走 `OwnershipTarget:
 | CIFS | 读不到（`NotApplicable`） | `WindowsSecurityDescriptor`（只保留 account 类 ACE） | 不支持 | `cifs/metadata.rs` 的 decode 只认这一种 |
 | HDFS | 字符串，走「只有 mode」（`OwnerAndGroupDropped`） | 不支持 | 不支持 | 观测侧也一律 `unavailable` |
 | S3（源端） | 没有（`NotApplicable`）；mtime 读 `Last-Modified`（秒） | 读不了 | 读不了 | 每文件一次绑定身份的 HEAD |
-| S3（目的端） | 存不了（跳过，`DestinationCannotStore`） | 存不了 | 存不了 | `stores_nothing()`，mtime 也 `NotStored` |
+| S3（目的端） | 存不了（跳过，`DestinationCannotStore`） | 存不了 | 存不了 | mtime `NotStored`；tags 按兼容配置支持 |
+
+Tags：S3 两端按兼容配置读写，Local / NFS / HDFS / CIFS 目的端均声明 `Unsupported`。
 
 目录对象（S3 键 `p/d/`，P7 F5）不是元数据问题而是能不能存的问题：只有 `NamespaceCapabilities::directory_objects`
 为真的目的端（S3）能存；文件系统目的端由 `transfer::directory_object_action` 判定无操作 / 跳过，引擎在 Preflight

@@ -19,7 +19,7 @@ type Result = std::result::Result<(), Box<dyn std::error::Error>>;
 #[tokio::test]
 async fn local_metadata_copies_mode_and_mtime_to_hdfs_without_replacing_principals() -> Result {
     let root = tempfile::tempdir()?;
-    let path = root.path().join("source");
+    let path = root.path().join("final");
     std::fs::write(&path, b"payload")?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
     filetime::set_file_mtime(
@@ -50,11 +50,10 @@ async fn local_metadata_copies_mode_and_mtime_to_hdfs_without_replacing_principa
         transfer(
             TransferRequest::new(
                 source.clone(),
-                StoragePath::new("source")?,
+                StoragePath::new("final")?,
                 destination,
                 CancellationToken::new(),
             )
-            .with_final_path(StoragePath::new("final")?)
             .with_identity_override(TransferIdentity::from_label(format!(
                 "hdfs-metadata-{policy:?}"
             ))?)
@@ -85,17 +84,18 @@ async fn local_metadata_copies_mode_and_mtime_to_hdfs_without_replacing_principa
 #[tokio::test]
 async fn direct_failure_never_exposes_stage_cleanup() -> Result {
     let protocol = Arc::new(MemoryHdfs::default());
-    protocol.insert("source", Bytes::from_static(b"new")).await;
+    protocol
+        .insert("src/final", Bytes::from_static(b"new"))
+        .await;
     protocol.insert("final", Bytes::from_static(b"old")).await;
     protocol.fail_writes();
     let storage = connect(protocol.clone(), test_identity("direct-failure")?)?;
     let request = TransferRequest::new(
-        storage.clone(),
-        StoragePath::new("source")?,
+        connect(protocol.source_root("src"), test_identity("direct-source")?)?,
+        StoragePath::new("final")?,
         storage,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new("final")?)
     .with_identity_override(TransferIdentity::from_label("direct-hdfs-failure")?)
     .with_transfer_policy(TransferPolicy::Direct);
     let failure = transfer(request)
@@ -117,10 +117,10 @@ async fn checkpointed_registers_only_after_hsync_and_resumes_durable_prefix() ->
     for size in [INTERVAL, INTERVAL + 1] {
         let protocol = Arc::new(MemoryHdfs::default());
         let content = Bytes::from(vec![31; size]);
-        protocol.insert("source", content.clone()).await;
+        protocol.insert("src/final", content.clone()).await;
         protocol.insert("final", Bytes::from_static(b"old")).await;
         let source = connect(
-            protocol.clone(),
+            protocol.source_root("src"),
             test_identity(&format!("checkpoint-source-{size}"))?,
         )?;
         let destination = connect(
@@ -130,11 +130,10 @@ async fn checkpointed_registers_only_after_hsync_and_resumes_durable_prefix() ->
         let request = || -> std::result::Result<TransferRequest, Box<dyn std::error::Error>> {
             Ok(TransferRequest::new(
                 source.clone(),
-                StoragePath::new("source")?,
+                StoragePath::new("final")?,
                 destination.clone(),
                 CancellationToken::new(),
             )
-            .with_final_path(StoragePath::new("final")?)
             .with_identity_override(TransferIdentity::from_label(format!(
                 "hdfs-checkpoint-{}-{size}",
                 std::process::id()
@@ -192,17 +191,19 @@ async fn a_failed_first_pointer_leaves_nothing_to_resume() -> Result {
     const SIZE: usize = 64 * 1024 * 1024 + 1;
     let protocol = Arc::new(MemoryHdfs::default());
     let content = Bytes::from(vec![47; SIZE]);
-    protocol.insert("source", content.clone()).await;
+    protocol.insert("src/final", content.clone()).await;
     protocol.insert("final", Bytes::from_static(b"old")).await;
     let storage = connect(protocol.clone(), test_identity("pointer-failure")?)?;
     let request = || -> std::result::Result<TransferRequest, Box<dyn std::error::Error>> {
         Ok(TransferRequest::new(
-            storage.clone(),
-            StoragePath::new("source")?,
+            connect(
+                protocol.source_root("src"),
+                test_identity("pointer-source")?,
+            )?,
+            StoragePath::new("final")?,
             storage.clone(),
             CancellationToken::new(),
         )
-        .with_final_path(StoragePath::new("final")?)
         .with_identity_override(TransferIdentity::from_label("hdfs-pointer-failure")?)
         .with_transfer_policy(TransferPolicy::Checkpointed)
         .with_read_back_verification(ReadBackVerification::Disabled))
@@ -245,7 +246,7 @@ async fn all_policies_copy_with_independent_read_and_write_limits() -> Result {
             let protocol = Arc::new(MemoryHdfs::default());
             protocol.configure_io(read, write);
             let content = Bytes::from_static(b"0123456789abcdefghijklmnop");
-            protocol.insert("source", content.clone()).await;
+            protocol.insert("src/final", content.clone()).await;
             protocol
                 .insert(
                     "final",
@@ -256,12 +257,11 @@ async fn all_policies_copy_with_independent_read_and_write_limits() -> Result {
                 protocol.fail_rename_after_commit();
             }
             let request = TransferRequest::new(
-                connect(protocol.clone(), test_identity("source-policy")?)?,
-                StoragePath::new("source")?,
+                connect(protocol.source_root("src"), test_identity("source-policy")?)?,
+                StoragePath::new("final")?,
                 connect(protocol.clone(), test_identity("target-policy")?)?,
                 CancellationToken::new(),
             )
-            .with_final_path(StoragePath::new("final")?)
             .with_identity_override(TransferIdentity::from_label(format!(
                 "hdfs-policy-{policy:?}-{read}"
             ))?)
@@ -284,8 +284,10 @@ async fn source_prefetch_obeys_chunks_bytes_and_operations() -> Result {
     for (chunks, bytes, operations) in [(1, 128, 128), (128, 2, 128), (128, 128, 1)] {
         let protocol = Arc::new(MemoryHdfs::default());
         protocol.configure_io(2, 8);
-        protocol.insert("source", Bytes::from_static(b"abcd")).await;
-        let storage = connect(protocol.clone(), test_identity("bounded")?)?;
+        protocol
+            .insert("src/final", Bytes::from_static(b"abcd"))
+            .await;
+        let storage = connect(protocol.source_root("src"), test_identity("bounded")?)?;
         let source = storage.read_source()?;
         let cancel = CancellationToken::new();
         let (runtime, mut ordered) = InflightRuntime::channel(
@@ -297,7 +299,7 @@ async fn source_prefetch_obeys_chunks_bytes_and_operations() -> Result {
         let budget = ReadBudget::new(runtime.clone());
         let mut stream = source
             .read(ReadRequest {
-                path: StoragePath::new("source")?,
+                path: StoragePath::new("final")?,
                 range: None,
                 expected_source: None,
                 maximum_chunk_bytes: 2,
@@ -361,9 +363,12 @@ async fn hdfs_to_local_copies_mode_mtime_and_verifies_positioned_content() -> Re
     use std::os::unix::fs::MetadataExt as _;
     let protocol = Arc::new(MemoryHdfs::default());
     let content = Bytes::from((0_u8..=255).cycle().take(4096).collect::<Vec<_>>());
-    protocol.insert("source", content.clone()).await;
+    protocol.insert("src/final", content.clone()).await;
     protocol.configure_io(128, 128);
-    let source = connect(protocol, test_identity("hdfs-positioned-metadata")?)?;
+    let source = connect(
+        protocol.source_root("src"),
+        test_identity("hdfs-positioned-metadata")?,
+    )?;
     for policy in [
         TransferPolicy::Checkpointed,
         TransferPolicy::AtomicReplace,
@@ -386,11 +391,10 @@ async fn hdfs_to_local_copies_mode_mtime_and_verifies_positioned_content() -> Re
         let outcome = transfer(
             TransferRequest::new(
                 source.clone(),
-                StoragePath::new("source")?,
+                StoragePath::new("final")?,
                 destination,
                 CancellationToken::new(),
             )
-            .with_final_path(StoragePath::new("final")?)
             .with_identity_override(TransferIdentity::from_label(format!(
                 "hdfs-local-{policy:?}"
             ))?)
@@ -416,9 +420,14 @@ async fn hdfs_to_local_copies_mode_mtime_and_verifies_positioned_content() -> Re
 #[tokio::test]
 async fn hdfs_source_metadata_is_bound_and_does_not_fabricate_numeric_ownership() -> Result {
     let protocol = Arc::new(MemoryHdfs::default());
-    protocol.insert("source", Bytes::from_static(b"old")).await;
-    let storage = connect(protocol.clone(), test_identity("bound-metadata")?)?;
-    let path = StoragePath::new("source")?;
+    protocol
+        .insert("src/final", Bytes::from_static(b"old"))
+        .await;
+    let storage = connect(
+        protocol.source_root("src"),
+        test_identity("bound-metadata")?,
+    )?;
+    let path = StoragePath::new("final")?;
     let descriptor = storage.read_source()?.describe(&path).await?;
     let metadata = storage.metadata()?;
     let plan = metadata
@@ -432,7 +441,7 @@ async fn hdfs_source_metadata_is_bound_and_does_not_fabricate_numeric_ownership(
     assert_eq!(observed.mode_without_ownership, Some(0o640));
     assert!(observed.observations.ownership_mode().value().is_none());
     protocol
-        .insert("source", Bytes::from_static(b"replacement"))
+        .insert("src/final", Bytes::from_static(b"replacement"))
         .await;
     assert!(
         metadata

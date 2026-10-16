@@ -43,20 +43,18 @@ async fn an_unwritable_destination_is_attributed_to_destination_prepare()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = tempfile::tempdir()?;
     let destination_root = tempfile::tempdir()?;
-    std::fs::write(source_root.path().join("file"), b"payload")?;
+    std::fs::create_dir_all(source_root.path().join("blocker"))?;
+    std::fs::write(source_root.path().join("blocker/child"), b"payload")?;
     std::fs::write(destination_root.path().join("blocker"), b"not a directory")?;
     let source = common::connect_local(source_root.path(), 4).await?;
     let destination = common::connect_local(destination_root.path(), 4).await?;
 
-    let Err(failure) = transfer(
-        TransferRequest::new(
-            source,
-            StoragePath::new("file")?,
-            destination,
-            CancellationToken::new(),
-        )
-        .with_final_path(StoragePath::new("blocker/child")?),
-    )
+    let Err(failure) = transfer(TransferRequest::new(
+        source,
+        StoragePath::new("blocker/child")?,
+        destination,
+        CancellationToken::new(),
+    ))
     .await
     else {
         panic!("a file unexpectedly became a parent directory");

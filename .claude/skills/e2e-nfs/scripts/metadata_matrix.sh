@@ -19,6 +19,8 @@ RUN=${RUN:-$(date +%s)}
 V41="${NFS_META_V41_EXPORT%%\?*}:/dm-meta-$RUN?${NFS_META_V41_EXPORT#*\?}"
 V41_ROOT="${NFS_META_V41_EXPORT%%\?*}:/?${NFS_META_V41_EXPORT#*\?}"
 CIFS="cifs:dm-meta-$RUN"
+# Endpoint roots distinguish source and destination; each copy preserves its relative path.
+v41_at() { printf '%s/%s?%s' "${V41%%\?*}" "$1" "${V41#*\?}"; }
 cargo_build_examples nfs_metadata_copy storage_role_operations || exit $?
 BIN=$(cargo_example_binary nfs_metadata_copy) || exit 1
 ROLE=$(cargo_example_binary storage_role_operations) || exit 1
@@ -34,39 +36,39 @@ case_() { # name, expected exit (0|1), grep marker, args...
 echo "run=$RUN"
 if [ -n "${NFS_META_V3_URL:-}" ]; then
 case_ "v3->v4.1 acl+xattrs asked: copied, both skipped, the ACL reason names the source" 0 "ACL skipped: the source cannot read it" \
-  --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$V41" --destination-path v3-asked \
+  --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$(v41_at v3-asked)" --destination-path "$NFS_META_V3_FILE" \
   --acl --xattrs --expect copied --expect-acl unsupported --expect-xattrs unsupported
 case_ "v3->v4.1 xattrs asked: skipped, the reason names the source" 0 "extended attributes skipped: the source cannot read it" \
-  --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$V41" --destination-path v3-xattrs \
+  --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$(v41_at v3-xattrs)" --destination-path "$NFS_META_V3_FILE" \
   --xattrs --expect copied --expect-xattrs unsupported
 else echo "SKIP NFSv3 rung (NFS_META_V3_URL unset)"; fi
 case_ "v4.1->v4.1 acl asked, principal mark: carried" 0 "ACLs equal and marked: 4" \
   --source "$V41" --source-path src-principal --seed-bytes 4096 --mark-acl principal \
-  --destination "$V41" --destination-path acl-principal --acl --expect copied --expect-acl applied --verify-acl
+  --destination "$(v41_at acl-principal)" --destination-path src-principal --acl --expect copied --expect-acl applied --verify-acl
 case_ "v4.1->v4.1 acl asked, EVERYONE@ WRITE_ACL mark: carried" 0 "ACLs equal and marked: 3" \
   --source "$V41" --source-path src-everyone --seed-bytes 4096 --mark-acl everyone-write-acl \
-  --destination "$V41" --destination-path acl-everyone --acl --expect copied --expect-acl applied --verify-acl
+  --destination "$(v41_at acl-everyone)" --destination-path src-everyone --acl --expect copied --expect-acl applied --verify-acl
 case_ "negative control: acl not asked loses the mark" 1 "lost the Principal mark" \
   --source "$V41" --source-path src-omit --seed-bytes 4096 --mark-acl principal \
-  --destination "$V41" --destination-path omit-principal --expect copied --expect-acl omitted-by-policy --verify-acl
+  --destination "$(v41_at omit-principal)" --destination-path src-omit --expect copied --expect-acl omitted-by-policy --verify-acl
 case_ "v4.1->v4.1 xattrs asked: copied, skipped (export did not negotiate named attributes)" 0 "extended attributes skipped: the source cannot read it" \
-  --source "$V41" --source-path src-principal --destination "$V41" --destination-path xattrs-asked \
+  --source "$V41" --source-path src-principal --destination "$(v41_at xattrs-asked)" --destination-path src-principal \
   --xattrs --expect copied --expect-xattrs unsupported
 if [ -n "${CIFS_REAL_SERVER:-}" ]; then
 case_ "v4.1->cifs acl asked: copied, skipped (NfsV4 vs Windows SD, no conversion)" 0 "ACL skipped: the source holds a NfsV4 ACL and the destination stores WindowsSecurityDescriptor" \
-  --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path acl-asked \
+  --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path src-principal \
   --acl --expect copied --expect-acl unsupported
 case_ "cifs->v4.1 xattrs asked: copied, skipped (smb-rs exposes no EA query)" 0 "extended attributes skipped: the source cannot read it" \
-  --source "$CIFS" --source-path src-cifs --seed-bytes 4096 --destination "$V41" --destination-path cifs-xattrs \
+  --source "$CIFS" --source-path src-cifs --seed-bytes 4096 --destination "$V41" --destination-path src-cifs \
   --xattrs --expect copied --expect-xattrs unsupported
 else echo "SKIP CIFS rung (CIFS_REAL_* unset)"; fi
 case_ "guard: seeding an existing path is refused" 1 "already exists" \
-  --source "$V41" --source-path src-principal --seed-bytes 1 --destination "$V41" --destination-path never \
+  --source "$V41" --source-path src-principal --seed-bytes 1 --destination "$(v41_at never)" --destination-path src-principal \
   --expect copied
 case_ "guard: copy onto itself is refused" 1 "same file" \
   --source "$V41" --source-path src-principal --destination "$V41" --destination-path src-principal --expect copied
 case_ "guard: verify without mark is rejected" 1 "mark-acl" \
-  --source "$V41" --source-path src-principal --destination "$V41" --destination-path x --expect copied --verify-acl
+  --source "$V41" --source-path src-principal --destination "$(v41_at x)" --destination-path src-principal --expect copied --verify-acl
 
 # Cleanup: the run directory on each share. Case outcomes above do not depend on it.
 NFS_REAL_URL="$V41_ROOT" "$ROLE" --backend nfs \

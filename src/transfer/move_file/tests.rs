@@ -29,8 +29,7 @@ fn request(source: Storage, destination: Storage) -> TestResult<TransferRequest>
         StoragePath::new("source")?,
         destination,
         CancellationToken::new(),
-    )
-    .with_final_path(StoragePath::new("final")?))
+    ))
 }
 
 #[tokio::test]
@@ -47,9 +46,12 @@ async fn verified_move_removes_source_and_keeps_content_and_mode() -> TestResult
     assert_eq!(outcome.read_back, ReadBackVerification::Enabled);
     assert!(outcome.blake3.is_some());
     assert!(!from.path().join("source").exists());
-    assert_eq!(std::fs::read(to.path().join("final"))?, b"verified payload");
     assert_eq!(
-        std::fs::metadata(to.path().join("final"))?.permissions(),
+        std::fs::read(to.path().join("source"))?,
+        b"verified payload"
+    );
+    assert_eq!(
+        std::fs::metadata(to.path().join("source"))?.permissions(),
         permissions
     );
     Ok(())
@@ -61,13 +63,12 @@ async fn preflight_refusal_and_cancel_keep_source_and_destination_untouched() ->
     std::fs::write(root.path().join("source"), b"keep")?;
     let storage = connect(root.path())?;
     let same = request(storage.clone(), storage.clone())?;
-    let source_path = same.source_path().clone();
-    let same = same.with_final_path(source_path);
     assert!(matches!(move_file(same).await, Err(error) if error.published.is_none()));
     let historical = request(storage.clone(), storage.clone())?
         .with_source_version(SourceVersion::Id("old".into()));
     assert!(matches!(move_file(historical).await, Err(error) if error.published.is_none()));
-    let cancelled = request(storage.clone(), storage)?;
+    let destination = tempfile::tempdir()?;
+    let cancelled = request(storage, connect(destination.path())?)?;
     cancelled.cancel.cancel();
     assert!(
         matches!(move_file(cancelled).await, Err(error) if matches!(error.error, MoveError::Cancelled))
@@ -82,14 +83,14 @@ async fn copy_failure_keeps_source() -> TestResult {
     let from = tempfile::tempdir()?;
     let to = tempfile::tempdir()?;
     std::fs::write(from.path().join("source"), b"keep")?;
-    std::fs::create_dir(to.path().join("final"))?;
-    std::fs::write(to.path().join("final/child"), b"keep too")?;
+    std::fs::create_dir(to.path().join("source"))?;
+    std::fs::write(to.path().join("source/child"), b"keep too")?;
     let Err(failure) = move_file(request(connect(from.path())?, connect(to.path())?)?).await else {
         return Err("published over a nonempty directory".into());
     };
     assert!(failure.published.is_none());
     assert_eq!(std::fs::read(from.path().join("source"))?, b"keep");
-    assert_eq!(std::fs::read(to.path().join("final/child"))?, b"keep too");
+    assert_eq!(std::fs::read(to.path().join("source/child"))?, b"keep too");
     Ok(())
 }
 
@@ -141,6 +142,6 @@ async fn delete_failure_returns_published_copy_and_preserves_source() -> TestRes
     assert!(failure.published.is_some());
     assert!(matches!(failure.error, MoveError::Source(_)));
     assert_eq!(std::fs::read(from.path().join("source"))?, b"copied");
-    assert_eq!(std::fs::read(to.path().join("final"))?, b"copied");
+    assert_eq!(std::fs::read(to.path().join("source"))?, b"copied");
     Ok(())
 }

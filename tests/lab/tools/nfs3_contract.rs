@@ -405,7 +405,6 @@ async fn validate_streaming_copy(source: &Storage, destination: &Storage) -> Con
             destination.clone(),
             CancellationToken::new(),
         )
-        .with_final_path(path("copied.bin")?)
         .with_identity_override(TransferIdentity::from_label("nfs3-contract-stream-copy")?)
         .with_source_qos(SourceQosGroup::new(SourceQosPolicy::new(
             Some((1024 * 1024, 1024 * 1024, Duration::ZERO)),
@@ -431,7 +430,6 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
         destination.clone(),
         cancel.clone(),
     )
-    .with_final_path(path("restarted.bin")?)
     .with_identity_override(TransferIdentity::from_label("nfs-contract-cancel")?)
     .with_source_qos(SourceQosGroup::new(SourceQosPolicy::new(
         Some((64 * 1024, 64 * 1024, Duration::ZERO)),
@@ -459,7 +457,6 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
             destination.clone(),
             CancellationToken::new(),
         )
-        .with_final_path(path("restarted.bin")?)
         .with_identity_override(TransferIdentity::from_label("nfs-contract-restart")?)
         .with_transfer_policy(TransferPolicy::Checkpointed),
     )

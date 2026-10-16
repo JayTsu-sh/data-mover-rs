@@ -13,9 +13,10 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 #[ignore = "requires the nightly lab HDFS cluster"]
 async fn nightly_lab_transfer_policies_and_chunk_boundaries() -> TestResult {
     let (raw, storage) = fixture("policy-runtime").await?;
+    let (source_raw, source) = fixture("policy-runtime-source").await?;
     for size in [4096, 2 * 1024 * 1024 + 1, 64 * 1024 * 1024 + 1] {
         let content = bytes::Bytes::from(vec![73; size]);
-        create_hdfs_file(&raw, "source", content.clone()).await?;
+        create_hdfs_file(&source_raw, "final", content.clone()).await?;
         for policy in [
             TransferPolicy::Checkpointed,
             TransferPolicy::AtomicReplace,
@@ -23,12 +24,11 @@ async fn nightly_lab_transfer_policies_and_chunk_boundaries() -> TestResult {
         ] {
             create_hdfs_file(&raw, "final", bytes::Bytes::from_static(b"old target")).await?;
             let request = TransferRequest::new(
-                storage.clone(),
-                StoragePath::new("source")?,
+                source.clone(),
+                StoragePath::new("final")?,
                 storage.clone(),
                 tokio_util::sync::CancellationToken::new(),
             )
-            .with_final_path(StoragePath::new("final")?)
             .with_identity_override(TransferIdentity::from_label(format!(
                 "lab-hdfs-{policy:?}-{size}"
             ))?)
@@ -39,6 +39,7 @@ async fn nightly_lab_transfer_policies_and_chunk_boundaries() -> TestResult {
             assert_eq!(raw_read(&raw, "final").await?, content);
         }
     }
+    source_raw.cleanup().await?;
     raw.cleanup().await?;
     Ok(())
 }
@@ -195,7 +196,7 @@ async fn nightly_lab_local_source_metadata_to_hdfs_policies() -> TestResult {
         TransferPolicy::AtomicReplace,
         TransferPolicy::Direct,
     ] {
-        let final_path = format!("final-{policy:?}").to_ascii_lowercase();
+        let final_path = "source".to_owned();
         let outcome = transfer(
             TransferRequest::new(
                 source.clone(),
@@ -203,7 +204,6 @@ async fn nightly_lab_local_source_metadata_to_hdfs_policies() -> TestResult {
                 destination.clone(),
                 tokio_util::sync::CancellationToken::new(),
             )
-            .with_final_path(StoragePath::new(final_path.clone())?)
             .with_identity_override(TransferIdentity::from_label(format!(
                 "hdfs-lab-local-metadata-{policy:?}"
             ))?)

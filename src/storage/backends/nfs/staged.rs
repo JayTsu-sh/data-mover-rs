@@ -544,6 +544,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
                 } else {
                     crate::storage::CopiedValueTarget::Unsupported
                 },
+                tags: crate::storage::CopiedValueTarget::Unsupported,
             })
     }
 

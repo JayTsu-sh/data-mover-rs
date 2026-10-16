@@ -18,7 +18,7 @@ use crate::storage::PrepareFact;
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
 use crate::storage::backends::local::{test_destination_storage, test_source_storage};
 use crate::storage::backends::s3::tests::{
-    MemoryS3, content_md5, endpoint_of, identity, native_context,
+    MemoryS3, content_md5, endpoint_of, identity, native_context, source_storage,
 };
 use crate::storage::backends::s3::{S3Protocol as _, connect, connect_native_at_destination};
 use crate::storage::{Storage, StorageRoleFailure};
@@ -50,15 +50,13 @@ fn request(
     source: Storage,
     source_path: &str,
     destination: Storage,
-    final_path: &str,
 ) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
         source,
         StoragePath::new(source_path)?,
         destination,
         CancellationToken::new(),
-    )
-    .with_final_path(StoragePath::new(final_path)?))
+    ))
 }
 
 /// (phase, side, class) of a failed transfer.
@@ -105,9 +103,18 @@ async fn what_a_nas_bucket_cannot_write_is_refused_before_any_request() -> TestR
         ("small", long_key.as_str()),
     ] {
         let protocol = nas();
-        let (local, _) = test_source_storage(root.path(), "nas-preflight")?;
-        let Err(failure) = transfer(request(local, source, bucket(&protocol)?, final_path)?).await
-        else {
+        let input = if source == "big" {
+            test_source_storage(root.path(), "nas-preflight")?.0
+        } else {
+            let source_protocol = Arc::new(MemoryS3::default());
+            source_protocol
+                .objects
+                .lock()
+                .await
+                .insert(final_path.to_owned(), Bytes::from_static(b"x"));
+            bucket(&source_protocol)?
+        };
+        let Err(failure) = transfer(request(input, final_path, bucket(&protocol)?)?).await else {
             return Err(format!("{final_path} was written").into());
         };
         assert_eq!(refusal(&failure), REFUSED_AT_PREFLIGHT, "{final_path}");
@@ -155,8 +162,8 @@ async fn a_checkpointed_transfer_to_a_nas_bucket_reports_unsupported_by_destinat
     fs::write(root.path().join("file"), vec![7; 100 * 1024])?;
     let protocol = nas();
     let planted = [
-        artifact_name("dst/streamed", ArtifactKind::Upload),
-        artifact_name("dst/native", ArtifactKind::Upload),
+        artifact_name("file", ArtifactKind::Upload),
+        artifact_name("native", ArtifactKind::Upload),
     ];
     for pointer in &planted {
         protocol
@@ -166,7 +173,7 @@ async fn a_checkpointed_transfer_to_a_nas_bucket_reports_unsupported_by_destinat
             .insert(pointer.clone(), Bytes::from_static(b"a leftover pointer"));
     }
     let (local, _) = test_source_storage(root.path(), "nas-checkpointed")?;
-    let streamed = request(local, "file", bucket(&protocol)?, "dst/streamed")?
+    let streamed = request(local, "file", bucket(&protocol)?)?
         .with_transfer_policy(TransferPolicy::Checkpointed)
         .with_read_back_verification(ReadBackVerification::Disabled);
     let outcome = transfer(streamed).await?;
@@ -187,12 +194,11 @@ async fn a_checkpointed_transfer_to_a_nas_bucket_reports_unsupported_by_destinat
         .objects
         .lock()
         .await
-        .insert("src/file".into(), Bytes::from(vec![8; 100 * 1024]));
+        .insert("src/native".into(), Bytes::from(vec![8; 100 * 1024]));
     let native = request(
+        source_storage(&protocol, "src")?,
+        "native",
         bucket(&protocol)?,
-        "src/file",
-        bucket(&protocol)?,
-        "dst/native",
     )?
     .with_transfer_policy(TransferPolicy::Checkpointed)
     .with_payload_shaping(PayloadShapingPolicy::AllowUnshapedNative)
@@ -212,7 +218,7 @@ async fn a_checkpointed_transfer_to_a_nas_bucket_reports_unsupported_by_destinat
     }
     for policy in [TransferPolicy::AtomicReplace, TransferPolicy::Direct] {
         let (local, _) = test_source_storage(root.path(), "nas-other-policies")?;
-        let other = request(local, "file", bucket(&protocol)?, "dst/other")?
+        let other = request(local, "file", bucket(&protocol)?)?
             .with_transfer_policy(policy)
             .with_read_back_verification(ReadBackVerification::Disabled);
         assert_eq!(transfer(other).await?.recovery, EffectiveRecovery::Disabled);
@@ -259,7 +265,7 @@ async fn an_object_over_the_threshold_is_one_streamed_put() -> TestResult {
         let protocol = nas();
         let (local, _) = test_source_storage(root.path(), "nas-streamed")?;
         let outcome = transfer(
-            request(local, "big", bucket(&protocol)?, "dst/big")?
+            request(local, "big", bucket(&protocol)?)?
                 .with_transfer_policy(policy)
                 .with_read_back_verification(ReadBackVerification::Disabled),
         )
@@ -271,12 +277,7 @@ async fn an_object_over_the_threshold_is_one_streamed_put() -> TestResult {
         };
         assert_eq!(outcome.recovery, expected, "{policy:?}");
         assert_eq!(
-            protocol
-                .objects
-                .lock()
-                .await
-                .get("dst/big")
-                .map(Bytes::as_ref),
+            protocol.objects.lock().await.get("big").map(Bytes::as_ref),
             Some(bytes.as_slice()),
             "{policy:?}"
         );
@@ -337,13 +338,11 @@ async fn the_outcome_says_how_the_copy_was_checked() -> TestResult {
         let (local, _) = test_source_storage(root.path(), "nas-verification-source")?;
         let source = if label == "nas small" { "small" } else { "big" };
         let outcome = transfer(
-            request(local, source, destination, "dst/file")?.with_read_back_verification(
-                if read_back {
-                    ReadBackVerification::Enabled
-                } else {
-                    ReadBackVerification::Disabled
-                },
-            ),
+            request(local, source, destination)?.with_read_back_verification(if read_back {
+                ReadBackVerification::Enabled
+            } else {
+                ReadBackVerification::Disabled
+            }),
         )
         .await
         .map_err(|failure| format!("{label}: {failure:?}"))?;
@@ -441,7 +440,7 @@ async fn a_native_copy_confirms_no_upload_digest() -> TestResult {
             )
         };
         let outcome = transfer(
-            request(connect()?, "src/file", connect()?, "dst/file")?
+            request(source_storage(&protocol, "src")?, "file", connect()?)?
                 .with_payload_shaping(PayloadShapingPolicy::AllowUnshapedNative)
                 .with_read_back_verification(ReadBackVerification::Disabled),
         )
@@ -477,7 +476,7 @@ async fn a_native_copy_within_a_nas_bucket_is_one_copy_object() -> TestResult {
         )
     };
     let outcome = transfer(
-        request(connect()?, "src/big", connect()?, "dst/big")?
+        request(source_storage(&protocol, "src")?, "big", connect()?)?
             .with_transfer_policy(TransferPolicy::Checkpointed)
             .with_payload_shaping(PayloadShapingPolicy::AllowUnshapedNative),
     )
@@ -500,6 +499,6 @@ async fn a_native_copy_within_a_nas_bucket_is_one_copy_object() -> TestResult {
     assert_eq!(*protocol.native_copies.lock().await, 1);
     assert_eq!(*protocol.part_copies.lock().await, 0);
     assert_eq!(*protocol.multipart_begins.lock().await, 0);
-    assert_eq!(protocol.objects.lock().await.get("dst/big"), Some(&body));
+    assert_eq!(protocol.objects.lock().await.get("big"), Some(&body));
     Ok(())
 }

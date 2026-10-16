@@ -86,7 +86,6 @@ async fn a_named_version_from_a_source_without_versions_fails_before_any_write()
         local(destination_root.path()).await?,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new("copy")?)
     .with_source_version(SourceVersion::Id("v1".into()));
     let Err(failure) = transfer(request).await else {
         return Err("a named version was copied from Local".into());

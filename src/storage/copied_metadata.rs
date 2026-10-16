@@ -6,7 +6,7 @@ use crate::model::{AclEncoding, MetadataObservations, TimePrecision};
 /// Destination capabilities used by the copied metadata families.
 ///
 /// `timestamps` and `ownership` describe the baseline every copy carries; a caller cannot turn
-/// them off. `acl` and `xattrs` describe families a caller has to ask for — what a
+/// them off. `acl`, `xattrs` and `tags` describe families a caller has to ask for — what a
 /// destination reports here is only its ability to accept them, never a decision to copy them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CopiedMetadataTarget {
@@ -17,6 +17,8 @@ pub struct CopiedMetadataTarget {
     pub acl: CopiedAclTarget,
     /// Whether this destination stores extended attributes.
     pub xattrs: CopiedValueTarget,
+    /// Whether this destination stores object tags.
+    pub tags: CopiedValueTarget,
 }
 
 impl CopiedMetadataTarget {
@@ -28,6 +30,7 @@ impl CopiedMetadataTarget {
             && matches!(self.ownership, CopiedOwnershipTarget::Unsupported)
             && matches!(self.acl, CopiedAclTarget::Unsupported)
             && matches!(self.xattrs, CopiedValueTarget::Unsupported)
+            && matches!(self.tags, CopiedValueTarget::Unsupported)
     }
 }
 
@@ -92,6 +95,7 @@ mod tests {
         ownership: CopiedOwnershipTarget::Unsupported,
         acl: CopiedAclTarget::Unsupported,
         xattrs: CopiedValueTarget::Unsupported,
+        tags: CopiedValueTarget::Unsupported,
     };
 
     /// Anything the destination does store means the source has to be read.
@@ -113,6 +117,10 @@ mod tests {
             },
             CopiedMetadataTarget {
                 xattrs: CopiedValueTarget::Supported,
+                ..OBJECT_STORE
+            },
+            CopiedMetadataTarget {
+                tags: CopiedValueTarget::Supported,
                 ..OBJECT_STORE
             },
         ] {

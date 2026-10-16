@@ -650,6 +650,7 @@ async fn verified_copy(
 ) -> TestResult {
     use data_mover::integrity::{IntegrityMode, IntegrityOptions, IntegrityRequest, compare};
     use data_mover::transfer::{ReadBackVerification, TransferRequest, transfer};
+    assert_eq!(from, to, "migration preserves relative paths");
     let outcome = transfer(
         TransferRequest::new(
             source.clone(),
@@ -657,7 +658,6 @@ async fn verified_copy(
             destination.clone(),
             CancellationToken::new(),
         )
-        .with_final_path(StoragePath::new(to)?)
         .with_transfer_policy(policy)
         .with_read_back_verification(ReadBackVerification::Enabled),
     )
@@ -685,6 +685,7 @@ async fn nightly_lab_cross_protocol_copy_and_integrity() -> TestResult {
     use data_mover::storage::LocalBackendConfig;
     use data_mover::transfer::TransferPolicy;
     let (raw, hdfs) = fixture("cross-protocol").await?;
+    let (second_raw, second_hdfs) = fixture("cross-protocol-second").await?;
     let root = tempfile::tempdir()?;
     let slots = NonZeroUsize::new(2).ok_or("nonzero")?;
     let local = connect_backend(BackendConfig::Local(LocalBackendConfig {
@@ -703,19 +704,24 @@ async fn nightly_lab_cross_protocol_copy_and_integrity() -> TestResult {
             TransferPolicy::AtomicReplace,
             TransferPolicy::Direct,
         ] {
-            verified_copy(&local, &hdfs, "source", "copied", policy).await?;
-            assert_eq!(raw_read(&raw, "copied").await?, data);
-            verified_copy(&hdfs, &local, "copied", "roundtrip", policy).await?;
-            assert_eq!(std::fs::read(root.path().join("roundtrip"))?, data);
-            verified_copy(&hdfs, &hdfs, "copied", "second", policy).await?;
+            verified_copy(&local, &hdfs, "source", "source", policy).await?;
+            assert_eq!(raw_read(&raw, "source").await?, data);
+            verified_copy(&hdfs, &local, "source", "source", policy).await?;
+            assert_eq!(std::fs::read(root.path().join("source"))?, data);
+            verified_copy(&hdfs, &second_hdfs, "source", "source", policy).await?;
         }
     }
-    create_hdfs_file(&raw, "second", bytes::Bytes::from_static(b"corrupted")).await?;
+    create_hdfs_file(
+        &second_raw,
+        "source",
+        bytes::Bytes::from_static(b"corrupted"),
+    )
+    .await?;
     let report = data_mover::integrity::compare(data_mover::integrity::IntegrityRequest {
         source: hdfs.clone(),
-        source_path: StoragePath::new("copied")?,
-        destination: hdfs,
-        destination_path: StoragePath::new("second")?,
+        source_path: StoragePath::new("source")?,
+        destination: second_hdfs,
+        destination_path: StoragePath::new("source")?,
         options: data_mover::integrity::IntegrityOptions {
             mode: data_mover::integrity::IntegrityMode::Content,
             ..Default::default()
@@ -724,6 +730,7 @@ async fn nightly_lab_cross_protocol_copy_and_integrity() -> TestResult {
     })
     .await?;
     assert!(!report.differences().is_empty());
+    second_raw.cleanup().await?;
     raw.cleanup().await
 }
 
@@ -749,9 +756,10 @@ async fn nightly_lab_copies_between_s3_and_hdfs() -> TestResult {
             TransferPolicy::Direct,
         ] {
             let name = format!("hdfs-{size}-{policy:?}").to_ascii_lowercase();
-            verified_copy(&hdfs, &s3, "source", &name, policy).await?;
-            verified_copy(&s3, &hdfs, &name, "roundtrip", policy).await?;
-            assert_eq!(raw_read(&raw, "roundtrip").await?, data);
+            create_hdfs_file(&raw, &name, data.clone()).await?;
+            verified_copy(&hdfs, &s3, &name, &name, policy).await?;
+            verified_copy(&s3, &hdfs, &name, &name, policy).await?;
+            assert_eq!(raw_read(&raw, &name).await?, data);
         }
     }
     raw.cleanup().await

@@ -260,6 +260,7 @@ impl StagedDestination for CifsStagedDestination {
                     crate::model::AclEncoding::WindowsSecurityDescriptor,
                 ),
                 xattrs: crate::storage::CopiedValueTarget::Unsupported,
+                tags: crate::storage::CopiedValueTarget::Unsupported,
             })
     }
 

@@ -18,6 +18,20 @@ use crate::storage::artifacts::{ArtifactKind, parse_artifact_name};
 
 #[derive(Default)]
 pub(crate) struct MemoryHdfs {
+    state: Arc<MemoryHdfsState>,
+    source_prefix: String,
+}
+
+impl std::ops::Deref for MemoryHdfs {
+    type Target = MemoryHdfsState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct MemoryHdfsState {
     objects: Mutex<HashMap<String, Bytes>>,
     metadata_calls: Mutex<Vec<String>>,
     stat_calls: AtomicUsize,
@@ -111,6 +125,14 @@ fn is_pointer(path: &StoragePath) -> bool {
 }
 
 impl MemoryHdfs {
+    /// A read-only source root in the same test filesystem, retaining shared I/O counters.
+    pub(crate) fn source_root(self: &Arc<Self>, prefix: &str) -> Arc<Self> {
+        Arc::new(Self {
+            state: self.state.clone(),
+            source_prefix: format!("{}/", prefix.trim_end_matches('/')),
+        })
+    }
+
     /// Fails the first data write after an hsync: the pointer an at-destination checkpoint
     /// writes right after its hsync is not data and goes through.
     pub(crate) fn fail_once_after_hsync(&self) {
@@ -249,7 +271,7 @@ impl HdfsProtocol for MemoryHdfs {
         self.stat_calls.fetch_add(1, Ordering::SeqCst);
         let objects = self.objects.lock().await;
         let value = objects
-            .get(path.as_str())
+            .get(&format!("{}{}", self.source_prefix, path.as_str()))
             .ok_or_else(|| Self::missing(path, Operation::Observe))?;
         Ok(Self::facts(path, value.len() as u64))
     }
@@ -310,7 +332,7 @@ impl HdfsProtocol for MemoryHdfs {
         }
         let objects = self.objects.lock().await;
         let value = objects
-            .get(path.as_str())
+            .get(&format!("{}{}", self.source_prefix, path.as_str()))
             .ok_or_else(|| Self::missing(path, Operation::Read))?;
         let start = usize::try_from(range.start).map_err(|_| {
             entry_failure(

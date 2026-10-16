@@ -137,14 +137,14 @@ async fn checkpointed_persists_large_transfer_and_cleans_recovery_files() -> Tes
 async fn checkpointed_syncs_new_parent_directories() -> TestResult {
     let source = tempfile::tempdir()?;
     let destination = tempfile::tempdir()?;
-    std::fs::write(source.path().join("file.bin"), b"new parent")?;
+    std::fs::create_dir_all(source.path().join("new/child"))?;
+    std::fs::write(source.path().join("new/child/file.bin"), b"new parent")?;
     let request = TransferRequest::new(
         local(source.path()).await?,
-        StoragePath::new("file.bin")?,
+        StoragePath::new("new/child/file.bin")?,
         local(destination.path()).await?,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new("new/child/file.bin")?)
     .with_identity_override(TransferIdentity::from_label("native-new-parent")?)
     .with_transfer_policy(TransferPolicy::Checkpointed);
     transfer(request).await?;

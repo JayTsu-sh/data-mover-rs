@@ -51,9 +51,9 @@ async fn real_share_checkpointed_and_atomic_replace_roundtrip() -> Result {
                     .finalize_xof()
                     .fill(&mut payload);
                 let payload = Bytes::from(payload);
-                std::fs::write(root.path().join("source"), &payload)?;
+                std::fs::write(root.path().join(&name), &payload)?;
                 filetime::set_file_mtime(
-                    root.path().join("source"),
+                    root.path().join(&name),
                     filetime::FileTime::from_unix_time(1_700_000_001, 123_456_700),
                 )?;
                 let copied =
@@ -104,6 +104,7 @@ async fn copy(
     policy: TransferPolicy,
     read_back: ReadBackVerification,
 ) -> Result<TransferOutcome> {
+    assert_eq!(from, to, "migration preserves relative paths");
     let started = std::time::Instant::now();
     let copied = transfer(
         TransferRequest::new(
@@ -112,7 +113,6 @@ async fn copy(
             destination.clone(),
             tokio_util::sync::CancellationToken::new(),
         )
-        .with_final_path(StoragePath::new(to)?)
         .with_identity_override(TransferIdentity::from_label(format!("{from}-{to}"))?)
         .with_transfer_policy(policy)
         .with_read_back_verification(read_back),
@@ -135,10 +135,10 @@ async fn roundtrip(
     policy: TransferPolicy,
 ) -> Result {
     let expected = Some(*blake3::hash(payload).as_bytes());
-    let target = format!("{name}-copied");
+    let target = name.to_owned();
     let copied = copy(
         local,
-        "source",
+        name,
         remote,
         name,
         policy,
@@ -172,13 +172,13 @@ async fn roundtrip(
         destination,
         &target,
         local,
-        "returned",
+        &target,
         TransferPolicy::AtomicReplace,
         ReadBackVerification::Enabled,
     )
     .await?;
     assert_eq!(back.blake3, expected);
-    assert_mtime(local, "returned").await?;
+    assert_mtime(local, &target).await?;
     Ok(())
 }
 

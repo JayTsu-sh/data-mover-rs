@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, StoragePath, Transience};
 use crate::storage::PrepareFact;
-use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of};
+use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, source_storage};
 use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect};
 use crate::transfer::{
     EffectiveRecovery, TransferPolicy, TransferRequest, TransferRoute, transfer,
@@ -22,12 +22,11 @@ const MIB: usize = 1024 * 1024;
 fn direct_request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
     let storage = || connect(protocol.clone(), endpoint_of(protocol), None);
     Ok(TransferRequest::new(
-        storage()?,
-        StoragePath::new("source")?,
+        source_storage(protocol, "src")?,
+        StoragePath::new("final")?,
         storage()?,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new("direct-final")?)
     .with_transfer_policy(TransferPolicy::Direct))
 }
 
@@ -38,7 +37,7 @@ async fn seeded(size: usize) -> (Arc<MemoryS3>, Bytes) {
         .objects
         .lock()
         .await
-        .insert("source".into(), payload.clone());
+        .insert("src/final".into(), payload.clone());
     (protocol, payload)
 }
 
@@ -46,7 +45,7 @@ async fn seeded(size: usize) -> (Arc<MemoryS3>, Bytes) {
 /// (every upload the fake saw was begun on the final key: see `multipart_begins`).
 async fn leaves_nothing_behind(protocol: &MemoryS3) -> TestResult<bool> {
     let open = protocol
-        .list_uploads("direct-final")
+        .list_uploads("final")
         .await
         .map_err(|failure| format!("{failure:?}"))?;
     let staged = protocol
@@ -69,10 +68,7 @@ async fn a_small_direct_transfer_is_one_put() -> TestResult {
     assert!(outcome.blake3.is_some());
     assert_eq!(*protocol.puts.lock().await, 1);
     assert_eq!(*protocol.multipart_begins.lock().await, 0);
-    assert_eq!(
-        protocol.objects.lock().await.get("direct-final"),
-        Some(&payload)
-    );
+    assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
     assert!(leaves_nothing_behind(&protocol).await?);
     Ok(())
 }
@@ -83,7 +79,7 @@ async fn a_small_direct_transfer_is_one_put() -> TestResult {
 async fn a_large_direct_transfer_is_one_upload_on_the_final_key() -> TestResult {
     let (protocol, payload) = seeded(20 * MIB).await;
     protocol
-        .put_version("direct-final", "v1", Bytes::from_static(b"old"))
+        .put_version("final", "v1", Bytes::from_static(b"old"))
         .await;
     let outcome = transfer(direct_request(&protocol)?).await?;
     assert!(outcome.blake3.is_some());
@@ -94,10 +90,7 @@ async fn a_large_direct_transfer_is_one_upload_on_the_final_key() -> TestResult 
     assert_eq!(*protocol.multipart_begins.lock().await, 1);
     assert_eq!(*protocol.completes.lock().await, 1);
     assert_eq!(*protocol.puts.lock().await, 0);
-    assert_eq!(
-        protocol.objects.lock().await.get("direct-final"),
-        Some(&payload)
-    );
+    assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
     assert!(leaves_nothing_behind(&protocol).await?);
     Ok(())
 }
@@ -122,7 +115,7 @@ async fn a_failed_direct_upload_leaves_no_upload() -> TestResult {
     assert!(failure.final_destination_changed());
     assert!(!failure.has_unpublished_stage());
     assert_eq!(*protocol.aborts.lock().await, 1);
-    assert!(!protocol.objects.lock().await.contains_key("direct-final"));
+    assert!(!protocol.objects.lock().await.contains_key("final"));
     assert!(leaves_nothing_behind(&protocol).await?);
     Ok(())
 }

@@ -17,7 +17,7 @@ use crate::model::{
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
 use crate::storage::backends::local::{test_destination_storage, test_source_storage};
 use crate::storage::backends::s3::tests::{
-    MemoryS3, Versioning, content_md5, endpoint_of, identity, native_context,
+    MemoryS3, Versioning, content_md5, endpoint_of, identity, native_context, source_storage,
 };
 use crate::storage::backends::s3::{S3Protocol as _, connect};
 use crate::storage::listing::testing::listed;
@@ -53,15 +53,13 @@ fn request(
     source: Storage,
     source_path: &str,
     destination: Storage,
-    final_path: &str,
 ) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
         source,
         StoragePath::new(source_path)?,
         destination,
         CancellationToken::new(),
-    )
-    .with_final_path(StoragePath::new(final_path)?))
+    ))
 }
 
 /// The diagnostic of a failed transfer's entry failure.
@@ -109,11 +107,11 @@ async fn a_directory_object_between_buckets_is_copied() -> TestResult {
             .lock()
             .await
             .insert("src/d/".into(), bytes.clone());
-        let copy = request(bucket(&protocol)?, "src/d/", bucket(&protocol)?, "dst/d/")?
+        let copy = request(source_storage(&protocol, "src")?, "d/", bucket(&protocol)?)?
             .with_payload_shaping(shaping);
         transfer(copy).await?;
         assert_eq!(
-            protocol.objects.lock().await.get("dst/d/"),
+            protocol.objects.lock().await.get("d/"),
             Some(&bytes),
             "{shaping:?} {} B",
             body.len()
@@ -130,7 +128,7 @@ async fn a_directory_object_to_a_filesystem_is_unsupported_before_any_io() -> Te
     put(&protocol, "d/", b"hello").await?;
     let root = tempfile::tempdir()?;
     let local = test_destination_storage(root.path(), "directory-object-destination")?;
-    let Err(failure) = transfer(request(bucket(&protocol)?, "d/", local, "d/")?).await else {
+    let Err(failure) = transfer(request(bucket(&protocol)?, "d/", local)?).await else {
         return Err("a directory object was written to a filesystem".into());
     };
     assert_eq!(
@@ -142,8 +140,7 @@ async fn a_directory_object_to_a_filesystem_is_unsupported_before_any_io() -> Te
 
     let source_root = tempfile::tempdir()?;
     let (local_source, _) = test_source_storage(source_root.path(), "directory-object-source")?;
-    let Err(failure) = transfer(request(local_source, "x/", bucket(&protocol)?, "x/")?).await
-    else {
+    let Err(failure) = transfer(request(local_source, "x/", bucket(&protocol)?)?).await else {
         return Err("a filesystem path ending in '/' was read".into());
     };
     assert_eq!(
@@ -414,7 +411,7 @@ async fn rustfs_like() -> Arc<MemoryS3> {
         .objects
         .lock()
         .await
-        .insert("dst/d".into(), Bytes::from_static(b"a real file"));
+        .insert("d".into(), Bytes::from_static(b"a real file"));
     protocol
 }
 
@@ -458,7 +455,7 @@ async fn a_directory_object_over_the_single_put_threshold_is_one_request() -> Te
             .lock()
             .await
             .insert("src/d/".into(), bytes.clone());
-        let copy = request(bucket(&protocol)?, "src/d/", bucket(&protocol)?, "dst/d/")?
+        let copy = request(source_storage(&protocol, "src")?, "d/", bucket(&protocol)?)?
             .with_transfer_policy(policy)
             .with_payload_shaping(shaping);
         let outcome = transfer(copy)
@@ -466,9 +463,9 @@ async fn a_directory_object_over_the_single_put_threshold_is_one_request() -> Te
             .map_err(|e| format!("{label}: {e:?}"))?;
         assert_eq!(outcome.route, route, "{label}");
         let objects = protocol.objects.lock().await.clone();
-        assert_eq!(objects.get("dst/d/"), Some(&bytes), "{label}");
+        assert_eq!(objects.get("d/"), Some(&bytes), "{label}");
         assert_eq!(
-            objects.get("dst/d").map(Bytes::as_ref),
+            objects.get("d").map(Bytes::as_ref),
             Some(&b"a real file"[..]),
             "{label}"
         );
@@ -491,10 +488,15 @@ async fn a_directory_object_one_request_cannot_carry_is_refused_at_preflight() -
     let protocol = Arc::new(MemoryS3::default());
     let pointer = artifact_name("d/", ArtifactKind::Upload);
     put(&protocol, &pointer, b"stale pointer").await?;
-    let root = tempfile::tempdir()?;
-    fs::File::create(root.path().join("big"))?.set_len(OVER_ONE_REQUEST)?;
-    let (local, _) = test_source_storage(root.path(), "directory-object-oversized")?;
-    let Err(failure) = transfer(request(local, "big", bucket(&protocol)?, "d/")?).await else {
+    put(&protocol, "src/d/", b"x").await?;
+    *protocol.declared_size.lock().await = Some(OVER_ONE_REQUEST);
+    let Err(failure) = transfer(request(
+        source_storage(&protocol, "src")?,
+        "d/",
+        bucket(&protocol)?,
+    )?)
+    .await
+    else {
         return Err("a directory object over 5 GiB was written".into());
     };
     assert_eq!(
@@ -508,8 +510,12 @@ async fn a_directory_object_one_request_cannot_carry_is_refused_at_preflight() -
     );
     let mut keys: Vec<String> = protocol.objects.lock().await.keys().cloned().collect();
     keys.sort();
-    assert_eq!(keys, [pointer.as_str()]);
-    assert_eq!(*protocol.puts.lock().await, 1, "only the planted pointer");
+    assert_eq!(keys, [pointer.as_str(), "src/d/"]);
+    assert_eq!(
+        *protocol.puts.lock().await,
+        2,
+        "the pointer and source fixture"
+    );
     assert_eq!(*protocol.multipart_begins.lock().await, 0);
 
     let observation = ObservedEntry::new(
@@ -543,6 +549,6 @@ async fn a_directory_object_one_request_cannot_carry_is_refused_at_preflight() -
         Some(DIRECTORY_OBJECT_TOO_LARGE_REASON)
     );
     assert!(protocol.objects.lock().await.contains_key(&pointer));
-    assert_eq!(*protocol.puts.lock().await, 1);
+    assert_eq!(*protocol.puts.lock().await, 2);
     Ok(())
 }

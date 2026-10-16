@@ -232,31 +232,35 @@ if [ "$LOCK" = 1 ] && ! s3c "$H/$LB?versioning" | grep -q '<Status>Enabled'; the
   versioning "$LB" Enabled
 fi
 for entry in m4:4194304 m20:20971520 m200:209715200 h1:104857600 h2:104857600; do seed "${entry%%:*}" "${entry#*:}"; done
-LOCAL=(--source "$WORK/src")
+for name in m4 m20 m200 h1 h2; do
+  mkdir -p "$WORK/fixtures/$name"
+  ln "$WORK/src/$name" "$WORK/fixtures/$name/obj"
+  ln "$WORK/src/$name" "$WORK/fixtures/$name/src"
+done
 
 echo "-- versioned bucket: one version per copy, nothing else"
-case_ "checkpointed 4 MiB (single PUT)" "$VB" small obj "${LOCAL[@]}" --source-path m4 --policy checkpointed
-case_ "checkpointed 200 MiB (pointer)" "$VB" large obj "${LOCAL[@]}" --source-path m200 --policy checkpointed
-case_ "direct 4 MiB" "$VB" direct-small obj "${LOCAL[@]}" --source-path m4 --policy direct
-case_ "direct 20 MiB (multipart)" "$VB" direct-large obj "${LOCAL[@]}" --source-path m20 --policy direct
+case_ "checkpointed 4 MiB (single PUT)" "$VB" small obj --source "$WORK/fixtures/m4" --source-path obj --policy checkpointed
+case_ "checkpointed 200 MiB (pointer)" "$VB" large obj --source "$WORK/fixtures/m200" --source-path obj --policy checkpointed
+case_ "direct 4 MiB" "$VB" direct-small obj --source "$WORK/fixtures/m4" --source-path obj --policy direct
+case_ "direct 20 MiB (multipart)" "$VB" direct-large obj --source "$WORK/fixtures/m20" --source-path obj --policy direct
 
 echo "-- native S3 -> S3 to the final key (C18): one version, no temp-key version or marker"
 case_ "native 4 MiB" "$VB" native-small obj --source "s3:${P}small" --source-path obj --policy checkpointed
 case_ "native 200 MiB" "$VB" native-large obj --source "s3:${P}large" --source-path obj --policy checkpointed
 
 echo "-- v1 -> v2 by --source-version"
-case_ "source v1" "$VB" hist src "${LOCAL[@]}" --source-path h1 --policy checkpointed
+case_ "source v1" "$VB" hist src --source "$WORK/fixtures/h1" --source-path src --policy checkpointed
 V1=$(field "$LAST" destination_version)
-case_ "source v2" "$VB" hist src "${LOCAL[@]}" --source-path h2 --policy checkpointed
+case_ "source v2" "$VB" hist src --source "$WORK/fixtures/h2" --source-path src --policy checkpointed
 V2=$(field "$LAST" destination_version)
 S3SRC=(--source "s3:${P}hist" --source-path src --client-shaped --policy checkpointed)
-case_ "copy of v1" "$VB" hist dst "${S3SRC[@]}" --source-version "$V1"
+case_ "copy of v1" "$VB" hist/dst src "${S3SRC[@]}" --source-version "$V1"
 D1=$(field "$LAST" destination_version)
-case_ "copy of v2" "$VB" hist dst "${S3SRC[@]}" --source-version "$V2"
+case_ "copy of v2" "$VB" hist/dst src "${S3SRC[@]}" --source-version "$V2"
 D2=$(field "$LAST" destination_version)
-order=$(entries "$VB" "${P}hist/dst" | awk -F'\t' -v k="${P}hist/dst" '$1 == k && $3 == 0 {print $2}' | paste -sd' ')
+order=$(entries "$VB" "${P}hist/dst/src" | awk -F'\t' -v k="${P}hist/dst/src" '$1 == k && $3 == 0 {print $2}' | paste -sd' ')
 for pair in "$D1:h1" "$D2:h2"; do
-  s3c -o "$WORK/check" "$H/$VB/$(enc "${P}hist/dst" /)?versionId=${pair%%:*}"
+  s3c -o "$WORK/check" "$H/$VB/$(enc "${P}hist/dst/src" /)?versionId=${pair%%:*}"
   cmp -s "$WORK/check" "$WORK/src/${pair#*:}" && same=yes || same=NO
   echo "   version ${pair%%:*} holds ${pair#*:}: $same"
 done
@@ -264,22 +268,22 @@ echo "   listed newest first: $order (expected: $D2 $D1)"
 
 echo "-- v1 -> v2 by --source-version, native (C18: CopyObject / UploadPartCopy with ?versionId=)"
 NSRC=(--source "s3:${P}hist" --source-path src --policy checkpointed)
-case_ "native copy of v1" "$VB" hist ndst "${NSRC[@]}" --source-version "$V1"
+case_ "native copy of v1" "$VB" hist/ndst src "${NSRC[@]}" --source-version "$V1"
 N1=$(field "$LAST" destination_version)
-case_ "native copy of v2" "$VB" hist ndst "${NSRC[@]}" --source-version "$V2"
+case_ "native copy of v2" "$VB" hist/ndst src "${NSRC[@]}" --source-version "$V2"
 N2=$(field "$LAST" destination_version)
-order=$(entries "$VB" "${P}hist/ndst" | awk -F'\t' -v k="${P}hist/ndst" '$1 == k && $3 == 0 {print $2}' | paste -sd' ')
+order=$(entries "$VB" "${P}hist/ndst/src" | awk -F'\t' -v k="${P}hist/ndst/src" '$1 == k && $3 == 0 {print $2}' | paste -sd' ')
 for pair in "$N1:h1" "$N2:h2"; do
-  s3c -o "$WORK/check" "$H/$VB/$(enc "${P}hist/ndst" /)?versionId=${pair%%:*}"
+  s3c -o "$WORK/check" "$H/$VB/$(enc "${P}hist/ndst/src" /)?versionId=${pair%%:*}"
   cmp -s "$WORK/check" "$WORK/src/${pair#*:}" && same=yes || same=NO
   echo "   version ${pair%%:*} holds ${pair#*:}: $same"
 done
 echo "   listed newest first: $order (expected: $N2 $N1)"
 
 echo "-- interrupted copy of v1 (cancel after 3 s at 20 MiB/s), then resumed"
-case_ "cut" "$VB" hist-cut dst "${S3SRC[@]}" --source-version "$V1" --bandwidth 20971520 --cancel-after-ms 3000
-case_ "resumed" "$VB" hist-cut dst "${S3SRC[@]}" --source-version "$V1"
-s3c -o "$WORK/check" "$H/$VB/$(enc "${P}hist-cut/dst" /)"; cmp -s "$WORK/check" "$WORK/src/h1" && echo "   content = v1: yes" || echo "   content = v1: NO"
+case_ "cut" "$VB" hist-cut src "${S3SRC[@]}" --source-version "$V1" --bandwidth 20971520 --cancel-after-ms 3000
+case_ "resumed" "$VB" hist-cut src "${S3SRC[@]}" --source-version "$V1"
+s3c -o "$WORK/check" "$H/$VB/$(enc "${P}hist-cut/src" /)"; cmp -s "$WORK/check" "$WORK/src/h1" && echo "   content = v1: yes" || echo "   content = v1: NO"
 
 if [ "${SKIP_RESUME:-0}" != 1 ]; then
   echo "-- resume matrix (cancel / SIGKILL at 6 s, 200 MiB) into $VB"
@@ -291,7 +295,7 @@ fi
 if [ "$LOCK" = 1 ]; then
 echo "-- Object Lock: a legal hold on the pointer while the copy runs"
 KEYS+=(locked/obj)
-env S3_BUCKET="$LB" RUST_LOG=warn "$BIN" "${LOCAL[@]}" --source-path m200 --destination s3:locked \
+env S3_BUCKET="$LB" RUST_LOG=warn "$BIN" --source "$WORK/fixtures/m200" --source-path obj --destination s3:locked \
   --destination-path obj --policy checkpointed --bandwidth 20971520 >"$WORK/lock.out" 2>"$WORK/lock.err" &
 pid=$!
 held=no
@@ -320,6 +324,6 @@ fi
 [ "$EXISTING" = 1 ] && exit 0
 echo "-- suspended versioning: destination_version null"
 versioning "$VB" Suspended
-case_ "suspended checkpointed 4 MiB" "$VB" susp-small obj "${LOCAL[@]}" --source-path m4 --policy checkpointed
-case_ "suspended checkpointed 200 MiB" "$VB" susp-large obj "${LOCAL[@]}" --source-path m200 --policy checkpointed
-case_ "suspended direct 20 MiB" "$VB" susp-direct obj "${LOCAL[@]}" --source-path m20 --policy direct
+case_ "suspended checkpointed 4 MiB" "$VB" susp-small obj --source "$WORK/fixtures/m4" --source-path obj --policy checkpointed
+case_ "suspended checkpointed 200 MiB" "$VB" susp-large obj --source "$WORK/fixtures/m200" --source-path obj --policy checkpointed
+case_ "suspended direct 20 MiB" "$VB" susp-direct obj --source "$WORK/fixtures/m20" --source-path obj --policy direct

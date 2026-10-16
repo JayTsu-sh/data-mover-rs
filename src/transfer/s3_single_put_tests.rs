@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 use super::engine::run_until_transferred;
 use crate::model::StoragePath;
 use crate::storage::backends::s3::connect;
-use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, etag_of, native_context};
+use crate::storage::backends::s3::tests::{
+    MemoryS3, endpoint_of, etag_of, native_context, source_storage,
+};
 use crate::transfer::{
     EffectiveRecovery, PayloadShapingPolicy, TransferPolicy, TransferRequest, TransferRoute,
     transfer,
@@ -19,11 +21,7 @@ use crate::transfer::{
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn request(protocol: &Arc<MemoryS3>, final_path: &str) -> TestResult<TransferRequest> {
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(protocol),
-        Some(native_context()),
-    )?;
+    let source = source_storage(protocol, "src")?;
     let destination = connect(
         protocol.clone(),
         endpoint_of(protocol),
@@ -31,11 +29,10 @@ fn request(protocol: &Arc<MemoryS3>, final_path: &str) -> TestResult<TransferReq
     )?;
     Ok(TransferRequest::new(
         source,
-        StoragePath::new("source")?,
+        StoragePath::new(final_path)?,
         destination,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new(final_path)?)
     // The same fake on both ends would otherwise copy natively.
     .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped))
 }
@@ -46,7 +43,9 @@ fn request(protocol: &Arc<MemoryS3>, final_path: &str) -> TestResult<TransferReq
 async fn a_small_object_is_one_put_verified_after_publication() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let payload = Bytes::from(vec![3; 200 * 1024]);
-    protocol.put_version("source", "v1", payload.clone()).await;
+    protocol
+        .put_version("src/single-final", "v1", payload.clone())
+        .await;
     let outcome = transfer(request(&protocol, "single-final")?).await?;
     assert_eq!(outcome.route, TransferRoute::Streaming);
     let version = outcome
@@ -92,7 +91,7 @@ async fn a_checkpointed_small_object_keeps_no_recovery_state() -> TestResult {
         .objects
         .lock()
         .await
-        .insert("source".into(), payload.clone());
+        .insert("src/checkpointed-final".into(), payload.clone());
     let checkpointed = || {
         request(&protocol, "checkpointed-final")
             .map(|request| request.with_transfer_policy(TransferPolicy::Checkpointed))
