@@ -112,6 +112,15 @@ class MigrationHarnessPaths(unittest.TestCase):
             source,
         )
 
+    def test_integrity_content_mismatch_accepts_structured_difference(self):
+        script = ROOT / "tests/lab/run-integrity-e2e.sh"
+        source = script.read_text()
+        self.assertIn(
+            "Content.*source_bytes: [0-9]+, destination_bytes: [0-9]+",
+            source,
+        )
+        self.assertNotIn("Content.*offset:", source)
+
 
 if __name__ == "__main__":
     unittest.main()

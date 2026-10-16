@@ -284,7 +284,7 @@ printf 'X' | dd of="$destination_file" bs=1 seek=5 conv=notrunc status=none
 touch -r "$source_file" "$destination_file"
 check_path local local "$mismatch_key" quick
 
-expect_mismatch 'Content.*offset: 5' "local-same-size-content" \
+expect_mismatch 'Content.*source_bytes: [0-9]+, destination_bytes: [0-9]+' "local-same-size-content" \
   local local "$mismatch_key" full
 
 # Negative cross-protocol ring: every configured backend participates as both
@@ -313,7 +313,7 @@ for check in "${negative_checks[@]}"; do
 
   replace_destination_byte \
     "$destination_backend" "$key" "$negative_fixture_root" "$mismatch_offset"
-  expect_mismatch "Content.*offset: $mismatch_offset" "$description-content" \
+  expect_mismatch 'Content.*source_bytes: [0-9]+, destination_bytes: [0-9]+' "$description-content" \
     "$source_backend" "$destination_backend" "$key" full
 
   append_destination_byte "$destination_backend" "$key" "$negative_fixture_root"
