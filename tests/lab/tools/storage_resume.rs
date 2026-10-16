@@ -177,7 +177,7 @@ async fn interrupt(
     // durable checkpoint is valid, but it cannot produce the recovery state this tool is meant
     // to hand to the next process. Retry those attempts with a longer window instead of turning
     // a below-threshold interruption into a lab failure.
-    for attempt in 0..6 {
+    for attempt in 0_u64..6 {
         let cancel = CancellationToken::new();
         let request = TransferRequest::new(
             source.clone(),
@@ -188,7 +188,7 @@ async fn interrupt(
         .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
         let stop_after_bytes = (state.size / 2)
             .saturating_add(32 << 20)
-            .saturating_add((attempt as u64) * (32 << 20));
+            .saturating_add(attempt * (32 << 20));
         let delay = Duration::from_millis(stop_after_bytes.saturating_mul(1000) / BANDWIDTH);
         let timer_cancel = cancel.clone();
         let timer = tokio::spawn(async move {
