@@ -40,6 +40,12 @@ def test_health_check_requires_canonical_hdfs_names() -> None:
         assert hostname in HEALTH_CHECK
 
 
+def test_hdfs_smoke_retries_after_transient_cluster_io_failure() -> None:
+    assert 'HDFS_SMOKE_ATTEMPTS="${HDFS_SMOKE_ATTEMPTS:-2}"' in SMOKE
+    assert "cleanup_hdfs_run_root" in SMOKE
+    assert "attempt == HDFS_SMOKE_ATTEMPTS" in SMOKE
+
+
 if __name__ == "__main__":
     tests = [
         test_keytab_is_required_and_process_cache_is_poisoned,

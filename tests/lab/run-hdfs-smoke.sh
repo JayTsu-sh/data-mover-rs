@@ -8,12 +8,17 @@ validate_run_id "$run_id"
 prepare_hdfs_kerberos "$run_id"
 export LAB_HDFS_RUN_ROOT
 LAB_HDFS_RUN_ROOT="$(hdfs_run_root "$run_id")"
+HDFS_SMOKE_ATTEMPTS="${HDFS_SMOKE_ATTEMPTS:-2}"
+
+cleanup_hdfs_run_root() {
+  cargo test --test hdfs_native_contract nightly_lab_cleanup_confined_run_root -- \
+    --ignored --exact --test-threads=1
+}
 
 cleanup_hdfs_run() {
   local test_status="$1"
   local cleanup_status=0
-  cargo test --test hdfs_native_contract nightly_lab_cleanup_confined_run_root -- \
-    --ignored --exact --test-threads=1 || cleanup_status=$?
+  cleanup_hdfs_run_root || cleanup_status=$?
   if (( test_status != 0 )); then
     exit "$test_status"
   fi
@@ -22,6 +27,23 @@ cleanup_hdfs_run() {
 
 trap 'cleanup_hdfs_run $?' EXIT
 
-cargo test --test hdfs_native_contract nightly_lab_ -- --ignored --test-threads=1 \
-  --skip nightly_lab_copies_between_s3_and_hdfs \
-  --skip nightly_lab_cleanup_confined_run_root
+run_hdfs_contract() {
+  cargo test --test hdfs_native_contract nightly_lab_ -- --ignored --test-threads=1 \
+    --skip nightly_lab_copies_between_s3_and_hdfs \
+    --skip nightly_lab_cleanup_confined_run_root
+}
+
+attempt=1
+while (( attempt <= HDFS_SMOKE_ATTEMPTS )); do
+  if run_hdfs_contract; then
+    exit 0
+  fi
+  status=$?
+  if (( attempt == HDFS_SMOKE_ATTEMPTS )); then
+    exit "$status"
+  fi
+  echo "HDFS contract attempt $attempt failed; cleaning the isolated root before retry" >&2
+  cleanup_hdfs_run_root || true
+  sleep 5
+  ((attempt++))
+done
