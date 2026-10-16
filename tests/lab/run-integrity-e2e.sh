@@ -226,7 +226,7 @@ for backend in "${backends[@]}"; do
   missing_key="integrity-missing-destination-$backend.bin"
   printf 'source-only' > "$edge_fixture_root/$missing_key"
   copy_local_fixture "$edge_fixture_root" source "$backend" "$missing_key"
-  expect_mismatch '(Missing.*Destination|File not found|IO error:.*not found|NoSuchKey|NotFound)' \
+  expect_mismatch 'Missing.*side: Destination' \
     "$backend-missing-destination" \
     "$backend" "$backend" "$missing_key" quick
 done
@@ -317,7 +317,7 @@ for check in "${negative_checks[@]}"; do
     "$source_backend" "$destination_backend" "$key" full
 
   append_destination_byte "$destination_backend" "$key" "$negative_fixture_root"
-  expect_mismatch 'Size.*src: [0-9]+, dest: [0-9]+' "$description-size" \
+  expect_mismatch 'Size.*source: Some\([0-9]+\), destination: Some\([0-9]+\)' "$description-size" \
     "$source_backend" "$destination_backend" "$key" quick
 done
 

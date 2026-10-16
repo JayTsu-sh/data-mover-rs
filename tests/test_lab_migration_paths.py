@@ -91,7 +91,7 @@ class MigrationHarnessPaths(unittest.TestCase):
         script = ROOT / "tests/lab/run-integrity-e2e.sh"
         source = script.read_text()
         self.assertIn(
-            "(Missing.*Destination|File not found|IO error:.*not found|NoSuchKey|NotFound)",
+            "Missing.*side: Destination",
             source,
         )
 
@@ -120,6 +120,15 @@ class MigrationHarnessPaths(unittest.TestCase):
             source,
         )
         self.assertNotIn("Content.*offset:", source)
+
+    def test_integrity_size_mismatch_accepts_structured_difference(self):
+        script = ROOT / "tests/lab/run-integrity-e2e.sh"
+        source = script.read_text()
+        self.assertIn(
+            r"Size.*source: Some\([0-9]+\), destination: Some\([0-9]+\)",
+            source,
+        )
+        self.assertNotIn("Size.*src:", source)
 
 
 if __name__ == "__main__":
