@@ -2,8 +2,6 @@
 //! observation role takes, so ownership and timestamps of a listed child need no second one.
 //! Only an ACL or xattrs the plan really wants take a call.
 
-#[cfg(not(unix))]
-use super::additional_only;
 use super::failure;
 use super::{inline_value, optional_not_applicable};
 use crate::model::{
@@ -66,5 +64,7 @@ fn listed_ownership(
     mode: ObservationMode,
     _listed: Option<InlineOwnership>,
 ) -> Option<MetadataObservation<OwnershipMode>> {
-    Some(additional_only(mode))
+    // Windows has no numeric uid/gid ownership model, so ownership is not a
+    // meaningful metadata family for this backend.
+    Some(optional_not_applicable(mode))
 }

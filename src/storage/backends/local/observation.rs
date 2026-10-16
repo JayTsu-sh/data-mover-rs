@@ -598,7 +598,11 @@ fn inline_ownership(
     mode: ObservationMode,
     _metadata: &Metadata,
 ) -> MetadataObservation<OwnershipMode> {
-    additional_only(mode)
+    // Windows has no numeric uid/gid ownership model. Report the family as not
+    // applicable when it is requested, rather than unsupported/not observed;
+    // the latter makes the normal AllowKnownLoss transfer policy fail before
+    // any data is copied.
+    optional_not_applicable(mode)
 }
 
 fn inline_timestamps(

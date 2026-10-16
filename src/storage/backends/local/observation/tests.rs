@@ -72,6 +72,27 @@ async fn observes_file_directory_and_stable_identity() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+#[tokio::test]
+async fn non_unix_ownership_is_not_applicable() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    std::fs::write(root.0.join("file"), b"value")?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    let observed = adapter
+        .observe_with_plan(
+            StoragePath::new("file").map_err(io::Error::other)?,
+            ObservationPlan::default().with_ownership_mode(ObservationMode::Required),
+        )
+        .await
+        .map_err(io::Error::other)?;
+
+    assert!(matches!(
+        observed.metadata().ownership_mode(),
+        MetadataObservation::NotApplicable
+    ));
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn inline_plan_uses_stat_facts_without_optional_storage_calls() -> io::Result<()> {
