@@ -99,7 +99,7 @@ class MigrationHarnessPaths(unittest.TestCase):
         script = ROOT / "tests/lab/run-integrity-e2e.sh"
         source = script.read_text()
         self.assertIn(
-            "(Modified.*source:.*destination:|MismatchMeta.*Mtime)",
+            "Modified.*source:.*destination:",
             source,
         )
 

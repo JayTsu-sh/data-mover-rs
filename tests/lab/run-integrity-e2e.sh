@@ -247,7 +247,7 @@ for backend in "${nas_backends[@]}"; do
   copy_local_fixture "$edge_fixture_root" destination "$backend" "$metadata_key"
   check_path "$backend" "$backend" "$metadata_key" quick
   change_destination_mtime "$backend" "$metadata_key"
-  expect_mismatch '(Modified.*source:.*destination:|MismatchMeta.*Mtime)' "$backend-metadata-mismatch" \
+  expect_mismatch 'Modified.*source:.*destination:' "$backend-metadata-mismatch" \
     "$backend" "$backend" "$metadata_key" quick
 
   type_key="integrity-type-mismatch-$backend"
