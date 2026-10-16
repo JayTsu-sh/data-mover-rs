@@ -102,6 +102,7 @@ class MigrationHarnessPaths(unittest.TestCase):
             "Modified.*source:.*destination:",
             source,
         )
+        self.assertNotIn("MismatchMeta.*Mtime", source)
 
     def test_integrity_entry_kind_mismatch_accepts_structured_difference(self):
         script = ROOT / "tests/lab/run-integrity-e2e.sh"

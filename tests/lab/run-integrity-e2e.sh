@@ -265,7 +265,7 @@ printf 'mtime-options' > "$local_root/source/$mtime_key"
 cp "$local_root/source/$mtime_key" "$local_root/destination/$mtime_key"
 touch -m -d '@1700000400.000000000' "$local_root/source/$mtime_key"
 touch -m -d '@1700000400.005000000' "$local_root/destination/$mtime_key"
-expect_mismatch 'MismatchMeta.*Mtime' "local-mtime-exact-default" \
+expect_mismatch 'Modified.*source:.*destination:' "local-mtime-exact-default" \
   local local "$mtime_key" quick
 check_path_with_mtime_options local local "$mtime_key" 5
 
