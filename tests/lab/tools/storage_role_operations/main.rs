@@ -341,16 +341,19 @@ impl SeedFiles<'_> {
             .map_err(|error| (destination, error))
     }
 
-    async fn transfer(&self, index: usize, name: String, destination: &str) -> Result<u64, Error> {
-        std::fs::write(self.local_root.join(&name), self.payload)?;
+    async fn transfer(&self, index: usize, _name: String, destination: &str) -> Result<u64, Error> {
+        let local_path = self.local_root.join(destination);
+        if let Some(parent) = local_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(local_path, self.payload)?;
         let outcome = transfer(
             TransferRequest::new(
                 self.source.clone(),
-                StoragePath::new(name)?,
+                StoragePath::new(destination)?,
                 self.storage.clone(),
                 CancellationToken::new(),
             )
-            .with_final_path(StoragePath::new(destination)?)
             .with_identity_override(TransferIdentity::from_label(format!(
                 "seed-{}-{index}",
                 std::process::id()

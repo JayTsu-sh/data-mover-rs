@@ -33,16 +33,23 @@ async fn request(
 ) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
         local(source).await?,
-        StoragePath::new("in.bin")?,
+        StoragePath::new(final_path)?,
         local(destination).await?,
         CancellationToken::new(),
-    )
-    .with_final_path(StoragePath::new(final_path)?))
+    ))
 }
 
 fn roots() -> TestResult<(tempfile::TempDir, tempfile::TempDir)> {
     let source = tempfile::tempdir()?;
-    std::fs::write(source.path().join("in.bin"), b"payload")?;
+    for path in [
+        "in.bin",
+        "out.bin",
+        "other.bin",
+        "derived.bin",
+        "labelled.bin",
+    ] {
+        std::fs::write(source.path().join(path), b"payload")?;
+    }
     Ok((source, tempfile::tempdir()?))
 }
 
@@ -59,7 +66,7 @@ async fn independent_connections_derive_one_identity() -> TestResult {
         first.identity(),
         TransferIdentity::derive(
             source_storage.identity(),
-            &StoragePath::new("in.bin")?,
+            &StoragePath::new("out.bin")?,
             &SourceVersion::Current,
             destination_storage.identity(),
             &StoragePath::new("out.bin")?,
@@ -129,7 +136,7 @@ async fn observe(storage: &Storage, path: &str) -> TestResult<ObservedEntry> {
 #[tokio::test]
 async fn the_expert_destination_derives_the_same_identity_as_a_request() -> TestResult {
     let (source, destination) = roots()?;
-    let observation = observe(&local(source.path()).await?, "in.bin").await?;
+    let observation = observe(&local(source.path()).await?, "out.bin").await?;
     let session = ExpertDestinationSession::prepare(ExpertDestinationRequest::new(
         observation,
         256 * 1024,
@@ -210,19 +217,12 @@ async fn a_concurrent_transfer_of_the_same_pair_is_refused() -> TestResult {
 }
 
 #[tokio::test]
-async fn default_and_explicit_paths_share_identity_while_remapping_changes_it() -> TestResult {
+async fn relative_paths_determine_identity_and_identity_overrides_still_win() -> TestResult {
     let (source, destination) = roots()?;
-    let default = TransferRequest::new(
-        local(source.path()).await?,
-        StoragePath::new("in.bin")?,
-        local(destination.path()).await?,
-        CancellationToken::new(),
-    );
-    let explicit = default.clone().with_final_path(StoragePath::new("in.bin")?);
-    assert_eq!(default.final_path(), default.source_path());
-    assert_eq!(default.identity(), explicit.identity());
+    let request = request(source.path(), destination.path(), "in.bin").await?;
+    assert_eq!(request.final_path(), request.source_path());
     assert_eq!(
-        default.identity(),
+        request.identity(),
         TransferIdentity::derive(
             local(source.path()).await?.identity(),
             &StoragePath::new("in.bin")?,
@@ -231,31 +231,13 @@ async fn default_and_explicit_paths_share_identity_while_remapping_changes_it() 
             &StoragePath::new("in.bin")?,
         )
     );
-
-    let remapped = default
-        .clone()
-        .with_final_path(StoragePath::new("renamed.bin")?);
-    assert_ne!(default.identity(), remapped.identity());
-    assert_eq!(remapped.source_path(), &StoragePath::new("in.bin")?);
-    let expected = remapped.identity();
-    assert_eq!(transfer(remapped).await?.identity, expected);
+    let expected = request.identity();
+    assert_eq!(transfer(request.clone()).await?.identity, expected);
     assert_eq!(
-        std::fs::read(destination.path().join("renamed.bin"))?,
+        std::fs::read(destination.path().join("in.bin"))?,
         b"payload"
     );
-    assert!(!destination.path().join("in.bin").exists());
-
     let label = TransferIdentity::from_label("explicit-root-copy")?;
-    for request in [
-        default
-            .clone()
-            .with_identity_override(label)
-            .with_final_path(StoragePath::new("other.bin")?),
-        default
-            .with_final_path(StoragePath::new("other.bin")?)
-            .with_identity_override(label),
-    ] {
-        assert_eq!(request.identity(), label);
-    }
+    assert_eq!(request.with_identity_override(label).identity(), label);
     Ok(())
 }

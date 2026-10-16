@@ -239,9 +239,13 @@ async fn refuse_upload(
     scratch: &Path,
     refused: &str,
 ) -> Result {
-    std::fs::write(scratch.join("upload.bin"), b"must not arrive")?;
     let target = format!("{refused}.bin");
-    let error = match copy(local, "upload.bin", storage, &target).await {
+    let local_path = scratch.join(&target);
+    if let Some(parent) = local_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(local_path, b"must not arrive")?;
+    let error = match copy(local, &target, storage, &target).await {
         Ok(outcome) => return Err(format!("upload was accepted: {outcome:?}").into()),
         Err(error) => error,
     };
@@ -271,6 +275,7 @@ async fn copy(
     destination: &Storage,
     to: &str,
 ) -> Result<TransferOutcome> {
+    assert_eq!(from, to, "migration preserves relative paths");
     Ok(transfer(
         TransferRequest::new(
             source.clone(),
@@ -278,7 +283,6 @@ async fn copy(
             destination.clone(),
             CancellationToken::new(),
         )
-        .with_final_path(StoragePath::new(to)?)
         .with_identity_override(TransferIdentity::from_label(format!("ro-{from}-{to}"))?)
         .with_read_back_verification(ReadBackVerification::Enabled),
     )

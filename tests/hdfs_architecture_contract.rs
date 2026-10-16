@@ -133,7 +133,7 @@ async fn architecture_roles_traverse_stream_verify_and_overwrite() -> TestResult
     create_file(
         &destination_client,
         &destination_root,
-        "published/final.bin",
+        "nested/source.bin",
         Bytes::from_static(b"old"),
     )
     .await?;
@@ -144,19 +144,13 @@ async fn architecture_roles_traverse_stream_verify_and_overwrite() -> TestResult
             destination.clone(),
             CancellationToken::new(),
         )
-        .with_final_path(StoragePath::new("published/final.bin")?)
         .with_identity_override(TransferIdentity::from_label("hdfs-architecture-contract")?),
     )
     .await?;
     assert_eq!(outcome.blake3, Some(*blake3::hash(&payload).as_bytes()));
     assert!(observes_nested_source(&source).await?);
     assert_eq!(
-        read_file(
-            &destination_client,
-            &destination_root,
-            "published/final.bin"
-        )
-        .await?,
+        read_file(&destination_client, &destination_root, "nested/source.bin").await?,
         payload
     );
     cleanup(&source).await?;
@@ -178,19 +172,16 @@ async fn native_writer_crosses_block_boundary_through_bounded_transfer() -> Test
     let (destination_client, destination_root) = raw_client(&destination_location)?;
     let payload = Bytes::from(vec![0x3c; 3 * 1024 * 1024 + 257]);
     create_file(&source_client, &source_root, "source.bin", payload.clone()).await?;
-    let outcome = transfer(
-        TransferRequest::new(
-            source.clone(),
-            StoragePath::new("source.bin")?,
-            destination.clone(),
-            CancellationToken::new(),
-        )
-        .with_final_path(StoragePath::new("reordered.bin")?),
-    )
+    let outcome = transfer(TransferRequest::new(
+        source.clone(),
+        StoragePath::new("source.bin")?,
+        destination.clone(),
+        CancellationToken::new(),
+    ))
     .await?;
     assert_eq!(outcome.blake3, Some(*blake3::hash(&payload).as_bytes()));
     assert_eq!(
-        read_file(&destination_client, &destination_root, "reordered.bin").await?,
+        read_file(&destination_client, &destination_root, "source.bin").await?,
         payload
     );
     cleanup(&source).await?;

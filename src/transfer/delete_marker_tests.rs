@@ -57,14 +57,13 @@ async fn a_delete_marker_holds_the_destination_guard() -> TestResult {
         .objects
         .lock()
         .await
-        .insert("src".into(), Bytes::from_static(b"payload"));
+        .insert("dst/k".into(), Bytes::from_static(b"payload"));
     let request = TransferRequest::new(
         bucket(&protocol)?,
-        StoragePath::new("src")?,
+        StoragePath::new("dst/k")?,
         bucket(&protocol)?,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new("dst/k")?)
     .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
     let transferred = run_until_transferred(request).await?;
     let Err(busy) = marker(&bucket(&protocol)?, "dst/k").await else {

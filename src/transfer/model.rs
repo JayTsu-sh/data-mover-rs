@@ -66,7 +66,6 @@ pub struct TransferRequest {
     input: SourceInput,
     pub(crate) source: Storage,
     pub(crate) destination: Storage,
-    final_path_override: Option<StoragePath>,
     pub(crate) cancel: CancellationToken,
     pub(crate) transfer_policy: TransferPolicy,
     pub(crate) source_qos: Option<SourceQosGroup>,
@@ -94,7 +93,8 @@ enum SourceInput {
 ///
 /// Only the optional features appear here. Ownership, mode and mtime are carried by every copy
 /// and cannot be turned off — **what is absent from this type is what is mandatory**. xattrs are
-/// one feature, never selected attribute by attribute.
+/// one feature, never selected attribute by attribute. Object tags are a separate optional
+/// family, distinct from extended attributes and S3 user-defined metadata.
 ///
 /// Asking for a feature is not a guarantee it is carried: whether it *can* be is decided inside
 /// data-mover, by the source's ability to read it and the destination's ability to store it,
@@ -111,6 +111,7 @@ enum SourceInput {
 pub struct CopiedMetadataRequest {
     acl: bool,
     xattrs: bool,
+    tags: bool,
 }
 
 impl CopiedMetadataRequest {
@@ -128,6 +129,19 @@ impl CopiedMetadataRequest {
         self
     }
 
+    /// Asks for object tags.
+    #[must_use]
+    pub const fn with_tags(mut self) -> Self {
+        self.tags = true;
+        self
+    }
+
+    /// Whether object tags are requested.
+    #[must_use]
+    pub const fn tags(self) -> bool {
+        self.tags
+    }
+
     #[must_use]
     pub const fn acl(self) -> bool {
         self.acl
@@ -141,14 +155,13 @@ impl CopiedMetadataRequest {
     /// Whether no optional feature is asked for, which is the default.
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        !self.acl && !self.xattrs
+        !self.acl && !self.xattrs && !self.tags
     }
 }
 
 impl TransferRequest {
     /// Creates one transfer attempt preserving the source path relative to each storage's root.
-    /// Each backend applies its own configured root/prefix. Use [`Self::with_final_path`] only
-    /// when the destination needs a different relative path.
+    /// Each backend applies its own configured root/prefix.
     ///
     /// Its [`TransferIdentity`] is derived from the two endpoints and paths, so any process
     /// building the same request — with no state of its own — names the same transfer.
@@ -161,7 +174,6 @@ impl TransferRequest {
     ) -> Self {
         Self {
             identity_override: None,
-            final_path_override: None,
             input: SourceInput::Path {
                 path: source_path,
                 version: SourceVersion::Current,
@@ -178,8 +190,7 @@ impl TransferRequest {
     }
 
     /// Copies the file advertised by an observation to the same relative path at the destination,
-    /// revalidating it before destination writes. Each backend applies its own root/prefix;
-    /// [`Self::with_final_path`] optionally overrides the destination-relative path.
+    /// revalidating it before destination writes. Each backend applies its own root/prefix.
     /// A history selects the observed current object's version, even if a newer version is
     /// written later. Without a history, the current object must still match the observation.
     /// This copies one object, not every version of a history. Validation checks the backend's
@@ -251,22 +262,11 @@ impl TransferRequest {
         }
     }
 
-    /// The destination-relative path, defaulting to the source-relative path. The destination
+    /// The destination-relative path, always equal to the source-relative path. The destination
     /// backend applies its own configured root/prefix when accessing this path.
     #[must_use]
     pub fn final_path(&self) -> &StoragePath {
-        self.final_path_override
-            .as_ref()
-            .unwrap_or_else(|| self.source_path())
-    }
-
-    /// Overrides the destination-relative path for renaming or directory mapping. Ordinary
-    /// root-to-root copies need no override. The effective path participates in transfer identity
-    /// derivation; a caller-supplied identity override remains unchanged.
-    #[must_use]
-    pub fn with_final_path(mut self, path: StoragePath) -> Self {
-        self.final_path_override = Some(path);
-        self
+        self.source_path()
     }
 
     /// The source version this request copies.

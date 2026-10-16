@@ -138,6 +138,7 @@ impl StagedDestination for HdfsStagedDestination {
             // The metadata role reports both families unavailable on observation too.
             acl: CopiedAclTarget::Unsupported,
             xattrs: CopiedValueTarget::Unsupported,
+            tags: CopiedValueTarget::Unsupported,
         })
     }
 

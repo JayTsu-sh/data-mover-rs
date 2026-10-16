@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, StoragePath, Transience};
 use crate::storage::PrepareFact;
-use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context};
+use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context, source_storage};
 use crate::storage::backends::s3::{S3NativeContext, S3Protocol as _, S3ProtocolFailure, connect};
 use crate::transfer::{
     EffectiveRecovery, PayloadShapingPolicy, ReadBackVerification, SourceQosGroup, SourceQosPolicy,
@@ -20,11 +20,10 @@ fn request(
 ) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
         source,
-        StoragePath::new("source")?,
+        StoragePath::new("final")?,
         destination,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new("final")?)
     .with_identity_override(TransferIdentity::from_label("native-s3")?))
 }
 
@@ -36,12 +35,8 @@ async fn same_connected_pair_uses_native_stage_and_reports_unshaped_payload() ->
         .objects
         .lock()
         .await
-        .insert("source".into(), payload.clone());
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
+        .insert("src/final".into(), payload.clone());
+    let source = source_storage(&protocol, "src")?;
     let destination = connect(
         protocol.clone(),
         endpoint_of(&protocol),
@@ -73,12 +68,8 @@ async fn disabled_read_back_native_copy_skips_client_source_hashing() -> TestRes
         .objects
         .lock()
         .await
-        .insert("source".into(), payload.clone());
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
+        .insert("src/final".into(), payload.clone());
+    let source = source_storage(&protocol, "src")?;
     let destination = connect(
         protocol.clone(),
         endpoint_of(&protocol),
@@ -112,13 +103,9 @@ async fn disabled_read_back_reconciles_a_committed_native_publication() -> TestR
         .objects
         .lock()
         .await
-        .insert("source".into(), payload.clone());
+        .insert("src/final".into(), payload.clone());
     *protocol.copy_commits_then_fails.lock().await = true;
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
+    let source = source_storage(&protocol, "src")?;
     let destination = connect(
         protocol.clone(),
         endpoint_of(&protocol),
@@ -148,12 +135,8 @@ async fn native_copy_never_enables_streaming_recovery() -> TestResult {
         .objects
         .lock()
         .await
-        .insert("source".into(), payload.clone());
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
+        .insert("src/final".into(), payload.clone());
+    let source = source_storage(&protocol, "src")?;
     let destination = connect(
         protocol.clone(),
         endpoint_of(&protocol),
@@ -179,12 +162,8 @@ async fn strict_shaping_falls_back_before_native_mutation() -> TestResult {
         .objects
         .lock()
         .await
-        .insert("source".into(), Bytes::from_static(b"stream me"));
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
+        .insert("src/final".into(), Bytes::from_static(b"stream me"));
+    let source = source_storage(&protocol, "src")?;
     let destination = connect(
         protocol.clone(),
         endpoint_of(&protocol),
@@ -212,12 +191,8 @@ async fn different_endpoint_affinity_falls_back_to_streaming() -> TestResult {
         .objects
         .lock()
         .await
-        .insert("source".into(), Bytes::from_static(b"fallback"));
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
+        .insert("src/final".into(), Bytes::from_static(b"fallback"));
+    let source = source_storage(&protocol, "src")?;
     let other = Some(S3NativeContext::new(
         "memory://other",
         "standard",
@@ -243,7 +218,7 @@ async fn failed_small_native_copy(
         .objects
         .lock()
         .await
-        .insert("source".into(), Bytes::from_static(b"failure"));
+        .insert("src/final".into(), Bytes::from_static(b"failure"));
     *protocol.native_failure.lock().await = Some(failure);
     let storage = || {
         connect(
@@ -253,7 +228,10 @@ async fn failed_small_native_copy(
         )
     };
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 2, None)?);
-    let Err(error) = transfer(request(storage()?, storage()?)?.with_source_qos(qos)).await else {
+    let Err(error) =
+        transfer(request(source_storage(&protocol, "src")?, storage()?)?.with_source_qos(qos))
+            .await
+    else {
         return Err("native failure unexpectedly succeeded".into());
     };
     // The copy was counted when the stage was filled; publication sent it.
@@ -307,12 +285,8 @@ async fn cancellation_before_planning_performs_no_native_or_final_mutation() -> 
         .objects
         .lock()
         .await
-        .insert("source".into(), Bytes::from_static(b"cancel"));
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
+        .insert("src/final".into(), Bytes::from_static(b"cancel"));
+    let source = source_storage(&protocol, "src")?;
     let destination = connect(
         protocol.clone(),
         endpoint_of(&protocol),
@@ -323,11 +297,10 @@ async fn cancellation_before_planning_performs_no_native_or_final_mutation() -> 
     let mut request = request(source, destination)?;
     request = TransferRequest::new(
         request.source,
-        StoragePath::new("source")?,
+        StoragePath::new("final")?,
         request.destination,
         cancel,
     )
-    .with_final_path(StoragePath::new("final")?)
     .with_identity_override(TransferIdentity::from_label("cancel-native")?);
 
     assert!(transfer(request).await.is_err());
@@ -350,12 +323,8 @@ async fn native_binding_accepts_a_null_or_empty_version_id() -> TestResult {
             .objects
             .lock()
             .await
-            .insert("source".into(), payload.clone());
-        let source = connect(
-            protocol.clone(),
-            endpoint_of(&protocol),
-            Some(native_context()),
-        )?;
+            .insert("src/final".into(), payload.clone());
+        let source = source_storage(&protocol, "src")?;
         let destination = connect(
             protocol.clone(),
             endpoint_of(&protocol),
@@ -383,12 +352,8 @@ async fn a_native_copy_up_to_64_mib_is_one_copy_to_the_final_key() -> TestResult
         .objects
         .lock()
         .await
-        .insert("source".into(), payload.clone());
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
+        .insert("src/final".into(), payload.clone());
+    let source = source_storage(&protocol, "src")?;
     let destination = connect(
         protocol.clone(),
         endpoint_of(&protocol),
@@ -397,11 +362,10 @@ async fn a_native_copy_up_to_64_mib_is_one_copy_to_the_final_key() -> TestResult
     for policy in [TransferPolicy::Checkpointed, TransferPolicy::AtomicReplace] {
         let request = TransferRequest::new(
             source.clone(),
-            StoragePath::new("source")?,
+            StoragePath::new("final")?,
             destination.clone(),
             CancellationToken::new(),
         )
-        .with_final_path(StoragePath::new("final")?)
         .with_transfer_policy(policy);
         let outcome = transfer(request).await?;
         assert_eq!(outcome.route, TransferRoute::Native, "{policy:?}");

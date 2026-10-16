@@ -194,7 +194,7 @@ mod tests {
             Some(7),
             source_identity,
         );
-        let final_destination = FinalDestination::new(StoragePath::new("final")?);
+        let final_destination = FinalDestination::new(StoragePath::new("source")?);
         let stage = destination_role
             .prepare_at_destination(DestinationPrepareRequest::new(
                 PrepareRequest {
@@ -212,7 +212,6 @@ mod tests {
             destination_storage,
             cancel,
         )
-        .with_final_path(final_destination.path().clone())
         .with_identity_override(TransferIdentity::from_label("single-cancel")?);
         let source: Arc<dyn ReadSource> = Arc::new(CancelsAtEof {
             descriptor: descriptor.clone(),

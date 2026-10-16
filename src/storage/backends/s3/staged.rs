@@ -218,16 +218,19 @@ fn cleanup_result(
 
 #[async_trait]
 impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
-    /// An object stores none of a file's metadata: its time is when it was written, and owner,
-    /// mode, ACL and extended attributes have nowhere to go. Declared rather than left undeclared,
-    /// so a copy reports each family as skipped because of the destination instead of silently
-    /// carrying nothing.
+    /// Objects store tags when the bucket supports them. File timestamps, owner, mode, ACL and
+    /// extended attributes are unavailable and reported as skipped.
     fn copied_metadata_target(&self) -> Option<crate::storage::CopiedMetadataTarget> {
         Some(crate::storage::CopiedMetadataTarget {
             timestamps: crate::storage::CopiedTimestampTarget::NotStored,
             ownership: crate::storage::CopiedOwnershipTarget::Unsupported,
             acl: crate::storage::CopiedAclTarget::Unsupported,
             xattrs: crate::storage::CopiedValueTarget::Unsupported,
+            tags: if self.tags_supported {
+                crate::storage::CopiedValueTarget::Supported
+            } else {
+                crate::storage::CopiedValueTarget::Unsupported
+            },
         })
     }
 

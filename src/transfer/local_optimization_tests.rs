@@ -8,7 +8,7 @@ async fn optional_read_back_skips_verification_and_reports_no_digest()
     let source_root = TestRoot::new("optional-verify-source")?;
     let destination_root = TestRoot::new("optional-verify-destination")?;
     let payload = vec![0x31; 4096];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "optional-verify")?;
     // This probe corrupts and fails only if destination verification is actually called.
@@ -37,7 +37,7 @@ async fn automatic_small_multichunk_uses_inflight_without_checkpoints()
     let source_root = TestRoot::new("auto-inflight-source")?;
     let destination_root = TestRoot::new("auto-inflight-destination")?;
     let payload = vec![0x47; 4 * 1024 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (source, source_role) = test_source_storage(source_root.path(), "auto-inflight-source")?;
     source_role.delay_reads(Duration::from_millis(1));
     let (destination, role) =
@@ -71,10 +71,7 @@ async fn automatic_first_checkpoint_is_deferred_until_data_is_written()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("auto-deferred-source")?;
     let destination_root = TestRoot::new("auto-deferred-destination")?;
-    std::fs::write(
-        source_root.path().join("source.bin"),
-        vec![0x51; 512 * 1024],
-    )?;
+    std::fs::write(source_root.path().join("final.bin"), vec![0x51; 512 * 1024])?;
     let (source, source_role) = test_source_storage(source_root.path(), "auto-deferred-source")?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "auto-deferred-destination")?;
@@ -114,7 +111,7 @@ async fn assert_automatic_resume(
     let source_root = TestRoot::new("auto-resume-source")?;
     let destination_root = TestRoot::new("auto-resume-destination")?;
     let payload = vec![0x61; 512 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     std::fs::write(destination_root.path().join("final.bin"), b"original")?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "auto-resume-destination")?;
@@ -163,7 +160,7 @@ async fn a_losing_concurrent_transfer_does_not_touch_the_winners_stage()
     let source_root = TestRoot::new("auto-competing-source")?;
     let destination_root = TestRoot::new("auto-competing-destination")?;
     let payload = vec![0x71; 512 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(source_root.path().join("final.bin"), &payload)?;
     std::fs::write(destination_root.path().join("final.bin"), b"old")?;
     let (source_a, role_a) = test_source_storage(source_root.path(), "auto-competing-source")?;
     let (source_b, _) = test_source_storage(source_root.path(), "auto-competing-source")?;
@@ -222,7 +219,7 @@ async fn deferred_recovery_requires_more_than_one_interval()
             let source_root = TestRoot::new("threshold-source")?;
             let destination_root = TestRoot::new("threshold-destination")?;
             let payload = vec![0x81; size];
-            std::fs::write(source_root.path().join("source.bin"), &payload)?;
+            std::fs::write(source_root.path().join("final.bin"), &payload)?;
             let (destination, role) = test_destination_storage_with_role(
                 destination_root.path(),
                 "threshold-destination",
@@ -273,7 +270,7 @@ async fn deferred_recovery_skips_checkpoint_at_end_of_file()
             let source_root = TestRoot::new("eof-checkpoint-source")?;
             let destination_root = TestRoot::new("eof-checkpoint-destination")?;
             let payload = vec![0x82; size];
-            std::fs::write(source_root.path().join("source.bin"), &payload)?;
+            std::fs::write(source_root.path().join("final.bin"), &payload)?;
             let (destination, role) =
                 test_destination_storage_with_role(destination_root.path(), "eof-checkpoint")?;
             role.set_automatic_checkpoint_interval(interval);
@@ -302,7 +299,7 @@ async fn automatic_empty_file_skips_checkpoints_but_is_published()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("checkpointed-empty-source")?;
     let destination_root = TestRoot::new("checkpointed-empty-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), [])?;
+    std::fs::write(source_root.path().join("final.bin"), [])?;
     let destination = test_destination_storage(destination_root.path(), "checkpointed-empty")?;
     let outcome = transfer(
         transfer_request(
@@ -334,7 +331,7 @@ async fn atomic_replace_skips_final_syncs_while_checkpointed_retains_them()
             let source_root = TestRoot::new("policy-sync-source")?;
             let destination_root = TestRoot::new("policy-sync-destination")?;
             let payload = vec![0x53; size];
-            std::fs::write(source_root.path().join("source.bin"), &payload)?;
+            std::fs::write(source_root.path().join("final.bin"), &payload)?;
             let (destination, role) =
                 test_destination_storage_with_role(destination_root.path(), "policy-sync")?;
             if policy == TransferPolicy::AtomicReplace {
@@ -387,7 +384,7 @@ async fn checkpointed_and_atomic_replace_preserve_storage_enum_file_metadata()
     for policy in [TransferPolicy::Checkpointed, TransferPolicy::AtomicReplace] {
         let source_root = TestRoot::new("metadata-source")?;
         let destination_root = TestRoot::new("metadata-destination")?;
-        let source_path = source_root.path().join("source.bin");
+        let source_path = source_root.path().join("final.bin");
         std::fs::write(&source_path, vec![0x6d; 4096])?;
         std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(SOURCE_MODE))?;
         filetime::set_file_times(
@@ -484,7 +481,7 @@ async fn direct_preserves_inode_and_metadata_without_stage_or_sync()
         ] {
             let source_root = TestRoot::new("direct-source")?;
             let destination_root = TestRoot::new("direct-target")?;
-            let source_path = source_root.path().join("source.bin");
+            let source_path = source_root.path().join("final.bin");
             let target_path = destination_root.path().join("final.bin");
             let payload = vec![0x3a; size];
             std::fs::write(&source_path, &payload)?;
@@ -553,19 +550,23 @@ async fn direct_preserves_inode_and_metadata_without_stage_or_sync()
 async fn direct_rejects_source_aliases_and_destination_symlinks_before_truncation()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = TestRoot::new("direct-alias")?;
-    let source_path = root.path().join("source.bin");
-    let target_path = root.path().join("final.bin");
+    let source_root = root.path().join("source");
+    let target_root = root.path().join("target");
+    std::fs::create_dir_all(&source_root)?;
+    std::fs::create_dir_all(&target_root)?;
+    let source_path = source_root.join("final.bin");
+    let target_path = target_root.join("final.bin");
     std::fs::write(&source_path, b"keep source intact")?;
     for symlink in [false, true] {
         if symlink {
-            std::os::unix::fs::symlink("source.bin", &target_path)?;
+            std::os::unix::fs::symlink(&source_path, &target_path)?;
         } else {
             std::fs::hard_link(&source_path, &target_path)?;
         }
         let error = transfer(
             transfer_request(
-                local_source(root.path())?,
-                test_destination_storage(root.path(), "direct-alias-target")?,
+                local_source(&source_root)?,
+                test_destination_storage(&target_root, "direct-alias-target")?,
                 tokio_util::sync::CancellationToken::new(),
             )?
             .with_transfer_policy(TransferPolicy::Direct),
@@ -586,7 +587,7 @@ async fn direct_verification_failure_retains_visible_target_without_cleanup_auth
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("direct-verify-source")?;
     let target_root = TestRoot::new("direct-verify-target")?;
-    std::fs::write(source_root.path().join("source.bin"), vec![0x31; 4096])?;
+    std::fs::write(source_root.path().join("final.bin"), vec![0x31; 4096])?;
     let (destination, writer) =
         test_destination_storage_with_role(target_root.path(), "direct-verify")?;
     writer.corrupt_before_verify();
@@ -618,7 +619,7 @@ async fn direct_cancellation_returns_after_writes_settle_and_retains_target()
     let source_root = TestRoot::new("direct-cancel-source")?;
     let target_root = TestRoot::new("direct-cancel-target")?;
     std::fs::write(
-        source_root.path().join("source.bin"),
+        source_root.path().join("final.bin"),
         vec![0x55; 4 * 1024 * 1024],
     )?;
     let (source, reader) = test_source_storage(source_root.path(), "direct-cancel")?;
@@ -653,12 +654,12 @@ async fn a_failed_metadata_barrier_is_not_absorbed_by_a_best_effort_family()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("metadata-barrier-source")?;
     let destination_root = TestRoot::new("metadata-barrier-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"metadata payload")?;
+    std::fs::write(source_root.path().join("final.bin"), b"metadata payload")?;
     let source = local_source(source_root.path())?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "metadata-barrier")?;
     role.fail_metadata_sync();
-    let observation = expert_observation(&source, "source.bin").await?;
+    let observation = expert_observation(&source, "final.bin").await?;
     let observations = MetadataObservations::new(
         MetadataObservation::NotRequested,
         observed(vec![ExtendedAttribute::new(
@@ -783,7 +784,7 @@ async fn a_refused_family_fails_the_item_after_the_rest_is_applied()
     for fail_barrier in [false, true] {
         let source_root = TestRoot::new("metadata-refusal-source")?;
         let destination_root = TestRoot::new("metadata-refusal-destination")?;
-        let source_path = source_root.path().join("source.bin");
+        let source_path = source_root.path().join("final.bin");
         std::fs::write(&source_path, b"metadata payload")?;
         let source = local_source(source_root.path())?;
         let (destination, role) =
@@ -791,7 +792,7 @@ async fn a_refused_family_fails_the_item_after_the_rest_is_applied()
         if fail_barrier {
             role.fail_metadata_sync();
         }
-        let observation = expert_observation(&source, "source.bin").await?;
+        let observation = expert_observation(&source, "final.bin").await?;
         let Err(error) = complete_expert_transfer(
             "metadata-refusal",
             source,

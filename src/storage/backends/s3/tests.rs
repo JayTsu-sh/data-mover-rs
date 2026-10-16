@@ -42,6 +42,21 @@ pub(crate) struct RangeGate {
 
 #[derive(Default)]
 pub(crate) struct MemoryS3 {
+    state: Arc<MemoryS3State>,
+    prefix: String,
+}
+
+impl std::ops::Deref for MemoryS3 {
+    type Target = MemoryS3State;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct MemoryS3State {
+    pub(crate) declared_size: Mutex<Option<u64>>,
     pub(crate) read_window: Option<usize>,
     pub(crate) range_gate: Mutex<Option<Arc<RangeGate>>>,
     pub(crate) body_fragments: Mutex<Option<BodyFragments>>,
@@ -51,7 +66,8 @@ pub(crate) struct MemoryS3 {
     pub(crate) objects: Mutex<HashMap<String, Bytes>>,
     pub(super) uploads: Mutex<UploadParts>,
     tags: Mutex<HashMap<String, Vec<ObjectTag>>>,
-    tag_reads: Mutex<u32>,
+    pub(crate) tag_reads: Mutex<u32>,
+    pub(crate) tag_write_failure: Mutex<Option<S3ProtocolFailure>>,
     /// `AbortMultipartUpload` requests that got past `abort_failure`, whether or not the upload
     /// was still there.
     pub(crate) aborts: Mutex<u32>,
@@ -76,6 +92,7 @@ pub(crate) struct MemoryS3 {
     pub(crate) versions: Mutex<HashMap<(String, String), Option<Bytes>>>,
     /// The version id each tag read asked for.
     pub(crate) tag_versions: Mutex<Vec<Option<String>>>,
+    pub(crate) tagged_versions: Mutex<HashMap<(String, String), Vec<ObjectTag>>>,
     /// A tag read of this version id fails with this failure (every time, until cleared).
     pub(crate) tag_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
     /// Behave like a store that ignores `?versionId=` and answers with the current object.
@@ -141,9 +158,24 @@ pub(crate) struct MemoryS3 {
 impl MemoryS3 {
     pub(crate) fn with_read_window(read_window: usize) -> Self {
         Self {
-            read_window: Some(read_window),
+            state: Arc::new(MemoryS3State {
+                read_window: Some(read_window),
+                ..MemoryS3State::default()
+            }),
             ..Self::default()
         }
+    }
+
+    /// A read-only source root of the same bucket, as a real S3 URL's prefix.
+    pub(crate) fn source_root(self: &Arc<Self>, prefix: &str) -> Arc<Self> {
+        Arc::new(Self {
+            state: self.state.clone(),
+            prefix: format!("{}/", prefix.trim_end_matches('/')),
+        })
+    }
+
+    fn full_key(&self, key: &str) -> String {
+        format!("{}{key}", self.prefix)
     }
 }
 
@@ -368,6 +400,8 @@ impl S3Protocol for MemoryS3 {
         self.capabilities()
     }
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts> {
+        let full_key = self.full_key(key);
+        let key = full_key.as_str();
         self.head_versions.lock().await.push(None);
         self.nas_head_served();
         if let Some((failed_key, failure)) = &*self.head_failure.lock().await
@@ -387,7 +421,11 @@ impl S3Protocol for MemoryS3 {
             )
         })?;
         Ok(S3ObjectFacts {
-            size: bytes.len() as u64,
+            size: self
+                .declared_size
+                .lock()
+                .await
+                .unwrap_or(bytes.len() as u64),
             etag: self.object_etag(key, bytes),
             version_id: self.version.lock().await.clone(),
             last_modified: *self.last_modified.lock().await,
@@ -401,6 +439,9 @@ impl S3Protocol for MemoryS3 {
         if *self.ignores_version_id.lock().await {
             return self.head(key).await;
         }
+        let relative_key = key;
+        let full_key = self.full_key(key);
+        let key = full_key.as_str();
         let stored = self
             .versions
             .lock()
@@ -410,7 +451,7 @@ impl S3Protocol for MemoryS3 {
         let bytes = match stored {
             Some(stored) => stored.ok_or_else(not_found)?,
             None if self.version.lock().await.as_deref() == Some(version_id) => {
-                return self.head(key).await;
+                return self.head(relative_key).await;
             }
             None => return Err(not_found()),
         };
@@ -427,6 +468,8 @@ impl S3Protocol for MemoryS3 {
         range: Range<u64>,
         observed: &S3ObjectFacts,
     ) -> S3Result<Bytes> {
+        let full_key = self.full_key(key);
+        let key = full_key.as_str();
         self.range_observations.lock().await.push(observed.clone());
         let gate = self
             .range_gate
@@ -721,7 +764,23 @@ impl S3Protocol for MemoryS3 {
         self.versions_of(key).await
     }
     async fn list_objects_page(&self, prefix: &str, token: Option<&str>) -> S3Result<S3ObjectPage> {
-        self.list_objects_page_in_memory(prefix, token).await
+        let mut page = self
+            .list_objects_page_in_memory(&self.full_key(prefix), token)
+            .await?;
+        for object in &mut page.objects {
+            object.key = object
+                .key
+                .strip_prefix(&self.prefix)
+                .unwrap_or(&object.key)
+                .to_owned();
+        }
+        for prefix in &mut page.prefixes {
+            *prefix = prefix
+                .strip_prefix(&self.prefix)
+                .unwrap_or(prefix)
+                .to_owned();
+        }
+        Ok(page)
     }
     async fn list_versions_page(
         &self,
@@ -729,9 +788,27 @@ impl S3Protocol for MemoryS3 {
         marker: Option<&S3VersionMarker>,
     ) -> S3Result<S3VersionPage> {
         self.nas_refusal(NasRefused::NotImplemented)?;
-        self.list_versions_page_in_memory(prefix, marker).await
+        let mut page = self
+            .list_versions_page_in_memory(&self.full_key(prefix), marker)
+            .await?;
+        for version in page.versions.iter_mut().chain(&mut page.markers) {
+            version.key = version
+                .key
+                .strip_prefix(&self.prefix)
+                .unwrap_or(&version.key)
+                .to_owned();
+        }
+        for prefix in &mut page.prefixes {
+            *prefix = prefix
+                .strip_prefix(&self.prefix)
+                .unwrap_or(prefix)
+                .to_owned();
+        }
+        Ok(page)
     }
     async fn get_tags(&self, key: &str, version_id: Option<&str>) -> S3Result<Vec<ObjectTag>> {
+        let full_key = self.full_key(key);
+        let key = full_key.as_str();
         *self.tag_reads.lock().await += 1;
         self.tag_versions
             .lock()
@@ -742,9 +819,21 @@ impl S3Protocol for MemoryS3 {
         {
             return Err(failure.clone());
         }
+        if let Some(version) = version_id
+            && let Some(tags) = self
+                .tagged_versions
+                .lock()
+                .await
+                .get(&(key.to_owned(), version.to_owned()))
+        {
+            return Ok(tags.clone());
+        }
         Ok(self.tags.lock().await.get(key).cloned().unwrap_or_default())
     }
     async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()> {
+        if let Some(failure) = self.tag_write_failure.lock().await.clone() {
+            return Err(failure);
+        }
         self.tags
             .lock()
             .await
@@ -785,6 +874,28 @@ pub(crate) fn identity() -> BackendIdentity {
 
 pub(crate) fn native_context() -> S3NativeContext {
     S3NativeContext::new("memory://s3", "standard", "memory".into(), None)
+}
+
+/// Source roles rooted under `prefix`; the destination can keep using the bucket root.
+pub(crate) fn source_storage(
+    protocol: &Arc<MemoryS3>,
+    prefix: &str,
+) -> Result<Storage, Box<dyn std::error::Error>> {
+    let rooted = protocol.source_root(prefix);
+    let identity = BackendIdentity::new(
+        BackendKind::S3,
+        format!("memory-source-{:p}/{prefix}", Arc::as_ptr(protocol)),
+    )?;
+    connect(
+        rooted,
+        identity,
+        Some(S3NativeContext::new(
+            "memory://s3",
+            "standard",
+            "memory".into(),
+            Some(prefix.into()),
+        )),
+    )
 }
 
 #[path = "memory_tests.rs"]

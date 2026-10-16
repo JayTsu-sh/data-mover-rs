@@ -9,7 +9,7 @@ use futures::channel::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, ObservedEntry, StoragePath, Transience};
-use crate::storage::backends::s3::tests::{MemoryS3, identity};
+use crate::storage::backends::s3::tests::{MemoryS3, identity, source_storage};
 use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect_at_destination};
 use crate::storage::{PrepareFact, Storage};
 use crate::transfer::{
@@ -36,23 +36,22 @@ fn checkpointed_every(
 ) -> TestResult<TransferRequest> {
     let storage = || connect_at_destination(protocol.clone(), identity(), interval as u64);
     Ok(TransferRequest::new(
-        storage()?,
-        StoragePath::new("source")?,
+        source_storage(protocol, "src")?,
+        StoragePath::new(final_key)?,
         storage()?,
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new(final_key)?)
     .with_transfer_policy(TransferPolicy::Checkpointed))
 }
 
-async fn seeded(size: usize) -> (Arc<MemoryS3>, Bytes) {
+async fn seeded(size: usize, path: &str) -> (Arc<MemoryS3>, Bytes) {
     let protocol = Arc::new(MemoryS3::default());
     let payload = Bytes::from((0..=252_u8).cycle().take(size).collect::<Vec<_>>());
     protocol
         .objects
         .lock()
         .await
-        .insert("source".into(), payload.clone());
+        .insert(format!("src/{path}"), payload.clone());
     (protocol, payload)
 }
 
@@ -76,7 +75,7 @@ async fn leaves_nothing_behind(protocol: &MemoryS3, final_key: &str) -> TestResu
 #[tokio::test]
 async fn a_checkpointed_object_up_to_the_interval_writes_no_pointer() -> TestResult {
     const FINAL: &str = "dir/small-checkpointed";
-    let (protocol, payload) = seeded(INTERVAL).await;
+    let (protocol, payload) = seeded(INTERVAL, FINAL).await;
     let outcome = transfer(checkpointed(&protocol, FINAL)?).await?;
     assert_eq!(outcome.prepare, PrepareFact::Fresh);
     assert_eq!(
@@ -97,7 +96,7 @@ async fn a_checkpointed_object_up_to_the_interval_writes_no_pointer() -> TestRes
 #[tokio::test]
 async fn a_checkpointed_object_over_the_interval_writes_one_pointer() -> TestResult {
     const FINAL: &str = "dir/large-checkpointed";
-    let (protocol, payload) = seeded(INTERVAL + 8 * MIB).await;
+    let (protocol, payload) = seeded(INTERVAL + 8 * MIB, FINAL).await;
     let outcome = transfer(checkpointed(&protocol, FINAL)?).await?;
     assert_eq!(outcome.recovery, EffectiveRecovery::Checkpointed);
     assert!(outcome.blake3.is_some());
@@ -114,7 +113,7 @@ async fn a_checkpointed_object_over_the_interval_writes_one_pointer() -> TestRes
 #[tokio::test]
 async fn a_failed_upload_is_discarded_without_touching_the_final_key() -> TestResult {
     const FINAL: &str = "dir/failed-checkpointed";
-    let (protocol, _) = seeded(20 * MIB).await;
+    let (protocol, _) = seeded(20 * MIB, FINAL).await;
     protocol
         .objects
         .lock()
@@ -157,7 +156,7 @@ fn reset() -> S3ProtocolFailure {
 async fn an_interrupted_transfer_resumes_in_a_fresh_connection() -> TestResult {
     const PART: usize = 8 * MIB;
     for (final_key, lost_pointer_reply) in [("dir/resumed", false), ("dir/resumed-lost", true)] {
-        let (protocol, payload) = seeded(3 * PART).await;
+        let (protocol, payload) = seeded(3 * PART, final_key).await;
         *protocol.part_failure.lock().await = Some((3, reset()));
         *protocol.part_failure_waits.lock().await = true;
         *protocol.put_commits_then_fails.lock().await = lost_pointer_reply;
@@ -196,7 +195,7 @@ async fn an_interrupted_transfer_resumes_in_a_fresh_connection() -> TestResult {
 async fn a_transfer_killed_before_its_first_checkpoint_resumes() -> TestResult {
     const PART: usize = 8 * MIB;
     let final_key = "dir/early";
-    let (protocol, payload) = seeded(4 * PART).await;
+    let (protocol, payload) = seeded(4 * PART, final_key).await;
     *protocol.part_failure.lock().await = Some((3, reset()));
     *protocol.part_failure_waits.lock().await = true;
     let failure = transfer(checkpointed_every(&protocol, final_key, 3 * PART + MIB)?)
@@ -249,7 +248,7 @@ async fn expert_run(
     final_key: &str,
 ) -> TestResult<TransferOutcome> {
     let storage = || connect_at_destination(protocol.clone(), identity(), interval);
-    let source = storage()?;
+    let source = source_storage(protocol, "src")?;
     let observation = observed(&source).await?;
     let source_half = ExpertSourceSession::open(ExpertSourceRequest::new(
         source,
@@ -298,7 +297,7 @@ async fn the_expert_half_writes_a_pointer_only_over_the_interval() -> TestResult
     ];
     for (interval, pointers, recovery) in cases {
         let final_key = format!("dir/expert-{interval}");
-        let (protocol, payload) = seeded(24 * MIB).await;
+        let (protocol, payload) = seeded(24 * MIB, "source").await;
         let outcome = expert_run(&protocol, interval as u64, &final_key).await?;
         assert_eq!(outcome.recovery, recovery, "{interval}");
         assert_eq!(*protocol.puts.lock().await, pointers, "{interval}");

@@ -823,6 +823,7 @@ impl StagedDestination for LocalStagedDestination {
                 ownership: crate::storage::CopiedOwnershipTarget::Numeric,
                 acl: crate::storage::CopiedAclTarget::Encoding(crate::model::AclEncoding::Posix),
                 xattrs: crate::storage::CopiedValueTarget::Supported,
+                tags: crate::storage::CopiedValueTarget::Unsupported,
             })
         }
         #[cfg(windows)]
@@ -836,6 +837,7 @@ impl StagedDestination for LocalStagedDestination {
                     AclEncoding::WindowsSecurityDescriptor,
                 ),
                 xattrs: crate::storage::CopiedValueTarget::Unsupported,
+                tags: crate::storage::CopiedValueTarget::Unsupported,
             })
         }
         #[cfg(not(any(unix, windows)))]

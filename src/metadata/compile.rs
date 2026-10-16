@@ -11,6 +11,47 @@ use crate::model::{
 };
 use crate::storage::MetadataMutation;
 
+/// Compiles automatic copy facts without fabricating numeric owner/group IDs.
+pub(crate) fn compile_copied_metadata_plan(
+    request: &MetadataPlanRequest<'_>,
+    mode_without_ownership: Option<u32>,
+    owner_names_unmapped: bool,
+) -> Result<MetadataPlan, MetadataPlanError> {
+    let mut plan = compile_copied_observations(request, mode_without_ownership.is_some())?;
+    if let Some(mode) = mode_without_ownership
+        .filter(|_| request.policies.get(MetadataFamily::OwnershipMode) != MetadataPolicy::Omit)
+    {
+        let family = MetadataFamily::OwnershipMode;
+        // This alternative observation replaces the absent numeric ownership family.
+        plan.mappings.retain(|value| value.family != family);
+        plan.mutations.retain(|(value, _)| *value != family);
+        plan.losses.0.retain(|(value, _)| *value != family);
+        plan.skipped.retain(|value| value.family != family);
+        let supported = matches!(
+            request.target.ownership_mode,
+            OwnershipTarget::Numeric | OwnershipTarget::ModeOnly | OwnershipTarget::NotPermitted
+        );
+        drop_with_loss(
+            &mut plan,
+            family,
+            request.policies.get(family),
+            match (supported, owner_names_unmapped) {
+                (true, true) => SemanticLoss::OwnerAndGroupUnmapped,
+                (true, false) => SemanticLoss::OwnerAndGroupDropped,
+                (false, _) => SemanticLoss::OwnershipModeDropped,
+            },
+        )?;
+        if supported {
+            // The ownership mutation was just retained away, so every mutation left is one that
+            // has to observe the new mode: the ACL is recomputed by it, and the timestamps have
+            // to be stamped after it. Front of the queue is the only correct place.
+            plan.mutations
+                .insert(0, (family, MetadataMutation::Mode(mode_only(mode))));
+        }
+    }
+    Ok(plan)
+}
+
 /// Compiles all mappings before a target mutation can be issued.
 ///
 /// # Errors
@@ -58,53 +99,40 @@ const fn mode_only(mode: u32) -> u32 {
     without_unowned_set_id(mode & 0o7777, false, false, false)
 }
 
-/// Compiles automatic copy facts without fabricating numeric owner/group IDs.
-pub(crate) fn compile_copied_metadata_plan(
+fn compile_copied_observations(
     request: &MetadataPlanRequest<'_>,
-    mode_without_ownership: Option<u32>,
-    owner_names_unmapped: bool,
+    omit_ownership: bool,
 ) -> Result<MetadataPlan, MetadataPlanError> {
+    // A copy never fetches object tags that its destination cannot store. Keep that known
+    // destination refusal distinct from a source that was simply not observed.
+    let tags_unstored = request.target.tags == ValueTarget::Unsupported
+        && request.policies.get(MetadataFamily::Tags) != MetadataPolicy::Omit;
+    let policies = if tags_unstored {
+        request.policies.with_tags(MetadataPolicy::Omit)
+    } else {
+        request.policies
+    };
     let projected = MetadataPlanRequest {
         observations: request.observations,
         target: request.target,
-        policies: if mode_without_ownership.is_some() {
-            request.policies.with_ownership_mode(MetadataPolicy::Omit)
+        policies: if omit_ownership {
+            policies.with_ownership_mode(MetadataPolicy::Omit)
         } else {
-            request.policies
+            policies
         },
         principal_mapper: request.principal_mapper,
     };
     let mut plan = compile_metadata_plan(&projected)?;
-    if let Some(mode) = mode_without_ownership
-        .filter(|_| request.policies.get(MetadataFamily::OwnershipMode) != MetadataPolicy::Omit)
-    {
-        let family = MetadataFamily::OwnershipMode;
-        // This alternative observation replaces the absent numeric ownership family.
-        plan.mappings.retain(|value| value.family != family);
-        plan.mutations.retain(|(value, _)| *value != family);
-        plan.losses.0.retain(|(value, _)| *value != family);
-        plan.skipped.retain(|value| value.family != family);
-        let supported = matches!(
-            request.target.ownership_mode,
-            OwnershipTarget::Numeric | OwnershipTarget::ModeOnly | OwnershipTarget::NotPermitted
-        );
-        drop_with_loss(
+    if tags_unstored {
+        plan.mappings
+            .retain(|mapping| mapping.family != MetadataFamily::Tags);
+        unavailable(
             &mut plan,
-            family,
-            request.policies.get(family),
-            match (supported, owner_names_unmapped) {
-                (true, true) => SemanticLoss::OwnerAndGroupUnmapped,
-                (true, false) => SemanticLoss::OwnerAndGroupDropped,
-                (false, _) => SemanticLoss::OwnershipModeDropped,
-            },
+            MetadataFamily::Tags,
+            request.policies.get(MetadataFamily::Tags),
+            MappingDecision::Unsupported,
+            RefusalCause::DestinationCannotStore,
         )?;
-        if supported {
-            // The ownership mutation was just retained away, so every mutation left is one that
-            // has to observe the new mode: the ACL is recomputed by it, and the timestamps have
-            // to be stamped after it. Front of the queue is the only correct place.
-            plan.mutations
-                .insert(0, (family, MetadataMutation::Mode(mode_only(mode))));
-        }
     }
     Ok(plan)
 }

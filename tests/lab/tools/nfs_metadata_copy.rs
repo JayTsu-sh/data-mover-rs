@@ -4,7 +4,7 @@
 //! ```text
 //! # NFSv3 cannot read an ACL, so asking for one skips it with the reason and still copies the file
 //! cargo run --example nfs_metadata_copy -- \
-//!     --source 'nfs://10.131.5.221/m1-source:/?uid=0&gid=0&noresvport=true' --source-path d000/f000 \
+//!     --source 'nfs://10.131.5.221/m1-source:/d000?uid=0&gid=0&noresvport=true' --source-path f000 \
 //!     --destination /tmp/dm-meta --destination-path f000 \
 //!     --acl --expect copied --expect-acl unsupported
 //! ```
@@ -209,13 +209,17 @@ fn request(
     destination: &Storage,
     destination_path: &str,
 ) -> Result<TransferRequest> {
+    if source_path != destination_path {
+        return Err(
+            "migration requires equal relative paths; configure endpoint roots instead".into(),
+        );
+    }
     Ok(TransferRequest::new(
         source.clone(),
         StoragePath::new(source_path)?,
         destination.clone(),
         CancellationToken::new(),
     )
-    .with_final_path(StoragePath::new(destination_path)?)
     .with_identity_override(TransferIdentity::from_label(format!(
         "metadata-copy-{}",
         process::id()
@@ -405,6 +409,11 @@ async fn copied(args: &Args, outcome: TransferOutcome) -> Result {
 #[tokio::main]
 async fn main() -> Result {
     let args = Args::parse();
+    if args.source_path != args.destination_path {
+        return Err(
+            "migration requires equal relative paths; configure endpoint roots instead".into(),
+        );
+    }
     if args.expect == Expect::Refused
         && (args.verify_acl || args.expect_acl.is_some() || args.expect_xattrs.is_some())
     {

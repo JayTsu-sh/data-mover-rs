@@ -403,7 +403,7 @@ mod plan_tests {
         let identity =
             SourceIdentity::new(backend, IdentityStrength::StableWithinBackend, b"entry")?;
         Ok(SourceDescriptor::new(
-            StoragePath::new("source.bin")?,
+            StoragePath::new("final.bin")?,
             EntryKind::File,
             Some(size),
             identity,
@@ -454,18 +454,17 @@ mod plan_tests {
         std::fs::create_dir(&source_root)?;
         std::fs::create_dir(&destination_root)?;
         let payload = vec![0x6a; 2 * 64 * 1024 + 1];
-        std::fs::write(source_root.join("source.bin"), &payload)?;
+        std::fs::write(source_root.join("final.bin"), &payload)?;
         let (source, _) = test_source_storage(&source_root, "publishing-source")?;
         let (destination, role) =
             test_destination_storage_with_role(&destination_root, "publishing-destination")?;
         role.set_automatic_checkpoint_interval(64 * 1024);
         let request = TransferRequest::new(
             source,
-            StoragePath::new("source.bin")?,
+            StoragePath::new("final.bin")?,
             destination,
             tokio_util::sync::CancellationToken::new(),
         )
-        .with_final_path(StoragePath::new("final.bin")?)
         .with_transfer_policy(TransferPolicy::Checkpointed);
 
         let transferred = run_until_transferred(request.clone()).await?;
