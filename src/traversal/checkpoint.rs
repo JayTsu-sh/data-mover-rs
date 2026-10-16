@@ -79,7 +79,7 @@ pub enum Resumable {
 
 impl Resumable {
     /// The interval P7 decided on (Q14).
-    pub const DEFAULT_EVERY: Duration = Duration::from_secs(60);
+    pub const DEFAULT_EVERY: Duration = Duration::from_mins(1);
 
     /// Checkpoints every [`Self::DEFAULT_EVERY`].
     #[must_use]

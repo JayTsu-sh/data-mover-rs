@@ -386,9 +386,9 @@ async fn cancelling_during_a_backoff_ends_the_listing_at_once() -> TestResult {
     // Backoff that would outlast the test's patience many times over.
     let namespace = S3Namespace::new(protocol.clone(), identity()).with_limits(ListingLimits {
         throttle: ThrottleBackoff {
-            first: Duration::from_secs(60),
-            max_delay: Duration::from_secs(60),
-            budget: Duration::from_secs(3600),
+            first: Duration::from_mins(1),
+            max_delay: Duration::from_mins(1),
+            budget: Duration::from_hours(1),
         },
         ..ListingLimits::PRODUCTION
     });
