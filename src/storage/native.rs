@@ -66,14 +66,12 @@ pub(crate) trait NativeEndpoint: Send + Sync {
         request: DestinationPrepareRequest,
     ) -> Result<PreparedStage, StorageRoleFailure>;
 
-    /// Copies `source` into `stage`, with at most `operations` copy requests in flight (the
-    /// transfer's `InflightLimits` operation bound).
+    /// Copies `source` into `stage` using the native backend's own bounded request window.
     async fn copy_into_stage(
         &self,
         source: NativeSourceBinding,
         stage: &PreparedStage,
         cancel: CancellationToken,
-        operations: usize,
     ) -> Result<NativeStageEvidence, NativeStageFailure>;
 }
 
@@ -113,10 +111,9 @@ impl NativePair {
         source: NativeSourceBinding,
         stage: &PreparedStage,
         cancel: CancellationToken,
-        operations: usize,
     ) -> Result<NativeStageEvidence, NativeStageFailure> {
         self.destination
-            .copy_into_stage(source, stage, cancel, operations)
+            .copy_into_stage(source, stage, cancel)
             .await
     }
 }

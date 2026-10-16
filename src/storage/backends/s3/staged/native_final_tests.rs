@@ -139,7 +139,7 @@ async fn a_small_native_copy_is_sent_at_publication() -> TestResult {
     let after = destination.verification_point(&stage) == VerificationPoint::AfterPublish;
     assert!(after);
     let filled = destination
-        .fill_native(&stage, source, CancellationToken::new(), 6)
+        .fill_native(&stage, source, CancellationToken::new())
         .await
         .map_err(|failure| format!("{:?}", failure.error))?;
     assert_eq!(
@@ -195,7 +195,7 @@ async fn a_small_native_copy_settles_refusals_and_lost_replies() -> TestResult {
             .prepare_native_stage(request(MIB, ResumeMode::Discover)?)
             .await?;
         destination
-            .fill_native(&stage, bound, CancellationToken::new(), 6)
+            .fill_native(&stage, bound, CancellationToken::new())
             .await
             .map_err(|failure| format!("{:?}", failure.error))?;
         let published = destination.publish(&stage, publication(&bytes)).await;
@@ -230,7 +230,7 @@ async fn a_large_native_copy_fills_and_completes_an_upload_on_the_final_key() ->
         assert!(!stage.recovery_enabled());
         assert_eq!(*protocol.puts.lock().await, pointers, "{resume:?}");
         let filled = destination
-            .fill_native(&stage, source, CancellationToken::new(), 6)
+            .fill_native(&stage, source, CancellationToken::new())
             .await
             .map_err(|failure| format!("{:?}", failure.error))?;
         assert_eq!((filled.native_bytes, filled.native_requests), (size, 5));
@@ -262,7 +262,7 @@ async fn a_native_completion_is_not_held_to_the_part_composite() -> TestResult {
         .prepare_native_stage(request(size, ResumeMode::Discover)?)
         .await?;
     destination
-        .fill_native(&stage, source, CancellationToken::new(), 6)
+        .fill_native(&stage, source, CancellationToken::new())
         .await
         .map_err(|failure| format!("{:?}", failure.error))?;
     *protocol.complete_etag.lock().await = Some("\"00000000000000000000000000000000-3\"".into());
@@ -281,7 +281,7 @@ fn a_streamed_resume_of_larger_parts_keeps_fewer_in_flight() -> TestResult {
     let upload = |size: u64, part: u64| -> TestResult<usize> {
         let pointer = StoragePath::new("dir/.pointer")?;
         let request = request(size, ResumeMode::Discover)?;
-        Ok(FinalUpload::new(&request, "id".into(), part, pointer)?.streamed_inflight())
+        Ok(FinalUpload::new(&request, "id".into(), part, pointer)?.streamed_inflight(4))
     };
     assert_eq!(upload(200 * MIB, 8 * MIB)?, 4);
     assert_eq!(upload(200 * MIB, 5 * MIB)?, 4);

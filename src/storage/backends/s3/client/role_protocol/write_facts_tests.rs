@@ -44,7 +44,7 @@ async fn reported(suspended: bool, version: Option<&'static str>) -> Option<Stri
     storage.versioning_suspended = suspended;
     let body = Bytes::from_static(b"pointer");
     storage
-        .put_object("k.upload", body, "1B2M2Y8AsgTpgAmY7PhCfg==")
+        .put_object("k.upload", body.into(), "1B2M2Y8AsgTpgAmY7PhCfg==")
         .await
         .map_err(|failure| format!("{failure:?}"))
         .and_then(|facts| {

@@ -10,9 +10,9 @@ use uuid::Uuid;
 
 use super::super::S3WriteFacts;
 use super::super::source::classified_entry;
+use super::PART_SIZE;
 use super::parts::UploadedParts;
 use super::upload_pointer::{NONCE_BYTES, UploadRecord};
-use super::{MAX_INFLIGHT_PARTS, PART_SIZE};
 use crate::model::{FailureClass, ObjectTag, Operation, StoragePath, Transience};
 use crate::storage::{DestinationPrepareRequest, PreparedStage, StorageRoleFailure};
 
@@ -139,21 +139,22 @@ impl FinalUpload {
         }
     }
 
-    /// Parts a streamed `write` keeps in flight: [`MAX_INFLIGHT_PARTS`], unless the upload resumed
+    /// Parts a streamed `write` keeps in flight: the backend's configured maximum, unless the upload resumed
     /// at a part size larger than a streamed upload of this source plans (a native copy's 64 MiB,
     /// ADR-0006 C18) — then as many as fit in the bytes those would take, at least one, so a
     /// streamed resume of a native upload buffers two such parts, not five.
-    pub(super) fn streamed_inflight(&self) -> usize {
+    pub(super) fn streamed_inflight(&self, maximum: usize) -> usize {
         let planned = self
             .expected_size
             .unwrap_or(0)
             .div_ceil(10_000)
             .max(PART_SIZE as u64);
-        let budget = planned.saturating_mul(MAX_INFLIGHT_PARTS as u64);
+        let maximum = maximum.max(1);
+        let budget = planned.saturating_mul(maximum as u64);
         let fitting = budget / (self.part_size as u64).max(1);
         usize::try_from(fitting)
-            .unwrap_or(MAX_INFLIGHT_PARTS)
-            .clamp(1, MAX_INFLIGHT_PARTS)
+            .unwrap_or(maximum)
+            .clamp(1, maximum)
     }
 
     pub(super) fn extension(&self) -> Option<Bytes> {

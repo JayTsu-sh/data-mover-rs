@@ -335,7 +335,7 @@ async fn verification_reads_our_version_and_detects_a_later_overwrite() -> TestR
     protocol
         .put_object(
             "final",
-            later.clone(),
+            later.clone().into(),
             &super::super::tests::content_md5(&later),
         )
         .await

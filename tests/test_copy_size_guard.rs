@@ -7,8 +7,7 @@ use std::path::Path;
 
 use data_mover::model::StoragePath;
 use data_mover::transfer::{
-    ExpertSourceRequest, ExpertSourceSession, InflightLimits, TransferPhase, TransferRequest,
-    transfer,
+    ExpertSourceRequest, ExpertSourceSession, TransferPhase, TransferRequest, transfer,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -40,7 +39,6 @@ async fn stale_observation_is_refused(
     let Err(failure) = ExpertSourceSession::open(ExpertSourceRequest::new(
         source,
         observation,
-        InflightLimits::new(2, 128 * 1024, 2)?,
         CancellationToken::new(),
     ))
     .await
@@ -82,7 +80,6 @@ async fn intact_small_and_multi_chunk_transfers_still_match_the_source()
             common::connect_local(source_root.path(), 4).await?,
             path.clone(),
             common::connect_local(destination_root.path(), 4).await?,
-            InflightLimits::new(2, 128 * 1024, 2)?,
             CancellationToken::new(),
         ))
         .await?;

@@ -9,8 +9,8 @@ use data_mover::storage::{
     SourceDescriptor, Storage, VerifyRequest, connect_backend,
 };
 use data_mover::transfer::{
-    InflightLimits, PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferIdentity,
-    TransferRequest, transfer,
+    PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferRequest,
+    transfer,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -99,7 +99,6 @@ fn transfer_request(
         storage.clone(),
         source.clone(),
         storage.clone(),
-        InflightLimits::new(4, PART_SIZE, 4)?,
         CancellationToken::new(),
     )
     .with_final_path(final_path)

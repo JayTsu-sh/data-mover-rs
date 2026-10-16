@@ -26,7 +26,7 @@ async fn bucket(keys: &[&str]) -> TestResult<Arc<MemoryS3>> {
     for key in keys {
         let body = Bytes::from_static(b"x");
         protocol
-            .put_object(key, body.clone(), &content_md5(&body))
+            .put_object(key, body.clone().into(), &content_md5(&body))
             .await
             .map_err(|e| format!("{e:?}"))?;
     }

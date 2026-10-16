@@ -172,7 +172,7 @@ async fn the_same_content_at_two_keys_has_two_identities() -> TestResult {
     for key in ["a", "b", "d/a"] {
         let empty = Bytes::new();
         protocol
-            .put_object(key, empty.clone(), &content_md5(&empty))
+            .put_object(key, empty.clone().into(), &content_md5(&empty))
             .await
             .map_err(|e| format!("{e:?}"))?;
     }
@@ -245,7 +245,7 @@ async fn a_listed_identity_never_matches_another_keys_describe() -> TestResult {
     for key in ["a", "b"] {
         let bytes = Bytes::from_static(b"same");
         protocol
-            .put_object(key, bytes.clone(), &content_md5(&bytes))
+            .put_object(key, bytes.clone().into(), &content_md5(&bytes))
             .await
             .map_err(|e| format!("{e:?}"))?;
     }

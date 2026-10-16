@@ -19,7 +19,7 @@ async fn nas_with(content: &'static [u8]) -> TestResult<Arc<MemoryS3>> {
     let protocol = Arc::new(MemoryS3::nas_bucket());
     let body = Bytes::from_static(content);
     protocol
-        .put_object("source", body.clone(), &content_md5(&body))
+        .put_object("source", body.clone().into(), &content_md5(&body))
         .await
         .map_err(|failure| format!("{failure:?}"))?;
     Ok(protocol)

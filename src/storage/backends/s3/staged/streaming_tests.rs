@@ -50,7 +50,7 @@ async fn nas(
     if let Some(old) = old {
         let body = Bytes::from_static(old);
         protocol
-            .put_object("dir/final", body.clone(), &content_md5(&body))
+            .put_object("dir/final", body.clone().into(), &content_md5(&body))
             .await
             .map_err(|failure| format!("{failure:?}"))?;
     }

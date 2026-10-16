@@ -1,9 +1,7 @@
 //! Transfer failures retain their phase and endpoint attribution through the role API.
 
 use data_mover::model::StoragePath;
-use data_mover::transfer::{
-    InflightLimits, TransferPhase, TransferRequest, TransferSide, transfer,
-};
+use data_mover::transfer::{TransferPhase, TransferRequest, TransferSide, transfer};
 use tokio_util::sync::CancellationToken;
 
 mod common;
@@ -24,7 +22,6 @@ async fn a_source_removed_after_observation_is_attributed_to_describe()
         source,
         path.clone(),
         destination,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     ))
     .await
@@ -56,7 +53,6 @@ async fn an_unwritable_destination_is_attributed_to_destination_prepare()
             source,
             StoragePath::new("file")?,
             destination,
-            InflightLimits::new(2, 64 * 1024, 2)?,
             CancellationToken::new(),
         )
         .with_final_path(StoragePath::new("blocker/child")?),

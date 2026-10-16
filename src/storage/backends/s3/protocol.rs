@@ -309,6 +309,17 @@ pub(crate) struct S3NativeCopyEvidence {
 
 #[async_trait]
 pub(crate) trait S3Protocol: Send + Sync {
+    fn read_concurrency(&self) -> usize {
+        super::DEFAULT_READ_CONCURRENCY
+    }
+
+    fn write_concurrency(&self) -> usize {
+        super::DEFAULT_WRITE_CONCURRENCY
+    }
+
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        8 * 1024 * 1024
+    }
     /// Whether the bucket had versioning enabled when it was connected (`GetBucketVersioning`
     /// answered `Enabled`). A write there whose reply names no version is settled
     /// through the key's versions (ADR-0006 C18: DXN's `CopyObject` sends no `x-amz-version-id`).
@@ -357,7 +368,7 @@ pub(crate) trait S3Protocol: Send + Sync {
     async fn put_object(
         &self,
         key: &str,
-        body: Bytes,
+        body: super::S3Body,
         content_md5_base64: &str,
     ) -> S3Result<S3WriteFacts>;
     /// How long a streamed upload may make no progress — a chunk not taken, a reply not given —
@@ -384,7 +395,7 @@ pub(crate) trait S3Protocol: Send + Sync {
         key: &str,
         upload_id: &str,
         part_number: i32,
-        bytes: Bytes,
+        bytes: super::S3Body,
         content_md5_base64: &str,
     ) -> S3Result<String>;
     /// Completes an upload from `parts` (number, `ETag`), in ascending part order. A part the

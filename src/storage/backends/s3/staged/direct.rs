@@ -19,10 +19,7 @@ use super::super::source::{cancelled, classified_entry, entry, role_failure};
 use super::super::{S3Protocol, S3ProtocolFailure, S3WriteFacts, composite_etag};
 use super::completion::completed_object;
 use super::parts::{PartTarget, UploadedParts};
-use super::{
-    MAX_INFLIGHT_PARTS, S3StagedDestination, cleanup_result, limits, planned_part_size, single,
-    streaming,
-};
+use super::{S3StagedDestination, cleanup_result, limits, planned_part_size, single, streaming};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
     ByteStream, PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
@@ -230,7 +227,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             key: path.as_str(),
             upload_id,
             part_size: upload.part_size,
-            max_inflight: MAX_INFLIGHT_PARTS,
+            max_inflight: self.protocol.write_concurrency().max(1),
             checkpoint: None,
         };
         let sent = self.upload_parts(&target, Vec::new(), input).await?;

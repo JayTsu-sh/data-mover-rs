@@ -137,6 +137,9 @@ impl CifsReadSource {
 
 #[async_trait]
 impl ReadSource for CifsReadSource {
+    fn read_concurrency(&self) -> usize {
+        self.read_inflight
+    }
     fn supports_read_budget(&self) -> bool {
         true
     }

@@ -12,7 +12,7 @@ use crate::storage::PrepareFact;
 use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of};
 use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect};
 use crate::transfer::{
-    EffectiveRecovery, InflightLimits, TransferPolicy, TransferRequest, TransferRoute, transfer,
+    EffectiveRecovery, TransferPolicy, TransferRequest, TransferRoute, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -25,7 +25,6 @@ fn direct_request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
         storage()?,
         StoragePath::new("source")?,
         storage()?,
-        InflightLimits::new(4, 4 * MIB, 4)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("direct-final")?)

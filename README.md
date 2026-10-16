@@ -59,10 +59,11 @@ error instead of being silently ignored.
 
 | Backend | Read default | Write default |
 |---------|--------------|---------------|
-| Local | `4` | `8` |
+| Local (example baseline; typed configuration is explicit) | `4` | `2` |
 | NFS | `4` | `8` |
 | SMB/CIFS | `8` | `8` |
-| S3 | `4` | `5` |
+| S3 | `2` | `4` |
+| HDFS | `4` | `1` |
 
 `DATA_MOVER_INFLIGHT=8`, `16`, or `24` sets both read and write depths.
 `DATA_MOVER_READ_INFLIGHT` and `DATA_MOVER_WRITE_INFLIGHT` override each direction.
@@ -71,7 +72,8 @@ Use `DATA_MOVER_<BACKEND>_READ_INFLIGHT` or
 `<BACKEND>` is `LOCAL`, `NFS`, `CIFS`, or `S3`. Each direction is resolved
 independently: backend-specific direction, global direction, shared
 `DATA_MOVER_INFLIGHT`, then protocol default. Use `TransferConcurrency::from_env`
-to resolve the pair, then apply it to backend configuration and transfer `InflightLimits`.
+to resolve the pair, then apply it to backend configuration. A transfer uses its source's
+read window and its destination's write window independently; callers do not supply inflight limits.
 
 The upper bound is intentional: lab measurements across the complete Local,
 NFSv3, NFSv4.1, and S3 copy matrix showed that increasing inflight from 8 to 16
@@ -82,16 +84,34 @@ configuration never differs silently from what the operator requested.
 
 Role-based callers can resolve the same environment rules with
 `TransferConcurrency::from_env(BackendKind::Nfs, defaults)` and use that pair
-for their backend configuration and `InflightLimits`. Explicitly supplied
-transfer limits are not silently overwritten by environment settings.
+for their backend configuration. Explicit backend concurrency overrides the environment.
 The `nfs_mount_comparison` example does this for both transport paths.
 
-The defaults are the recommended general-purpose settings. For a high-latency
-NFS path with sufficient server session capacity, `read=8` and `write=16` can
-improve throughput. S3 normally reaches its throughput knee around 4 to 8, and
-Local reads normally reach it around 4; raising them to 16 is generally not a
-good CPU/memory tradeoff. The role-based CIFS backend defaults to 8/8 and reads
+These defaults are backend baselines, not universal optima. The decoupled pipeline's DXN and
+StorageGRID 40/128 MiB sweeps support S3 2/4: lower CPU/RSS than 4/4, with higher throughput.
+Local's example baseline is 4/2 after warm-XFS 128 MiB/1 GiB CPU/RSS measurements;
+the factory still requires explicit windows. NFS 4/8 remains a compromise between FAS and
+openfs; other baselines are retained pending broader workload coverage.
+One-sample S3 1 GiB checks favor 4/4 slightly in throughput, so 2/4 is a resource/throughput
+tradeoff, not a claim of higher throughput at every size. Historical symmetric-depth tests do not establish the
+best independent read/write combination. The role-based CIFS backend defaults to 8/8 and reads
 the same `DATA_MOVER_CIFS_*` variables through `TransferConcurrency::from_env`.
+
+The source emits an ordered byte stream into a bounded four-chunk channel. A full destination
+write window stops consuming input, so channel backpressure eventually stops source prefetch.
+Each backend bounds its own buffers, including completed reads waiting for their predecessors
+and payload retained for durability or retries. The channel bounds queued chunks, not total RSS.
+Read and write chunk sizes need not match. S3 aggregates shared `Bytes` fragments into exact
+multipart boundaries and replays those fragments for retries without merging payload buffers.
+Native copies manage their own backend request window and do not use the payload channel.
+
+`TransferRequest::new(source, path, destination, cancel)` and its observation constructor no
+longer take `InflightLimits`; the expert source/destination constructors and `TarRequest` follow
+the same rule. Local backend configuration accepts independent optional `read_chunk_bytes`
+and `write_chunk_bytes`; NFS accepts an optional explicit `transfer_concurrency`. These are
+backend settings shared by transfers, while each transfer retains its own bounded queues.
+Default tuning and its workload limitations are documented in
+[the backend defaults research](docs/research/backend-transfer-defaults.md).
 
 ### QoS semantics
 

@@ -45,6 +45,7 @@ pub(crate) struct LocalReadSource {
     identity: BackendIdentity,
     observer: LocalObservationAdapter,
     read_concurrency: usize,
+    read_chunk_bytes: usize,
     #[cfg(test)]
     probe: Arc<ReadProbe>,
 }
@@ -102,9 +103,15 @@ impl LocalReadSource {
             root,
             identity,
             read_concurrency,
+            read_chunk_bytes: LOCAL_MAX_READ_CHUNK_BYTES,
             #[cfg(test)]
             probe: Arc::new(ReadProbe::default()),
         })
+    }
+
+    pub(crate) fn with_read_chunk_bytes(mut self, bytes: std::num::NonZeroUsize) -> Self {
+        self.read_chunk_bytes = bytes.get().min(LOCAL_MAX_READ_CHUNK_BYTES);
+        self
     }
 
     #[cfg(test)]
@@ -181,11 +188,14 @@ impl LocalReadSource {
 
 #[async_trait]
 impl ReadSource for LocalReadSource {
+    fn read_concurrency(&self) -> usize {
+        self.read_concurrency
+    }
     fn supports_read_budget(&self) -> bool {
         true
     }
     fn maximum_read_chunk_bytes(&self) -> usize {
-        LOCAL_MAX_READ_CHUNK_BYTES
+        self.read_chunk_bytes
     }
 
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
@@ -290,7 +300,7 @@ impl LocalReadSource {
             next_issue: range.start,
             next_emit: range.start,
             end: range.end,
-            maximum_chunk_bytes: request.maximum_chunk_bytes.min(LOCAL_MAX_READ_CHUNK_BYTES),
+            maximum_chunk_bytes: request.maximum_chunk_bytes.min(self.read_chunk_bytes),
             read_concurrency: self.read_concurrency.min(request.read_inflight),
             inflight: if ordered {
                 ReadQueue::Ordered(FuturesOrdered::new())

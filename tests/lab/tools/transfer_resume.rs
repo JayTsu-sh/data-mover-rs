@@ -45,9 +45,8 @@ use data_mover::integrity::{IntegrityMode, IntegrityOptions, IntegrityRequest, c
 use data_mover::model::StoragePath;
 use data_mover::storage::{Storage, StorageRoleFailure, create_directory_all};
 use data_mover::transfer::{
-    InflightLimits, PayloadShapingPolicy, ReadBackVerification, SourceQosGroup, SourceQosPolicy,
-    SourceVersion, TransferFailure, TransferIdentity, TransferOutcome, TransferPolicy,
-    TransferRequest, transfer,
+    PayloadShapingPolicy, ReadBackVerification, SourceQosGroup, SourceQosPolicy, SourceVersion,
+    TransferFailure, TransferIdentity, TransferOutcome, TransferPolicy, TransferRequest, transfer,
 };
 use endpoint_support::{Result, artifacts, connect, remove_run};
 use serde_json::{Value, json};
@@ -183,23 +182,18 @@ fn request(
     cancel: CancellationToken,
 ) -> Result<TransferRequest> {
     let source_path = args.source_path.as_deref().ok_or("--source-path")?;
-    let mut request = TransferRequest::new(
-        source,
-        StoragePath::new(source_path)?,
-        destination,
-        InflightLimits::new(8, 64 << 20, 8)?,
-        cancel,
-    )
-    .with_final_path(StoragePath::new(destination_path)?)
-    .with_transfer_policy(match args.policy {
-        Policy::Checkpointed => TransferPolicy::Checkpointed,
-        Policy::Atomic => TransferPolicy::AtomicReplace,
-        Policy::Direct => TransferPolicy::Direct,
-    })
-    .with_read_back_verification(match args.read_back {
-        OnOff::On => ReadBackVerification::Enabled,
-        OnOff::Off => ReadBackVerification::Disabled,
-    });
+    let mut request =
+        TransferRequest::new(source, StoragePath::new(source_path)?, destination, cancel)
+            .with_final_path(StoragePath::new(destination_path)?)
+            .with_transfer_policy(match args.policy {
+                Policy::Checkpointed => TransferPolicy::Checkpointed,
+                Policy::Atomic => TransferPolicy::AtomicReplace,
+                Policy::Direct => TransferPolicy::Direct,
+            })
+            .with_read_back_verification(match args.read_back {
+                OnOff::On => ReadBackVerification::Enabled,
+                OnOff::Off => ReadBackVerification::Disabled,
+            });
     if let Some(version) = &args.source_version {
         request = request.with_source_version(SourceVersion::Id(version.clone()));
     }

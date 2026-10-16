@@ -2,7 +2,7 @@
 //! Local-only — no external storage service is required.
 
 use data_mover::model::StoragePath;
-use data_mover::transfer::{InflightLimits, TransferRequest, transfer};
+use data_mover::transfer::{TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
 
 mod common;
@@ -29,7 +29,6 @@ async fn full_role_transfer_has_no_tail_loss_under_repetition()
             source.clone(),
             path.clone(),
             destination.clone(),
-            InflightLimits::new(8, 8 * BLOCK, 8)?,
             CancellationToken::new(),
         );
         transfer(request).await?;

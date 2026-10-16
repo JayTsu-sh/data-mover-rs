@@ -62,7 +62,7 @@ async fn memory_upload_part_checks_the_digest_and_replaces_a_part() -> S3Result<
     let id = s3.begin_multipart("key").await?;
     let body = Bytes::from_static(b"part");
     let refused = s3
-        .upload_part("key", &id, 1, body.clone(), &content_md5(b"other"))
+        .upload_part("key", &id, 1, body.clone().into(), &content_md5(b"other"))
         .await;
     assert_eq!(
         refused,
@@ -76,12 +76,12 @@ async fn memory_upload_part_checks_the_digest_and_replaces_a_part() -> S3Result<
             "key",
             &id,
             1,
-            Bytes::from_static(b"old"),
+            Bytes::from_static(b"old").into(),
             &content_md5(b"old"),
         )
         .await?;
     let etag = s3
-        .upload_part("key", &id, 1, body.clone(), &content_md5(&body))
+        .upload_part("key", &id, 1, body.clone().into(), &content_md5(&body))
         .await?;
     assert_ne!(first, etag);
     assert_eq!(etag, etag_of(&body));
@@ -100,7 +100,7 @@ async fn upload(
     let mut listed = Vec::new();
     for (number, part) in (1..).zip(parts) {
         let etag = s3
-            .upload_part(key, &id, number, part.clone(), &content_md5(part))
+            .upload_part(key, &id, number, part.clone().into(), &content_md5(part))
             .await?;
         listed.push((number, etag));
     }

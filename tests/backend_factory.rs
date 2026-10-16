@@ -5,7 +5,7 @@ use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, HdfsBackendConfig,
     LocalBackendConfig, NfsBackendConfig, S3BackendConfig, connect_backend, endpoint_identity,
 };
-use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
+use data_mover::transfer::{TransferIdentity, TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -75,26 +75,24 @@ async fn explicit_factory_handles_source_and_destination_without_pair_dispatch()
     let destination_root = tempfile::tempdir()?;
     tokio::fs::write(source_root.path().join("payload.bin"), b"protocol-neutral").await?;
     let source = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: source_root.path().to_path_buf(),
         read_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
         write_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
     }))
     .await?;
     let destination = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: destination_root.path().to_path_buf(),
         read_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
         write_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
     }))
     .await?;
     let path = StoragePath::new("payload.bin")?;
-    let request = TransferRequest::new(
-        source,
-        path.clone(),
-        destination,
-        InflightLimits::new(2, 128 * 1024, 2)?,
-        CancellationToken::new(),
-    )
-    .with_identity_override(TransferIdentity::from_label("factory-transfer")?);
+    let request = TransferRequest::new(source, path.clone(), destination, CancellationToken::new())
+        .with_identity_override(TransferIdentity::from_label("factory-transfer")?);
 
     let outcome = transfer(request).await?;
 
@@ -108,6 +106,8 @@ async fn explicit_factory_handles_source_and_destination_without_pair_dispatch()
 
 fn local_config(root: &std::path::Path) -> Result<BackendConfig, Box<dyn std::error::Error>> {
     Ok(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.to_path_buf(),
         read_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
         write_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
@@ -169,6 +169,7 @@ fn network_endpoint_identities_are_derived_offline_without_credentials()
     }))?;
     assert_eq!(with_options.stable_id(), s3.stable_id());
     let nfs = endpoint_identity(&BackendConfig::Nfs(NfsBackendConfig {
+        transfer_concurrency: None,
         url: "nfs://10.128.61.200/ontap_lisaauto_nfs:/data?version=4.1&uid=0&gid=0".into(),
         block_size: None,
         ensure_dir: false,

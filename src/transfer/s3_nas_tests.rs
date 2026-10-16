@@ -24,9 +24,9 @@ use crate::storage::backends::s3::{S3Protocol as _, connect, connect_native_at_d
 use crate::storage::{Storage, StorageRoleFailure};
 use crate::transfer::{
     EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest,
-    ExpertSourceSession, InflightLimits, PayloadShapingPolicy, ReadBackMethod,
-    ReadBackVerification, TransferFailure, TransferPhase, TransferPolicy, TransferRequest,
-    TransferRoute, TransferSide, UnpinnedReadReason, UploadDigest, UploadDigestGap, transfer,
+    ExpertSourceSession, PayloadShapingPolicy, ReadBackMethod, ReadBackVerification,
+    TransferFailure, TransferPhase, TransferPolicy, TransferRequest, TransferRoute, TransferSide,
+    UnpinnedReadReason, UploadDigest, UploadDigestGap, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -56,7 +56,6 @@ fn request(
         source,
         StoragePath::new(source_path)?,
         destination,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new(final_path)?))
@@ -132,7 +131,6 @@ async fn what_a_nas_bucket_cannot_write_is_refused_before_any_request() -> TestR
             1024,
             bucket(&protocol)?,
             StoragePath::new(final_path)?,
-            InflightLimits::new(2, 1024, 2)?,
             CancellationToken::new(),
         ))
         .await;
@@ -234,7 +232,6 @@ async fn a_checkpointed_transfer_to_a_nas_bucket_reports_unsupported_by_destinat
             1024,
             bucket(&protocol)?,
             StoragePath::new("dst/expert")?,
-            InflightLimits::new(2, 1024, 2)?,
             CancellationToken::new(),
         )
         .with_transfer_policy(TransferPolicy::Checkpointed),
@@ -368,7 +365,7 @@ async fn an_expert_copy_to_a_nas_bucket_reports_what_it_could_do() -> TestResult
     let storage = bucket(&protocol)?;
     let body = Bytes::from(vec![3_u8; 100 * 1024]);
     protocol
-        .put_object("src/file", body.clone(), &content_md5(&body))
+        .put_object("src/file", body.clone().into(), &content_md5(&body))
         .await
         .map_err(|failure| format!("{failure:?}"))?;
     let path = StoragePath::new("src/file")?;
@@ -380,11 +377,9 @@ async fn an_expert_copy_to_a_nas_bucket_reports_what_it_could_do() -> TestResult
         None,
         described.source_identity,
     )?;
-    let limits = InflightLimits::new(2, 1024, 2)?;
     let source = ExpertSourceSession::open(ExpertSourceRequest::new(
         storage.clone(),
         observation.clone(),
-        limits,
         CancellationToken::new(),
     ))
     .await?;
@@ -394,7 +389,6 @@ async fn an_expert_copy_to_a_nas_bucket_reports_what_it_could_do() -> TestResult
             source.offer().maximum_chunk_bytes,
             storage.clone(),
             StoragePath::new("dst/expert")?,
-            limits,
             CancellationToken::new(),
         )
         .with_transfer_policy(TransferPolicy::Checkpointed),
@@ -471,7 +465,7 @@ async fn a_native_copy_within_a_nas_bucket_is_one_copy_object() -> TestResult {
     let protocol = nas();
     let body = Bytes::from(vec![6_u8; 12 * 1024 * 1024]);
     protocol
-        .put_object("src/big", body.clone(), &content_md5(&body))
+        .put_object("src/big", body.clone().into(), &content_md5(&body))
         .await
         .map_err(|failure| format!("{failure:?}"))?;
     let connect = || {

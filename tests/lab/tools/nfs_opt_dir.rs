@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
 /// handle cache: every level goes to the server as `mkdir` of an existing directory.
 async fn connect(url: &str) -> Result<Storage> {
     Ok(connect_backend(BackendConfig::Nfs(NfsBackendConfig {
+        transfer_concurrency: None,
         url: url.to_owned(),
         block_size: None,
         ensure_dir: false,

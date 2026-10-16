@@ -13,7 +13,7 @@ use crate::storage::{
     NativePair, PreparedStage, ReadSource, SourceDescriptor, SourceQosBudget, StagedDestination,
 };
 use crate::transfer::identity::{BindingSource, binding_hash};
-use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy, TransferRequest};
+use crate::transfer::{TransferIdentity, TransferPolicy, TransferRequest};
 
 pub(super) fn final_recovery(stage: &PreparedStage, plan: TransferPlan) -> EffectiveRecovery {
     if plan.effective_recovery == EffectiveRecovery::UnsupportedByDestination {
@@ -84,7 +84,6 @@ pub(super) fn plan_request(
         .flatten();
     let mut plan = plan_transfer(
         descriptor,
-        request.inflight,
         source.maximum_read_chunk_bytes(),
         native_pair.is_some(),
         request.transfer_policy == TransferPolicy::Checkpointed,
@@ -214,7 +213,6 @@ pub(super) fn lend_transfer_roles(
 
 pub(super) fn plan_transfer(
     descriptor: &SourceDescriptor,
-    limits: InflightLimits,
     backend_chunk_bytes: usize,
     native: bool,
     recovery_allowed: bool,
@@ -228,9 +226,7 @@ pub(super) fn plan_transfer(
     let source_size = descriptor.size.ok_or_else(|| {
         TransferFailure::orchestration(TransferPhase::Describe, "source has no byte size")
     })?;
-    let chunk_bytes = limits
-        .negotiated_chunk_ceiling()
-        .min(backend_chunk_bytes.max(1));
+    let chunk_bytes = backend_chunk_bytes.max(1);
     Ok(TransferPlan {
         data_path: if native {
             TransferDataPath::Native

@@ -7,6 +7,55 @@ use crate::storage::{FinalDestination, PrepareFact, ResumeMode, SourceDescriptor
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+#[tokio::test]
+async fn multipart_aggregation_slices_shared_fragments_at_exact_boundaries() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    *protocol.body_fragments.lock().await = Some(Vec::new());
+    let destination =
+        S3StagedDestination::new(protocol.clone(), identity()).with_single_put_threshold(None);
+    let one = Bytes::from(vec![1; PART_SIZE - 3]);
+    let two = Bytes::from(vec![2; 11]);
+    let three = Bytes::from(vec![3; PART_SIZE + 9]);
+    let stage = destination
+        .prepare_at_destination(prepare_for_size(
+            (2 * PART_SIZE + 17) as u64,
+            ResumeMode::Restart,
+        )?)
+        .await?;
+    destination
+        .write(
+            &stage,
+            Box::pin(futures::stream::iter([
+                Ok(one.clone()),
+                Ok(two.clone()),
+                Ok(three.clone()),
+            ])),
+        )
+        .await?;
+    let mut records = protocol
+        .body_fragments
+        .lock()
+        .await
+        .take()
+        .ok_or("missing fragment recordings")?;
+    records.sort_by_key(|(number, _)| *number);
+    let expected = [
+        vec![one.clone(), two.slice(..3)],
+        vec![two.slice(3..), three.slice(..PART_SIZE - 8)],
+        vec![three.slice(PART_SIZE - 8..)],
+    ];
+    assert_eq!(records.len(), expected.len());
+    for ((_, fragments), expected) in records.iter().zip(expected) {
+        assert_eq!(fragments.len(), expected.len());
+        for (actual, expected) in fragments.iter().zip(expected) {
+            assert_eq!(actual.as_ptr(), expected.as_ptr());
+            assert_eq!(actual, &expected);
+        }
+    }
+    destination.discard(stage).await?;
+    Ok(())
+}
+
 #[test]
 fn part_sizes_cover_the_full_multipart_capacity() -> TestResult {
     let path = StoragePath::new("final")?;
@@ -82,7 +131,7 @@ async fn larger_parts_survive_reconnecting_to_a_partial_upload() -> TestResult {
             "unused".into(),
             "unused".into(),
             10_001,
-            Bytes::new()
+            Bytes::new().into()
         )
         .await
         .is_err()

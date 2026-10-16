@@ -59,7 +59,6 @@ pub(crate) use single::{
 
 const PART_SIZE: usize = 8 * 1024 * 1024;
 const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
-const MAX_INFLIGHT_PARTS: usize = 4;
 
 fn planned_part_size(size: Option<u64>, path: &StoragePath) -> Result<usize, StorageRoleFailure> {
     part_size_at_least(size, PART_SIZE as u64, path)

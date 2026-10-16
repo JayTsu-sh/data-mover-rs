@@ -1,7 +1,13 @@
 //! Standard S3 roles for the `ArchitectureReady` storage seam.
 
+// Low-latency DXN/StorageGRID sweeps favor two reads over four at lower CPU/RSS.
+// Connection-level environment overrides remain available for other network profiles.
+const DEFAULT_READ_CONCURRENCY: usize = 2;
+const DEFAULT_WRITE_CONCURRENCY: usize = 4;
+
 mod client;
 
+mod body;
 mod broken_body;
 mod capabilities;
 mod current;
@@ -16,8 +22,11 @@ mod paging;
 mod protocol;
 mod same_object;
 mod source;
+#[cfg(test)]
+mod source_pipeline_tests;
 mod staged;
 
+pub(crate) use body::S3Body;
 use std::sync::Arc;
 
 use crate::model::{

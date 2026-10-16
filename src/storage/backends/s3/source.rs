@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::{StreamExt as _, future::BoxFuture, stream::FuturesOrdered};
 
 use crate::model::{
     BackendIdentity, EntryKind, FailureClass, IdentityStrength, ModelValueError, Operation,
@@ -145,8 +146,13 @@ pub(super) fn path_scoped_bytes(path: &StoragePath, tail: &[u8]) -> Vec<u8> {
 
 #[async_trait]
 impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
+    fn read_concurrency(&self) -> usize {
+        self.protocol.read_concurrency().max(1)
+    }
     fn maximum_read_chunk_bytes(&self) -> usize {
-        usize::try_from(self.chunk_size).unwrap_or(usize::MAX)
+        usize::try_from(self.chunk_size)
+            .unwrap_or(usize::MAX)
+            .min(self.protocol.maximum_read_chunk_bytes().max(1))
     }
 
     async fn describe(
@@ -260,8 +266,16 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             protocol: self.protocol.clone(),
             path: request.path,
             offset: requested.start,
+            next_issue: requested.start,
+            depth: if request.source_qos.is_some() {
+                1
+            } else {
+                request.read_inflight.min(self.read_concurrency())
+            },
+            inflight: FuturesOrdered::new(),
             limit: requested.end,
-            chunk_size: self.chunk_size.min(request.maximum_chunk_bytes as u64),
+            chunk_size: (self.maximum_read_chunk_bytes() as u64)
+                .min(request.maximum_chunk_bytes as u64),
             cancel: request.cancel,
             qos: request.source_qos,
             facts,
@@ -278,6 +292,9 @@ struct ReadState<P> {
     protocol: Arc<P>,
     path: StoragePath,
     offset: u64,
+    next_issue: u64,
+    depth: usize,
+    inflight: FuturesOrdered<BoxFuture<'static, Result<(u64, Bytes), StorageRoleFailure>>>,
     limit: u64,
     chunk_size: u64,
     cancel: CancellationToken,
@@ -289,7 +306,7 @@ struct ReadState<P> {
 }
 
 /// The next range of a streamed read, or its end.
-async fn next_range<P: S3Protocol>(
+async fn next_range<P: S3Protocol + 'static>(
     mut state: ReadState<P>,
 ) -> Result<Option<(Bytes, ReadState<P>)>, StorageRoleFailure> {
     let path = &state.path;
@@ -302,28 +319,54 @@ async fn next_range<P: S3Protocol>(
     if state.cancel.is_cancelled() {
         return Err(cancelled(path, Operation::Read));
     }
-    let requested = (state.offset + state.chunk_size).min(state.limit) - state.offset;
-    let granted = if let Some(budget) = &state.qos {
-        budget
-            .admit_read(requested, &state.cancel)
-            .await
-            .map_err(|_| cancelled(path, Operation::Read))?
-    } else {
-        requested
+    while state.inflight.len() < state.depth && state.next_issue < state.limit {
+        let requested = state.chunk_size.min(state.limit - state.next_issue);
+        let granted = if let Some(budget) = &state.qos {
+            budget
+                .admit_read(requested, &state.cancel)
+                .await
+                .map_err(|_| cancelled(path, Operation::Read))?
+        } else {
+            requested
+        };
+        let offset = state.next_issue;
+        let end = offset + granted;
+        let protocol = Arc::clone(&state.protocol);
+        let facts = state.facts.clone();
+        let path = path.clone();
+        let cancel = state.cancel.clone();
+        state.inflight.push_back(Box::pin(async move {
+            let bytes = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(cancelled(&path, Operation::Read)),
+                result = protocol.get_range(path.as_str(), offset..end, &facts) =>
+                    result.map_err(|e| role_failure(&path, Operation::Read, e))?,
+            };
+            if bytes.len() as u64 != granted {
+                return Err(entry(&path, Operation::Read, "short S3 range response"));
+            }
+            Ok((offset, bytes))
+        }));
+        state.next_issue = end;
+    }
+    let next = tokio::select! {
+        biased;
+        () = state.cancel.cancelled() => return Err(cancelled(path, Operation::Read)),
+        next = state.inflight.next() => next,
     };
-    let end = state.offset + granted;
-    let bytes = state
-        .protocol
-        .get_range(path.as_str(), state.offset..end, &state.facts)
-        .await
-        .map_err(|e| role_failure(path, Operation::Read, e))?;
-    if bytes.len() as u64 != end - state.offset {
-        return Err(entry(path, Operation::Read, "short S3 range response"));
+    let (offset, bytes) =
+        next.ok_or_else(|| entry(path, Operation::Read, "S3 read window is empty"))??;
+    if offset != state.offset {
+        return Err(entry(
+            path,
+            Operation::Read,
+            "S3 read stream is out of order",
+        ));
     }
     if let Some(budget) = &state.qos {
         budget.record_read_bytes(bytes.len() as u64);
     }
-    state.offset = end;
+    state.offset += bytes.len() as u64;
     Ok(Some((bytes, state)))
 }
 

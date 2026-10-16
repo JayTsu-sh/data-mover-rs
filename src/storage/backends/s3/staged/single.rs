@@ -11,9 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::StreamExt;
-use md5::{Digest as _, Md5};
 
 use super::super::source::{cancelled, classified_entry, entry, role_failure};
 use super::super::{
@@ -83,7 +82,7 @@ pub(super) struct SingleStage {
 
 #[derive(Default)]
 struct SingleState {
-    written: Option<Bytes>,
+    written: Option<super::super::S3Body>,
     tags: Option<Vec<ObjectTag>>,
     published: Option<S3WriteFacts>,
     /// The source a native copy publishes with one `CopyObject` instead of a `PutObject`
@@ -101,7 +100,7 @@ impl SingleStage {
         &self,
         path: &StoragePath,
         expected_size: u64,
-    ) -> Result<(Bytes, Option<Vec<ObjectTag>>), PublicationFailure> {
+    ) -> Result<(super::super::S3Body, Option<Vec<ObjectTag>>), PublicationFailure> {
         let guard = self.lock();
         let body = guard
             .written
@@ -264,17 +263,23 @@ pub(super) async fn write(
     mut input: ByteStream,
 ) -> Result<WriteEvidence, StorageRoleFailure> {
     let path = stage.final_destination.path();
-    let capacity = usize::try_from(single.expected_size)
+    let _capacity = usize::try_from(single.expected_size)
         .map_err(|_| entry(path, Operation::Write, "S3 object cannot fit address space"))?;
-    let mut buffer = BytesMut::with_capacity(capacity);
+    let mut fragments = Vec::new();
+    let mut total = 0_u64;
     while let Some(chunk) = input.next().await {
         let chunk = chunk?;
-        if (buffer.len() + chunk.len()) as u64 > single.expected_size {
+        total = total
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| oversized(path))?;
+        if total > single.expected_size {
             return Err(oversized(path));
         }
-        buffer.extend_from_slice(&chunk);
+        if !chunk.is_empty() {
+            fragments.push(chunk);
+        }
     }
-    store(stage, single, buffer.freeze())
+    store(stage, single, super::super::S3Body::new(fragments))
 }
 
 /// Buffers one complete chunk without copying it.
@@ -286,13 +291,13 @@ pub(super) fn write_single(
     if data.len() as u64 > single.expected_size {
         return Err(oversized(stage.final_destination.path()));
     }
-    store(stage, single, data)
+    store(stage, single, data.into())
 }
 
 fn store(
     stage: &PreparedStage,
     single: &SingleStage,
-    content: Bytes,
+    content: super::super::S3Body,
 ) -> Result<WriteEvidence, StorageRoleFailure> {
     let persisted_bytes = content.len() as u64;
     let mut guard = single.lock();
@@ -414,10 +419,10 @@ async fn put<P: S3Protocol>(
     adapter: &S3StagedDestination<P>,
     path: &StoragePath,
     single: &SingleStage,
-    body: Bytes,
+    body: super::super::S3Body,
     expected_size: u64,
 ) -> Result<S3WriteFacts, PublicationFailure> {
-    let digest = Md5::digest(&body);
+    let digest = body.md5();
     let quoted_md5 = format!("\"{digest:x}\"");
     let failure = match adapter
         .protocol

@@ -20,7 +20,7 @@ ALLOWED = {
 }
 FILE_ALLOWED = {
     # Factory Debug redacts credentials; backend construction stays behind backend facades.
-    "storage/factory.rs": {"url_redact"},
+    "storage/factory.rs": {"url_redact", "transfer_concurrency"},
 }
 # Protocol clients share leaf error, time and concurrency helpers. These do not authorize
 # dependencies on orchestration or other backends. Root values are neutral constants/aliases;

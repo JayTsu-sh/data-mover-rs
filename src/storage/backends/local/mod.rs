@@ -37,11 +37,12 @@ pub(crate) fn connect_backend(config: LocalBackendConfig) -> Result<Storage, Bac
 fn connect_roles(config: LocalBackendConfig) -> Result<Storage, Box<dyn std::error::Error>> {
     let root = std::fs::canonicalize(config.root)?;
     let identity = crate::storage::endpoint::local(&root)?;
-    let source = Arc::new(source::LocalReadSource::new(
-        &root,
-        identity.clone(),
-        config.read_concurrency.get(),
-    )?);
+    let mut source =
+        source::LocalReadSource::new(&root, identity.clone(), config.read_concurrency.get())?;
+    if let Some(bytes) = config.read_chunk_bytes {
+        source = source.with_read_chunk_bytes(bytes);
+    }
+    let source = Arc::new(source);
     let sandbox = open_root(&root)?;
     let metadata = Arc::new(observation::LocalObservationAdapter::from_root(
         Arc::clone(&sandbox),
@@ -51,11 +52,15 @@ fn connect_roles(config: LocalBackendConfig) -> Result<Storage, Box<dyn std::err
         sandbox,
         identity.clone(),
     ));
-    let staged = Arc::new(staged::LocalStagedDestination::new(
+    let mut staged = staged::LocalStagedDestination::new(
         root,
         identity.clone(),
         config.write_concurrency.get(),
-    )?);
+    )?;
+    if let Some(bytes) = config.write_chunk_bytes {
+        staged = staged.with_write_chunk_bytes(bytes);
+    }
+    let staged = Arc::new(staged);
     Ok(Storage::connected(
         identity,
         BackendCapabilities::new(
@@ -95,7 +100,12 @@ pub(crate) fn test_source_storage(
     Box<dyn std::error::Error>,
 > {
     let identity = test_identity(name);
-    let source = std::sync::Arc::new(source::LocalReadSource::new(root, identity.clone(), 4)?);
+    // Small backend-owned chunks keep recovery fixtures multi-chunk without transfer budgets.
+    let source = std::sync::Arc::new(
+        source::LocalReadSource::new(root, identity.clone(), 4)?.with_read_chunk_bytes(
+            std::num::NonZeroUsize::new(64 * 1024).ok_or("nonzero fixture chunk")?,
+        ),
+    );
     let metadata = std::sync::Arc::new(observation::LocalObservationAdapter::new(
         root,
         identity.clone(),

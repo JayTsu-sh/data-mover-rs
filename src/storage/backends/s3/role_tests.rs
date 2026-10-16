@@ -513,7 +513,7 @@ async fn a_temp_key_stage_is_refused() -> TestResult {
         size: 4,
     };
     let adapter = S3StagedDestination::new(protocol.clone(), identity());
-    let filled = adapter.fill_native(&stage, source, CancellationToken::new(), 1);
+    let filled = adapter.fill_native(&stage, source, CancellationToken::new());
     let refused = filled.await.err().ok_or("a temp-key stage was filled")?;
     assert_eq!(class(&Err::<(), _>(refused.error)), conflict);
     assert_eq!(class(&destination.discard(stage).await), conflict);

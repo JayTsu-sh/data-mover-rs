@@ -138,7 +138,6 @@ impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
         source: NativeSourceBinding,
         stage: &PreparedStage,
         cancel: CancellationToken,
-        operations: usize,
     ) -> Result<NativeStageEvidence, NativeStageFailure> {
         if source.affinity != self.context.affinity {
             return Err(stage_failure(stage, "native pair affinity changed"));
@@ -148,9 +147,7 @@ impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
         if native.size != source.size {
             return Err(stage_failure(stage, "native source size changed"));
         }
-        self.staged
-            .fill_native(stage, native, cancel, operations)
-            .await
+        self.staged.fill_native(stage, native, cancel).await
     }
 }
 

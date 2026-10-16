@@ -3,6 +3,8 @@
 //! - `nfs://…` — an NFS URL, used as given;
 //! - `smb:<sub-path>` — that sub-path of the share named by `CIFS_REAL_SERVER` / `CIFS_REAL_SHARE` /
 //!   `CIFS_REAL_USER` / `CIFS_REAL_PASS` (the e2e-cifs `.env`);
+//!   `CIFS_GUEST_POLICY=allow_unsigned` explicitly permits unsigned guest for lab fixtures only;
+//!   the default remains `deny`;
 //! - `s3:<prefix>` — that prefix of the bucket named by `S3_HOST` / `S3_BUCKET` / `S3_AK` / `S3_SK` /
 //!   `S3_USE_HTTPS` / `S3_COMPAT` / `S3_TLS_VERIFY` / `S3_BUCKET_TYPE` (the e2e-s3 `.env`, or its
 //!   `dxn/` / `storagegrid/` / `ontap/` / `rustfs/` siblings);
@@ -18,7 +20,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use data_mover::model::StoragePath;
+use data_mover::model::{BackendKind, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, DeleteTreeRequest,
     HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, Storage,
@@ -31,6 +33,14 @@ pub type Result<T = (), E = Box<dyn Error>> = std::result::Result<T, E>;
 
 fn env_var(name: &str) -> Result<String> {
     env::var(name).map_err(|_| format!("{name} is not set (source the skill's .env)").into())
+}
+
+fn cifs_guest_policy(value: Option<&str>) -> Result<CifsGuestPolicy> {
+    match value {
+        None | Some("deny") => Ok(CifsGuestPolicy::Deny),
+        Some("allow_unsigned") => Ok(CifsGuestPolicy::AllowUnsigned),
+        _ => Err("CIFS_GUEST_POLICY must be deny or allow_unsigned".into()),
+    }
 }
 
 /// `s3[+https]://AK:SK@bucket.host/prefix[?options]` — the crate takes the key and secret as
@@ -110,6 +120,7 @@ pub async fn connect_with_options(
 ) -> Result<Storage> {
     let config = if endpoint.starts_with("nfs://") {
         BackendConfig::Nfs(NfsBackendConfig {
+            transfer_concurrency: None,
             url: endpoint.to_owned(),
             block_size,
             ensure_dir,
@@ -123,7 +134,7 @@ pub async fn connect_with_options(
             username: env_var("CIFS_REAL_USER")?,
             password: env_var("CIFS_REAL_PASS")?,
             signing_policy: CifsSigningPolicy::default(),
-            guest_policy: CifsGuestPolicy::default(),
+            guest_policy: cifs_guest_policy(env::var("CIFS_GUEST_POLICY").ok().as_deref())?,
         })
     } else if endpoint.split_once("://").is_some_and(|(scheme, _)| {
         scheme.eq_ignore_ascii_case("s3") || scheme.to_ascii_lowercase().starts_with("s3+")
@@ -157,11 +168,18 @@ pub async fn connect_with_options(
         if ensure_dir {
             fs::create_dir_all(endpoint)?;
         }
-        let slots = NonZeroUsize::new(4).ok_or("non-zero")?;
+        let concurrency = data_mover::TransferConcurrency::from_env(
+            BackendKind::Local,
+            data_mover::TransferConcurrency::new(4, 2)?,
+        )?;
         BackendConfig::Local(LocalBackendConfig {
+            read_chunk_bytes: block_size
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .and_then(NonZeroUsize::new),
+            write_chunk_bytes: None,
             root: endpoint.into(),
-            read_concurrency: slots,
-            write_concurrency: slots,
+            read_concurrency: NonZeroUsize::new(concurrency.read()).ok_or("non-zero")?,
+            write_concurrency: NonZeroUsize::new(concurrency.write()).ok_or("non-zero")?,
         })
     };
     Ok(connect_backend(config).await?)
@@ -321,4 +339,22 @@ async fn nfs_mount(endpoint: &str, dir: &str) -> Result<(Box<dyn nfs_rs::Mount>,
     let url = format!("nfs://{host}/{export}?{}", params.join("&"));
     let mount = nfs_rs::parse_url_and_mount(&url).await?;
     Ok((mount, directory))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_access_is_denied_unless_explicitly_selected() -> Result {
+        assert_eq!(cifs_guest_policy(None)?, CifsGuestPolicy::Deny);
+        assert_eq!(cifs_guest_policy(Some("deny"))?, CifsGuestPolicy::Deny);
+        assert_eq!(
+            cifs_guest_policy(Some("allow_unsigned"))?,
+            CifsGuestPolicy::AllowUnsigned,
+        );
+        assert!(cifs_guest_policy(Some("true")).is_err());
+        assert!(cifs_guest_policy(Some("")).is_err());
+        Ok(())
+    }
 }

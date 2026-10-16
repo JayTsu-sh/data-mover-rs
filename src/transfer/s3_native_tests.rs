@@ -8,8 +8,8 @@ use crate::storage::PrepareFact;
 use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context};
 use crate::storage::backends::s3::{S3NativeContext, S3Protocol as _, S3ProtocolFailure, connect};
 use crate::transfer::{
-    EffectiveRecovery, InflightLimits, PayloadShapingPolicy, ReadBackVerification, SourceQosGroup,
-    SourceQosPolicy, TransferIdentity, TransferPolicy, TransferRequest, TransferRoute, transfer,
+    EffectiveRecovery, PayloadShapingPolicy, ReadBackVerification, SourceQosGroup, SourceQosPolicy,
+    TransferIdentity, TransferPolicy, TransferRequest, TransferRoute, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -22,7 +22,6 @@ fn request(
         source,
         StoragePath::new("source")?,
         destination,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("final")?)
@@ -326,7 +325,6 @@ async fn cancellation_before_planning_performs_no_native_or_final_mutation() -> 
         request.source,
         StoragePath::new("source")?,
         request.destination,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         cancel,
     )
     .with_final_path(StoragePath::new("final")?)
@@ -401,7 +399,6 @@ async fn a_native_copy_up_to_64_mib_is_one_copy_to_the_final_key() -> TestResult
             source.clone(),
             StoragePath::new("source")?,
             destination.clone(),
-            InflightLimits::new(2, 4 << 20, 2)?,
             CancellationToken::new(),
         )
         .with_final_path(StoragePath::new("final")?)

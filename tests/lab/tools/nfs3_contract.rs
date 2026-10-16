@@ -15,8 +15,7 @@ use data_mover::storage::{
     StorageRoleFailure, VerifyRequest, connect_backend,
 };
 use data_mover::transfer::{
-    InflightLimits, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy,
-    TransferRequest, transfer,
+    SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy, TransferRequest, transfer,
 };
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSource,
@@ -268,6 +267,7 @@ async fn validate_nfs4_stale_retry(
 
 async fn connect_nfs(url: &str, ensure_dir: bool) -> ContractResult<Storage> {
     Ok(connect_backend(BackendConfig::Nfs(NfsBackendConfig {
+        transfer_concurrency: None,
         url: url.to_owned(),
         block_size: Some(64 * 1024),
         ensure_dir,
@@ -403,7 +403,6 @@ async fn validate_streaming_copy(source: &Storage, destination: &Storage) -> Con
             source.clone(),
             path("fixture.bin")?,
             destination.clone(),
-            InflightLimits::new(4, 256 * 1024, 4)?,
             CancellationToken::new(),
         )
         .with_final_path(path("copied.bin")?)
@@ -430,7 +429,6 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
         source.clone(),
         path("cancellation.bin")?,
         destination.clone(),
-        InflightLimits::new(1, 64 * 1024, 1)?,
         cancel.clone(),
     )
     .with_final_path(path("restarted.bin")?)
@@ -459,7 +457,6 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
             source.clone(),
             path("cancellation.bin")?,
             destination.clone(),
-            InflightLimits::new(4, 256 * 1024, 4)?,
             CancellationToken::new(),
         )
         .with_final_path(path("restarted.bin")?)

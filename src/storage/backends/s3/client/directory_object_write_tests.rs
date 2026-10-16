@@ -57,6 +57,8 @@ fn storage(wire: &Wire) -> S3Storage {
         .http_client(http_client)
         .build();
     S3Storage {
+        read_chunk_bytes: 8 * 1024 * 1024,
+        transfer_concurrency: crate::transfer_concurrency::TransferConcurrency::defaults(4, 4),
         options: S3UrlOptions::default(),
         endpoint: "http://d13.test".into(),
         bucket_name: "destination".into(),

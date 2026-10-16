@@ -17,9 +17,8 @@ use crate::storage::backends::s3::tests::{
 use crate::storage::backends::s3::{S3Protocol as _, S3VersionFacts, connect};
 use crate::storage::{Storage, StorageRoleFailure};
 use crate::transfer::{
-    DeleteMarkerOutcome, InflightLimits, PayloadShapingPolicy, SourceVersion, TransferFailure,
-    TransferPhase, TransferRequest, TransferSide, destination_keeps_history, transfer,
-    write_delete_marker,
+    DeleteMarkerOutcome, PayloadShapingPolicy, SourceVersion, TransferFailure, TransferPhase,
+    TransferRequest, TransferSide, destination_keeps_history, transfer, write_delete_marker,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -63,7 +62,6 @@ async fn a_delete_marker_holds_the_destination_guard() -> TestResult {
         bucket(&protocol)?,
         StoragePath::new("src")?,
         bucket(&protocol)?,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("dst/k")?)
@@ -134,7 +132,7 @@ async fn a_mixed_history_is_replayed_in_order() -> TestResult {
                 let bytes = Bytes::copy_from_slice(body);
                 let md5 = content_md5(&bytes);
                 source
-                    .put_object("m/", bytes, &md5)
+                    .put_object("m/", bytes.into(), &md5)
                     .await
                     .map_err(|e| format!("{e:?}"))?;
             }
@@ -159,7 +157,6 @@ async fn a_mixed_history_is_replayed_in_order() -> TestResult {
                 bucket(&source)?,
                 StoragePath::new("m/")?,
                 bucket(&destination)?,
-                InflightLimits::new(2, 64 * 1024, 2)?,
                 CancellationToken::new(),
             )
             .with_source_version(SourceVersion::Id(record.version_id.clone()))

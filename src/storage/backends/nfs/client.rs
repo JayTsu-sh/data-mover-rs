@@ -400,6 +400,9 @@ impl NfsReadCursor for NfsRoleReadCursor {
 
 #[async_trait]
 impl NfsSourceProtocol for NFSStorage {
+    fn read_concurrency(&self) -> usize {
+        self.config.transfer_concurrency.read()
+    }
     fn maximum_read_chunk_bytes(&self) -> usize {
         usize::try_from(self.config.read_chunk_bytes).unwrap_or(usize::MAX)
     }
@@ -1320,7 +1323,11 @@ impl NFSStorage {
 
     /// 内部方法：解析 URL、挂载 NFS、构建初始 storage 实例
     /// 返回 `(storage, root_dir)`，此时 `root_fh` 指向 mount 根，尚未解析 `root_dir`
-    async fn mount_and_build(url: &str, block_size: Option<u64>) -> Result<(Self, String)> {
+    async fn mount_and_build(
+        url: &str,
+        block_size: Option<u64>,
+        concurrency: Option<TransferConcurrency>,
+    ) -> Result<(Self, String)> {
         let (nfs_url, root_dir) = Self::parse_nfs_url(url)?;
         info!(
             "Mounting NFS at: {:?} with root dir: {:?}",
@@ -1397,7 +1404,7 @@ impl NFSStorage {
                 transfer_concurrency: resolve_transfer_concurrency(
                     TransferBackend::Nfs,
                     DEFAULT_TRANSFER_CONCURRENCY,
-                    None,
+                    concurrency,
                 )?,
             },
             refresh_generation: Arc::new(AtomicU64::new(0)),
@@ -2021,11 +2028,12 @@ pub(crate) async fn create_nfs_role_storage(
     url: &str,
     block_size: Option<u64>,
     ensure_dir: bool,
+    concurrency: Option<TransferConcurrency>,
 ) -> Result<crate::storage::Storage> {
     // The canonical endpoint (ADR-0006), derived before mounting so a bad URL fails fast.
     let identity = crate::storage::endpoint::nfs(url)
         .map_err(|error| StorageError::UrlParseError(error.to_string()))?;
-    let (storage, root_dir) = NFSStorage::mount_and_build(url, block_size).await?;
+    let (storage, root_dir) = NFSStorage::mount_and_build(url, block_size, concurrency).await?;
     let storage = storage.attach_root(root_dir, ensure_dir).await?;
     crate::storage::backends::nfs::connect(Arc::new(storage), identity)
         .map_err(|error| StorageError::ConfigError(error.to_string()))

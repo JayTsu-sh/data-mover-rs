@@ -8,20 +8,10 @@ use data_mover::model::{
 };
 use data_mover::storage::ReadRequest;
 use data_mover::storage::{Storage, create_directory_all};
-use data_mover::transfer::InflightLimits;
 use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 pub type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
-
-pub fn limits(chunk_bytes: u64) -> Result<InflightLimits> {
-    let chunk = usize::try_from(chunk_bytes)?;
-    Ok(InflightLimits::new(
-        8,
-        chunk.checked_mul(8).ok_or("inflight size overflow")?,
-        8,
-    )?)
-}
 
 pub async fn create_parent(storage: &Storage, path: &StoragePath) -> Result {
     if storage.kind() != BackendKind::S3

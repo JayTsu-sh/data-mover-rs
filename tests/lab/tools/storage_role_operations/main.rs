@@ -34,7 +34,7 @@ use data_mover::storage::{
     DeleteTreeRequest, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, Storage,
     connect_backend, create_directory_all, delete_tree,
 };
-use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
+use data_mover::transfer::{TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::TraversalOrder;
 use futures::stream::{self, StreamExt as _};
 use tokio_util::sync::CancellationToken;
@@ -201,11 +201,14 @@ async fn connect(backend: Backend, root: &str, depth: usize) -> Result<Storage, 
     let slots = NonZeroUsize::new(depth).ok_or("concurrency must be non-zero")?;
     let config = match backend {
         Backend::Local => BackendConfig::Local(LocalBackendConfig {
+            read_chunk_bytes: None,
+            write_chunk_bytes: None,
             root: root.into(),
             read_concurrency: slots,
             write_concurrency: slots,
         }),
         Backend::Nfs => BackendConfig::Nfs(NfsBackendConfig {
+            transfer_concurrency: None,
             url: std::env::var("NFS_REAL_URL")?,
             block_size: None,
             ensure_dir: false,
@@ -260,14 +263,12 @@ async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), E
         args.concurrency,
     )
     .await?;
-    let inflight = InflightLimits::new(slots.get(), (*bytes).max(1) * slots.get(), slots.get())?;
     let seeding = SeedFiles {
         source: &source,
         storage,
         path,
         local_root: local_root.path(),
         payload: &payload,
-        inflight,
     };
     seeding.all(*files, slots.get()).await
 }
@@ -293,7 +294,6 @@ struct SeedFiles<'a> {
     path: &'a str,
     local_root: &'a Path,
     payload: &'a [u8],
-    inflight: InflightLimits,
 }
 
 impl SeedFiles<'_> {
@@ -348,7 +348,6 @@ impl SeedFiles<'_> {
                 self.source.clone(),
                 StoragePath::new(name)?,
                 self.storage.clone(),
-                self.inflight,
                 CancellationToken::new(),
             )
             .with_final_path(StoragePath::new(destination)?)

@@ -1,0 +1,12 @@
+PROFILE:dxn-s3 PATH:fixture-4k.bin
+bytes=4096 elapsed_ns=8214442 source_read=4 source_chunk=2097152 verified=true
+bytes=4096 elapsed_ns=10608840 source_read=2 source_chunk=8388608 verified=true
+PROFILE:dxn-s3 PATH:fixture-4m.bin
+bytes=4194441 elapsed_ns=101053157 source_read=4 source_chunk=2097152 verified=true
+bytes=4194441 elapsed_ns=169797577 source_read=2 source_chunk=8388608 verified=true
+PROFILE:sg-s3 PATH:fixture-4k.bin
+bytes=4096 elapsed_ns=15346864 source_read=4 source_chunk=2097152 verified=true
+bytes=4096 elapsed_ns=23408327 source_read=2 source_chunk=8388608 verified=true
+PROFILE:sg-s3 PATH:fixture-4m.bin
+bytes=4194441 elapsed_ns=73037535 source_read=4 source_chunk=2097152 verified=true
+bytes=4194441 elapsed_ns=122864959 source_read=2 source_chunk=8388608 verified=true

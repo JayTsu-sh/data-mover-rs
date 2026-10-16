@@ -19,7 +19,7 @@ pub(super) async fn transfer(
             path: descriptor.path.clone(),
             range: Some(0..size),
             expected_source: Some(descriptor.source_identity.clone()),
-            maximum_chunk_bytes: request.inflight.negotiated_chunk_ceiling(),
+            maximum_chunk_bytes: source.maximum_read_chunk_bytes().max(1),
             read_inflight: 1,
             read_budget: None,
             cancel: request.cancel.clone(),
@@ -127,11 +127,12 @@ fn validate_source_completion(
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
+    use bytes::Bytes;
 
     use super::*;
     use crate::model::{IdentityStrength, SourceIdentity};
     use crate::storage::{ByteStream, DestinationPrepareRequest, FinalDestination, PrepareRequest};
-    use crate::transfer::{InflightLimits, TransferIdentity};
+    use crate::transfer::TransferIdentity;
 
     struct CancelsAtEof {
         descriptor: SourceDescriptor,
@@ -209,7 +210,6 @@ mod tests {
             source_storage,
             descriptor.path.clone(),
             destination_storage,
-            InflightLimits::new(1, 64 * 1024, 1)?,
             cancel,
         )
         .with_final_path(final_destination.path().clone())

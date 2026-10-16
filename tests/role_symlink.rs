@@ -20,6 +20,8 @@ async fn create_link_preserves_target_and_link_times_without_touching_target() -
     let target_before = std::fs::metadata(root.path().join("target"))?;
     let slots = NonZeroUsize::new(2).ok_or("nonzero")?;
     let storage = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.path().into(),
         read_concurrency: slots,
         write_concurrency: slots,
@@ -61,6 +63,8 @@ async fn create_link_refuses_symlink_parents_and_escaping_destinations() -> Resu
     std::os::unix::fs::symlink(outside.path(), root.path().join("escape"))?;
     let slots = NonZeroUsize::new(1).ok_or("nonzero")?;
     let storage = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.path().into(),
         read_concurrency: slots,
         write_concurrency: slots,
@@ -101,6 +105,8 @@ async fn create_link_preserves_opaque_absolute_parent_and_non_utf8_targets() -> 
     let before = outside.as_file().metadata()?;
     let slots = NonZeroUsize::new(1).ok_or("nonzero")?;
     let storage = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.path().into(),
         read_concurrency: slots,
         write_concurrency: slots,

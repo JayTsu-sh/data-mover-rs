@@ -52,7 +52,7 @@ use data_mover::model::{
 };
 use data_mover::storage::{Storage, StorageRoleFailure};
 use data_mover::transfer::{
-    DeleteMarkerOutcome, InflightLimits, PayloadShapingPolicy, TransferFailure, TransferRequest,
+    DeleteMarkerOutcome, PayloadShapingPolicy, TransferFailure, TransferRequest,
     destination_keeps_history, transfer, write_delete_marker,
 };
 use data_mover::traversal::{
@@ -230,7 +230,6 @@ impl Replay {
             self.source.clone(),
             path.clone(),
             self.destination.clone(),
-            InflightLimits::new(4, 64 * 1024 * 1024, 4)?,
             CancellationToken::new(),
         )
         .with_source_version(version);

@@ -148,7 +148,7 @@ async fn a_lost_nas_single_put_is_settled_by_the_prepare_head() -> TestResult {
         let protocol = Arc::new(MemoryS3::nas_bucket());
         let old = Bytes::from_static(b"old");
         protocol
-            .put_object("small", old.clone(), &content_md5(&old))
+            .put_object("small", old.clone().into(), &content_md5(&old))
             .await
             .map_err(|failure| format!("{failure:?}"))?;
         let destination = S3StagedDestination::new(protocol.clone(), identity())
@@ -194,7 +194,7 @@ async fn copy_stage(
         }
         let body = Bytes::from_static(body);
         protocol
-            .put_object(key, body.clone(), &content_md5(&body))
+            .put_object(key, body.clone().into(), &content_md5(&body))
             .await
             .map_err(|failure| format!("{failure:?}"))?;
     }
@@ -292,7 +292,7 @@ async fn a_nas_copy_is_read_back_against_its_reply() -> TestResult {
         match case {
             "replaced" => {
                 protocol
-                    .put_object("dst", other.clone(), &content_md5(&other))
+                    .put_object("dst", other.clone().into(), &content_md5(&other))
                     .await
                     .map_err(|failure| format!("{failure:?}"))?;
             }

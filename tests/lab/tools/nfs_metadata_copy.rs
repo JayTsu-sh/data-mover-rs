@@ -29,8 +29,7 @@ use data_mover::storage::{
     NfsBackendConfig, S3BackendConfig, Storage, StorageRoleFailure, connect_backend,
 };
 use data_mover::transfer::{
-    CopiedMetadataRequest, InflightLimits, TransferIdentity, TransferOutcome, TransferRequest,
-    transfer,
+    CopiedMetadataRequest, TransferIdentity, TransferOutcome, TransferRequest, transfer,
 };
 use nfs_rs::{AceFlags, AceMask, AceType, Acl, Mount, NfsAce};
 use tokio_util::sync::CancellationToken;
@@ -167,6 +166,7 @@ async fn connect(endpoint: &str) -> Result<Storage> {
     let slots = NonZeroUsize::new(4).ok_or("non-zero")?;
     let config = if endpoint.starts_with("nfs://") {
         BackendConfig::Nfs(NfsBackendConfig {
+            transfer_concurrency: None,
             url: endpoint.to_owned(),
             block_size: None,
             ensure_dir: true,
@@ -193,6 +193,8 @@ async fn connect(endpoint: &str) -> Result<Storage> {
     } else {
         fs::create_dir_all(endpoint)?;
         BackendConfig::Local(LocalBackendConfig {
+            read_chunk_bytes: None,
+            write_chunk_bytes: None,
             root: endpoint.into(),
             read_concurrency: slots,
             write_concurrency: slots,
@@ -211,7 +213,6 @@ fn request(
         source.clone(),
         StoragePath::new(source_path)?,
         destination.clone(),
-        InflightLimits::new(4, 4 << 20, 4)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new(destination_path)?)

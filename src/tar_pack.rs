@@ -13,8 +13,8 @@ use crate::storage::{
     StorageRoleFailure,
 };
 use crate::transfer::{
-    ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, InflightLimits,
-    TransferFailure, TransferOutcome, TransferPolicy,
+    ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, TransferFailure,
+    TransferOutcome, TransferPolicy,
 };
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
@@ -40,7 +40,6 @@ pub struct TarRequest {
     pub destination: Storage,
     pub entries: Vec<ObservedEntry>,
     pub final_path: StoragePath,
-    pub inflight: InflightLimits,
     pub cancel: CancellationToken,
     pub source_qos: Option<SourceQosGroup>,
 }
@@ -70,18 +69,17 @@ pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
     let size = calculate_tar_size(&request.entries)?;
     let observed = archive_observation(&request, size)?;
     let identity_key = observed.identity_key();
-    let maximum = request.inflight.negotiated_chunk_ceiling();
     let source = request
         .source
         .read_source()
         .map_err(|error| invalid(&error.to_string()))?;
+    let maximum = source.maximum_read_chunk_bytes().max(512);
     let destination = ExpertDestinationSession::prepare(
         ExpertDestinationRequest::new(
             observed,
             maximum,
             request.destination,
             request.final_path.clone(),
-            request.inflight,
             request.cancel.clone(),
         )
         .with_transfer_policy(TransferPolicy::AtomicReplace),
@@ -104,7 +102,6 @@ pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
         padding: None,
         eof: false,
         maximum,
-        inflight: request.inflight,
         cancel: request.cancel,
         budget: budget.clone(),
         path: request.final_path,
@@ -187,7 +184,6 @@ struct ArchiveStream {
     padding: Option<Bytes>,
     eof: bool,
     maximum: usize,
-    inflight: InflightLimits,
     cancel: CancellationToken,
     budget: Option<SourceQosBudget>,
     path: StoragePath,
@@ -252,7 +248,7 @@ async fn next_raw(
                         range: Some(0..size),
                         expected_source: Some(entry.source_identity().clone()),
                         maximum_chunk_bytes: state.maximum,
-                        read_inflight: state.inflight.operations.min(state.inflight.chunks),
+                        read_inflight: state.source.read_concurrency().max(1),
                         read_budget: None,
                         cancel: state.cancel.clone(),
                         source_qos: state.budget.clone(),

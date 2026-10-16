@@ -1,0 +1,17 @@
+2026-10-15, node1 -> DXN-2 NFSv3, isolated namespace only.
+
+First Local -> NFS 41,943,177-byte seed:
+  TransferFailure phase=Metadata, side=Destination
+  OwnershipMode=Refused, operation=Metadata, class=Protocol, transience=Unknown
+  final_destination_changed=false; timestamps applied.
+  This attempt is not a successful throughput sample.
+
+Without code or server configuration changes:
+  Two 4,096-byte seeds passed metadata and content verification.
+  Two repeats of the original 41,943,177-byte seed passed metadata/content verification.
+  The source files are uid=0,gid=0,mode=0o100644.
+  The original failed stage was no longer present after normal transfer restart.
+
+The failure is not deterministically reproducible. No metadata fix, SETATTR
+probe, root-squash change or ignored-metadata policy was applied. Keep the
+initial failure distinct from successful benchmark samples and monitor further runs.

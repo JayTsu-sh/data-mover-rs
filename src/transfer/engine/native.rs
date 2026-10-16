@@ -97,12 +97,7 @@ pub(super) async fn transfer_native(
     let stage = prepare_native_stage(request, &input, lease).await?;
     let native = match input
         .pair
-        .copy_into_stage(
-            binding,
-            &stage,
-            request.cancel.clone(),
-            request.inflight.operations,
-        )
+        .copy_into_stage(binding, &stage, request.cancel.clone())
         .await
     {
         Ok(native) => native,

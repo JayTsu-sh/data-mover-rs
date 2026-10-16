@@ -8,15 +8,15 @@ use data_mover::model::{FailureClass, ObservationPlan, SourceVersion, StoragePat
 use data_mover::storage::{
     BackendConfig, LocalBackendConfig, ReadRequest, Storage, StorageRoleFailure, connect_backend,
 };
-use data_mover::transfer::{
-    InflightLimits, TransferPhase, TransferRequest, TransferSide, transfer,
-};
+use data_mover::transfer::{TransferPhase, TransferRequest, TransferSide, transfer};
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn local(root: &std::path::Path) -> TestResult<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.to_path_buf(),
         read_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
         write_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
@@ -84,7 +84,6 @@ async fn a_named_version_from_a_source_without_versions_fails_before_any_write()
         local(source_root.path()).await?,
         StoragePath::new("file")?,
         local(destination_root.path()).await?,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new("copy")?)

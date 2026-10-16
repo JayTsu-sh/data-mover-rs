@@ -16,8 +16,8 @@ use crate::storage::backends::s3::{
 };
 use crate::storage::{PrepareFact, RestartReason, Storage};
 use crate::transfer::{
-    EffectiveRecovery, InflightLimits, PayloadShapingPolicy, TransferPolicy, TransferRequest,
-    TransferRoute, transfer,
+    EffectiveRecovery, PayloadShapingPolicy, TransferPolicy, TransferRequest, TransferRoute,
+    transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -65,7 +65,6 @@ fn request_with(
         storage(protocol)?,
         StoragePath::new(source)?,
         storage(protocol)?,
-        InflightLimits::new(4, 4 * MIB, 4)?,
         cancel,
     )
     .with_final_path(StoragePath::new(final_key)?)
@@ -229,8 +228,8 @@ async fn an_interrupted_native_copy_resumes_from_the_parts_it_copied() -> TestRe
 }
 
 /// A checkpointed native upload whose source is not over the automatic interval writes no pointer
-/// and never turns recovery on: it reports `SkippedBelowCheckpointThreshold`, as a streamed copy
-/// of the same source does.
+/// and never turns recovery on. This fixture fits one backend source chunk, so both routes
+/// report `SkippedSingleSourceChunk`.
 #[tokio::test]
 async fn a_native_upload_below_the_interval_reports_what_a_streamed_copy_does() -> TestResult {
     let (protocol, payloads) = seeded(&[("source", PART + 3 * MIB)]).await;
@@ -242,7 +241,7 @@ async fn a_native_upload_below_the_interval_reports_what_a_streamed_copy_does() 
         assert_eq!(outcome.route, route);
         assert_eq!(
             outcome.recovery,
-            EffectiveRecovery::SkippedBelowCheckpointThreshold,
+            EffectiveRecovery::SkippedSingleSourceChunk,
             "{route:?}"
         );
         assert_eq!(
@@ -434,33 +433,25 @@ async fn a_native_copy_cancelled_before_publication_leaves_the_final_key() -> Te
     Ok(())
 }
 
-/// The transfer's operation bound caps the `UploadPartCopy` requests in flight: a bound of 2
-/// never has more than 2, and a bound of 8 still no more than the six a copy allows.
+/// Native copy owns its request window independently of source reads and streamed writes.
 #[tokio::test]
-async fn native_part_copies_stay_within_the_operation_bound() -> TestResult {
-    for (operations, peak) in [(2, 2), (8, 6)] {
-        let (protocol, payloads) = seeded(&[("source", 10 * PART)]).await;
-        let request = TransferRequest::new(
-            storage(&protocol)?,
-            StoragePath::new("source")?,
-            storage(&protocol)?,
-            InflightLimits::new(4, 4 * MIB, operations)?,
-            CancellationToken::new(),
-        )
-        .with_final_path(StoragePath::new("bounded")?);
-        let outcome = transfer(request).await?;
-        assert_eq!(outcome.route, TransferRoute::Native);
-        assert_eq!(*protocol.part_copies.lock().await, 10);
-        assert_eq!(
-            *protocol.part_copies_peak.lock().await,
-            peak,
-            "{operations}"
-        );
-        assert_eq!(
-            protocol.objects.lock().await.get("bounded"),
-            Some(&payloads[0])
-        );
-    }
+async fn native_part_copies_stay_within_the_backend_window() -> TestResult {
+    let (protocol, payloads) = seeded(&[("source", 10 * PART)]).await;
+    let request = TransferRequest::new(
+        storage(&protocol)?,
+        StoragePath::new("source")?,
+        storage(&protocol)?,
+        CancellationToken::new(),
+    )
+    .with_final_path(StoragePath::new("bounded")?);
+    let outcome = transfer(request).await?;
+    assert_eq!(outcome.route, TransferRoute::Native);
+    assert_eq!(*protocol.part_copies.lock().await, 10);
+    assert_eq!(*protocol.part_copies_peak.lock().await, 6);
+    assert_eq!(
+        protocol.objects.lock().await.get("bounded"),
+        Some(&payloads[0])
+    );
     Ok(())
 }
 

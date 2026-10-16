@@ -169,7 +169,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         stage: &PreparedStage,
         upload: &FinalUpload,
         source: &S3NativeCopySource,
-        (cancel, operations): (&CancellationToken, usize),
+        cancel: &CancellationToken,
     ) -> Result<S3NativeCopyEvidence, NativeFillFailure> {
         let path = stage.final_destination.path();
         let fail = |diagnostic| native_role_failure(refused(path, Operation::Write, diagnostic), 0);
@@ -192,7 +192,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             first,
         );
         let copied = self
-            .copy_parts(stage, upload, source, ranges, (cancel, operations))
+            .copy_parts(stage, upload, source, ranges, cancel)
             .await?;
         parts.extend(copied.parts.iter().cloned());
         parts.sort_by_key(|part| part.0);
@@ -214,8 +214,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         })
     }
 
-    /// Copies `ranges`, up to [`PARALLEL_PARTS`] at once and never more than `operations` (the
-    /// transfer's operation bound). A cancellation starts no more parts and waits for those in
+    /// Copies `ranges` using the backend-owned window, up to [`PARALLEL_PARTS`] at once.
+    /// A cancellation starts no more parts and waits for those in
     /// flight; a failed part fails at once.
     async fn copy_parts(
         &self,
@@ -223,10 +223,10 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         upload: &FinalUpload,
         source: &S3NativeCopySource,
         ranges: Vec<(i32, Range<u64>)>,
-        (cancel, operations): (&CancellationToken, usize),
+        cancel: &CancellationToken,
     ) -> Result<CopiedParts, NativeFillFailure> {
         let path = stage.final_destination.path();
-        let parallel = PARALLEL_PARTS.min(operations).max(1);
+        let parallel = PARALLEL_PARTS;
         let total = ranges.len();
         let mut pending = ranges.into_iter();
         let mut inflight = FuturesUnordered::new();

@@ -18,7 +18,7 @@ use crate::storage::listing::testing::listed as listed_current;
 use crate::storage::{SourceDescriptor, Storage};
 use crate::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession,
-    InflightLimits, TransferOutcome,
+    TransferOutcome,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -26,7 +26,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 async fn put(protocol: &MemoryS3, key: &str, body: &'static [u8]) -> TestResult {
     let bytes = Bytes::from_static(body);
     protocol
-        .put_object(key, bytes.clone(), &content_md5(&bytes))
+        .put_object(key, bytes.clone().into(), &content_md5(&bytes))
         .await
         .map_err(|e| format!("{e:?}"))?;
     Ok(())
@@ -78,11 +78,9 @@ async fn copy(
     observation: ObservedEntry,
     final_key: &str,
 ) -> TestResult<TransferOutcome> {
-    let limits = InflightLimits::new(2, 1024, 2)?;
     let source = ExpertSourceSession::open(ExpertSourceRequest::new(
         storage.clone(),
         observation.clone(),
-        limits,
         CancellationToken::new(),
     ))
     .await?;
@@ -91,7 +89,6 @@ async fn copy(
         source.offer().maximum_chunk_bytes,
         storage.clone(),
         StoragePath::new(final_key)?,
-        limits,
         CancellationToken::new(),
     ))
     .await?;
@@ -111,11 +108,9 @@ async fn copy(
 }
 
 async fn open_error(storage: &Storage, observation: ObservedEntry) -> String {
-    let limits = InflightLimits::new(2, 1024, 2).unwrap_or_else(|e| panic!("{e}"));
     match ExpertSourceSession::open(ExpertSourceRequest::new(
         storage.clone(),
         observation,
-        limits,
         CancellationToken::new(),
     ))
     .await

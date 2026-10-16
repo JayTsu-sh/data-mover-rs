@@ -8,8 +8,8 @@ use std::path::Path;
 use data_mover::model::{ObservedEntry, SourceVersion, StoragePath};
 use data_mover::storage::{BackendConfig, LocalBackendConfig, Storage, connect_backend};
 use data_mover::transfer::{
-    ExpertDestinationRequest, ExpertDestinationSession, InflightLimits, TransferIdentity,
-    TransferPhase, TransferPolicy, TransferRequest, transfer,
+    ExpertDestinationRequest, ExpertDestinationSession, TransferIdentity, TransferPhase,
+    TransferPolicy, TransferRequest, transfer,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -17,15 +17,13 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn local(root: &Path) -> TestResult<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.to_path_buf(),
         read_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
         write_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
     }))
     .await?)
-}
-
-fn limits() -> TestResult<InflightLimits> {
-    Ok(InflightLimits::new(2, 256 * 1024, 2)?)
 }
 
 async fn request(
@@ -37,7 +35,6 @@ async fn request(
         local(source).await?,
         StoragePath::new("in.bin")?,
         local(destination).await?,
-        limits()?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new(final_path)?))
@@ -138,7 +135,6 @@ async fn the_expert_destination_derives_the_same_identity_as_a_request() -> Test
         256 * 1024,
         local(destination.path()).await?,
         StoragePath::new("out.bin")?,
-        limits()?,
         CancellationToken::new(),
     ))
     .await?;
@@ -162,7 +158,6 @@ fn checkpointed_half(
         64 * 1024,
         destination,
         StoragePath::new("out.bin")?,
-        limits()?,
         CancellationToken::new(),
     )
     .with_transfer_policy(TransferPolicy::Checkpointed))
@@ -221,7 +216,6 @@ async fn default_and_explicit_paths_share_identity_while_remapping_changes_it() 
         local(source.path()).await?,
         StoragePath::new("in.bin")?,
         local(destination.path()).await?,
-        limits()?,
         CancellationToken::new(),
     );
     let explicit = default.clone().with_final_path(StoragePath::new("in.bin")?);

@@ -1,7 +1,6 @@
 use data_mover::model::{ObservationMode, ObservationPlan, ObservedEntry, StoragePath};
 use data_mover::storage::{BackendConfig, LocalBackendConfig, Storage, connect_backend};
 use data_mover::tar_pack::{TarRequest, calculate_tar_size, pack};
-use data_mover::transfer::InflightLimits;
 use std::num::NonZeroUsize;
 use tokio_util::sync::CancellationToken;
 
@@ -10,6 +9,8 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 async fn local(path: &std::path::Path) -> Result<Storage> {
     let slots = NonZeroUsize::new(2).ok_or("nonzero")?;
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: path.into(),
         read_concurrency: slots,
         write_concurrency: slots,
@@ -66,7 +67,7 @@ async fn archive_streams_files_headers_and_padding_with_small_chunk_limits() -> 
         destination,
         entries,
         final_path: StoragePath::new("result.tar")?,
-        inflight: InflightLimits::new(2, 128, 2)?,
+
         cancel: CancellationToken::new(),
         source_qos: None,
     })
@@ -106,7 +107,7 @@ async fn archive_records_a_link_without_reading_its_target() -> Result {
         destination: local(destination_root.path()).await?,
         entries,
         final_path: StoragePath::new("link.tar")?,
-        inflight: InflightLimits::new(2, 2048, 2)?,
+
         cancel: CancellationToken::new(),
         source_qos: None,
     })
@@ -132,7 +133,7 @@ async fn archive_preserves_long_names_using_pax_headers() -> Result {
         destination: local(destination_root.path()).await?,
         entries,
         final_path: StoragePath::new("long.tar")?,
-        inflight: InflightLimits::new(2, 128, 2)?,
+
         cancel: CancellationToken::new(),
         source_qos: None,
     })
@@ -175,7 +176,7 @@ async fn archive_preserves_long_non_utf8_link_targets_in_binary_pax() -> Result 
         destination: local(destination_root.path()).await?,
         entries,
         final_path: StoragePath::new("binary-link.tar")?,
-        inflight: InflightLimits::new(2, 128, 2)?,
+
         cancel: CancellationToken::new(),
         source_qos: None,
     })
@@ -226,7 +227,7 @@ async fn archive_preserves_positive_fractional_mtime_in_pax() -> Result {
         destination: local(destination_root.path()).await?,
         entries,
         final_path: StoragePath::new("fractional.tar")?,
-        inflight: InflightLimits::new(2, 128, 2)?,
+
         cancel: CancellationToken::new(),
         source_qos: None,
     })

@@ -245,6 +245,7 @@ impl NfsSymlinkFixture {
             return Ok(None);
         };
         let storage = connect_backend(BackendConfig::Nfs(NfsBackendConfig {
+            transfer_concurrency: None,
             url,
             block_size: None,
             ensure_dir: false,

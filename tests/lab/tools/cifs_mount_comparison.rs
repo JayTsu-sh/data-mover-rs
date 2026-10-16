@@ -10,8 +10,7 @@ use data_mover::storage::{
     connect_backend,
 };
 use data_mover::transfer::{
-    InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
-    transfer,
+    ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest, transfer,
 };
 use futures::{StreamExt, TryStreamExt, stream};
 use tokio_util::sync::CancellationToken;
@@ -57,12 +56,9 @@ struct Args {
     files: usize,
     #[arg(long, default_value_t = 1)]
     concurrency: usize,
-    // Payload budget is separate from the protocol-negotiated request limits.
+    // Requested Local source chunk; the CIFS client uses its negotiated backend limit.
     #[arg(long, default_value_t = 2 * 1024 * 1024)]
     chunk_bytes: usize,
-    /// Fix the payload byte budget independently of read concurrency.
-    #[arg(long)]
-    byte_budget: Option<usize>,
     #[arg(long)]
     read_back: bool,
 }
@@ -76,6 +72,8 @@ async fn endpoint(
 ) -> Result<data_mover::storage::Storage, Error> {
     let config = match transport {
         Transport::Mounted => BackendConfig::Local(LocalBackendConfig {
+            read_chunk_bytes: NonZeroUsize::new(args.chunk_bytes),
+            write_chunk_bytes: None,
             root: root.into(),
             read_concurrency: NonZeroUsize::new(concurrency.read()).ok_or("invalid concurrency")?,
             write_concurrency: NonZeroUsize::new(concurrency.write())
@@ -129,16 +127,6 @@ async fn main() -> Result<(), Error> {
         destination_concurrency,
     )
     .await?;
-    let slots = concurrency.read().max(concurrency.write());
-    let inflight = InflightLimits::new(
-        slots,
-        args.byte_budget.unwrap_or(
-            args.chunk_bytes
-                .checked_mul(concurrency.read())
-                .ok_or("byte budget overflow")?,
-        ),
-        concurrency.read(),
-    )?;
     let policy = match args.policy {
         Policy::Checkpointed => TransferPolicy::Checkpointed,
         Policy::AtomicReplace => TransferPolicy::AtomicReplace,
@@ -163,7 +151,6 @@ async fn main() -> Result<(), Error> {
                     source,
                     path.clone(),
                     destination,
-                    inflight,
                     CancellationToken::new(),
                 )
                 .with_identity_override(TransferIdentity::from_label(format!(

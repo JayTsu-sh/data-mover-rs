@@ -421,7 +421,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             key: path.as_str(),
             upload_id: &upload.upload_id,
             part_size: upload.part_size,
-            max_inflight: upload.streamed_inflight(),
+            max_inflight: upload.streamed_inflight(self.protocol.write_concurrency()),
             checkpoint,
         };
         let sent = self.upload_parts(&target, prefix, input).await?;

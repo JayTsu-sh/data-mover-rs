@@ -11,6 +11,10 @@ pub struct LocalBackendConfig {
     pub root: PathBuf,
     pub read_concurrency: NonZeroUsize,
     pub write_concurrency: NonZeroUsize,
+    /// Preferred read size, capped by the Local backend ceiling. `None` uses that ceiling.
+    pub read_chunk_bytes: Option<NonZeroUsize>,
+    /// Maximum write task size, independently capped by the Local backend ceiling.
+    pub write_chunk_bytes: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Debug)]
@@ -18,6 +22,8 @@ pub struct NfsBackendConfig {
     pub url: String,
     pub block_size: Option<u64>,
     pub ensure_dir: bool,
+    /// Explicit backend read/write windows; otherwise resolve environment and protocol defaults.
+    pub transfer_concurrency: Option<crate::transfer_concurrency::TransferConcurrency>,
 }
 
 /// Controls SMB integrity negotiation for CIFS connections.

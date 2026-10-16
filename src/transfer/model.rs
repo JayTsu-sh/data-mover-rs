@@ -25,21 +25,6 @@ impl fmt::Display for TransferValueError {
 
 impl std::error::Error for TransferValueError {}
 
-/// Explicit chunk, payload-byte, and source-operation admission bounds.
-///
-/// `operations` also caps the server-side copy requests a native copy keeps in flight (S3
-/// `UploadPartCopy`, at most six). `bytes` bounds what the engine reads ahead; a destination
-/// writer's own part buffers are outside it: an S3 multipart writer buffers the part it fills plus
-/// up to four in flight — 8 MiB parts by default, larger for objects over 80 GiB — and a streamed
-/// resume of a native S3 copy's upload uses that upload's 64 MiB parts, with as many in flight as
-/// fit in the four default-sized ones (at least one: 128 MiB in all).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InflightLimits {
-    pub(crate) chunks: usize,
-    pub(crate) bytes: usize,
-    pub(crate) operations: usize,
-}
-
 /// Selects target write visibility, recovery behavior, and publication durability.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TransferPolicy {
@@ -74,36 +59,6 @@ pub enum PayloadShapingPolicy {
     RequireClientShaped,
 }
 
-impl InflightLimits {
-    /// Creates non-zero bounded inflight limits.
-    ///
-    /// # Errors
-    /// Returns an error when any limit is zero or exceeds semaphore capacity.
-    pub fn new(chunks: usize, bytes: usize, operations: usize) -> Result<Self, TransferValueError> {
-        let maximum = u32::MAX as usize;
-        if chunks == 0 || bytes == 0 || operations == 0 {
-            return Err(TransferValueError(
-                "inflight limits must be greater than zero",
-            ));
-        }
-        if chunks > maximum || bytes > maximum || operations > maximum {
-            return Err(TransferValueError(
-                "inflight limits exceed semaphore capacity",
-            ));
-        }
-        Ok(Self {
-            chunks,
-            bytes,
-            operations,
-        })
-    }
-
-    pub(crate) fn negotiated_chunk_ceiling(self) -> usize {
-        let streams = self.chunks.min(self.operations).max(1);
-        (self.bytes / streams).max(1)
-    }
-}
-
 /// Immutable inputs for one transfer attempt.
 #[derive(Clone)]
 pub struct TransferRequest {
@@ -112,7 +67,6 @@ pub struct TransferRequest {
     pub(crate) source: Storage,
     pub(crate) destination: Storage,
     final_path_override: Option<StoragePath>,
-    pub(crate) inflight: InflightLimits,
     pub(crate) cancel: CancellationToken,
     pub(crate) transfer_policy: TransferPolicy,
     pub(crate) source_qos: Option<SourceQosGroup>,
@@ -203,7 +157,6 @@ impl TransferRequest {
         source: Storage,
         source_path: StoragePath,
         destination: Storage,
-        inflight: InflightLimits,
         cancel: CancellationToken,
     ) -> Self {
         Self {
@@ -215,7 +168,6 @@ impl TransferRequest {
             },
             source,
             destination,
-            inflight,
             cancel,
             transfer_policy: TransferPolicy::default(),
             source_qos: None,
@@ -241,7 +193,6 @@ impl TransferRequest {
         source: Storage,
         observation: ObservedEntry,
         destination: Storage,
-        inflight: InflightLimits,
         cancel: CancellationToken,
     ) -> Result<Self, TransferValueError> {
         if observation.source_identity().backend() != source.identity() {
@@ -255,13 +206,7 @@ impl TransferRequest {
         let version = observation.source_version().ok_or(TransferValueError(
             "observation does not identify a current object",
         ))?;
-        let mut request = Self::new(
-            source,
-            observation.path().clone(),
-            destination,
-            inflight,
-            cancel,
-        );
+        let mut request = Self::new(source, observation.path().clone(), destination, cancel);
         request.input = SourceInput::Observed {
             entry: Box::new(observation),
             version,

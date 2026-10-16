@@ -649,13 +649,12 @@ async fn verified_copy(
     policy: data_mover::transfer::TransferPolicy,
 ) -> TestResult {
     use data_mover::integrity::{IntegrityMode, IntegrityOptions, IntegrityRequest, compare};
-    use data_mover::transfer::{InflightLimits, ReadBackVerification, TransferRequest, transfer};
+    use data_mover::transfer::{ReadBackVerification, TransferRequest, transfer};
     let outcome = transfer(
         TransferRequest::new(
             source.clone(),
             StoragePath::new(from)?,
             destination.clone(),
-            InflightLimits::new(2, 2 * 1024 * 1024, 2)?,
             CancellationToken::new(),
         )
         .with_final_path(StoragePath::new(to)?)
@@ -689,6 +688,8 @@ async fn nightly_lab_cross_protocol_copy_and_integrity() -> TestResult {
     let root = tempfile::tempdir()?;
     let slots = NonZeroUsize::new(2).ok_or("nonzero")?;
     let local = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.path().into(),
         read_concurrency: slots,
         write_concurrency: slots,
@@ -765,7 +766,6 @@ async fn nightly_lab_role_tar_write() -> TestResult {
         destination: storage,
         entries: Vec::new(),
         final_path: StoragePath::new("empty.tar")?,
-        inflight: data_mover::transfer::InflightLimits::new(2, 1024, 2)?,
         cancel: CancellationToken::new(),
         source_qos: None,
     })

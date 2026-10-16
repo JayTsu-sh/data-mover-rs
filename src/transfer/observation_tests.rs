@@ -5,9 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    InflightLimits, PayloadShapingPolicy, TransferPhase, TransferRequest, TransferRoute, transfer,
-};
+use super::{PayloadShapingPolicy, TransferPhase, TransferRequest, TransferRoute, transfer};
 use crate::model::{EntryKind, ObservedEntry, SourceVersion, StoragePath};
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, endpoint_of, native_context};
 use crate::storage::backends::{local, s3};
@@ -38,7 +36,6 @@ fn request(
         source.clone(),
         observed,
         destination.clone(),
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )?
     .with_final_path(StoragePath::new("final")?))
@@ -88,7 +85,6 @@ async fn observed_version_is_pinned_for_streaming_and_native_copy() -> TestResul
             storage.clone(),
             StoragePath::new("source")?,
             storage.clone(),
-            InflightLimits::new(2, 64 * 1024, 2)?,
             CancellationToken::new(),
         )
         .with_final_path(StoragePath::new("final")?)

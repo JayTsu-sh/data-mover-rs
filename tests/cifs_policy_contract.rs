@@ -8,8 +8,8 @@ use data_mover::storage::{
     Storage, connect_backend,
 };
 use data_mover::transfer::{
-    InflightLimits, ReadBackVerification, TransferIdentity, TransferOutcome, TransferPolicy,
-    TransferRequest, transfer,
+    ReadBackVerification, TransferIdentity, TransferOutcome, TransferPolicy, TransferRequest,
+    transfer,
 };
 use futures::TryStreamExt as _;
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -87,6 +87,8 @@ async fn connect_remote(server: &str, share: &str) -> Result<Storage> {
 
 async fn connect_local(root: &std::path::Path) -> Result<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        read_chunk_bytes: None,
+        write_chunk_bytes: None,
         root: root.to_path_buf(),
         read_concurrency: std::num::NonZeroUsize::new(8).ok_or("invalid depth")?,
         write_concurrency: std::num::NonZeroUsize::new(8).ok_or("invalid depth")?,
@@ -108,7 +110,6 @@ async fn copy(
             source.clone(),
             StoragePath::new(from)?,
             destination.clone(),
-            InflightLimits::new(8, 16 * 1024 * 1024, 8)?,
             tokio_util::sync::CancellationToken::new(),
         )
         .with_final_path(StoragePath::new(to)?)

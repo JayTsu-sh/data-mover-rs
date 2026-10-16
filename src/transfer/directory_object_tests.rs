@@ -25,9 +25,9 @@ use crate::storage::{NamespaceCapabilities, SourceDescriptor, Storage, StorageRo
 use crate::transfer::{
     DIRECTORY_OBJECT_SKIP_REASON, DIRECTORY_OBJECT_TOO_LARGE_REASON, DirectoryObjectAction,
     DirectoryObjectDestination, ExpertDestinationRequest, ExpertDestinationSession,
-    ExpertSourceRequest, ExpertSourceSession, InflightLimits, PayloadShapingPolicy,
-    TransferFailure, TransferPhase, TransferPolicy, TransferRequest, TransferRoute, TransferSide,
-    directory_object_action, transfer,
+    ExpertSourceRequest, ExpertSourceSession, PayloadShapingPolicy, TransferFailure, TransferPhase,
+    TransferPolicy, TransferRequest, TransferRoute, TransferSide, directory_object_action,
+    transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -43,7 +43,7 @@ fn bucket(protocol: &Arc<MemoryS3>) -> TestResult<Storage> {
 async fn put(protocol: &MemoryS3, key: &str, body: &'static [u8]) -> TestResult {
     let bytes = Bytes::from_static(body);
     protocol
-        .put_object(key, bytes.clone(), &content_md5(&bytes))
+        .put_object(key, bytes.clone().into(), &content_md5(&bytes))
         .await
         .map_err(|e| format!("{e:?}"))?;
     Ok(())
@@ -59,7 +59,6 @@ fn request(
         source,
         StoragePath::new(source_path)?,
         destination,
-        InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
     .with_final_path(StoragePath::new(final_path)?))
@@ -171,7 +170,6 @@ async fn expert_source_refuses_a_directory_object_on_a_filesystem() -> TestResul
     let opened = ExpertSourceSession::open(ExpertSourceRequest::new(
         local,
         observation,
-        InflightLimits::new(2, 1024, 2)?,
         CancellationToken::new(),
     ))
     .await;
@@ -203,7 +201,6 @@ async fn expert_destination_refuses_a_directory_object_on_a_filesystem() -> Test
         1024,
         local,
         StoragePath::new("d/")?,
-        InflightLimits::new(2, 1024, 2)?,
         CancellationToken::new(),
     ))
     .await;
@@ -531,7 +528,6 @@ async fn a_directory_object_one_request_cannot_carry_is_refused_at_preflight() -
         1024,
         bucket(&protocol)?,
         StoragePath::new("d/")?,
-        InflightLimits::new(2, 1024, 2)?,
         CancellationToken::new(),
     ))
     .await;

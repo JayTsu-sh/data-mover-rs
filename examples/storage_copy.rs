@@ -110,7 +110,6 @@ fn qos_from_args(args: &Args) -> Result<Option<SourceQosGroup>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let limits = copy_support::limits(args.chunk_bytes)?;
     let source = connect_with_options(&args.source, false, Some(args.chunk_bytes)).await?;
     let destination = connect_with_options(&args.destination, true, Some(args.chunk_bytes)).await?;
     let path = StoragePath::new(&args.path)?;
@@ -121,7 +120,6 @@ async fn main() -> Result<()> {
         source.clone(),
         path.clone(),
         destination.clone(),
-        limits,
         CancellationToken::new(),
     );
     if let Some(qos) = qos {

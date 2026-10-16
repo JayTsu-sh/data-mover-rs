@@ -32,9 +32,19 @@ use memory_nas::NasRefused;
 pub(super) type UploadParts = HashMap<String, (String, Vec<(i32, Bytes)>)>;
 /// MD5s by (address, length) of a body, each with a clone that keeps the body allocated.
 type Md5Cache = HashMap<(usize, usize), (Bytes, [u8; 16])>;
+type BodyFragments = Vec<(i32, Vec<Bytes>)>;
+
+pub(crate) struct RangeGate {
+    pub(crate) offset: u64,
+    pub(crate) started: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
 
 #[derive(Default)]
 pub(crate) struct MemoryS3 {
+    pub(crate) read_window: Option<usize>,
+    pub(crate) range_gate: Mutex<Option<Arc<RangeGate>>>,
+    pub(crate) body_fragments: Mutex<Option<BodyFragments>>,
     pub(crate) version: Mutex<Option<String>>,
     pub(crate) last_modified: Mutex<Option<crate::model::StorageTimestamp>>,
     pub(crate) range_observations: Mutex<Vec<S3ObjectFacts>>,
@@ -126,6 +136,15 @@ pub(crate) struct MemoryS3 {
     nas: std::sync::Mutex<memory_nas::NasBucket>,
     /// Streamed `PutObject`s (P7 §14.2 N3): see [`memory_streaming`].
     streaming: std::sync::Mutex<memory_streaming::StreamingKnobs>,
+}
+
+impl MemoryS3 {
+    pub(crate) fn with_read_window(read_window: usize) -> Self {
+        Self {
+            read_window: Some(read_window),
+            ..Self::default()
+        }
+    }
 }
 
 /// The `ETag` S3 reports for an object written by one `PutObject`: the quoted hex MD5 of its body.
@@ -336,6 +355,9 @@ fn not_found() -> S3ProtocolFailure {
 
 #[async_trait]
 impl S3Protocol for MemoryS3 {
+    fn read_concurrency(&self) -> usize {
+        self.read_window.unwrap_or(DEFAULT_READ_CONCURRENCY)
+    }
     fn versioning_enabled(&self) -> bool {
         self.versioning_is_enabled()
     }
@@ -406,6 +428,16 @@ impl S3Protocol for MemoryS3 {
         observed: &S3ObjectFacts,
     ) -> S3Result<Bytes> {
         self.range_observations.lock().await.push(observed.clone());
+        let gate = self
+            .range_gate
+            .lock()
+            .await
+            .clone()
+            .filter(|gate| gate.offset == range.start);
+        if let Some(gate) = gate {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
         let bytes = self.bytes_at(key, observed.version_id.as_deref()).await?;
         // Pinned by `If-Match` on an object bucket; checked after the fact in NAS mode, as the
         // real protocol checks the response `ETag`: either way another object is a `Conflict`.
@@ -436,9 +468,10 @@ impl S3Protocol for MemoryS3 {
     async fn put_object(
         &self,
         key: &str,
-        body: Bytes,
+        body: crate::storage::backends::s3::S3Body,
         content_md5_base64: &str,
     ) -> S3Result<S3WriteFacts> {
+        let body = body.into_bytes();
         *self.puts.lock().await += 1;
         let corrupted = mem::take(&mut *self.bad_digest_next_put.lock().await);
         if corrupted || content_md5(&body) != content_md5_base64 {
@@ -504,9 +537,13 @@ impl S3Protocol for MemoryS3 {
         _key: &str,
         id: &str,
         number: i32,
-        bytes: Bytes,
+        bytes: crate::storage::backends::s3::S3Body,
         content_md5_base64: &str,
     ) -> S3Result<String> {
+        if let Some(recorded) = self.body_fragments.lock().await.as_mut() {
+            recorded.push((number, bytes.fragments().to_vec()));
+        }
+        let bytes = bytes.into_bytes();
         *self.part_uploads.lock().await += 1;
         let id = bare_upload_id(id);
         let id = id.as_str();

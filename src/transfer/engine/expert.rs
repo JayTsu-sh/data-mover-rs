@@ -1,15 +1,16 @@
 //! Transport-neutral source half of the unified transfer lifecycle.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
 use super::at_destination;
 use super::directory_object::{refuse_unholdable, refuse_unwritable};
 use super::plan::expert_recovery;
+use super::producer::{PayloadReceiver, payload_channel};
 use super::{
-    ProducerRequest, TransferFailure, TransferOutcome, TransferPhase, TransferSide,
-    inflight_channel, inflight_role_failure, produce, recovery_binding_for,
+    ProducerRequest, TransferFailure, TransferOutcome, TransferPhase, TransferSide, produce,
+    recovery_binding_for,
 };
 use crate::metadata::MetadataPlan;
 use crate::model::observation::PrivateBackendEntryFacts;
@@ -20,7 +21,7 @@ use crate::storage::{
     StagedDestination, Storage, VerificationPoint, VerifyRequest, WriteEvidence,
     WriteProgressObserver,
 };
-use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy};
+use crate::transfer::{TransferIdentity, TransferPolicy};
 
 use super::observation;
 
@@ -29,7 +30,6 @@ use super::observation;
 pub struct ExpertSourceRequest {
     source: Storage,
     observation: ObservedEntry,
-    inflight: InflightLimits,
     cancel: tokio_util::sync::CancellationToken,
     source_qos: Option<SourceQosGroup>,
 }
@@ -39,13 +39,11 @@ impl ExpertSourceRequest {
     pub fn new(
         source: Storage,
         observation: ObservedEntry,
-        inflight: InflightLimits,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
         Self {
             source,
             observation,
-            inflight,
             cancel,
             source_qos: None,
         }
@@ -79,7 +77,6 @@ pub struct ExpertSourceEvidence {
 pub struct ExpertSourceSession {
     source: Arc<dyn ReadSource>,
     descriptor: SourceDescriptor,
-    inflight: InflightLimits,
     cancel: tokio_util::sync::CancellationToken,
     source_qos: Option<SourceQosBudget>,
     offer: ExpertSourceOffer,
@@ -110,10 +107,7 @@ impl ExpertSourceSession {
         let source_size = descriptor.size.ok_or_else(|| {
             TransferFailure::orchestration(TransferPhase::Describe, "source has no byte size")
         })?;
-        let maximum_chunk_bytes = request
-            .inflight
-            .negotiated_chunk_ceiling()
-            .min(source.maximum_read_chunk_bytes().max(1));
+        let maximum_chunk_bytes = source.maximum_read_chunk_bytes().max(1);
         let source_qos = request
             .source_qos
             .as_ref()
@@ -131,7 +125,6 @@ impl ExpertSourceSession {
         Ok(Self {
             source,
             descriptor,
-            inflight: request.inflight,
             cancel: request.cancel,
             source_qos,
             offer,
@@ -154,13 +147,7 @@ impl ExpertSourceSession {
                 "destination durable prefix exceeds source size",
             ));
         }
-        let (runtime, ordered) = inflight_channel(
-            self.inflight,
-            durable_prefix,
-            self.offer.source_size,
-            self.cancel.clone(),
-        )?;
-        let failure = Arc::new(Mutex::new(None));
+        let (sender, receiver) = payload_channel(self.cancel.clone(), self.descriptor.path.clone());
         let producer = tokio::spawn(produce(ProducerRequest {
             hash_content: true,
             source: self.source,
@@ -168,17 +155,14 @@ impl ExpertSourceSession {
             version: self.descriptor.version,
             source_identity: self.descriptor.source_identity,
             cancel: self.cancel,
-            runtime,
-            failure: Arc::clone(&failure),
+            sender,
             size: self.offer.source_size,
             write_start: durable_prefix,
             source_qos: self.source_qos.clone(),
         }));
         Ok(ExpertSourcePayload {
-            ordered,
+            receiver,
             producer,
-            failure,
-            path: self.descriptor.path,
             source_qos: self.source_qos,
             offer: self.offer,
             exhausted: false,
@@ -188,10 +172,8 @@ impl ExpertSourceSession {
 
 /// Bounded source payload consumed by a caller-owned transport.
 pub struct ExpertSourcePayload {
-    ordered: crate::runtime::inflight::OrderedChunks,
+    receiver: PayloadReceiver,
     producer: tokio::task::JoinHandle<Result<Option<[u8; 32]>, TransferFailure>>,
-    failure: Arc<Mutex<Option<crate::storage::StorageRoleFailure>>>,
-    path: crate::model::StoragePath,
     source_qos: Option<SourceQosBudget>,
     offer: ExpertSourceOffer,
     exhausted: bool,
@@ -203,21 +185,13 @@ impl ExpertSourcePayload {
     /// # Errors
     /// Returns a source-attributed transfer failure.
     pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, TransferFailure> {
-        match self.ordered.next().await {
+        match self.receiver.next().await {
             Some(Ok(bytes)) => Ok(Some(bytes)),
-            Some(Err(error)) => {
-                let role = self
-                    .failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-                    .unwrap_or_else(|| inflight_role_failure(&error, &self.path));
-                Err(TransferFailure::role(
-                    TransferPhase::Transfer,
-                    TransferSide::Source,
-                    role,
-                ))
-            }
+            Some(Err(error)) => Err(TransferFailure::role(
+                TransferPhase::Transfer,
+                TransferSide::Source,
+                error,
+            )),
             None => {
                 self.exhausted = true;
                 Ok(None)
@@ -273,7 +247,6 @@ pub struct ExpertDestinationRequest {
     source_maximum_chunk_bytes: usize,
     destination: Storage,
     final_path: StoragePath,
-    inflight: InflightLimits,
     cancel: tokio_util::sync::CancellationToken,
     transfer_policy: TransferPolicy,
     metadata_plan: Option<MetadataPlan>,
@@ -290,7 +263,6 @@ impl ExpertDestinationRequest {
         source_maximum_chunk_bytes: usize,
         destination: Storage,
         final_path: StoragePath,
-        inflight: InflightLimits,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
         // The expert halves copy the current version only.
@@ -307,7 +279,6 @@ impl ExpertDestinationRequest {
             source_maximum_chunk_bytes,
             destination,
             final_path,
-            inflight,
             cancel,
             transfer_policy: TransferPolicy::default(),
             metadata_plan: None,
@@ -389,10 +360,7 @@ impl ExpertDestinationSession {
         let source_size = source.size.ok_or_else(|| {
             TransferFailure::orchestration(TransferPhase::Describe, "source has no byte size")
         })?;
-        let maximum_chunk_bytes = request
-            .inflight
-            .negotiated_chunk_ceiling()
-            .min(request.source_maximum_chunk_bytes);
+        let maximum_chunk_bytes = request.source_maximum_chunk_bytes;
         let destination = request.destination.staged_destination().map_err(|_| {
             TransferFailure::capability(
                 TransferSide::Destination,

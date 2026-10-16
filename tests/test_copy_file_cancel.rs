@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use data_mover::model::StoragePath;
 use data_mover::storage::{SourceQosGroup, SourceQosPolicy};
-use data_mover::transfer::{InflightLimits, TransferPolicy, TransferRequest, transfer};
+use data_mover::transfer::{TransferPolicy, TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
 
 mod common;
@@ -24,7 +24,6 @@ async fn pre_cancelled_transfer_preserves_an_existing_final()
             common::connect_local(source_root.path(), 4).await?,
             StoragePath::new("blob.bin")?,
             common::connect_local(destination_root.path(), 4).await?,
-            InflightLimits::new(2, 64 * 1024, 2)?,
             cancel,
         )
         .with_transfer_policy(TransferPolicy::AtomicReplace),
@@ -67,7 +66,6 @@ async fn cancellation_stops_a_shaped_transfer_before_the_entire_payload()
         common::connect_local(source_root.path(), 4).await?,
         StoragePath::new("blob.bin")?,
         common::connect_local(destination_root.path(), 4).await?,
-        InflightLimits::new(4, 256 * 1024, 4)?,
         cancel.clone(),
     )
     .with_source_qos(qos);

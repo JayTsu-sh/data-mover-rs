@@ -5,9 +5,7 @@ use data_mover::storage::{
     DestinationPrepareRequest, FinalDestination, PrepareFact, PrepareRequest, ResumeMode,
     SourceDescriptor, Storage, connect_backend,
 };
-use data_mover::transfer::{
-    InflightLimits, TransferIdentity, TransferPolicy, TransferRequest, transfer,
-};
+use data_mover::transfer::{TransferIdentity, TransferPolicy, TransferRequest, transfer};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -28,7 +26,6 @@ async fn nightly_lab_transfer_policies_and_chunk_boundaries() -> TestResult {
                 storage.clone(),
                 StoragePath::new("source")?,
                 storage.clone(),
-                InflightLimits::new(8, 16 * 1024 * 1024, 8)?,
                 tokio_util::sync::CancellationToken::new(),
             )
             .with_final_path(StoragePath::new("final")?)
@@ -184,6 +181,8 @@ async fn nightly_lab_local_source_metadata_to_hdfs_policies() -> TestResult {
     )?;
     let source = connect_backend(data_mover::storage::BackendConfig::Local(
         LocalBackendConfig {
+            read_chunk_bytes: None,
+            write_chunk_bytes: None,
             root: local_root.clone(),
             read_concurrency: NonZeroUsize::new(2).ok_or("invalid read concurrency")?,
             write_concurrency: NonZeroUsize::new(2).ok_or("invalid write concurrency")?,
@@ -202,7 +201,6 @@ async fn nightly_lab_local_source_metadata_to_hdfs_policies() -> TestResult {
                 source.clone(),
                 StoragePath::new("source")?,
                 destination.clone(),
-                InflightLimits::new(2, 128, 2)?,
                 tokio_util::sync::CancellationToken::new(),
             )
             .with_final_path(StoragePath::new(final_path.clone())?)

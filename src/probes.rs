@@ -11,8 +11,8 @@ use crate::model::{
     ObservationPlan, ObservedEntry, SourceIdentity, StoragePath, StorageTimestamp,
 };
 use crate::transfer::{
-    ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, InflightLimits,
-    TransferFailure, TransferPhase, TransferPolicy, TransferSide, TransferValueError,
+    ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, TransferFailure,
+    TransferPhase, TransferPolicy, TransferSide, TransferValueError,
 };
 
 use crate::storage::{CapabilityUnavailable, SourceQosStats, Storage, StorageRoleFailure};
@@ -173,7 +173,6 @@ async fn write_probe(storage: &Storage, path: &StoragePath) -> Result<(), ProbeF
         1,
         storage.clone(),
         path.clone(),
-        InflightLimits::new(1, 1, 1).map_err(ProbeError::Limits)?,
         CancellationToken::new(),
     )
     .with_transfer_policy(TransferPolicy::AtomicReplace);
