@@ -15,7 +15,6 @@ destination_url="nfs://$LAB_NFS40_DATA$LAB_NFS40_EXPORT:/$destination_root?versi
 
 cargo run --quiet --locked --example nfs3_contract -- \
   --dialect nfs40 \
-  --expect-setacl-unsupported \
   --require-stale-identity-change \
   --seed-mount "$mount_url" \
   --seed-root "$source_root" \

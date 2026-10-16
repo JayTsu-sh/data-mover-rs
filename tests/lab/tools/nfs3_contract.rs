@@ -117,12 +117,22 @@ async fn probe_nfs4_acl(
             Ok(())
         }
         Ok(()) if !expect_setacl_unsupported => {
-            eprintln!("nfs-rs SETACL succeeded");
+            let fresh = mount.lookup_path(file).await?;
+            let read_back = mount.getacl(fresh.fh).await?;
+            assert_acl_round_trip(&acl, &read_back)?;
+            eprintln!("nfs-rs SETACL succeeded; GETACL read-back matched");
             Ok(())
         }
         Err(error) => Err(format!("unexpected nfs-rs SETACL result: {error:?}").into()),
         Ok(()) => Err("nfs-rs SETACL succeeded but Unsupported was required".into()),
     }
+}
+
+fn assert_acl_round_trip<T: PartialEq>(expected: &T, actual: &T) -> ContractResult {
+    if expected != actual {
+        return Err("NFSv4 ACL read-back differed after successful SETACL".into());
+    }
+    Ok(())
 }
 
 async fn seed_nfs4_fixture(
@@ -361,39 +371,49 @@ fn assert_acl_set_result<T>(
     }
 }
 
+async fn read_fixture_acl(source: &Storage) -> ContractResult<data_mover::model::AclMetadata> {
+    let observed = source
+        .metadata()?
+        .observe(
+            &path("fixture.bin")?,
+            ObservationPlan::default().with_acl(ObservationMode::Required),
+        )
+        .await;
+    match observed {
+        Ok(observations) => match observations.acl() {
+            MetadataObservation::Value { value, .. } => Ok(value.clone()),
+            other => Err(format!("unexpected GETACL observation: {other:?}").into()),
+        },
+        Err(error) => Err(format!("unexpected GETACL failure: {error:?}").into()),
+    }
+}
+
 async fn validate_acl(
     source: &Storage,
+    source_url: &str,
     dialect: ContractDialect,
     expect_setacl_unsupported: bool,
 ) -> ContractResult {
     if dialect == ContractDialect::Nfs3 {
         return Ok(());
     }
-    let metadata = source.metadata()?;
-    let fixture = path("fixture.bin")?;
-    let observed = metadata
-        .observe(
-            &fixture,
-            ObservationPlan::default().with_acl(ObservationMode::Required),
-        )
-        .await;
-    let acl_to_set = match observed {
-        Ok(observations) => match observations.acl() {
-            MetadataObservation::Value { value, .. } => value.clone(),
-            other => return Err(format!("unexpected GETACL observation: {other:?}").into()),
-        },
-        Err(error) => return Err(format!("unexpected GETACL failure: {error:?}").into()),
-    };
+    let acl_to_set = read_fixture_acl(source).await?;
     assert_acl_set_result(
-        metadata
+        source
+            .metadata()?
             .apply(
-                &fixture,
-                MetadataMutation::Acl(acl_to_set),
+                &path("fixture.bin")?,
+                MetadataMutation::Acl(acl_to_set.clone()),
                 CancellationToken::new(),
             )
             .await,
         expect_setacl_unsupported,
     )?;
+    if !expect_setacl_unsupported {
+        let fresh = connect_nfs(source_url, false).await?;
+        assert_acl_round_trip(&acl_to_set, &read_fixture_acl(&fresh).await?)?;
+        eprintln!("production SETACL succeeded; fresh-connection GETACL read-back matched");
+    }
     Ok(())
 }
 
@@ -580,7 +600,13 @@ async fn main() -> ContractResult {
     }
     eprintln!("contract stage: traversal and metadata");
     validate_traversal(&source, args.dialect).await?;
-    validate_acl(&source, args.dialect, args.expect_setacl_unsupported).await?;
+    validate_acl(
+        &source,
+        &args.source,
+        args.dialect,
+        args.expect_setacl_unsupported,
+    )
+    .await?;
     eprintln!("contract stage: streaming transfer");
     validate_streaming_copy(&source, &destination).await?;
     if args.dialect != ContractDialect::Nfs3 {
@@ -598,4 +624,32 @@ async fn main() -> ContractResult {
         }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod acl_contract_tests {
+    use super::*;
+
+    #[test]
+    fn acl_read_back_rejects_changed_or_missing_aces() {
+        let expected = nfs_rs::Acl {
+            aces: vec![nfs_rs::NfsAce {
+                ace_type: nfs_rs::AceType::AccessAllowed,
+                flags: nfs_rs::AceFlags(0),
+                access_mask: nfs_rs::AceMask(1),
+                who: "OWNER@".to_owned(),
+            }],
+        };
+        assert!(assert_acl_round_trip(&expected, &expected).is_ok());
+        let mut changed = expected.clone();
+        changed.aces[0].access_mask = nfs_rs::AceMask(2);
+        assert!(assert_acl_round_trip(&expected, &changed).is_err());
+        assert!(assert_acl_round_trip(&expected, &nfs_rs::Acl::default()).is_err());
+    }
+
+    #[test]
+    fn acl_success_does_not_satisfy_an_unsupported_expectation() {
+        assert!(assert_acl_set_result(Ok(()), false).is_ok());
+        assert!(assert_acl_set_result(Ok(()), true).is_err());
+    }
 }

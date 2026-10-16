@@ -91,8 +91,11 @@ DXN `10.131.7.201:/jay_nfs` fixture using the exact `version=4.0` selector. It s
 run root through NFSv4.0, then validates the production role seam for traversal, stateful file
 handles, streaming copy, source-only QoS accounting, reconnect recovery, and atomic recovery
 claims. ACL operations are exercised rather than inferred from a capability bit: DXN GETACL is
-observed and SETACL must fail as typed permanent `Unsupported`; named attributes are also typed
-`Unsupported`.
+observed and SETACL must succeed with identical ACL read-back, both through raw `nfs-rs` and
+through a fresh production role connection. The current fixture supports this round-trip;
+`--expect-setacl-unsupported` is reserved for explicitly unsupported fixtures, not selected by
+the nightly runner. Typed permanent `Unsupported` mapping is covered by a cluster-free
+metadata-adapter test. Named attributes are also typed `Unsupported`.
 
 `run-nfs41-contract.sh <run-id>` is the independent `DM-NFS41-CONTRACT` gate across the source
 and destination Linux NFS servers using exact `version=4.1` URLs. It replaces a source directory

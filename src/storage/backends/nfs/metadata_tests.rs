@@ -98,7 +98,10 @@ impl NfsMetadataProtocol for CancellingProtocol {
         _path: &StoragePath,
         _acl: &nfs_rs::Acl,
     ) -> Result<(), NfsProtocolFailure> {
-        Err(NfsProtocolFailure::protocol())
+        self.sets.fetch_add(1, Ordering::SeqCst);
+        Err(super::super::protocol::classify_error(
+            nfs_rs::NfsError::Unsupported("SETACL unavailable for this request".to_owned()),
+        ))
     }
     async fn set_xattr(
         &self,
@@ -165,7 +168,7 @@ async fn a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not
     });
     let identity = crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "dest")
         .unwrap_or_else(|error| panic!("{error}"));
-    let adapter = NfsMetadataAdapter::new(protocol, identity);
+    let adapter = NfsMetadataAdapter::new(protocol.clone(), identity);
     let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
     let acl = acl::encode(&nfs_rs::Acl::default()).unwrap_or_else(|error| panic!("{error:?}"));
     let refused = adapter
@@ -176,9 +179,12 @@ async fn a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not
         )
         .await;
     assert!(
-        matches!(refused, Err(StorageRoleFailure::Entry(_))),
+        matches!(&refused, Err(StorageRoleFailure::Entry(error))
+            if error.class() == FailureClass::Unsupported
+                && error.transience() == Transience::Permanent),
         "{refused:?}"
     );
+    assert_eq!(protocol.sets.load(Ordering::SeqCst), 1);
     for class in [
         FailureClass::Protocol,
         FailureClass::PermissionDenied,

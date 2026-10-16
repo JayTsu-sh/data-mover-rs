@@ -158,6 +158,7 @@ path = "tests/lab/tools/transfer_resume.rs"
 [[example]]
 name = "nfs3_contract"
 path = "tests/lab/tools/nfs3_contract.rs"
+test = true
 
 [[example]]
 name = "hdfs_kerberos_copy"

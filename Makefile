@@ -91,7 +91,7 @@ arch-guard-selftest:
 	python3 -m unittest tests/test_architecture_dependencies.py
 
 harness-contract:
-	python3 -m unittest tests/test_cargo_examples.py tests/test_lab_migration_paths.py
+	python3 -m unittest tests/test_cargo_examples.py tests/test_lab_migration_paths.py tests/test_nfs40_contract.py
 
 ci: fmt arch-guard harness-contract clippy test examples e2e-local
 

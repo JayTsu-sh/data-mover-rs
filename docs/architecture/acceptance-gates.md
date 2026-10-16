@@ -179,8 +179,11 @@ without issuing unavailable enrichment calls.
 
 The gate independently covers v4.0 state/reconnect, file handles, stable writes, ACL/xattr,
 rename/replace, replay safety, and recovery. ACL support is determined by the actual GETACL and
-SETACL results, not by a backend-name branch or a capability short-circuit: the current DXN
-fixture permits GETACL and returns typed `Unsupported` for SETACL, while FAS2750 may support both.
+SETACL results, not by a backend-name branch or a capability short-circuit. The current DXN
+fixture must pass GETACL/SETACL with identical read-back through both raw `nfs-rs` and a fresh
+production role connection. Historical `Unsupported` observations do not override current
+operation results. Explicitly unsupported fixtures can select `--expect-setacl-unsupported`;
+cluster-free tests independently verify typed permanent `Unsupported` mapping.
 Named attributes are typed `Unsupported` on the current v4.0 adapter. NFSv3 or v4.1 evidence
 cannot substitute.
 

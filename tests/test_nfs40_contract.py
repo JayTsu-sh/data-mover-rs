@@ -16,6 +16,16 @@ class Nfs40ContractTest(unittest.TestCase):
         self.assertNotIn("version=4,", runner)
         self.assertIn('run_root="data-mover-ci/$run_id"', runner)
         self.assertIn("--dialect nfs40", runner)
+        self.assertNotIn("--expect-setacl-unsupported", runner)
+
+    def test_successful_acl_writes_require_read_back_on_both_seams(self):
+        contract = (ROOT / "tests/lab/tools/nfs3_contract.rs").read_text()
+        self.assertIn("assert_acl_round_trip(&acl, &read_back)?", contract)
+        self.assertIn("let fresh = connect_nfs(source_url, false).await?", contract)
+        self.assertIn(
+            "assert_acl_round_trip(&acl_to_set, &read_fixture_acl(&fresh).await?)?",
+            contract,
+        )
 
     def test_endpoint_has_explicit_defaults(self):
         common = (ROOT / "tests/lab/common.sh").read_text()
