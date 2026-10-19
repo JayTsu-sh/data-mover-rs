@@ -739,6 +739,16 @@ Rules:
 - resume charges only repeated/new source work; restart charges all rereads;
 - internal chunks and channel operations are not IOPS.
 
+S3 preserves its configured bounded GET size under bandwidth shaping. The source
+waits for the whole request's byte budget before dispatch, with the policy's
+maximum read size as the burst bound; a 10 ms bandwidth quantum must not split
+one GET into many requests. This is admission pacing rather than instantaneous
+socket-level shaping. QoS GET retries use single SDK attempts and re-enter the
+shared admission scheduler, bounded to three attempts per range. Each attempt
+reserves its byte cost and consumes one IOPS slot; returned payload statistics
+count only complete successful ranges. Source identity conditions are retained
+across retries. Metadata/HEAD requests remain outside the payload-read budget.
+
 S3 native copy remains allowed with QoS enabled. Server-internal payload is not client-shaped.
 Outcomes distinguish logical payload, client-streamed shaped bytes, native bytes, source read
 operations, and native requests, and explicitly report native payload as unshaped. A caller

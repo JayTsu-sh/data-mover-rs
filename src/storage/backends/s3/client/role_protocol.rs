@@ -6,8 +6,8 @@ use bytes::Bytes;
 
 use crate::model::{FailureClass, Transience};
 use crate::storage::backends::s3::{
-    S3NativeCopySource, S3ObjectPage, S3ProtocolFailure, S3Result, S3VersionFacts, S3VersionMarker,
-    S3VersionPage, S3WriteFacts,
+    S3NativeCopySource, S3ObjectPage, S3Protocol as _, S3ProtocolFailure, S3Result, S3VersionFacts,
+    S3VersionMarker, S3VersionPage, S3WriteFacts,
 };
 use crate::time_util::http_last_modified;
 
@@ -39,6 +39,8 @@ mod hints;
 mod listing;
 mod multipart;
 mod native;
+#[cfg(test)]
+mod qos_wire_tests;
 pub(super) mod rename;
 mod streaming_put;
 #[cfg(test)]
@@ -104,6 +106,62 @@ fn continuation_marker(
 }
 
 impl S3Storage {
+    async fn get_range_request(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+        observed: &crate::storage::backends::s3::S3ObjectFacts,
+        retry: Option<aws_sdk_s3::config::retry::RetryConfig>,
+    ) -> crate::storage::backends::s3::S3Result<Bytes> {
+        if range.start == range.end {
+            return Ok(Bytes::new());
+        }
+        let pinned = self.bucket_capabilities().conditional_reads;
+        let mut config = aws_sdk_s3::config::Builder::default();
+        config.set_retry_config(retry);
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket_name)
+            .key(self.build_full_key(key))
+            .range(format!("bytes={}-{}", range.start, range.end - 1))
+            .set_version_id(observed.version_id.clone())
+            .set_if_match(pinned.then(|| observed.etag.clone()))
+            .customize()
+            .config_override(config)
+            .send()
+            .await
+            .map_err(|error| {
+                let failure = hints::not_implemented(
+                    self.options,
+                    classify_sdk!(error, "S3 GetObject range request failed"),
+                );
+                if observed.version_id.is_some() {
+                    versioned_failure(
+                        error.raw_response().map(|r| r.status().as_u16()),
+                        error
+                            .as_service_error()
+                            .and_then(ProvideErrorMetadata::code),
+                        failure,
+                    )
+                } else {
+                    failure
+                }
+            })?;
+        if !pinned {
+            return unpinned::read(response, range.end - range.start, observed, || {
+                self.head_object(key, None)
+            })
+            .await;
+        }
+        response
+            .body
+            .collect()
+            .await
+            .map(AggregatedBytes::into_bytes)
+            .map_err(|error| s3_role_session(error.to_string()))
+    }
+
     /// What a write reported: its `ETag` and its version as spelled — `"null"` when the reply
     /// named none in a bucket with versioning suspended. Every write there creates the `"null"`
     /// version; AWS and `MinIO` say so (`x-amz-version-id: null`), `RustFS` 1.0.0 leaves the header
@@ -220,50 +278,23 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         key: &str,
         range: std::ops::Range<u64>,
         observed: &crate::storage::backends::s3::S3ObjectFacts,
-    ) -> crate::storage::backends::s3::S3Result<Bytes> {
-        if range.start == range.end {
-            return Ok(Bytes::new());
-        }
-        let pinned = self.bucket_capabilities().conditional_reads;
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket_name)
-            .key(self.build_full_key(key))
-            .range(format!("bytes={}-{}", range.start, range.end - 1))
-            .set_version_id(observed.version_id.clone())
-            .set_if_match(pinned.then(|| observed.etag.clone()))
-            .send()
-            .await
-            .map_err(|error| {
-                let failure = hints::not_implemented(
-                    self.options,
-                    classify_sdk!(error, "S3 GetObject range request failed"),
-                );
-                if observed.version_id.is_some() {
-                    versioned_failure(
-                        error.raw_response().map(|r| r.status().as_u16()),
-                        error
-                            .as_service_error()
-                            .and_then(ProvideErrorMetadata::code),
-                        failure,
-                    )
-                } else {
-                    failure
-                }
-            })?;
-        if !pinned {
-            return unpinned::read(response, range.end - range.start, observed, || {
-                self.head_object(key, None)
-            })
-            .await;
-        }
-        response
-            .body
-            .collect()
-            .await
-            .map(AggregatedBytes::into_bytes)
-            .map_err(|error| s3_role_session(error.to_string()))
+    ) -> S3Result<Bytes> {
+        self.get_range_request(key, range, observed, None).await
+    }
+
+    async fn get_range_once(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+        observed: &crate::storage::backends::s3::S3ObjectFacts,
+    ) -> S3Result<Bytes> {
+        self.get_range_request(
+            key,
+            range,
+            observed,
+            Some(aws_sdk_s3::config::retry::RetryConfig::disabled()),
+        )
+        .await
     }
 
     async fn put_object(
@@ -652,6 +683,11 @@ pub(super) fn s3_role_remote_failure(
         // backs off within its budget, and the traversal never ends on one.
         (Some(429 | 503), _) => throttled(diagnostic),
         (_, Some(code)) if is_throttling_code(code) => throttled(diagnostic),
+        // AWS retries these even when carried by a 400 response. Preserve that
+        // classification when source admission owns the per-attempt retry loop.
+        (_, Some("RequestTimeout" | "RequestTimeoutException")) => {
+            s3_role_transport_failure(diagnostic)
+        }
         (Some(500..=599), _) => crate::storage::backends::s3::S3ProtocolFailure::session(
             FailureClass::Connectivity,
             Transience::Transient,
@@ -691,7 +727,6 @@ fn throttled(diagnostic: &'static str) -> S3ProtocolFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::backends::s3::S3Protocol as _;
     use crate::storage::backends::s3::S3ProtocolFailure;
 
     /// A request that named a version: 405 is a delete marker and 400 `InvalidArgument` a

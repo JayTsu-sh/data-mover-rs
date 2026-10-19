@@ -186,9 +186,15 @@ Set `QOS_LAB_PROFILE=iops` for protocol-operation shaping and
 `QOS_LAB_IOPS_MODE=soft-hard` for dual-rate IOPS. Nightly and release validation
 run strict bandwidth, soft/hard bandwidth, strict IOPS, and soft/hard IOPS as
 four separate gates and upload their measurement CSV files.
-For Local/NFS/HDFS, source IOPS must equal the number of burst-sized real reads.
-For S3 it must equal the number of 5 MiB Range GETs, proving that pacing slices
-inside one response do not inflate request IOPS. The CSV preserves baseline and
+For Local/NFS/HDFS, source IOPS must equal the number of 64 KiB real reads (257).
+S3 uses an explicit 8 MiB GET/request cap (three requests for this fixture),
+including at the 2 IOPS setting. Bandwidth paces each entire S3 request before
+dispatch rather than shrinking GETs to a 10 ms byte allowance. Thus the request
+size bounds the permitted burst; this is source admission pacing, not a claim
+about instantaneous socket throughput. S3 baseline and shaped runs use the
+same configured read size. Failed S3 GET attempts consume IOPS again, with at
+most three attempts per range; HEAD/metadata requests use separate accounting.
+The CSV preserves baseline and
 limited measurements for diagnosing lab drift. The default strict case has
 soft and hard rates both set to 8 MiB/s. Set `QOS_LAB_SOFT_RATE_MIB`,
 `QOS_LAB_HARD_RATE_MIB`, and `QOS_LAB_PEAK_DURATION_MS` to exercise a dual-rate

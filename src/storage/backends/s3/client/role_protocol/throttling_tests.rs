@@ -39,3 +39,17 @@ fn throttling_is_its_own_transient_class() {
         ));
     }
 }
+
+#[test]
+fn sdk_retryable_request_timeouts_keep_their_transient_class() {
+    for code in ["RequestTimeout", "RequestTimeoutException"] {
+        assert!(matches!(
+            s3_role_remote_failure(Some(400), Some(code), "read"),
+            S3ProtocolFailure::Session {
+                class: FailureClass::Connectivity,
+                transience: Transience::Transient,
+                ..
+            }
+        ));
+    }
+}

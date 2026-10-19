@@ -185,6 +185,17 @@ impl SourceQosBudget {
         self.admit(requested, cancel).await
     }
 
+    /// Admit one bounded protocol request without turning bandwidth time slices into requests.
+    /// The entire grant is paced before dispatch; `max_read_bytes` bounds its burst and memory.
+    pub(crate) async fn admit_request(
+        &self,
+        requested: u64,
+        cancel: &CancellationToken,
+    ) -> Result<u64, SourceQosCancelled> {
+        self.schedule(requested.min(self.group.0.policy.max_read_bytes), cancel)
+            .await
+    }
+
     async fn admit(
         &self,
         requested: u64,
@@ -207,6 +218,14 @@ impl SourceQosBudget {
         let granted = requested
             .min(self.group.0.policy.max_read_bytes)
             .min(hard_quantum);
+        self.schedule(granted, cancel).await
+    }
+
+    async fn schedule(
+        &self,
+        granted: u64,
+        cancel: &CancellationToken,
+    ) -> Result<u64, SourceQosCancelled> {
         if granted == 0 {
             return Ok(0);
         }
