@@ -56,6 +56,14 @@ reads. Read depth is bounded by backend read concurrency and the transfer limits
 are acquired before reads allocate data, survive ordered submission, and are released according
 to the shared runtime's payload and operation lifecycle. Retries use the same opened reader.
 
+Staged read-back verification also opens one reader for the whole file. Its sequential reads
+respect the backend limit and a 2 MiB ceiling, without fetching the complete block-location list
+again for each chunk. Cancellation interrupts both opening and pending reads. Short reads remain
+corruption errors; protocols without a reusable cursor retain the bounded range-read fallback.
+Verification retries refresh block locations after a transient failure, preserving the previous
+range-read retry behavior. Source cursors keep their original observation; this refresh policy
+is specific to verification, whose caller checks the complete expected digest.
+
 ## Durability and Direct semantics
 
 The pinned `hdfs-native` revision `373739f` provides public asynchronous and synchronous

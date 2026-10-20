@@ -124,6 +124,17 @@ async fn nightly_lab_recovers_closed_hdfs_prefix() -> TestResult {
         )
         .await?;
     destination
+        .verify(
+            &resumed,
+            data_mover::storage::VerifyRequest {
+                expected_size: content.len() as u64,
+                expected_blake3: *blake3::hash(&content).as_bytes(),
+                cancel: CancellationToken::new(),
+                published: None,
+            },
+        )
+        .await?;
+    destination
         .publish(
             &resumed,
             data_mover::storage::PublishRequest {
@@ -136,6 +147,68 @@ async fn nightly_lab_recovers_closed_hdfs_prefix() -> TestResult {
         .map_err(|error| error.error)?;
     assert_eq!(raw_read(&raw, "final").await?, content);
     assert_no_artifacts(&raw).await?;
+    raw.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the nightly lab HDFS cluster"]
+async fn nightly_lab_readback_handles_eof_and_partial_tail() -> TestResult {
+    let (raw, storage) = fixture("readback-bounds").await?;
+    for size in [2 * 1024 * 1024, 2 * 1024 * 1024 + 137] {
+        let content = bytes::Bytes::from(
+            (0..size)
+                .map(|index| u8::try_from(index % 251).unwrap_or_default())
+                .collect::<Vec<_>>(),
+        );
+        create_hdfs_file(&raw, "source", content.clone()).await?;
+        let descriptor = storage
+            .read_source()?
+            .describe(&StoragePath::new("source")?)
+            .await?;
+        let destination = storage.staged_destination()?;
+        let stage = destination
+            .prepare_at_destination(resume_request(&descriptor)?.with_resume(ResumeMode::Restart))
+            .await?;
+        destination
+            .write(
+                &stage,
+                Box::pin(futures::stream::iter([Ok(content.clone())])),
+            )
+            .await?;
+        let expected_blake3 = *blake3::hash(&content).as_bytes();
+        destination
+            .verify(
+                &stage,
+                data_mover::storage::VerifyRequest {
+                    expected_size: content.len() as u64,
+                    expected_blake3,
+                    cancel: CancellationToken::new(),
+                    published: None,
+                },
+            )
+            .await?;
+        // At EOF (exact 2 MiB) and across EOF (partial last chunk), native read_range
+        // would panic if verification passed its original oversized range through.
+        let error = destination
+            .verify(
+                &stage,
+                data_mover::storage::VerifyRequest {
+                    expected_size: content.len() as u64 + 1,
+                    expected_blake3,
+                    cancel: CancellationToken::new(),
+                    published: None,
+                },
+            )
+            .await
+            .err()
+            .ok_or("oversized verification unexpectedly succeeded")?;
+        assert!(
+            matches!(error, StorageRoleFailure::Entry(error) if error.class() == FailureClass::Corruption)
+        );
+        destination.discard(stage).await?;
+        assert_no_artifacts(&raw).await?;
+    }
     raw.cleanup().await?;
     Ok(())
 }

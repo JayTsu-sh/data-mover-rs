@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 use super::protocol::{
-    HdfsEntryFacts, HdfsListedChild, HdfsListing, HdfsProtocol, HdfsWriteSession, entry_failure,
+    HdfsEntryFacts, HdfsListedChild, HdfsListing, HdfsProtocol, HdfsReadCursor, HdfsWriteSession,
+    entry_failure,
 };
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
@@ -16,7 +17,7 @@ use crate::model::{
 use crate::storage::StorageRoleFailure;
 use crate::storage::artifacts::{ArtifactKind, parse_artifact_name};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct MemoryHdfs {
     state: Arc<MemoryHdfsState>,
     source_prefix: String,
@@ -35,6 +36,10 @@ pub(crate) struct MemoryHdfsState {
     objects: Mutex<HashMap<String, Bytes>>,
     metadata_calls: Mutex<Vec<String>>,
     stat_calls: AtomicUsize,
+    use_read_cursor: std::sync::atomic::AtomicBool,
+    fail_cursor_reads: std::sync::atomic::AtomicBool,
+    reader_opens: AtomicUsize,
+    cursor_reads: AtomicUsize,
     read_active: AtomicUsize,
     read_peak: AtomicUsize,
     read_limit: AtomicUsize,
@@ -59,6 +64,27 @@ pub(crate) struct MemoryHdfsState {
     listing_stalls_after: std::sync::Mutex<Option<usize>>,
     /// Listings dropped so far.
     listings_dropped: Arc<AtomicUsize>,
+}
+
+struct MemoryReadCursor {
+    protocol: MemoryHdfs,
+    path: StoragePath,
+}
+
+#[async_trait]
+impl HdfsReadCursor for MemoryReadCursor {
+    async fn read_range(&self, range: std::ops::Range<u64>) -> Result<Bytes, StorageRoleFailure> {
+        self.protocol.cursor_reads.fetch_add(1, Ordering::SeqCst);
+        if self.protocol.fail_cursor_reads.load(Ordering::SeqCst) {
+            return Err(entry_failure(
+                &self.path,
+                Operation::Read,
+                FailureClass::Connectivity,
+                Transience::Transient,
+            ));
+        }
+        self.protocol.read_range(&self.path, range).await
+    }
 }
 
 /// One listing of a snapshot of a [`MemoryHdfs`] directory, in name order, page by page.
@@ -125,6 +151,20 @@ fn is_pointer(path: &StoragePath) -> bool {
 }
 
 impl MemoryHdfs {
+    pub(crate) fn enable_read_cursor(&self) {
+        self.use_read_cursor.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn fail_cursor_reads(&self, fail: bool) {
+        self.state.fail_cursor_reads.store(fail, Ordering::SeqCst);
+    }
+
+    pub(crate) fn reader_counts(&self) -> (usize, usize) {
+        (
+            self.reader_opens.load(Ordering::SeqCst),
+            self.cursor_reads.load(Ordering::SeqCst),
+        )
+    }
     /// A read-only source root in the same test filesystem, retaining shared I/O counters.
     pub(crate) fn source_root(self: &Arc<Self>, prefix: &str) -> Arc<Self> {
         Arc::new(Self {
@@ -255,6 +295,20 @@ impl MemoryHdfs {
 
 #[async_trait]
 impl HdfsProtocol for MemoryHdfs {
+    async fn open_reader(
+        &self,
+        path: &StoragePath,
+    ) -> Result<Option<Arc<dyn HdfsReadCursor>>, StorageRoleFailure> {
+        if !self.use_read_cursor.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        self.stat(path).await?;
+        self.reader_opens.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(Arc::new(MemoryReadCursor {
+            protocol: self.clone(),
+            path: path.clone(),
+        })))
+    }
     fn maximum_read_chunk_bytes(&self) -> usize {
         match self.read_limit.load(Ordering::SeqCst) {
             0 => 2 * 1024 * 1024,

@@ -34,6 +34,24 @@ impl RoleHdfsProtocol for HDFSStorage {
         Ok(Some(Arc::new(RoleReadCursor {
             file,
             path: path.clone(),
+            refresh: None,
+        })))
+    }
+    async fn open_verification_reader(
+        &self,
+        path: &RoleStoragePath,
+    ) -> Result<
+        Option<Arc<dyn crate::storage::backends::hdfs::protocol::HdfsReadCursor>>,
+        RoleFailure,
+    > {
+        let file = self
+            .open_file(Path::new(path.as_str()))
+            .await
+            .map_err(|error| hdfs_role_error(path, RoleOperation::Read, error))?;
+        Ok(Some(Arc::new(RoleReadCursor {
+            file,
+            path: path.clone(),
+            refresh: Some(self.clone()),
         })))
     }
     async fn stat(&self, path: &RoleStoragePath) -> Result<RoleHdfsEntryFacts, RoleFailure> {
@@ -494,14 +512,29 @@ fn hdfs_role_classify(error: &StorageError) -> (RoleFailureClass, RoleTransience
 struct RoleReadCursor {
     file: HdfsReadHandle,
     path: RoleStoragePath,
+    refresh: Option<HDFSStorage>,
 }
 
 #[async_trait::async_trait]
 impl crate::storage::backends::hdfs::protocol::HdfsReadCursor for RoleReadCursor {
     async fn read_range(&self, range: RoleRange<u64>) -> Result<RoleBytes, RoleFailure> {
-        let offset = usize::try_from(range.start).map_err(|_| invalid_stage_chunk(&self.path))?;
-        let length = usize::try_from(range.end - range.start)
-            .map_err(|_| invalid_stage_chunk(&self.path))?;
+        let count = range
+            .end
+            .checked_sub(range.start)
+            .ok_or_else(|| invalid_stage_chunk(&self.path))?;
+        if let Some(storage) = &self.refresh {
+            return storage
+                .read_at(&self.file, range.start, count)
+                .await
+                .map_err(|error| hdfs_role_error(&self.path, RoleOperation::Read, error));
+        }
+        // The native reader panics past its opened length. Match the ordinary read_at
+        // short-read behavior so verification can report truncated stages as corruption.
+        let Some((offset, length)) = plan_read_range(self.file.length, range.start, count)
+            .map_err(|error| hdfs_role_error(&self.path, RoleOperation::Read, error))?
+        else {
+            return Ok(RoleBytes::new());
+        };
         retry_hdfs_read(
             "read role cursor",
             Some(Path::new(self.path.as_str())),

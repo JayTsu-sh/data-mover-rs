@@ -16,12 +16,20 @@ struct Payload {
     release_prefix: tokio::sync::Notify,
     later_finished: tokio::sync::Notify,
     calls: AtomicUsize,
+    fail_read: AtomicBool,
 }
 
 #[async_trait]
 impl HdfsReadCursor for Payload {
     async fn read_range(&self, range: Range<u64>) -> Result<Bytes, StorageRoleFailure> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_read.load(Ordering::SeqCst) {
+            return Err(failure(
+                &StoragePath::root(),
+                Operation::Read,
+                FailureClass::Connectivity,
+            ));
+        }
         if range.start == 0 && self.gate_prefix.load(Ordering::SeqCst) {
             self.prefix_started.notify_one();
             self.release_prefix.notified().await;
@@ -29,8 +37,12 @@ impl HdfsReadCursor for Payload {
             self.later_finished.notify_one();
         }
         Ok(self.bytes.slice(
-            usize::try_from(range.start).unwrap_or(usize::MAX)
-                ..usize::try_from(range.end).unwrap_or(usize::MAX),
+            usize::try_from(range.start)
+                .unwrap_or(usize::MAX)
+                .min(self.bytes.len())
+                ..usize::try_from(range.end)
+                    .unwrap_or(usize::MAX)
+                    .min(self.bytes.len()),
         ))
     }
 }
@@ -38,6 +50,11 @@ impl HdfsReadCursor for Payload {
 struct ReadProtocol {
     payload: Arc<Payload>,
     use_cursor: bool,
+    opens: AtomicUsize,
+    verification_opens: AtomicUsize,
+    path_reads: AtomicUsize,
+    gate_open: AtomicBool,
+    fail_open: AtomicBool,
 }
 
 impl ReadProtocol {
@@ -50,8 +67,14 @@ impl ReadProtocol {
                 release_prefix: tokio::sync::Notify::new(),
                 later_finished: tokio::sync::Notify::new(),
                 calls: AtomicUsize::new(0),
+                fail_read: AtomicBool::new(false),
             }),
             use_cursor,
+            opens: AtomicUsize::new(0),
+            verification_opens: AtomicUsize::new(0),
+            path_reads: AtomicUsize::new(0),
+            gate_open: AtomicBool::new(false),
+            fail_open: AtomicBool::new(false),
         })
     }
 }
@@ -72,6 +95,18 @@ impl HdfsProtocol for ReadProtocol {
         &self,
         _path: &StoragePath,
     ) -> Result<Option<Arc<dyn HdfsReadCursor>>, StorageRoleFailure> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        if self.fail_open.load(Ordering::SeqCst) {
+            return Err(failure(
+                &StoragePath::root(),
+                Operation::Read,
+                FailureClass::Connectivity,
+            ));
+        }
+        if self.gate_open.load(Ordering::SeqCst) {
+            self.payload.prefix_started.notify_one();
+            self.payload.release_prefix.notified().await;
+        }
         Ok(self
             .use_cursor
             .then(|| self.payload.clone() as Arc<dyn HdfsReadCursor>))
@@ -90,11 +125,20 @@ impl HdfsProtocol for ReadProtocol {
             block_size: Some(128 * 1024 * 1024),
         })
     }
+
+    async fn open_verification_reader(
+        &self,
+        path: &StoragePath,
+    ) -> Result<Option<Arc<dyn HdfsReadCursor>>, StorageRoleFailure> {
+        self.verification_opens.fetch_add(1, Ordering::SeqCst);
+        self.open_reader(path).await
+    }
     async fn read_range(
         &self,
         _path: &StoragePath,
         range: Range<u64>,
     ) -> Result<Bytes, StorageRoleFailure> {
+        self.path_reads.fetch_add(1, Ordering::SeqCst);
         self.payload.read_range(range).await
     }
     async fn open_listing(&self, path: &StoragePath) -> Box<dyn HdfsListing> {
@@ -306,5 +350,116 @@ async fn positioned_cancellation_retains_cancelled_classification() -> TestResul
     assert!(
         matches!(next.await, Some(Err(StorageRoleFailure::Entry(error))) if error.class() == FailureClass::Cancelled)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_readback_opens_one_reader_and_respects_chunk_limit() -> TestResult {
+    let path = StoragePath::new("stage")?;
+    for use_cursor in [false, true] {
+        let protocol = ReadProtocol::new(false, use_cursor);
+        let digest = super::super::staged::hash_file(
+            &*protocol,
+            &path,
+            &path,
+            12,
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert_eq!(digest, *blake3::hash(b"abcdefghijkl").as_bytes());
+        assert_eq!(protocol.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(protocol.verification_opens.load(Ordering::SeqCst), 1);
+        assert_eq!(protocol.payload.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            protocol.path_reads.load(Ordering::SeqCst),
+            if use_cursor { 0 } else { 3 }
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_readback_empty_and_precancelled_do_not_open() -> TestResult {
+    let protocol = ReadProtocol::new(false, true);
+    let path = StoragePath::new("stage")?;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert_eq!(
+        super::super::staged::hash_file(&*protocol, &path, &path, 0, &cancel).await?,
+        *blake3::hash(b"").as_bytes(),
+    );
+    let error = super::super::staged::hash_file(&*protocol, &path, &path, 12, &cancel)
+        .await
+        .err()
+        .ok_or("cancelled readback succeeded")?;
+    assert!(
+        matches!(error, StorageRoleFailure::Entry(error) if error.class() == FailureClass::Cancelled)
+    );
+    assert_eq!(protocol.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(protocol.verification_opens.load(Ordering::SeqCst), 0);
+    assert_eq!(protocol.payload.calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_readback_cancels_pending_open_and_read() -> TestResult {
+    let path = StoragePath::new("stage")?;
+    for gate_open in [false, true] {
+        let protocol = ReadProtocol::new(!gate_open, true);
+        protocol.gate_open.store(gate_open, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let readback = super::super::staged::hash_file(&*protocol, &path, &path, 12, &cancel);
+        tokio::pin!(readback);
+        tokio::select! {
+            _ = &mut readback => panic!("blocked readback unexpectedly completed"),
+            () = protocol.payload.prefix_started.notified() => {},
+        }
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), readback).await?;
+        assert!(
+            matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_readback_rejects_truncation_and_propagates_io_errors() -> TestResult {
+    let path = StoragePath::new("stage")?;
+    for use_cursor in [false, true] {
+        let protocol = ReadProtocol::new(false, use_cursor);
+        let result = super::super::staged::hash_file(
+            &*protocol,
+            &path,
+            &path,
+            13,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Corruption)
+        );
+        protocol.payload.fail_read.store(true, Ordering::SeqCst);
+        let result = super::super::staged::hash_file(
+            &*protocol,
+            &path,
+            &path,
+            12,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Connectivity)
+        );
+    }
+    let protocol = ReadProtocol::new(false, true);
+    protocol.fail_open.store(true, Ordering::SeqCst);
+    let result =
+        super::super::staged::hash_file(&*protocol, &path, &path, 12, &CancellationToken::new())
+            .await;
+    assert!(
+        matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Connectivity)
+    );
+    assert_eq!(protocol.path_reads.load(Ordering::SeqCst), 0);
     Ok(())
 }

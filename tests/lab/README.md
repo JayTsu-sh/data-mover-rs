@@ -208,6 +208,9 @@ fixtures with a 1 MiB producer buffer, then measures only the release
 serial/default/high inflight profiles. A separate `storage_inspect` process
 reopens and fully hashes every destination. The CSV records sizes, profile,
 windows, chunk/channel/file concurrency, duration, throughput and peak RSS.
+HDFS read-back verification reuses one opened reader across bounded chunks of at most
+2 MiB. It still reads and hashes the complete file; increasing the application chunk is
+not required to avoid reopening the file and refetching block locations for every range.
 The budget is `(3×read + write + channel[4] + active[2]) × 2 MiB × concurrent
 files + 96 MiB`; it accounts for DataNode packet storage, `hdfs-native` range
 aggregation, published chunks, the copy channel and destination write window.
