@@ -219,14 +219,34 @@ sample may grow by at most 72 MiB
 over its 256 MiB peer. Nightly and release validation upload the CSV artifact and fail on either
 an absolute-budget or size-dependent-growth violation.
 The same run also preloads sparse deterministic zero fixtures into HDFS, then
-measures six independent `high` HDFS→HDFS transfers at `1 GiB + 137 bytes`
-and one at `100 GiB + 137 bytes`. Every transfer uses identical inflight, chunk,
-channel and file-concurrency settings, reopens and hashes the complete destination,
-and the 100 GiB peak RSS may not exceed the conservative 1 GiB peak by more than
-10%. Repeated short transfers avoid treating a missed transient allocator peak as
-size-dependent growth. The CSV binds every row to one run id and
-full candidate commit; the validator rejects a missing or approximate 100 GiB
-sample.
+measures one `high` HDFS→HDFS transfer at `1 GiB + 137 bytes` and one at
+`100 GiB + 137 bytes`, with identical inflight, chunk, channel and file-concurrency
+settings. The short run is a size/absolute-budget control, NOT the reference for
+long-run RSS: peaks from unrelated processes cannot demonstrate sustained growth.
+
+For the 100 GiB run, `hdfs_memory_sampler.py` samples only the copy child's Linux
+`VmRSS` every 100 ms into `hdfs-memory.csv.samples.csv`. The example's optional
+`--report-phases` markers distinguish transfer (including its policy verification)
+from the subsequent independent content comparison. In EACH phase, the p90 RSS
+in the 70–90% elapsed-time window may be at most 10% above the p90 in the 10–30%
+window. This excludes initial warmup and final buffer release, and avoids treating
+one transient allocation as sustained growth. It is a within-process steady-state
+test, not a proof of absence of leaks, nor a per-byte allocation slope measurement.
+
+Both phases must last at least five seconds, contain at least 50 samples and at
+least ten samples per comparison window, with no internal sampling gap above two
+seconds. Unknown/reordered phases, nonpositive RSS, missing evidence and mismatched
+run/commit bindings fail closed. The whole-process peak (the larger of the kernel
+child high-water mark and sampled RSS) STILL must satisfy the unchanged absolute
+budget; short spikes are not exempt. The sampler excludes its own RSS and the
+later `storage_inspect` processes, propagates copy failure, kills a timed-out child
+after 90 minutes, and preserves partial traces for diagnostics.
+
+Nightly and release validation upload BOTH CSVs, even after failure. Validate with
+`python3 tests/hdfs_memory_budget.py --require-100-gib --trace hdfs-memory.csv.samples.csv hdfs-memory.csv`.
+Old peak-only artifacts intentionally cannot pass the rebuilt growth gate: a new
+real run is required. No measured result for the old peak-comparison gate is
+retroactively reclassified as passing.
 
 `run-resume-e2e.sh` exercises the complete 5-by-5 Local/NFSv3/NFSv4.1/S3/HDFS
 directed matrix in independent processes. The first process writes a durable

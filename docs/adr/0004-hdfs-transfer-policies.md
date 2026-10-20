@@ -105,6 +105,14 @@ uses millisecond precision and reports any source precision reduction.
 
 ## Validation
 
+The lab memory gate separates absolute working-set bounds from sustained growth.
+The absolute budget remains derived from fixed chunk/concurrency windows. The
+100 GiB release copy is additionally sampled within a single process, separately
+for transfer and independent content comparison; early and late steady-state RSS
+windows must remain within 10%. A short-process peak is not a statistically valid
+reference for a long-process peak. Raw traces, full commit/run binding and coverage
+checks are mandatory evidence; see `tests/lab/README.md` for the exact windows.
+
 Contract tests cover asymmetric read/write limits, actual overlapping source reads, all three
 admission limits, overwrite, same-path rejection, the exact 64 MiB eligibility boundary, and
 resumption after a failure following the first synchronized prefix. The real-cluster test is

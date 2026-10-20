@@ -118,7 +118,9 @@ jobs:
         if: always()
         with:
           name: hdfs-memory-release-${{ github.run_id }}
-          path: hdfs-memory.csv
+          path: |
+            hdfs-memory.csv
+            hdfs-memory.csv.samples.csv
       - run: cargo build --release --locked
       - run: cargo build --examples --release --locked
       - name: Record dependency revisions

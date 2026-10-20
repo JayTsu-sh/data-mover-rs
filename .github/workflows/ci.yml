@@ -110,7 +110,7 @@ jobs:
         run: python3 tests/test_hdfs_directed_matrix.py
 
       - name: HDFS memory budget contract
-        run: python3 tests/test_hdfs_memory_budget.py
+        run: python3 -m unittest discover -s tests -p 'test_hdfs_memory*.py'
 
       - name: HDFS fault harness safety contract
         run: python3 tests/test_hdfs_fault_harness.py

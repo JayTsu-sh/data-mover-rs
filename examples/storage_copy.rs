@@ -33,6 +33,10 @@ struct Args {
     #[arg(long)]
     path: String,
 
+    /// Emit flushed phase markers for the external lab memory sampler.
+    #[arg(long)]
+    report_phases: bool,
+
     /// Requested transfer chunk size. Backends may negotiate a lower safe value.
     #[arg(long, default_value_t = 2 * 1024 * 1024)]
     chunk_bytes: u64,
@@ -128,12 +132,14 @@ async fn main() -> Result<()> {
             .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
     }
     let started = Instant::now();
+    report_phase(args.report_phases, "transfer")?;
     let outcome = if args.delete_source {
         move_file(request).await?
     } else {
         transfer(request).await?
     };
     let elapsed = started.elapsed().as_secs_f64();
+    report_phase(args.report_phases, "verification")?;
     let bytes = if args.delete_source {
         // move_file read back the copy and applied metadata before guarded source removal.
         outcome.transferred_bytes
@@ -144,8 +150,18 @@ async fn main() -> Result<()> {
         "copied and verified {bytes} bytes and applicable metadata: {}",
         args.path
     );
+    report_phase(args.report_phases, "complete")?;
     if report_qos {
         report_stats(outcome.source_qos, elapsed);
+    }
+    Ok(())
+}
+
+fn report_phase(enabled: bool, phase: &str) -> Result<()> {
+    if enabled {
+        use std::io::Write as _;
+        println!("memory_phase\t{phase}");
+        std::io::stdout().flush()?;
     }
     Ok(())
 }
@@ -165,6 +181,30 @@ fn report_stats(stats: SourceQosStats, elapsed: f64) {
 mod tests {
     use super::Args;
     use clap::Parser;
+
+    #[test]
+    fn memory_phase_reporting_is_opt_in() {
+        let plain = [
+            "storage_copy",
+            "--source",
+            "/source",
+            "--destination",
+            "/dest",
+            "--path",
+            "file",
+        ];
+        assert!(
+            !Args::try_parse_from(plain)
+                .expect("ordinary copy args")
+                .report_phases
+        );
+        assert!(
+            Args::try_parse_from(plain.into_iter().chain(["--report-phases"]))
+                .expect("memory sampler args")
+                .report_phases
+        );
+    }
+
     #[test]
     fn qos_cli_accepts_explicit_bandwidth_burst_and_iops() {
         let args = Args::try_parse_from([

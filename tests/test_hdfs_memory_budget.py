@@ -6,16 +6,95 @@ from pathlib import Path
 from hdfs_memory_budget import budget_mib, validate
 
 
-class HdfsMemoryBudgetTests(unittest.TestCase):
+class _TraceFixture(unittest.TestCase):
+    def _trace(self, transfer, verification=None):
+        temporary = tempfile.NamedTemporaryFile(mode="w", newline="", delete=False)
+        self.addCleanup(Path(temporary.name).unlink, missing_ok=True)
+        writer = csv.writer(temporary)
+        writer.writerow(["run_id", "commit", "pid", "phase", "elapsed_s", "rss_kib"])
+        elapsed = 0
+        for phase, values in [("transfer", transfer), ("verification", transfer if verification is None else verification)]:
+            for rss in values:
+                writer.writerow(["unit-test", "0" * 40, 1234, phase, elapsed, rss])
+                elapsed += 0.1
+        temporary.close()
+        return Path(temporary.name)
+
+    def check_trace(self, path, peak=180_000):
+        from hdfs_memory_budget import validate_trace
+        validate_trace(path, run_id="unit-test", commit="0" * 40,
+                       peak_kib=peak, budget_kib=188 * 1024)
+
+
+class HdfsMemoryTraceTests(_TraceFixture):
+    def test_warmup_and_bounded_allocator_peak_do_not_imply_growth(self):
+        # The process warms up, reaches a stable platform, then releases buffers.
+        values = [70_000] * 10 + [160_000] * 80 + [100_000] * 10
+        values[50] = 180_000
+        self.check_trace(self._trace(values))
+
+    def test_sustained_growth_fails_even_below_the_absolute_budget(self):
+        for phase in ["transfer", "verification"]:
+            with self.subTest(phase=phase):
+                stable = [110_000] * 100
+                growing = [110_000 + index * 600 for index in range(100)]
+                trace = self._trace(growing if phase == "transfer" else stable,
+                                    growing if phase == "verification" else stable)
+                with self.assertRaisesRegex(ValueError, "10%"):
+                    self.check_trace(trace)
+
+    def test_missing_short_and_unbound_evidence_fails_closed(self):
+        for values in [[100_000] * 10, [100_000] * 100]:
+            trace = self._trace(values)
+            if len(values) == 100:
+                trace.write_text(trace.read_text().replace("unit-test", "wrong-run"))
+            with self.assertRaises(ValueError):
+                self.check_trace(trace)
+
+    def test_absolute_budget_and_reported_peak_cannot_hide_trace_spikes(self):
+        values = [100_000] * 100
+        values[0] = 200_000
+        with self.assertRaisesRegex(ValueError, "budget"):
+            self.check_trace(self._trace(values), peak=200_000)
+        values[0] = 181_000
+        with self.assertRaisesRegex(ValueError, "peak"):
+            self.check_trace(self._trace(values))
+
+    def test_ten_percent_boundary_is_not_relaxed(self):
+        self.check_trace(self._trace([100_000] * 50 + [110_000] * 50))
+        with self.assertRaisesRegex(ValueError, "10%"):
+            self.check_trace(self._trace([100_000] * 50 + [110_001] * 50))
+
+    def test_missing_phase_gaps_nan_and_reordered_data_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "coverage"):
+            self.check_trace(self._trace([100_000] * 100, []))
+        for old, new in [("transfer", "unknown"), (",0.1,", ",nan,"),
+                         (",0.1,", ",100.1,"), (",1234,", ",5678,")]:
+            with self.subTest(new=new):
+                trace = self._trace([100_000] * 100)
+                trace.write_text(trace.read_text().replace(old, new, 1))
+                with self.assertRaises(ValueError):
+                    self.check_trace(trace)
+
+
+class HdfsMemoryBudgetTests(_TraceFixture):
     def test_real_runner_wires_the_exact_scale_pair(self) -> None:
         runner = (Path(__file__).parent / "lab" / "run-hdfs-memory-e2e.sh").read_text()
         self.assertIn("scale_small_size=$((1024 * 1024 * 1024 + 137))", runner)
         self.assertIn("scale_large_size=$((100 * 1024 * 1024 * 1024 + 137))", runner)
         self.assertIn("run_case scale high hdfs-hdfs scale-1g", runner)
-        self.assertIn("for scale_attempt in {1..6}", runner)
+        self.assertNotIn("for scale_attempt", runner)
+        self.assertIn("tests/hdfs_memory_sampler.py", runner)
+        self.assertIn('--trace "$trace_output"', runner)
+        self.assertIn("--report-phases", runner)
         self.assertIn("run_case scale high hdfs-hdfs scale-100g", runner)
         self.assertIn("--require-100-gib", runner)
         self.assertIn("resuming durable partial", runner)
+        root = Path(__file__).resolve().parents[1]
+        for workflow in ["nightly.yml", "release-validation.yml"]:
+            with self.subTest(workflow=workflow):
+                self.assertIn("hdfs-memory.csv.samples.csv",
+                              (root / ".github" / "workflows" / workflow).read_text())
 
     def test_budget_is_derived_from_windows_chunks_and_file_concurrency(self) -> None:
         self.assertEqual(budget_mib(1, 2, 1, 1), 116)
@@ -53,7 +132,7 @@ class HdfsMemoryBudgetTests(unittest.TestCase):
     def test_validator_requires_one_real_100_gib_sample_when_requested(self) -> None:
         hundred_gib = 100 * 1024 * 1024 * 1024 + 137
         path = self._csv(
-            [(1024**3 + 137, 75_000)] * 6 + [(hundred_gib, 76_000)],
+            [(1024**3 + 137, 75_000), (hundred_gib, 76_000)],
             profile="high",
             read=8,
             write=16,
@@ -61,7 +140,10 @@ class HdfsMemoryBudgetTests(unittest.TestCase):
             direction="hdfs-hdfs",
             sample_set="scale",
         )
-        validate(path, require_100_gib=True)
+        trace = self._trace([75_000] * 100)
+        validate(path, require_100_gib=True, trace=trace)
+        with self.assertRaisesRegex(ValueError, "trace"):
+            validate(path, require_100_gib=True)
 
         missing = self._csv(
             [(1024**3 + 137, 70_000), (2 * 1024**3 + 137, 75_000)],
@@ -73,25 +155,24 @@ class HdfsMemoryBudgetTests(unittest.TestCase):
             validate(missing, require_100_gib=True)
 
         unstable = self._csv(
-            [(1024**3 + 137, 75_000)] * 6 + [(hundred_gib, 84_000)],
+            [(1024**3 + 137, 75_000), (hundred_gib, 170_000)],
             profile="high",
+            read=8,
+            write=16,
+            budget=188,
             direction="hdfs-hdfs",
             sample_set="scale",
         )
         with self.assertRaisesRegex(ValueError, "10%"):
-            validate(unstable, require_100_gib=True)
+            validate(unstable, require_100_gib=True,
+                     trace=self._trace([100_000 + i * 600 for i in range(100)]))
 
-    def test_scale_guard_uses_repeated_short_transfer_peak(self) -> None:
+    def test_cross_process_peaks_are_not_used_as_a_growth_estimator(self) -> None:
         hundred_gib = 100 * 1024 * 1024 * 1024 + 137
         short = 1024**3 + 137
         path = self._csv(
             [
                 (short, 75_000),
-                (short, 88_000),
-                (short, 104_868),
-                (short, 96_980),
-                (short, 89_848),
-                (short, 120_876),
                 (hundred_gib, 132_064),
             ],
             profile="high",
@@ -102,7 +183,7 @@ class HdfsMemoryBudgetTests(unittest.TestCase):
             sample_set="scale",
         )
 
-        validate(path, require_100_gib=True)
+        validate(path, require_100_gib=True, trace=self._trace([130_000] * 100))
 
     def _csv(
         self,
