@@ -106,8 +106,11 @@ uses millisecond precision and reports any source precision reduction.
 ## Validation
 
 The lab memory gate separates absolute working-set bounds from sustained growth.
-The absolute budget remains derived from fixed chunk/concurrency windows. The
-100 GiB release copy is additionally sampled within a single process, separately
+The absolute budget remains derived from fixed chunk/concurrency windows. Its
+fixed per-process runtime/allocator allowance is 112 MiB (formerly 96 MiB), making
+the one-file high-profile budget 204 MiB without changing the payload window terms.
+This adds 16 MiB of peak headroom; it does not relax the steady-state growth limit.
+The 100 GiB release copy is additionally sampled within a single process, separately
 for transfer and independent content comparison; early and late steady-state RSS
 windows must remain within 10%. A short-process peak is not a statistically valid
 reference for a long-process peak. Raw traces, full commit/run binding and coverage

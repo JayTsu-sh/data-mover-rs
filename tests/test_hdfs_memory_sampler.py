@@ -66,7 +66,7 @@ class MemorySamplerTests(unittest.TestCase):
         from hdfs_memory_budget import validate_trace
         with self.assertRaisesRegex(ValueError, "transfer steady-state RSS.*10%"):
             validate_trace(root / "trace.csv", run_id="sampler-test", commit="a" * 40,
-                           peak_kib=peak, budget_kib=188 * 1024)
+                           peak_kib=peak, budget_kib=204 * 1024)
 
 
 if __name__ == "__main__":

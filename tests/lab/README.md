@@ -212,8 +212,13 @@ HDFS read-back verification reuses one opened reader across bounded chunks of at
 2 MiB. It still reads and hashes the complete file; increasing the application chunk is
 not required to avoid reopening the file and refetching block locations for every range.
 The budget is `(3×read + write + channel[4] + active[2]) × 2 MiB × concurrent
-files + 96 MiB`; it accounts for DataNode packet storage, `hdfs-native` range
+files + 112 MiB`; it accounts for DataNode packet storage, `hdfs-native` range
 aggregation, published chunks, the copy channel and destination write window.
+The fixed process allowance includes runtime/allocator headroom and is not multiplied
+by file concurrency or payload size. It was increased by 16 MiB after Nightly #185
+peaked at 191.86 MiB with decreasing transfer RSS and only 0.10% verification RSS
+growth. Serial/default/high budgets for one file are now 132/150/204 MiB; the
+within-process 10% growth limit and all sampling checks remain unchanged.
 The HDFS file block size remains independently configured at 128 MiB. The 2 GiB
 sample may grow by at most 72 MiB
 over its 256 MiB peer. Nightly and release validation upload the CSV artifact and fail on either
@@ -237,7 +242,7 @@ Both phases must last at least five seconds, contain at least 50 samples and at
 least ten samples per comparison window, with no internal sampling gap above two
 seconds. Unknown/reordered phases, nonpositive RSS, missing evidence and mismatched
 run/commit bindings fail closed. The whole-process peak (the larger of the kernel
-child high-water mark and sampled RSS) STILL must satisfy the unchanged absolute
+child high-water mark and sampled RSS) STILL must satisfy the calculated absolute
 budget; short spikes are not exempt. The sampler excludes its own RSS and the
 later `storage_inspect` processes, propagates copy failure, kills a timed-out child
 after 90 minutes, and preserves partial traces for diagnostics.

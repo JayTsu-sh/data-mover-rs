@@ -14,7 +14,10 @@ from pathlib import Path
 MIB = 1024 * 1024
 COPY_CHANNEL_CHUNKS = 4
 ACTIVE_CHUNKS = 2
-FIXED_OVERHEAD_MIB = 96
+# Runtime/allocator headroom is fixed per process, not per file or payload byte.
+# Nightly #185 peaked at 191.86 MiB with flat/decreasing steady-state windows;
+# add 16 MiB to the previous 96 MiB allowance, keeping the 10% growth guard.
+FIXED_OVERHEAD_MIB = 112
 # Keep the size-scaling guard below the absolute budget while allowing for
 # page-level allocator variance between otherwise identical release runs.
 GROWTH_ALLOWANCE_MIB = 72

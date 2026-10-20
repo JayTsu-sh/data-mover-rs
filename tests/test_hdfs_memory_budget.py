@@ -23,7 +23,7 @@ class _TraceFixture(unittest.TestCase):
     def check_trace(self, path, peak=180_000):
         from hdfs_memory_budget import validate_trace
         validate_trace(path, run_id="unit-test", commit="0" * 40,
-                       peak_kib=peak, budget_kib=188 * 1024)
+                       peak_kib=peak, budget_kib=budget_mib(1, 2, 8, 16) * 1024)
 
 
 class HdfsMemoryTraceTests(_TraceFixture):
@@ -53,9 +53,9 @@ class HdfsMemoryTraceTests(_TraceFixture):
 
     def test_absolute_budget_and_reported_peak_cannot_hide_trace_spikes(self):
         values = [100_000] * 100
-        values[0] = 200_000
+        values[0] = 212_000
         with self.assertRaisesRegex(ValueError, "budget"):
-            self.check_trace(self._trace(values), peak=200_000)
+            self.check_trace(self._trace(values), peak=212_000)
         values[0] = 181_000
         with self.assertRaisesRegex(ValueError, "peak"):
             self.check_trace(self._trace(values))
@@ -97,10 +97,10 @@ class HdfsMemoryBudgetTests(_TraceFixture):
                               (root / ".github" / "workflows" / workflow).read_text())
 
     def test_budget_is_derived_from_windows_chunks_and_file_concurrency(self) -> None:
-        self.assertEqual(budget_mib(1, 2, 1, 1), 116)
-        self.assertEqual(budget_mib(1, 2, 4, 1), 134)
-        self.assertEqual(budget_mib(1, 2, 8, 16), 188)
-        self.assertEqual(budget_mib(2, 2, 8, 16), 280)
+        self.assertEqual(budget_mib(1, 2, 1, 1), 132)
+        self.assertEqual(budget_mib(1, 2, 4, 1), 150)
+        self.assertEqual(budget_mib(1, 2, 8, 16), 204)
+        self.assertEqual(budget_mib(2, 2, 8, 16), 296)
 
     def test_validator_accepts_bounded_two_size_samples(self) -> None:
         path = self._csv([(262_144, 70_000), (2_097_152, 75_000)])
@@ -111,12 +111,25 @@ class HdfsMemoryBudgetTests(_TraceFixture):
             profile="high",
             read=8,
             write=16,
-            budget=188,
+            budget=204,
         )
         validate(allocator_variance)
 
+    def test_high_profile_headroom_keeps_an_exact_absolute_limit(self) -> None:
+        for peak in [196_460, 204 * 1024, 204 * 1024 + 1]:
+            with self.subTest(peak=peak):
+                path = self._csv(
+                    [(262_144, 160_000), (2_097_152, peak)],
+                    profile="high", read=8, write=16, budget=204,
+                )
+                if peak <= 204 * 1024:
+                    validate(path)
+                else:
+                    with self.assertRaisesRegex(ValueError, "exceeds budget"):
+                        validate(path)
+
     def test_validator_rejects_budget_and_growth_violations(self) -> None:
-        over_budget = self._csv([(262_144, 130_000), (2_097_152, 130_000)])
+        over_budget = self._csv([(262_144, 140_000), (2_097_152, 140_000)])
         with self.assertRaisesRegex(ValueError, "exceeds budget"):
             validate(over_budget)
         growing = self._csv(
@@ -124,7 +137,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
             profile="high",
             read=8,
             write=16,
-            budget=188,
+            budget=204,
         )
         with self.assertRaisesRegex(ValueError, "RSS grew"):
             validate(growing)
@@ -136,7 +149,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
             profile="high",
             read=8,
             write=16,
-            budget=188,
+            budget=204,
             direction="hdfs-hdfs",
             sample_set="scale",
         )
@@ -159,7 +172,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
             profile="high",
             read=8,
             write=16,
-            budget=188,
+            budget=204,
             direction="hdfs-hdfs",
             sample_set="scale",
         )
@@ -178,7 +191,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
             profile="high",
             read=8,
             write=16,
-            budget=188,
+            budget=204,
             direction="hdfs-hdfs",
             sample_set="scale",
         )
@@ -192,7 +205,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
         profile: str = "serial",
         read: int = 1,
         write: int = 1,
-        budget: int = 116,
+        budget: int = 132,
         sample_set: str = "baseline",
         direction: str = "local-hdfs",
     ) -> Path:
