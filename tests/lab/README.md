@@ -264,6 +264,18 @@ every source interval reader and destination resume writer. NAS destinations res
 from a `.terrasync-part` file; S3 destinations resume the server-side multipart
 upload through `ListMultipartUploads` and `ListParts`; HDFS destinations accept
 only a durable contiguous prefix and append its missing tail sequentially.
+The interrupt probe retries below-checkpoint cancellations with the SAME bounded
+time window, never an increasing one: for the 96 MiB fixture at 8 MiB/s every
+attempt cancels after 10 seconds (an 80 MiB pacing window plus at most one 2 MiB
+admission burst). A 14-second retry can already retain every S3 part; a fresh
+process then correctly reuses the whole file, which does not prove partial reuse.
+The gate still requires `0 < reused_bytes < size`, independently reopens and hashes
+the result, and reports the actual reuse and prepare fact if that assertion fails.
+Source streamed bytes remain diagnostic evidence, not an estimate of durable bytes.
+Each interruption attempt reconnects its endpoints instead of reusing a cancelled
+transport session. Before starting it, the probe rechecks source size, observation
+and derived transfer identity; a changed source or unexpected read/connection error
+still fails the gate rather than being silently retried.
 
 `run-hdfs-fault-e2e.sh` is the destructive HDFS service-recovery gate. Before
 every mutation it verifies that PVE VM 301/302/303 still map to the expected
