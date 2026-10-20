@@ -116,6 +116,12 @@ windows must remain within 10%. A short-process peak is not a statistically vali
 reference for a long-process peak. Raw traces, full commit/run binding and coverage
 checks are mandatory evidence; see `tests/lab/README.md` for the exact windows.
 
+The raw-client fault harness owns recovery authority for the append writer it
+confirms dead with SIGKILL. It explicitly recovers that lease before checking the
+unchanged seeded content. Restarting DataNodes and proving new writes work does
+not itself close an abandoned file. This is test-harness recovery, not permission
+for the read-source role to fence live writers or mutate files during inspection.
+
 Contract tests cover asymmetric read/write limits, actual overlapping source reads, all three
 admission limits, overwrite, same-path rejection, the exact 64 MiB eligibility boundary, and
 resumption after a failure following the first synchronized prefix. The real-cluster test is

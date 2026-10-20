@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Static safety contract for the destructive nightly HDFS fault harness."""
 
+import os
 from pathlib import Path
+import subprocess
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +95,71 @@ def test_cluster_recovery_is_followed_by_a_real_write_probe() -> None:
     assert 'readiness_path="readiness-${BASHPID}-${attempt}.bin"' in RUNNER
     assert '--path "$readiness_path" --phase seed' in RUNNER
     assert RUNNER.count("wait_for_hdfs_write") >= 4
+
+
+def test_killed_append_explicitly_recovers_its_lease_before_exact_content_validation() -> None:
+    killed = RUNNER.index("kill_mutation_at_checkpoint append datanodes append-killed.bin")
+    recover = RUNNER.index("recover_killed_append append-killed.bin", killed)
+    inspect = RUNNER.index("wait_for_inspect append-killed.bin", recover)
+    assert killed < recover < inspect
+    assert '[[ "$after_append" == "$before_append" ]]' in RUNNER
+    assert '--phase recover-lease' in RUNNER
+    assert "--kill-after=1s" in RUNNER
+    assert 'redact_log "$log_file" | tee -a "$artifact" >&2' in RUNNER
+
+
+def test_recovery_helpers_execute_in_order_and_preserve_failure_evidence() -> None:
+    # Execute the actual shell functions, not a Python copy of their logic.
+    functions = ""
+    for name in ("redact_log", "recover_killed_append", "wait_for_inspect"):
+        start = RUNNER.index(f"{name}() {{")
+        end = RUNNER.index("\n}", start) + 2
+        functions += RUNNER[start:end] + "\n"
+    script = "set -euo pipefail\n" + functions + r'''
+artifact="$local_root/artifact"
+hdfs_storage=hdfs://private-principal@example.invalid/isolated-root
+mutation_binary=mutation_probe
+inspect_binary=inspect_probe
+timeout() { printf '%s\n' "$*" >>"$local_root/timeouts"; shift 2; "$@"; }
+sleep() { SECONDS=$((SECONDS + 100)); }
+mutation_probe() {
+  [[ "$*" == *"--phase recover-lease"* ]]
+  if [[ "$failure_mode" == recovery ]]; then
+    echo 'recovery diagnostic hdfs://private-principal@example.invalid/isolated-root'
+    return 7
+  fi
+  touch "$local_root/recovered"
+}
+inspect_probe() {
+  test -f "$local_root/recovered"
+  touch "$local_root/inspected"
+  if [[ "$failure_mode" == inspection ]]; then
+    echo 'inspection diagnostic hdfs://private-principal@example.invalid/isolated-root' >&2
+    return 8
+  fi
+  printf '4194321\tseed-digest\n'
+}
+recover_killed_append append-killed.bin
+output="$(wait_for_inspect append-killed.bin)"
+[[ "$output" == $'4194321\tseed-digest' ]]
+'''
+    for mode in ("none", "recovery", "inspection"):
+        with tempfile.TemporaryDirectory(prefix="hdfs-fault-contract-") as directory:
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=5,
+                env={**os.environ, "local_root": directory, "failure_mode": mode},
+            )
+            root = Path(directory)
+            if mode == "none":
+                assert result.returncode == 0, result.stderr
+                assert (root / "inspected").exists()
+            else:
+                assert result.returncode != 0
+                assert f"{mode} diagnostic" in (root / "artifact").read_text()
+                assert "private-principal" not in (root / "artifact").read_text()
+                if mode == "recovery":
+                    assert not (root / "inspected").exists()
+            assert "--kill-after=1s 125s" in (root / "timeouts").read_text()
 
 
 if __name__ == "__main__":

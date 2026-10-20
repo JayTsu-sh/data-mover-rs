@@ -145,15 +145,33 @@ kill_mutation_at_checkpoint() {
   echo "$phase checkpoint: client SIGKILL and cluster recovery verified" >>"$artifact"
 }
 
+recover_killed_append() {
+  # Only the fault-owned writer just confirmed dead by SIGKILL may be fenced.
+  # A new write probe proves cluster health, not closure of this file's lease.
+  local path="$1" log_file="$local_root/append-lease-recovery.log"
+  if ! timeout --kill-after=1s 125s "$mutation_binary" --storage "$hdfs_storage" \
+    --path "$path" --phase recover-lease >"$log_file" 2>&1; then
+    redact_log "$log_file" | tee -a "$artifact" >&2
+    echo "killed append lease did not recover: $path" >&2
+    return 1
+  fi
+  redact_log "$log_file" >>"$artifact"
+}
+
 wait_for_inspect() {
-  local path="$1" output
-  for _ in {1..90}; do
-    if output="$("$inspect_binary" --storage "$hdfs_storage" --path "$path" 2>/dev/null)"; then
+  local path="$1" output remaining probe_seconds
+  local deadline=$((SECONDS + 90)) log_file="$local_root/inspect-recovery.log"
+  while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    probe_seconds=$((remaining < 15 ? remaining : 15))
+    if output="$(timeout --kill-after=1s "${probe_seconds}s" \
+      "$inspect_binary" --storage "$hdfs_storage" --path "$path" 2>"$log_file")"; then
       printf '%s\n' "$output"
       return 0
     fi
-    sleep 1
+    if (( SECONDS < deadline )); then sleep 1; fi
   done
+  redact_log "$log_file" | tee -a "$artifact" >&2
   echo "HDFS path did not become independently readable: $path" >&2
   return 1
 }
@@ -262,10 +280,11 @@ kill_mutation_at_checkpoint close namenode close-killed.bin
 "$mutation_binary" --storage "$hdfs_storage" --path append-killed.bin --phase seed
 before_append="$("$inspect_binary" --storage "$hdfs_storage" --path append-killed.bin)"
 kill_mutation_at_checkpoint append datanodes append-killed.bin
+recover_killed_append append-killed.bin
 after_append="$(wait_for_inspect append-killed.bin)"
-before_size="${before_append%%$'\t'*}"
-after_size="${after_append%%$'\t'*}"
-(( after_size >= before_size && after_size <= before_size * 2 ))
+# The barrier is before write_bytes and SIGSTOP precedes releasing it: no append
+# payload was sent. Recovery must retain the exact seeded length AND digest.
+[[ "$after_append" == "$before_append" ]]
 
 "$mutation_binary" --storage "$hdfs_storage" --path rename-source.bin --phase seed
 rename_source="$("$inspect_binary" --storage "$hdfs_storage" --path rename-source.bin)"

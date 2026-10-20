@@ -275,6 +275,15 @@ cleanup. The gate proves replica failover with one DataNode down, bounded and
 root-relative failure with both replicas down, bounded NameNode failure, and
 successful independent reopen/hash verification after each recovery. Its
 artifact contains structured redacted diagnostics only.
+The raw append checkpoint opens a writer but sends no append payload before SIGKILL.
+After services are healthy, the harness explicitly recovers ONLY that killed
+writer's file lease and waits for closure (120 seconds including RPC waits, with
+an outer 125-second process bound). It then independently reopens the file and
+requires the exact original size AND BLAKE3 digest, not just a size range. A healthy
+new-write probe does not establish closure of an unrelated abandoned append lease;
+ordinary readers must not fence potentially live writers to make such a file readable.
+Reopen retries have a 90-second overall deadline and bounded individual probes;
+their last redacted failure is preserved in the artifact instead of being discarded.
 
 `run-hdfs-ha-e2e.sh` is a separate, opt-in HA acceptance gate. The current
 10.131.9.30/31/32 lab has one NameNode and two DataNodes, so it is not an HA
