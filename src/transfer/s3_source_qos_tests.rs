@@ -1,4 +1,4 @@
-//! Source QoS applied to the real S3 range-read pipeline.
+//! Source `QoS` applied to the real S3 range-read pipeline.
 
 use std::{sync::Arc, time::Duration};
 
