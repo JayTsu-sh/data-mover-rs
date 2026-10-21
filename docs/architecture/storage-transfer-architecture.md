@@ -250,9 +250,10 @@ facts. Eligible copies bind the observed ETag/version, prepare an unpublished st
 ordinary destination role, and only then let the native endpoint fill that stage. S3 native copy,
 including multipart copy, never participates in streaming checkpoint recovery; a failed attempt is
 reissued through native operation semantics. Both forms use the ordinary BLAKE3 verification and
-publication lifecycle. Strict client-shaped payload, a different endpoint,
-or a non-standard S3 profile selects streaming before remote mutation. A native operation failure
-retains stage cleanup authority and is never silently retried through streaming.
+publication lifecycle. Native eligibility is derived entirely from the connected pair: a different
+endpoint or an incompatible/non-native S3 profile selects streaming before remote mutation. A
+native operation failure retains stage cleanup authority and is never silently retried through
+streaming.
 
 ## 6. Observation model and traversal
 
@@ -751,8 +752,8 @@ across retries. Metadata/HEAD requests remain outside the payload-read budget.
 
 S3 native copy remains allowed with QoS enabled. Server-internal payload is not client-shaped.
 Outcomes distinguish logical payload, client-streamed shaped bytes, native bytes, source read
-operations, and native requests, and explicitly report native payload as unshaped. A caller
-requiring client-shaped payload explicitly disables native transfer.
+operations, and native requests, and explicitly report native payload as unshaped. Payload route
+is not a request option: an eligible connected S3 pair always uses native transfer.
 The same accounting snapshot is available on `TransferFailure`, so cancellation and later-phase
 failures report the source work already performed. Resume and restart create new per-attempt
 meters against the shared group; every source reread required for BLAKE3 verification is charged,

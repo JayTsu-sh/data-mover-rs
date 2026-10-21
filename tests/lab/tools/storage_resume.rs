@@ -9,8 +9,7 @@ use clap::{Parser, ValueEnum};
 use data_mover::model::{FailureClass, StoragePath};
 use data_mover::storage::{Storage, StorageRoleFailure};
 use data_mover::transfer::{
-    PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferFailure, TransferRequest,
-    move_file, transfer,
+    SourceQosGroup, SourceQosPolicy, TransferFailure, TransferRequest, move_file, transfer,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -120,8 +119,7 @@ async fn main() -> Result {
         path.clone(),
         destination.clone(),
         cancel.clone(),
-    )
-    .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
+    );
     let mut state = ResumeState {
         schema: 2,
         size,
@@ -194,8 +192,7 @@ async fn interrupt(args: &Args, path: &StoragePath, state: &mut ResumeState) -> 
             path.clone(),
             destination.clone(),
             cancel.clone(),
-        )
-        .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
+        );
         let observation_guard = blake3::hash(observation.encode_snapshot().as_bytes())
             .to_hex()
             .to_string();

@@ -17,8 +17,8 @@ use crate::storage::backends::s3::tests::{
 use crate::storage::backends::s3::{S3Protocol as _, S3VersionFacts, connect};
 use crate::storage::{Storage, StorageRoleFailure};
 use crate::transfer::{
-    DeleteMarkerOutcome, PayloadShapingPolicy, SourceVersion, TransferFailure, TransferPhase,
-    TransferRequest, TransferSide, destination_keeps_history, transfer, write_delete_marker,
+    DeleteMarkerOutcome, SourceVersion, TransferFailure, TransferPhase, TransferRequest,
+    TransferSide, destination_keeps_history, transfer, write_delete_marker,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -63,8 +63,7 @@ async fn a_delete_marker_holds_the_destination_guard() -> TestResult {
         StoragePath::new("dst/k")?,
         bucket(&protocol)?,
         CancellationToken::new(),
-    )
-    .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
+    );
     let transferred = run_until_transferred(request).await?;
     let Err(busy) = marker(&bucket(&protocol)?, "dst/k").await else {
         return Err("a delete marker was written while a transfer held the key".into());
@@ -153,13 +152,12 @@ async fn a_mixed_history_is_replayed_in_order() -> TestResult {
             marker(&bucket(&destination)?, "m/").await?;
         } else {
             let request = TransferRequest::new(
-                bucket(&source)?,
+                connect(source.clone(), endpoint_of(&source), None)?,
                 StoragePath::new("m/")?,
-                bucket(&destination)?,
+                connect(destination.clone(), endpoint_of(&destination), None)?,
                 CancellationToken::new(),
             )
-            .with_source_version(SourceVersion::Id(record.version_id.clone()))
-            .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
+            .with_source_version(SourceVersion::Id(record.version_id.clone()));
             transfer(request).await?;
         }
     }

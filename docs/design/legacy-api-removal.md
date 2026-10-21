@@ -127,7 +127,7 @@ SHA-256 checked before execution. Earlier P7 acceptance is not substituted for t
 | Strict rustdoc | Passed with warnings denied |
 | HDFS upstream dependency contract | Exact upstream `695fc47e9f88804e39bba1d30bf128e66da9b8d6` pin and hsync/lease source checks passed; four offline native contracts passed |
 | FAS2750 NFSv4.1 and NFSv3 | Both end-to-end runners passed traversal, exports, directory lifecycle and mkdir permission contracts; v3 uses the established reserved-port configuration |
-| Standard S3 transfer contract | Reconnect/recovery, publication, metadata, positional reads, cancellation, native copy and client-shaped fallback passed on a 72 MiB + 137-byte payload |
+| Standard S3 transfer contract | Reconnect/recovery, publication, metadata, positional reads, cancellation, and connected-pair native route selection passed on a 72 MiB + 137-byte payload |
 | S3 namespace operations | Rename preserved content, user metadata and tags and removed the source; 103-object role deletion passed with independent absence checks |
 | HDFS live contracts | Four architecture cases and fourteen non-S3 native cases passed, including policy boundaries, durable-prefix reconnect, metadata, confinement and explicit native root deletion |
 | Example move and resume | Same-path move refused without mutation; QoS move passed; fresh-process resume of 96 MiB + 123 bytes reused 73,652,786 bytes, verified the destination and removed the source |
@@ -194,8 +194,8 @@ multipart-rename regression uses the current private protocol and confines its f
 DXN fixture keys now derive from the lab runner's scoped key. DXN was not contacted.
 
 A fresh standard-S3 run of this follow-up passed the 20 MiB multipart rename regression,
-the public 72 MiB + 137-byte architecture contract (including reconnect, native copy and
-shaped fallback), namespace rename with content/metadata/tags preserved, and deletion of
+the public 72 MiB + 137-byte architecture contract (including reconnect and native copy),
+namespace rename with content/metadata/tags preserved, and deletion of
 103 objects. Independent cleanup confirmed no current objects, historical versions,
 delete markers or incomplete uploads in the isolated test prefix. Run-local redacted logs
 are under `/tmp/dm-consolidate-live-058e61a8512a`; no server configuration changed.

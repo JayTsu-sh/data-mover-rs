@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run --example s3_history_replay -- --source s3:<prefix> \
-//!     --destination s3@<bucket>:<prefix> --path m/ [--path z/] [--client-shaped]
+//!     --destination s3@<bucket>:<prefix> --path m/ [--path z/]
 //! ```
 //!
 //! Endpoints as in `transfer_resume` (`s3:<prefix>` is `S3_BUCKET`, `s3@<bucket>:<prefix>` another
@@ -52,8 +52,8 @@ use data_mover::model::{
 };
 use data_mover::storage::{Storage, StorageRoleFailure};
 use data_mover::transfer::{
-    DeleteMarkerOutcome, PayloadShapingPolicy, TransferFailure, TransferRequest,
-    destination_keeps_history, transfer, write_delete_marker,
+    DeleteMarkerOutcome, TransferFailure, TransferRequest, destination_keeps_history, transfer,
+    write_delete_marker,
 };
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalRequest, TraversalSource as _,
@@ -71,9 +71,6 @@ struct Args {
     /// A key to replay (relative to the source root; the same path at the destination).
     #[arg(long = "path", required = true)]
     paths: Vec<String>,
-    /// Stream every version through this process instead of copying it natively.
-    #[arg(long)]
-    client_shaped: bool,
     /// Instead of replaying, write one delete marker on each `--path` of the destination.
     #[arg(long)]
     delete_marker: bool,
@@ -90,11 +87,10 @@ struct Tally {
     failed: u32,
 }
 
-/// The two ends and how versions are copied.
+/// The two ends of the replay.
 struct Replay {
     source: Storage,
     destination: Storage,
-    client_shaped: bool,
 }
 
 /// Where `key` is listed: its parent directory, and how deep below it (a directory object `m/` is
@@ -226,16 +222,13 @@ impl Replay {
     async fn copy(&self, key: &str, record: &VersionRecord, tally: &mut Tally) -> Result<String> {
         let version = record.source().unwrap_or(SourceVersion::Current);
         let path = StoragePath::new(key)?;
-        let mut request = TransferRequest::new(
+        let request = TransferRequest::new(
             self.source.clone(),
             path.clone(),
             self.destination.clone(),
             CancellationToken::new(),
         )
         .with_source_version(version);
-        if self.client_shaped {
-            request = request.with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
-        }
         Ok(match transfer(request).await {
             Ok(outcome) => {
                 tally.copied += 1;
@@ -315,7 +308,6 @@ async fn main() -> Result {
     let replay = Replay {
         source: connect(&args.source).await?,
         destination: connect(&args.destination).await?,
-        client_shaped: args.client_shaped,
     };
     let mut tally = Tally::default();
     if args.delete_marker {

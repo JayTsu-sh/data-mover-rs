@@ -1,5 +1,6 @@
-//! Which metadata a copy carries: the baseline every copy takes, the families the caller asks
-//! for, and what the two ends can do. See `.claude/docs/metadata-negotiation.md`.
+//! Which metadata a copy carries: the baseline every copy takes, caller-selected ACL/xattrs,
+//! automatic S3-to-S3 tags, and what the two ends can do. See
+//! `.claude/docs/metadata-negotiation.md`.
 
 use std::fmt;
 use std::sync::Arc;
@@ -45,6 +46,7 @@ pub(super) async fn copied_metadata_plan(
     descriptor: &SourceDescriptor,
 ) -> Result<Option<CopiedMetadataPlan>, TransferFailure> {
     let requested = request.copied_metadata;
+    let copy_tags = request.copies_tags();
     let Some(MetadataRoles {
         source: metadata,
         baseline,
@@ -54,8 +56,7 @@ pub(super) async fn copied_metadata_plan(
     else {
         return Ok(None);
     };
-    // Unrequested optional capabilities must not trigger source metadata I/O (notably a
-    // HEAD per object for ordinary S3 copies whose destination only stores tags).
+    // Unselected optional capabilities must not trigger source metadata I/O.
     let requested_target = CopiedMetadataTarget {
         acl: if requested.acl() {
             target.acl
@@ -67,7 +68,7 @@ pub(super) async fn copied_metadata_plan(
         } else {
             CopiedValueTarget::Unsupported
         },
-        tags: if requested.tags() {
+        tags: if copy_tags {
             target.tags
         } else {
             CopiedValueTarget::Unsupported
@@ -75,14 +76,14 @@ pub(super) async fn copied_metadata_plan(
         ..target
     };
     if requested_target.stores_nothing() {
-        return Ok(Some(nothing_stored(requested)));
+        return Ok(Some(nothing_stored(requested, copy_tags)));
     }
     let timestamps_stored = matches!(target.timestamps, CopiedTimestampTarget::Stored(_));
     let observation_plan = baseline
         .with_acl(observation_mode(requested.acl()))
         .with_xattrs(observation_mode(requested.xattrs()))
         .with_tags(observation_mode(
-            requested.tags() && target.tags == CopiedValueTarget::Supported,
+            copy_tags && target.tags == CopiedValueTarget::Supported,
         ));
     let observations = metadata
         .observe_copy_bound_version(
@@ -105,6 +106,7 @@ pub(super) async fn copied_metadata_plan(
     let (target, ownership_policy) = metadata_target(target, owner_permitted);
     let policies = copied_policies(
         requested,
+        copy_tags,
         ownership_policy,
         observations.mode_without_ownership.is_some(),
         timestamps_stored,
@@ -127,13 +129,13 @@ pub(super) async fn copied_metadata_plan(
 /// outcome, so the source is not read — no request per file just to report that the destination
 /// keeps none of it. The baseline and whatever the caller asked for are each skipped with that
 /// reason. The source identity is still enforced by every read of the data.
-fn nothing_stored(requested: CopiedMetadataRequest) -> CopiedMetadataPlan {
+fn nothing_stored(requested: CopiedMetadataRequest, copy_tags: bool) -> CopiedMetadataPlan {
     let policies = MetadataPolicies::default()
         .with_ownership_mode(MetadataPolicy::AllowKnownLoss)
         .with_timestamps(MetadataPolicy::AllowKnownLoss)
         .with_acl(optional_policy(requested.acl()))
         .with_xattrs(optional_policy(requested.xattrs()))
-        .with_tags(optional_policy(requested.tags()));
+        .with_tags(optional_policy(copy_tags));
     CopiedMetadataPlan {
         plan: compile_nothing_stored_plan(policies),
     }
@@ -230,10 +232,11 @@ fn metadata_target(
 }
 
 /// The baseline every copy carries — ownership/mode as the target allows, mtime — plus the
-/// optional families at whatever the caller asked for. A destination that does not store the
+/// selected ACL/xattrs and automatic S3-to-S3 tags. A destination that does not store the
 /// modification time has it skipped with that reason; it is not the copy's to refuse.
 fn copied_policies(
     requested: CopiedMetadataRequest,
+    copy_tags: bool,
     ownership_policy: MetadataPolicy,
     mode_without_ownership: bool,
     timestamps_stored: bool,
@@ -252,7 +255,7 @@ fn copied_policies(
         })
         .with_acl(optional_policy(requested.acl()))
         .with_xattrs(optional_policy(requested.xattrs()))
-        .with_tags(optional_policy(requested.tags()))
+        .with_tags(optional_policy(copy_tags))
 }
 
 /// How an optional feature is planned: not asked for, it is not even read; asked for, it is
@@ -392,6 +395,7 @@ mod tests {
         assert_eq!(target.timestamps, TimestampTargetCapability::Unsupported);
         let policies = copied_policies(
             CopiedMetadataRequest::default(),
+            false,
             ownership_policy,
             false,
             false,

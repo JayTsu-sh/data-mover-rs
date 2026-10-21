@@ -51,14 +51,6 @@ pub enum ReadBackVerification {
     Disabled,
 }
 
-/// Whether a planner may select a server-internal, unshaped native payload path.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PayloadShapingPolicy {
-    #[default]
-    AllowUnshapedNative,
-    RequireClientShaped,
-}
-
 /// Immutable inputs for one transfer attempt.
 #[derive(Clone)]
 pub struct TransferRequest {
@@ -69,7 +61,6 @@ pub struct TransferRequest {
     pub(crate) cancel: CancellationToken,
     pub(crate) transfer_policy: TransferPolicy,
     pub(crate) source_qos: Option<SourceQosGroup>,
-    pub(crate) payload_shaping: PayloadShapingPolicy,
     pub(crate) read_back: ReadBackVerification,
     pub(crate) copied_metadata: CopiedMetadataRequest,
 }
@@ -93,8 +84,8 @@ enum SourceInput {
 ///
 /// Only the optional features appear here. Ownership, mode and mtime are carried by every copy
 /// and cannot be turned off — **what is absent from this type is what is mandatory**. xattrs are
-/// one feature, never selected attribute by attribute. Object tags are a separate optional
-/// family, distinct from extended attributes and S3 user-defined metadata.
+/// one feature, never selected attribute by attribute. Object tags are always copied for S3 to
+/// S3 transfers and are not applicable to other backend pairs, so they are not caller-configured.
 ///
 /// Asking for a feature is not a guarantee it is carried: whether it *can* be is decided inside
 /// data-mover, by the source's ability to read it and the destination's ability to store it,
@@ -111,7 +102,6 @@ enum SourceInput {
 pub struct CopiedMetadataRequest {
     acl: bool,
     xattrs: bool,
-    tags: bool,
 }
 
 impl CopiedMetadataRequest {
@@ -129,19 +119,6 @@ impl CopiedMetadataRequest {
         self
     }
 
-    /// Asks for object tags.
-    #[must_use]
-    pub const fn with_tags(mut self) -> Self {
-        self.tags = true;
-        self
-    }
-
-    /// Whether object tags are requested.
-    #[must_use]
-    pub const fn tags(self) -> bool {
-        self.tags
-    }
-
     #[must_use]
     pub const fn acl(self) -> bool {
         self.acl
@@ -155,7 +132,7 @@ impl CopiedMetadataRequest {
     /// Whether no optional feature is asked for, which is the default.
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        !self.acl && !self.xattrs && !self.tags
+        !self.acl && !self.xattrs
     }
 }
 
@@ -183,7 +160,6 @@ impl TransferRequest {
             cancel,
             transfer_policy: TransferPolicy::default(),
             source_qos: None,
-            payload_shaping: PayloadShapingPolicy::default(),
             read_back: ReadBackVerification::default(),
             copied_metadata: CopiedMetadataRequest::default(),
         }
@@ -324,17 +300,14 @@ impl TransferRequest {
         self.read_back == ReadBackVerification::Enabled
     }
 
+    pub(crate) fn copies_tags(&self) -> bool {
+        self.source.copies_tags_to(&self.destination)
+    }
+
     /// Joins this attempt to one immutable shared source-read `QoS` group.
     #[must_use]
     pub fn with_source_qos(mut self, group: SourceQosGroup) -> Self {
         self.source_qos = Some(group);
-        self
-    }
-
-    /// Selects whether server-internal native payload is eligible.
-    #[must_use]
-    pub fn with_payload_shaping(mut self, policy: PayloadShapingPolicy) -> Self {
-        self.payload_shaping = policy;
         self
     }
 }

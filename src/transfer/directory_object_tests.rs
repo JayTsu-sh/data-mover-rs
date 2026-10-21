@@ -25,9 +25,8 @@ use crate::storage::{NamespaceCapabilities, SourceDescriptor, Storage, StorageRo
 use crate::transfer::{
     DIRECTORY_OBJECT_SKIP_REASON, DIRECTORY_OBJECT_TOO_LARGE_REASON, DirectoryObjectAction,
     DirectoryObjectDestination, ExpertDestinationRequest, ExpertDestinationSession,
-    ExpertSourceRequest, ExpertSourceSession, PayloadShapingPolicy, TransferFailure, TransferPhase,
-    TransferPolicy, TransferRequest, TransferRoute, TransferSide, directory_object_action,
-    transfer,
+    ExpertSourceRequest, ExpertSourceSession, TransferFailure, TransferPhase, TransferPolicy,
+    TransferRequest, TransferRoute, TransferSide, directory_object_action, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -95,10 +94,10 @@ const fn refused_at_preflight(
 /// Between buckets the key `d/` is recreated with its bytes, content or none, streamed or native.
 #[tokio::test]
 async fn a_directory_object_between_buckets_is_copied() -> TestResult {
-    for (body, shaping) in [
-        (&b"hello"[..], PayloadShapingPolicy::RequireClientShaped),
-        (&b"hello"[..], PayloadShapingPolicy::AllowUnshapedNative),
-        (&b""[..], PayloadShapingPolicy::RequireClientShaped),
+    for (body, native) in [
+        (&b"hello"[..], false),
+        (&b"hello"[..], true),
+        (&b""[..], false),
     ] {
         let protocol = Arc::new(MemoryS3::default());
         let bytes = Bytes::copy_from_slice(body);
@@ -107,13 +106,17 @@ async fn a_directory_object_between_buckets_is_copied() -> TestResult {
             .lock()
             .await
             .insert("src/d/".into(), bytes.clone());
-        let copy = request(source_storage(&protocol, "src")?, "d/", bucket(&protocol)?)?
-            .with_payload_shaping(shaping);
+        let destination = connect(
+            protocol.clone(),
+            endpoint_of(&protocol),
+            native.then(native_context),
+        )?;
+        let copy = request(source_storage(&protocol, "src")?, "d/", destination)?;
         transfer(copy).await?;
         assert_eq!(
             protocol.objects.lock().await.get("d/"),
             Some(&bytes),
-            "{shaping:?} {} B",
+            "native={native} {} B",
             body.len()
         );
     }
@@ -426,27 +429,19 @@ async fn a_directory_object_over_the_single_put_threshold_is_one_request() -> Te
             .take(OVER_THRESHOLD)
             .collect::<Vec<_>>(),
     );
-    for (policy, shaping, route) in [
+    for (policy, native, route) in [
         (
             TransferPolicy::Checkpointed,
-            PayloadShapingPolicy::RequireClientShaped,
+            false,
             TransferRoute::Streaming,
         ),
         (
             TransferPolicy::AtomicReplace,
-            PayloadShapingPolicy::RequireClientShaped,
+            false,
             TransferRoute::Streaming,
         ),
-        (
-            TransferPolicy::Direct,
-            PayloadShapingPolicy::RequireClientShaped,
-            TransferRoute::Streaming,
-        ),
-        (
-            TransferPolicy::Checkpointed,
-            PayloadShapingPolicy::AllowUnshapedNative,
-            TransferRoute::Native,
-        ),
+        (TransferPolicy::Direct, true, TransferRoute::Streaming),
+        (TransferPolicy::Checkpointed, true, TransferRoute::Native),
     ] {
         let label = format!("{policy:?} {route:?}");
         let protocol = rustfs_like().await;
@@ -455,9 +450,13 @@ async fn a_directory_object_over_the_single_put_threshold_is_one_request() -> Te
             .lock()
             .await
             .insert("src/d/".into(), bytes.clone());
-        let copy = request(source_storage(&protocol, "src")?, "d/", bucket(&protocol)?)?
-            .with_transfer_policy(policy)
-            .with_payload_shaping(shaping);
+        let destination = connect(
+            protocol.clone(),
+            endpoint_of(&protocol),
+            native.then(native_context),
+        )?;
+        let copy = request(source_storage(&protocol, "src")?, "d/", destination)?
+            .with_transfer_policy(policy);
         let outcome = transfer(copy)
             .await
             .map_err(|e| format!("{label}: {e:?}"))?;

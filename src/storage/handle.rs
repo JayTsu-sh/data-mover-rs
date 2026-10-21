@@ -210,6 +210,12 @@ impl Storage {
             Arc::clone(destination.backend.roles().native.as_ref()?),
         )
     }
+
+    /// Whether ordinary copy semantics carry object tags for this connected pair.
+    pub(crate) const fn copies_tags_to(&self, destination: &Self) -> bool {
+        matches!(self.backend, ConnectedBackend::S3(_))
+            && matches!(destination.backend, ConnectedBackend::S3(_))
+    }
 }
 
 #[cfg(test)]

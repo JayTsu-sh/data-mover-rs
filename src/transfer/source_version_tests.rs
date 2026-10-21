@@ -11,8 +11,8 @@ use crate::storage::StorageRoleFailure;
 use crate::storage::backends::s3::connect;
 use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context, source_storage};
 use crate::transfer::{
-    PayloadShapingPolicy, SourceVersion, TransferIdentity, TransferPhase, TransferRequest,
-    TransferRoute, TransferSide, transfer,
+    SourceVersion, TransferIdentity, TransferPhase, TransferRequest, TransferRoute, TransferSide,
+    transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -32,12 +32,12 @@ async fn versioned() -> Arc<MemoryS3> {
     protocol
 }
 
-fn request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
+fn request(protocol: &Arc<MemoryS3>, native: bool) -> TestResult<TransferRequest> {
     let source = source_storage(protocol, "src")?;
     let destination = connect(
         protocol.clone(),
         endpoint_of(protocol),
-        Some(native_context()),
+        native.then(native_context),
     )?;
     Ok(TransferRequest::new(
         source,
@@ -50,26 +50,20 @@ fn request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
 /// A named version is copied as it is — streamed or by native copy — although it is not current.
 #[tokio::test]
 async fn a_named_version_is_copied_streaming_and_native() -> TestResult {
-    for shaping in [
-        PayloadShapingPolicy::RequireClientShaped,
-        PayloadShapingPolicy::AllowUnshapedNative,
+    for (native, expected_route) in [
+        (false, TransferRoute::Streaming),
+        (true, TransferRoute::Native),
     ] {
         let protocol = versioned().await;
         let outcome = transfer(
-            request(&protocol)?
-                .with_source_version(SourceVersion::Id("v1".into()))
-                .with_payload_shaping(shaping),
+            request(&protocol, native)?.with_source_version(SourceVersion::Id("v1".into())),
         )
         .await?;
-        let expected_route = match shaping {
-            PayloadShapingPolicy::RequireClientShaped => TransferRoute::Streaming,
-            PayloadShapingPolicy::AllowUnshapedNative => TransferRoute::Native,
-        };
         assert_eq!(outcome.route, expected_route);
         assert_eq!(
             protocol.objects.lock().await.get("final"),
             Some(&Bytes::from_static(b"first version")),
-            "{shaping:?}"
+            "{expected_route:?}"
         );
     }
     Ok(())
@@ -81,7 +75,8 @@ async fn a_deleted_version_fails_the_entry_at_describe() -> TestResult {
     let protocol = versioned().await;
     protocol.put_delete_marker("src/final", "marker").await;
     let Err(failure) =
-        transfer(request(&protocol)?.with_source_version(SourceVersion::Id("marker".into()))).await
+        transfer(request(&protocol, true)?.with_source_version(SourceVersion::Id("marker".into())))
+            .await
     else {
         return Err("a delete marker was copied".into());
     };
@@ -100,7 +95,7 @@ async fn a_malformed_version_id_fails_at_preflight() -> TestResult {
     let protocol = versioned().await;
     for bad in [String::new(), "x".repeat(1025), "a\0b".to_string()] {
         let Err(failure) =
-            transfer(request(&protocol)?.with_source_version(SourceVersion::Id(bad))).await
+            transfer(request(&protocol, true)?.with_source_version(SourceVersion::Id(bad))).await
         else {
             return Err("a malformed version id was accepted".into());
         };
@@ -120,22 +115,22 @@ async fn a_malformed_version_id_fails_at_preflight() -> TestResult {
 #[tokio::test]
 async fn the_version_selects_the_identity_unless_overridden() -> TestResult {
     let protocol = versioned().await;
-    let current = request(&protocol)?;
+    let current = request(&protocol, true)?;
     assert_eq!(*current.source_version(), SourceVersion::Current);
-    let v1 = request(&protocol)?.with_source_version(SourceVersion::Id("v1".into()));
+    let v1 = request(&protocol, true)?.with_source_version(SourceVersion::Id("v1".into()));
     assert_ne!(v1.identity(), current.identity());
     assert_eq!(
-        request(&protocol)?
+        request(&protocol, true)?
             .with_source_version(SourceVersion::Current)
             .identity(),
         current.identity()
     );
     let label = TransferIdentity::from_label("job")?;
     for request in [
-        request(&protocol)?
+        request(&protocol, true)?
             .with_identity_override(label)
             .with_source_version(SourceVersion::Id("v1".into())),
-        request(&protocol)?
+        request(&protocol, true)?
             .with_source_version(SourceVersion::Id("v1".into()))
             .with_identity_override(label),
     ] {

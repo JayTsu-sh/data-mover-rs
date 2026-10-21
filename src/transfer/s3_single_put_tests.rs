@@ -10,31 +10,22 @@ use tokio_util::sync::CancellationToken;
 use super::engine::run_until_transferred;
 use crate::model::StoragePath;
 use crate::storage::backends::s3::connect;
-use crate::storage::backends::s3::tests::{
-    MemoryS3, endpoint_of, etag_of, native_context, source_storage,
-};
+use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, etag_of, source_storage};
 use crate::transfer::{
-    EffectiveRecovery, PayloadShapingPolicy, TransferPolicy, TransferRequest, TransferRoute,
-    transfer,
+    EffectiveRecovery, TransferPolicy, TransferRequest, TransferRoute, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn request(protocol: &Arc<MemoryS3>, final_path: &str) -> TestResult<TransferRequest> {
     let source = source_storage(protocol, "src")?;
-    let destination = connect(
-        protocol.clone(),
-        endpoint_of(protocol),
-        Some(native_context()),
-    )?;
+    let destination = connect(protocol.clone(), endpoint_of(protocol), None)?;
     Ok(TransferRequest::new(
         source,
         StoragePath::new(final_path)?,
         destination,
         CancellationToken::new(),
-    )
-    // The same fake on both ends would otherwise copy natively.
-    .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped))
+    ))
 }
 
 /// On a versioned bucket the outcome names the version the PUT created, and the read-back came
