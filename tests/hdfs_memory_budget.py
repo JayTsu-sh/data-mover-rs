@@ -21,6 +21,14 @@ FIXED_OVERHEAD_MIB = 112
 SCALE_SMALL_BYTES = 1024**3 + 137
 SCALE_LARGE_BYTES = 100 * 1024**3 + 137
 SCALE_SHORT_SAMPLES = 1
+BASELINE_SMALL_BYTES = 256 * 1024**2 + 137
+BASELINE_LARGE_BYTES = 2 * 1024**3 + 137
+BASELINE_DIRECTIONS = ("local-hdfs", "hdfs-hdfs", "hdfs-local")
+BASELINE_SETTINGS = {
+    "serial": (1, 2, 1, 1),
+    "default": (1, 2, 4, 1),
+    "high": (1, 2, 8, 16),
+}
 
 
 def validate_trace(
@@ -166,6 +174,20 @@ def validate(path: Path, *, require_100_gib: bool = False, trace: Path | None = 
 
     if require_100_gib and not has_100_gib:
         raise ValueError("HDFS memory CSV must contain a real 100 GiB sample")
+    if require_100_gib:
+        expected_baselines = {
+            ("baseline", profile, direction)
+            for profile in BASELINE_SETTINGS
+            for direction in BASELINE_DIRECTIONS
+        }
+        actual_baselines = {key for key in grouped if key[0] == "baseline"}
+        if actual_baselines != expected_baselines:
+            missing = sorted(expected_baselines - actual_baselines)
+            unexpected = sorted(actual_baselines - expected_baselines)
+            raise ValueError(
+                "HDFS memory baseline coverage mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
 
     for key, samples in grouped.items():
         samples.sort()
@@ -198,6 +220,16 @@ def validate(path: Path, *, require_100_gib: bool = False, trace: Path | None = 
             raise ValueError(f"unknown HDFS memory sample set: {key[0]}")
         if samples[0][0] == samples[1][0] or samples[0][2] != samples[1][2]:
             raise ValueError(f"{key} needs distinct sizes with identical settings")
+        expected_settings = BASELINE_SETTINGS.get(key[1])
+        if key[2] not in BASELINE_DIRECTIONS or expected_settings is None:
+            raise ValueError(f"unknown HDFS memory baseline group: {key}")
+        if samples[0][2] != expected_settings:
+            raise ValueError(f"{key} does not use its declared profile settings")
+        if require_100_gib and [sample[0] for sample in samples] != [
+            BASELINE_SMALL_BYTES,
+            BASELINE_LARGE_BYTES,
+        ]:
+            raise ValueError(f"{key} does not contain the required baseline payload sizes")
         # These are independent processes, not early/late steady-state windows.
         # Each peak already satisfies its calculated absolute budget above;
         # sustained growth is checked using the same-process scale trace only.

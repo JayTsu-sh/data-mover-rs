@@ -1,14 +1,16 @@
 //! Fresh-process recovery through the ordinary transfer engine. The state file is an
 //! observation guard, never an exported destination handle or an estimated durable prefix.
+use std::error::Error as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use data_mover::model::StoragePath;
-use data_mover::storage::Storage;
+use data_mover::model::{FailureClass, StoragePath};
+use data_mover::storage::{Storage, StorageRoleFailure};
 use data_mover::transfer::{
-    PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferRequest, move_file, transfer,
+    PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferFailure, TransferRequest,
+    move_file, transfer,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -219,7 +221,11 @@ async fn interrupt(args: &Args, path: &StoragePath, state: &mut ResumeState) -> 
         let failure = result
             .err()
             .ok_or("transfer completed before interruption")?;
-        if !cancel.is_cancelled() || failure.final_destination_changed() {
+        if !is_expected_interruption(
+            cancel.is_cancelled(),
+            failure.final_destination_changed(),
+            transfer_failure_class(&failure),
+        ) {
             return Err(failure.into());
         }
         if !failure.has_recoverable_stage() {
@@ -246,6 +252,27 @@ async fn interrupt(args: &Args, path: &StoragePath, state: &mut ResumeState) -> 
     Err("unable to establish a durable recovery checkpoint after repeated interruptions".into())
 }
 
+fn transfer_failure_class(failure: &TransferFailure) -> Option<FailureClass> {
+    match failure
+        .source()
+        .and_then(|cause| cause.downcast_ref::<StorageRoleFailure>())
+    {
+        Some(StorageRoleFailure::Entry(error)) => Some(error.class()),
+        Some(StorageRoleFailure::Session(error)) => Some(error.class()),
+        None => None,
+    }
+}
+
+const fn is_expected_interruption(
+    timer_cancelled: bool,
+    final_destination_changed: bool,
+    failure_class: Option<FailureClass>,
+) -> bool {
+    timer_cancelled
+        && !final_destination_changed
+        && matches!(failure_class, Some(FailureClass::Cancelled))
+}
+
 fn interruption_delays(size: u64) -> Result<[Duration; 6]> {
     if size < 96 << 20 {
         return Err("resume fixture must be at least 96 MiB for automatic checkpoints".into());
@@ -263,6 +290,33 @@ fn interruption_delays(size: u64) -> Result<[Duration; 6]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_cancelled_failure_is_an_expected_interruption() {
+        assert!(is_expected_interruption(
+            true,
+            false,
+            Some(FailureClass::Cancelled),
+        ));
+        for class in [
+            None,
+            Some(FailureClass::Connectivity),
+            Some(FailureClass::Protocol),
+            Some(FailureClass::Corruption),
+        ] {
+            assert!(!is_expected_interruption(true, false, class));
+        }
+        assert!(!is_expected_interruption(
+            false,
+            false,
+            Some(FailureClass::Cancelled),
+        ));
+        assert!(!is_expected_interruption(
+            true,
+            true,
+            Some(FailureClass::Cancelled),
+        ));
+    }
 
     #[test]
     fn retries_preserve_a_partial_upload_window() -> Result {

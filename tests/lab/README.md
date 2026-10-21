@@ -241,6 +241,8 @@ reach different allocator high-water marks while both remain bounded. The former
 been removed, without changing any absolute budget or the same-process growth gate.
 Nightly and release validation fail on either an absolute-budget violation or
 sustained growth in the long-run trace below.
+The full gate also fails closed unless all nine baseline profile/direction groups
+contain both exact fixture sizes with their declared concurrency settings.
 The same run also preloads sparse deterministic zero fixtures into HDFS, then
 measures one `high` HDFS→HDFS transfer at `1 GiB + 137 bytes` and one at
 `100 GiB + 137 bytes`, with identical inflight, chunk, channel and file-concurrency

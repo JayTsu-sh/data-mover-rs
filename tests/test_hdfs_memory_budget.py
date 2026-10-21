@@ -172,6 +172,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
             direction="hdfs-hdfs",
             sample_set="scale",
         )
+        self._append_complete_baseline(path)
         trace = self._trace([75_000] * 100)
         validate(path, require_100_gib=True, trace=trace)
         with self.assertRaisesRegex(ValueError, "trace"):
@@ -195,6 +196,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
             direction="hdfs-hdfs",
             sample_set="scale",
         )
+        self._append_complete_baseline(unstable)
         with self.assertRaisesRegex(ValueError, "10%"):
             validate(unstable, require_100_gib=True,
                      trace=self._trace([100_000 + i * 600 for i in range(100)]))
@@ -214,8 +216,47 @@ class HdfsMemoryBudgetTests(_TraceFixture):
             direction="hdfs-hdfs",
             sample_set="scale",
         )
+        self._append_complete_baseline(path)
 
         validate(path, require_100_gib=True, trace=self._trace([130_000] * 100))
+
+    def test_full_gate_rejects_missing_baseline_coverage(self) -> None:
+        path = self._csv(
+            [(1024**3 + 137, 75_000),
+             (100 * 1024**3 + 137, 132_064)],
+            profile="high", read=8, write=16, budget=204,
+            direction="hdfs-hdfs", sample_set="scale",
+        )
+        with self.assertRaisesRegex(ValueError, "baseline coverage"):
+            validate(path, require_100_gib=True,
+                     trace=self._trace([130_000] * 100))
+
+    def _append_complete_baseline(self, path: Path) -> None:
+        profiles = {
+            "serial": (1, 1, 132),
+            "default": (4, 1, 150),
+            "high": (8, 16, 204),
+        }
+        with path.open("a", newline="") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=[
+                    "run_id", "commit", "profile", "sample_set", "direction",
+                    "bytes", "max_rss_kib", "budget_mib", "file_concurrency",
+                    "chunk_mib", "read_inflight", "write_inflight",
+                ],
+            )
+            for profile, (read, write, budget) in profiles.items():
+                for direction in ["local-hdfs", "hdfs-hdfs", "hdfs-local"]:
+                    for size in [256 * 1024**2 + 137, 2 * 1024**3 + 137]:
+                        writer.writerow({
+                            "run_id": "unit-test", "commit": "0" * 40,
+                            "profile": profile, "sample_set": "baseline",
+                            "direction": direction, "bytes": size,
+                            "max_rss_kib": 70_000, "budget_mib": budget,
+                            "file_concurrency": 1, "chunk_mib": 2,
+                            "read_inflight": read, "write_inflight": write,
+                        })
 
     def _csv(
         self,
