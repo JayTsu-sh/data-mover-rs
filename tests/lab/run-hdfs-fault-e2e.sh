@@ -21,13 +21,16 @@ cleanup_fault_run() {
 }
 trap 'cleanup_fault_run $?' EXIT
 
+# Keep recovery intent outside the process tree that the runner can SIGKILL.
+local_root="/tmp/data-mover-lab/$run_id/hdfs-fault"
+mkdir -p "$local_root/source"
+touch "$local_root/restore-required"
+
 for target in namenode datanode1 datanode2; do
   validate_hdfs_fault_target "$target"
 done
 restore_hdfs_services
 
-local_root="/tmp/data-mover-lab/$run_id/hdfs-fault"
-mkdir -p "$local_root/source"
 fixture="$local_root/source/replicated.bin"
 python3 - "$fixture" <<'PY'
 import pathlib

@@ -2,6 +2,7 @@
 """Static safety contract for the destructive nightly HDFS fault harness."""
 
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -160,6 +161,73 @@ output="$(wait_for_inspect append-killed.bin)"
                 if mode == "recovery":
                     assert not (root / "inspected").exists()
             assert "--kill-after=1s 125s" in (root / "timeouts").read_text()
+
+
+def test_independent_cleanup_restores_only_fault_marked_runs_before_any_deletion() -> None:
+    cleanup = (ROOT / "tests/lab/cleanup-run.sh").read_text()
+    for mode in ("ordinary", "interrupted", "restore-failed"):
+        with tempfile.TemporaryDirectory(prefix="hdfs-cancel-cleanup-") as directory:
+            sandbox = Path(directory)
+            run_id = f"nightly-cancel-contract-{sandbox.name}"
+            run_root = Path("/tmp/data-mover-lab") / run_id
+            run_root.mkdir(parents=True, exist_ok=False)
+            try:
+                if mode != "ordinary":
+                    marker = run_root / "hdfs-fault/restore-required"
+                    marker.parent.mkdir()
+                    marker.touch()
+                (sandbox / "cleanup-run.sh").write_text(cleanup)
+                (sandbox / "common.sh").write_text(r'''
+LAB_SOURCE_MGMT=source LAB_DEST_MGMT=dest LAB_WORKER_MGMT=worker
+LAB_NFS3_EXPORT=/v3 LAB_NFS41_EXPORT=/v4
+LAB_S3_ACCESS_KEY= LAB_S3_SECRET_KEY=
+validate_run_id() { [[ "$1" == nightly-cancel-contract-* ]]; }
+prepare_hdfs_kerberos() { :; }
+hdfs_run_root() { printf '/tmp/data-mover-nightly/%s/hdfs' "$1"; }
+ssh_lab() { echo remote-delete >>"$TRACE"; }
+ssh_lab_root() { echo remote-delete >>"$TRACE"; }
+cargo() {
+  echo hdfs-delete >>"$TRACE"
+  [[ "$MODE" == ordinary ]] || test -f "$RESTORED"
+}
+''')
+                (sandbox / "hdfs-fault-common.sh").write_text(r'''
+restore_hdfs_services() {
+  echo restore >>"$TRACE"
+  [[ "$RUN_ID" == "$run_id" ]] || return 2
+  [[ "$MODE" != restore-failed ]] || return 1
+  touch "$RESTORED"
+}
+''')
+                result = subprocess.run(
+                    ["bash", str(sandbox / "cleanup-run.sh"), run_id],
+                    capture_output=True, text=True, timeout=5,
+                    env={**os.environ, "MODE": mode, "RUN_ID": "different-inherited-run",
+                         "TRACE": str(sandbox / "trace"),
+                         "RESTORED": str(sandbox / "restored")},
+                )
+                trace = (sandbox / "trace").read_text().splitlines()
+                if mode == "restore-failed":
+                    assert result.returncode != 0
+                    assert trace == ["restore"]
+                    assert run_root.exists()
+                else:
+                    assert result.returncode == 0, result.stderr
+                    assert "hdfs-delete" in trace
+                    assert not run_root.exists()
+                    if mode == "ordinary":
+                        assert "restore" not in trace
+                    else:
+                        assert trace[0] == "restore"
+            finally:
+                if run_root.exists():
+                    shutil.rmtree(run_root)
+
+
+def test_fault_recovery_marker_precedes_service_changes() -> None:
+    marker = RUNNER.index('touch "$local_root/restore-required"')
+    mutations = RUNNER.index("for target in namenode datanode1 datanode2;")
+    assert marker < mutations
 
 
 if __name__ == "__main__":

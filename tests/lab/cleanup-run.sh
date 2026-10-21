@@ -8,6 +8,13 @@ prepare_hdfs_kerberos "$run_id"
 export LAB_HDFS_RUN_ROOT
 LAB_HDFS_RUN_ROOT="$(hdfs_run_root "$run_id")"
 
+# EXIT traps cannot survive the runner killing the whole fault process tree.
+# Ordinary runs must not gain authority to restart or fail over HDFS services.
+if [[ -f "/tmp/data-mover-lab/$run_id/hdfs-fault/restore-required" ]]; then
+  source "$(dirname "$0")/hdfs-fault-common.sh"
+  RUN_ID="$run_id" restore_hdfs_services
+fi
+
 for host in "$LAB_SOURCE_MGMT" "$LAB_DEST_MGMT" "$LAB_WORKER_MGMT"; do
   ssh_lab "$host" "rm -rf -- '/var/lib/terrasync-ci/$run_id'"
 done

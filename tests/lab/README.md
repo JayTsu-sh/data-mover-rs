@@ -297,6 +297,31 @@ ordinary readers must not fence potentially live writers to make such a file rea
 Reopen retries have a 90-second overall deadline and bounded individual probes;
 their last redacted failure is preserved in the artifact instead of being discarded.
 
+Cancellation can kill the fault harness before its EXIT restoration finishes.
+Before any service mutation the harness writes a run-scoped `restore-required`
+marker. Independent cleanup restores the validated services and cluster health
+before deleting any fixtures when that marker is present. Restoration failure
+stops cleanup and retains the marker for another attempt; ordinary unmarked
+runs do not restart or fail over services.
+The run-root delete additionally retries only the NameNode restart
+`SafeModeException` (including Hadoop's `RetriableException` wrapper), with one
+120-second deadline covering both RPC waits and retry sleeps. Other errors fail
+immediately. This does not force SafeMode off or broaden deletion authority:
+the same validated run root is deleted, and repeated deletion remains idempotent.
+
+Runner transport failures are separate from storage test failures. For example,
+nightly #188's runner exhausted ten broker long-poll retries and canceled its
+worker; its 150-minute job limit had not elapsed. On the dedicated
+`vm102-data-mover-rs` runner, both `NO_PROXY` and `no_proxy` now include
+`broker.actions.githubusercontent.com`, preserving the existing lab exclusions
+and all other proxy settings. This is a runner service setting, not a workflow
+environment override (the listener starts before workflow steps). Verify long
+runs before treating this routing mitigation as a proven connectivity fix.
+The dedicated service drop-in is `zz-broker-direct.conf` under
+`/etc/systemd/system/actions.runner.JayTsu-sh-data-mover-rs.vm102-data-mover-rs.service.d/`.
+The original `lab.conf` is unchanged. Rollback consists of removing only this
+drop-in, reloading systemd, and restarting this runner while it is idle.
+
 `run-hdfs-ha-e2e.sh` is a separate, opt-in HA acceptance gate. The current
 10.131.9.30/31/32 lab has one NameNode and two DataNodes, so it is not an HA
 topology and this gate visibly reports `NOT RUN`; that result is not HA
