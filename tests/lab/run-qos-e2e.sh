@@ -130,9 +130,17 @@ for backend in "${backends[@]}"; do
   qos_metrics="$(mktemp)"
   qos_log="$(mktemp)"
 
+  # S3 keeps normal ranged GETs even at low bandwidth/IOPS. File backends
+  # deliberately exercise a sub-chunk request cap.
+  burst_bytes=$((64 * 1024))
+  if [[ "$backend" == "s3" ]]; then
+    burst_bytes=$((8 * 1024 * 1024))
+  fi
+
   if ! /usr/bin/time -o "$baseline_metrics" -f '%e' \
     "$binary" --source "$(storage_url source "$backend")" \
       --destination "$(storage_url destination local)" --path "$key" \
+      --chunk-bytes "$burst_bytes" \
       >"$baseline_log" 2>&1; then
     echo "$backend baseline copy failed" >&2
     cat "$baseline_log" >&2
@@ -142,18 +150,14 @@ for backend in "${backends[@]}"; do
   baseline_mibps="$(awk -v bytes="$size" -v elapsed="$baseline_seconds" \
     'BEGIN { printf "%.6f", bytes / 1048576 / elapsed }')"
 
-  if [[ "$backend" == "s3" ]]; then
-    expected_iops=$(((size + 5 * 1024 * 1024 - 1) / (5 * 1024 * 1024)))
-  else
-    expected_iops=$(((size + burst_bytes - 1) / burst_bytes))
-  fi
+  expected_iops=$(((size + burst_bytes - 1) / burst_bytes))
   baseline_iops="$(awk -v operations="$expected_iops" -v elapsed="$baseline_seconds" \
     'BEGIN { printf "%.6f", operations / elapsed }')"
 
   if [[ "$profile" == "iops" ]]; then
     # The high bandwidth ceiling keeps bandwidth shaping out of the critical
     # path. The small request cap gives stream/file backends enough protocol
-    # operations to measure; S3 deliberately retains its natural 5 MiB GETs.
+    # operations to measure; S3 retains its configured 8 MiB GETs at 2 IOPS.
     soft_rate_mib=256
     hard_rate_mib=256
     peak_duration_ms=0
@@ -193,6 +197,7 @@ for backend in "${backends[@]}"; do
   fi
 
   qos_args=(
+    --chunk-bytes "$burst_bytes"
     --qos-bandwidth "${soft_rate_mib}MiB/s"
     --qos-burst-bytes "$burst_bytes"
     --qos-iops "$iops_limit"
@@ -253,12 +258,11 @@ for backend in "${backends[@]}"; do
         exit 1
       }
   else
-    # The first operation is immediately available; every later protocol
-    # operation occupies one strict IOPS schedule slot.
+    # Each protocol operation, including the first, occupies a hard-rate slot.
     awk -v elapsed="$qos_seconds" -v operations="$qos_total_iops" -v rate="$hard_iops_limit" \
-      'BEGIN { minimum = (operations - 1) / rate; exit !(elapsed + 0.02 >= minimum) }'
+      'BEGIN { minimum = operations / rate; exit !(elapsed + 0.02 >= minimum) }'
     awk -v elapsed="$qos_seconds" -v operations="$qos_total_iops" -v rate="$iops_limit" \
-      'BEGIN { expected = (operations - 1) / rate; exit !(elapsed <= expected * 3 + 5) }' || {
+      'BEGIN { expected = operations / rate; exit !(elapsed <= expected * 3 + 5) }' || {
         echo "$backend IOPS QoS run was unexpectedly slow (${qos_seconds}s)" >&2
         exit 1
       }

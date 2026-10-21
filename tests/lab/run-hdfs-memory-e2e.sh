@@ -4,6 +4,7 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:?run id required}"
 output="${2:-hdfs-memory.csv}"
+trace_output="$output.samples.csv"
 validate_run_id "$run_id"
 prepare_hdfs_kerberos "$run_id"
 export LAB_HDFS_RUN_ROOT
@@ -110,13 +111,24 @@ run_case() {
   if [[ "$direction" == "hdfs-local" ]]; then
     mkdir -p "$destination"
   fi
-  metrics="$(mktemp)"
+  metrics="$(mktemp -d)/metrics"
   log="$(mktemp)"
-  if ! /usr/bin/time -o "$metrics" -f '%e,%M' \
-    env DATA_MOVER_READ_INFLIGHT="$read" DATA_MOVER_WRITE_INFLIGHT="$write" \
-      DATA_MOVER_HDFS_READ_INFLIGHT="$read" DATA_MOVER_HDFS_WRITE_INFLIGHT="$write" \
-      "$binary" --source "$source" --destination "$destination" \
-        --path "$payload.bin" > "$log" 2>&1; then
+  local -a copy_command=(
+    env DATA_MOVER_READ_INFLIGHT="$read" DATA_MOVER_WRITE_INFLIGHT="$write"
+      DATA_MOVER_HDFS_READ_INFLIGHT="$read" DATA_MOVER_HDFS_WRITE_INFLIGHT="$write"
+      "$binary" --source "$source" --destination "$destination"
+        --path "$payload.bin" --report-phases
+  )
+  local measured_status=0
+  if [[ "$sample_set" == scale && "$payload" == scale-100g ]]; then
+    python3 tests/hdfs_memory_sampler.py --trace "$trace_output" \
+      --metrics "$metrics" --log "$log" --run-id "$run_id" --commit "$commit" \
+      -- "${copy_command[@]}" || measured_status=$?
+  else
+    /usr/bin/time -o "$metrics" -f '%e,%M' \
+      "${copy_command[@]}" > "$log" 2>&1 || measured_status=$?
+  fi
+  if (( measured_status != 0 )); then
     sed -E 's#hdfs://[^@]+@#hdfs://<redacted>@#g' "$log" >&2
     return 1
   fi
@@ -142,9 +154,7 @@ for profile_spec in serial:1:1 default:4:1 high:8:16; do
   done
 done
 
-for scale_attempt in {1..6}; do
-  run_case scale high hdfs-hdfs scale-1g "$scale_small_size" 8 16 "scale-1g-$scale_attempt"
-done
+run_case scale high hdfs-hdfs scale-1g "$scale_small_size" 8 16
 run_case scale high hdfs-hdfs scale-100g "$scale_large_size" 8 16
 
-python3 tests/hdfs_memory_budget.py --require-100-gib "$output"
+python3 tests/hdfs_memory_budget.py --require-100-gib --trace "$trace_output" "$output"

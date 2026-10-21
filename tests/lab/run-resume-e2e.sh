@@ -116,8 +116,9 @@ assert state["schema"] == 2 and size >= 96 * 1024 * 1024
 assert state["recovery_at_destination"] is True
 assert isinstance(state["identity"], str) and state["identity"]
 assert len(state["source_observation"]) == 64
-assert 0 < state["source_streamed_bytes"] < size
-# Only the subsequent resumed outcome can attest the receiver's durable prefix.
+assert 0 < state["source_streamed_bytes"] <= size
+# Source reads can finish while destination writes/publication are pending.
+# Only the subsequent resumed outcome can attest partial destination reuse.
 assert state["reused_bytes"] is None
 PY
       then

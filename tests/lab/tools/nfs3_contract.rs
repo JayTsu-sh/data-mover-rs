@@ -15,7 +15,8 @@ use data_mover::storage::{
     StorageRoleFailure, VerifyRequest, connect_backend,
 };
 use data_mover::transfer::{
-    SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy, TransferRequest, transfer,
+    ReadBackVerification, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy,
+    TransferRequest, transfer,
 };
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSource,
@@ -24,6 +25,10 @@ use futures::stream;
 use tokio_util::sync::CancellationToken;
 
 type ContractResult<T = ()> = Result<T, Box<dyn Error>>;
+
+#[allow(dead_code)]
+#[path = "../../../examples/support/copy.rs"]
+mod copy_support;
 
 #[derive(Debug, Parser)]
 #[command(about = "Run an ArchitectureReady NFS dialect contract against two real roots")]
@@ -442,7 +447,27 @@ async fn validate_streaming_copy(source: &Storage, destination: &Storage) -> Con
     Ok(())
 }
 
-async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) -> ContractResult {
+fn assert_cancelled_session_result(result: Result<(), StorageRoleFailure>) -> ContractResult {
+    match result {
+        Ok(()) => Ok(()),
+        Err(StorageRoleFailure::Session(failure))
+            if failure.class() == FailureClass::Connectivity =>
+        {
+            eprintln!("cancelled source session requires a fresh connection");
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn validate_cancel_and_restart(
+    source: &Storage,
+    destination: &Storage,
+    source_url: &str,
+    destination_url: &str,
+) -> ContractResult<(Storage, Storage)> {
+    let source_path = path("cancellation.bin")?;
+    let original = copy_support::observe(source, &source_path).await?;
     let cancel = CancellationToken::new();
     let request = TransferRequest::new(
         source.clone(),
@@ -470,6 +495,22 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
     }
     failure.discard_stage().await?;
 
+    // Cancellation may fence NFSv4.1 slots whose remote outcome is unknown.
+    // A lost session is not an entry's protocol failure; unrelated errors still fail.
+    assert_cancelled_session_result(
+        source
+            .read_source()?
+            .describe(&source_path)
+            .await
+            .map(|_| ()),
+    )?;
+    // Restart is a new attempt, not replay on a potentially fenced old session.
+    let source = connect_nfs(source_url, false).await?;
+    let destination = connect_nfs(destination_url, true).await?;
+    let reconnected = copy_support::observe(&source, &source_path).await?;
+    if original.encode_snapshot() != reconnected.encode_snapshot() {
+        return Err("cancellation source changed across reconnect".into());
+    }
     let outcome = transfer(
         TransferRequest::new(
             source.clone(),
@@ -484,11 +525,22 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
     if outcome.transferred_bytes != 8 * 64 * 1024 {
         return Err("restart upload did not publish the complete source".into());
     }
+    let expected_hash = blake3::hash(&vec![0x5a; 8 * 64 * 1024]);
+    if outcome.blake3 != Some(*expected_hash.as_bytes())
+        || outcome.read_back != ReadBackVerification::Enabled
+    {
+        return Err("restart upload did not verify the complete fixture content".into());
+    }
+    if copy_support::hash(&destination, &source_path).await?
+        != (8 * 64 * 1024, expected_hash.to_hex().to_string())
+    {
+        return Err("restart destination failed independent content verification".into());
+    }
     // The discard removed the cancelled stage, so the restart found nothing to clean.
     if outcome.prepare != PrepareFact::Fresh {
         return Err(format!("restart upload found leftovers: {:?}", outcome.prepare).into());
     }
-    Ok(())
+    Ok((source, destination))
 }
 
 /// Recovery kept at the destination (ADR-0006): a stage and its pointer survive the connection
@@ -579,8 +631,8 @@ async fn main() -> ContractResult {
         seed_nfs4_fixture(mount, root, args.expect_setacl_unsupported).await?;
     }
     eprintln!("contract stage: connect production role handles");
-    let source = connect_nfs(&args.source, false).await?;
-    let destination = connect_nfs(&args.destination, true).await?;
+    let mut source = connect_nfs(&args.source, false).await?;
+    let mut destination = connect_nfs(&args.destination, true).await?;
     validate_stale_retry(
         &source,
         args.stale_ready_file.as_deref(),
@@ -611,7 +663,9 @@ async fn main() -> ContractResult {
     validate_streaming_copy(&source, &destination).await?;
     if args.dialect != ContractDialect::Nfs3 {
         eprintln!("contract stage: cancellation and restart upload");
-        validate_cancel_and_restart(&source, &destination).await?;
+        (source, destination) =
+            validate_cancel_and_restart(&source, &destination, &args.source, &args.destination)
+                .await?;
     }
     eprintln!("contract stage: durable recovery");
     validate_recovery(&source, destination, &args.destination).await?;
@@ -624,6 +678,47 @@ async fn main() -> ContractResult {
         }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod cancellation_contract_tests {
+    use super::*;
+    use data_mover::model::{BackendSessionFailure, EntryOperationFailure, Operation};
+
+    #[test]
+    fn cancellation_probe_accepts_only_session_scoped_connectivity() -> ContractResult {
+        assert!(assert_cancelled_session_result(Ok(())).is_ok());
+        let session = StorageRoleFailure::Session(BackendSessionFailure::new(
+            Operation::Observe,
+            FailureClass::Connectivity,
+            Transience::Unknown,
+            "fenced session requires reconnect",
+        )?);
+        assert!(assert_cancelled_session_result(Err(session)).is_ok());
+        for class in [
+            FailureClass::Protocol,
+            FailureClass::PermissionDenied,
+            FailureClass::NotFound,
+            FailureClass::Connectivity,
+        ] {
+            let entry = StorageRoleFailure::Entry(EntryOperationFailure::new(
+                path("cancellation.bin")?,
+                Operation::Observe,
+                class,
+                Transience::Unknown,
+                "unexpected entry failure must not be hidden by reconnect",
+            )?);
+            assert!(assert_cancelled_session_result(Err(entry)).is_err());
+        }
+        let authentication = StorageRoleFailure::Session(BackendSessionFailure::new(
+            Operation::Observe,
+            FailureClass::Authentication,
+            Transience::Permanent,
+            "authentication failure must not be hidden by reconnect",
+        )?);
+        assert!(assert_cancelled_session_result(Err(authentication)).is_err());
+        Ok(())
+    }
 }
 
 #[cfg(test)]

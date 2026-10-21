@@ -104,6 +104,20 @@ streaming integrity, in-flight cancellation, restart upload, reconnect recovery,
 recovery claims. Named attributes must return typed `Unsupported` until the adapter implements
 that operation.
 
+For NFSv4 cancellation, restart is a new transfer attempt on freshly connected
+source and destination handles. The native client can fence session slots whose
+outcome became unknown when an RPC future was dropped; the gate must not assume
+that the canceled session remains reusable. A post-cancel source probe accepts
+only success or a session-scoped `Connectivity` failure, never a generic entry
+error. Source LOOKUP preserves native failure classification through the role's
+typed lookup path rather than the legacy string wrapper.
+The gate still requires exactly an unpublished, non-recoverable stage and its
+explicit discard, unchanged source identity/size/mtime across reconnect, a Fresh
+restart, the complete 512 KiB upload, matching BLAKE3 with read-back enabled,
+and an independent read/hash of the published destination. Subsequent recovery
+checks use the reconnected handles as well; reconnect does not swallow failed
+cleanup, permanent errors, or content mismatches.
+
 The nightly workflow runs this matrix three times: with protocol defaults,
 strictly serial read/write pipelines, and higher read/write concurrency. Release
 validation runs the defaults and higher-concurrency profiles. The integrity and
@@ -186,9 +200,15 @@ Set `QOS_LAB_PROFILE=iops` for protocol-operation shaping and
 `QOS_LAB_IOPS_MODE=soft-hard` for dual-rate IOPS. Nightly and release validation
 run strict bandwidth, soft/hard bandwidth, strict IOPS, and soft/hard IOPS as
 four separate gates and upload their measurement CSV files.
-For Local/NFS/HDFS, source IOPS must equal the number of burst-sized real reads.
-For S3 it must equal the number of 5 MiB Range GETs, proving that pacing slices
-inside one response do not inflate request IOPS. The CSV preserves baseline and
+For Local/NFS/HDFS, source IOPS must equal the number of 64 KiB real reads (257).
+S3 uses an explicit 8 MiB GET/request cap (three requests for this fixture),
+including at the 2 IOPS setting. Bandwidth paces each entire S3 request before
+dispatch rather than shrinking GETs to a 10 ms byte allowance. Thus the request
+size bounds the permitted burst; this is source admission pacing, not a claim
+about instantaneous socket throughput. S3 baseline and shaped runs use the
+same configured read size. Failed S3 GET attempts consume IOPS again, with at
+most three attempts per range; HEAD/metadata requests use separate accounting.
+The CSV preserves baseline and
 limited measurements for diagnosing lab drift. The default strict case has
 soft and hard rates both set to 8 MiB/s. Set `QOS_LAB_SOFT_RATE_MIB`,
 `QOS_LAB_HARD_RATE_MIB`, and `QOS_LAB_PEAK_DURATION_MS` to exercise a dual-rate
@@ -202,22 +222,56 @@ fixtures with a 1 MiB producer buffer, then measures only the release
 serial/default/high inflight profiles. A separate `storage_inspect` process
 reopens and fully hashes every destination. The CSV records sizes, profile,
 windows, chunk/channel/file concurrency, duration, throughput and peak RSS.
+HDFS read-back verification reuses one opened reader across bounded chunks of at most
+2 MiB. It still reads and hashes the complete file; increasing the application chunk is
+not required to avoid reopening the file and refetching block locations for every range.
 The budget is `(3×read + write + channel[4] + active[2]) × 2 MiB × concurrent
-files + 96 MiB`; it accounts for DataNode packet storage, `hdfs-native` range
+files + 112 MiB`; it accounts for DataNode packet storage, `hdfs-native` range
 aggregation, published chunks, the copy channel and destination write window.
-The HDFS file block size remains independently configured at 128 MiB. The 2 GiB
-sample may grow by at most 72 MiB
-over its 256 MiB peer. Nightly and release validation upload the CSV artifact and fail on either
-an absolute-budget or size-dependent-growth violation.
+The fixed process allowance includes runtime/allocator headroom and is not multiplied
+by file concurrency or payload size. It was increased by 16 MiB after Nightly #185
+peaked at 191.86 MiB with decreasing transfer RSS and only 0.10% verification RSS
+growth. Serial/default/high budgets for one file are now 132/150/204 MiB; the
+within-process 10% growth limit and all sampling checks remain unchanged.
+The HDFS file block size remains independently configured at 128 MiB. Each baseline
+process must meet its own absolute budget. The difference between the 256 MiB and
+2 GiB processes' peaks is NOT a sustained-growth measurement: independent runs can
+reach different allocator high-water marks while both remain bounded. The former
+72 MiB cross-process delta check caused a false positive in Nightly #191 and has
+been removed, without changing any absolute budget or the same-process growth gate.
+Nightly and release validation fail on either an absolute-budget violation or
+sustained growth in the long-run trace below.
+The full gate also fails closed unless all nine baseline profile/direction groups
+contain both exact fixture sizes with their declared concurrency settings.
 The same run also preloads sparse deterministic zero fixtures into HDFS, then
-measures six independent `high` HDFS→HDFS transfers at `1 GiB + 137 bytes`
-and one at `100 GiB + 137 bytes`. Every transfer uses identical inflight, chunk,
-channel and file-concurrency settings, reopens and hashes the complete destination,
-and the 100 GiB peak RSS may not exceed the conservative 1 GiB peak by more than
-10%. Repeated short transfers avoid treating a missed transient allocator peak as
-size-dependent growth. The CSV binds every row to one run id and
-full candidate commit; the validator rejects a missing or approximate 100 GiB
-sample.
+measures one `high` HDFS→HDFS transfer at `1 GiB + 137 bytes` and one at
+`100 GiB + 137 bytes`, with identical inflight, chunk, channel and file-concurrency
+settings. The short run is a size/absolute-budget control, NOT the reference for
+long-run RSS: peaks from unrelated processes cannot demonstrate sustained growth.
+
+For the 100 GiB run, `hdfs_memory_sampler.py` samples only the copy child's Linux
+`VmRSS` every 100 ms into `hdfs-memory.csv.samples.csv`. The example's optional
+`--report-phases` markers distinguish transfer (including its policy verification)
+from the subsequent independent content comparison. In EACH phase, the p90 RSS
+in the 70–90% elapsed-time window may be at most 10% above the p90 in the 10–30%
+window. This excludes initial warmup and final buffer release, and avoids treating
+one transient allocation as sustained growth. It is a within-process steady-state
+test, not a proof of absence of leaks, nor a per-byte allocation slope measurement.
+
+Both phases must last at least five seconds, contain at least 50 samples and at
+least ten samples per comparison window, with no internal sampling gap above two
+seconds. Unknown/reordered phases, nonpositive RSS, missing evidence and mismatched
+run/commit bindings fail closed. The whole-process peak (the larger of the kernel
+child high-water mark and sampled RSS) STILL must satisfy the calculated absolute
+budget; short spikes are not exempt. The sampler excludes its own RSS and the
+later `storage_inspect` processes, propagates copy failure, kills a timed-out child
+after 90 minutes, and preserves partial traces for diagnostics.
+
+Nightly and release validation upload BOTH CSVs, even after failure. Validate with
+`python3 tests/hdfs_memory_budget.py --require-100-gib --trace hdfs-memory.csv.samples.csv hdfs-memory.csv`.
+Old peak-only artifacts intentionally cannot pass the rebuilt growth gate: a new
+real run is required. No measured result for the old peak-comparison gate is
+retroactively reclassified as passing.
 
 `run-resume-e2e.sh` exercises the complete 5-by-5 Local/NFSv3/NFSv4.1/S3/HDFS
 directed matrix in independent processes. The first process writes a durable
@@ -230,6 +284,18 @@ every source interval reader and destination resume writer. NAS destinations res
 from a `.terrasync-part` file; S3 destinations resume the server-side multipart
 upload through `ListMultipartUploads` and `ListParts`; HDFS destinations accept
 only a durable contiguous prefix and append its missing tail sequentially.
+The interrupt probe retries below-checkpoint cancellations with the SAME bounded
+time window, never an increasing one: for the 96 MiB fixture at 8 MiB/s every
+attempt cancels after 10 seconds (an 80 MiB pacing window plus at most one 2 MiB
+admission burst). A 14-second retry can already retain every S3 part; a fresh
+process then correctly reuses the whole file, which does not prove partial reuse.
+The gate still requires `0 < reused_bytes < size`, independently reopens and hashes
+the result, and reports the actual reuse and prepare fact if that assertion fails.
+Source streamed bytes remain diagnostic evidence, not an estimate of durable bytes.
+Each interruption attempt reconnects its endpoints instead of reusing a cancelled
+transport session. Before starting it, the probe rechecks source size, observation
+and derived transfer identity; a changed source or unexpected read/connection error
+still fails the gate rather than being silently retried.
 
 `run-hdfs-fault-e2e.sh` is the destructive HDFS service-recovery gate. Before
 every mutation it verifies that PVE VM 301/302/303 still map to the expected
@@ -241,6 +307,40 @@ cleanup. The gate proves replica failover with one DataNode down, bounded and
 root-relative failure with both replicas down, bounded NameNode failure, and
 successful independent reopen/hash verification after each recovery. Its
 artifact contains structured redacted diagnostics only.
+The raw append checkpoint opens a writer but sends no append payload before SIGKILL.
+After services are healthy, the harness explicitly recovers ONLY that killed
+writer's file lease and waits for closure (120 seconds including RPC waits, with
+an outer 125-second process bound). It then independently reopens the file and
+requires the exact original size AND BLAKE3 digest, not just a size range. A healthy
+new-write probe does not establish closure of an unrelated abandoned append lease;
+ordinary readers must not fence potentially live writers to make such a file readable.
+Reopen retries have a 90-second overall deadline and bounded individual probes;
+their last redacted failure is preserved in the artifact instead of being discarded.
+
+Cancellation can kill the fault harness before its EXIT restoration finishes.
+Before any service mutation the harness writes a run-scoped `restore-required`
+marker. Independent cleanup restores the validated services and cluster health
+before deleting any fixtures when that marker is present. Restoration failure
+stops cleanup and retains the marker for another attempt; ordinary unmarked
+runs do not restart or fail over services.
+The run-root delete additionally retries only the NameNode restart
+`SafeModeException` (including Hadoop's `RetriableException` wrapper), with one
+120-second deadline covering both RPC waits and retry sleeps. Other errors fail
+immediately. This does not force SafeMode off or broaden deletion authority:
+the same validated run root is deleted, and repeated deletion remains idempotent.
+
+Runner transport failures are separate from storage test failures. For example,
+nightly #188's runner exhausted ten broker long-poll retries and canceled its
+worker; its 150-minute job limit had not elapsed. On the dedicated
+`vm102-data-mover-rs` runner, both `NO_PROXY` and `no_proxy` now include
+`broker.actions.githubusercontent.com`, preserving the existing lab exclusions
+and all other proxy settings. This is a runner service setting, not a workflow
+environment override (the listener starts before workflow steps). Verify long
+runs before treating this routing mitigation as a proven connectivity fix.
+The dedicated service drop-in is `zz-broker-direct.conf` under
+`/etc/systemd/system/actions.runner.JayTsu-sh-data-mover-rs.vm102-data-mover-rs.service.d/`.
+The original `lab.conf` is unchanged. Rollback consists of removing only this
+drop-in, reloading systemd, and restarting this runner while it is idle.
 
 `run-hdfs-ha-e2e.sh` is a separate, opt-in HA acceptance gate. The current
 10.131.9.30/31/32 lab has one NameNode and two DataNodes, so it is not an HA

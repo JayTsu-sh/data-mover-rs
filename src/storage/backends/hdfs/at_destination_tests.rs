@@ -6,7 +6,7 @@ use crate::storage::artifacts::artifact_name;
 use crate::storage::backends::hdfs::contract_tests::MemoryHdfs;
 use crate::storage::{
     ByteStream, FinalDestination, PrepareFact, PrepareRequest, PublishRequest, RestartReason,
-    SourceDescriptor, StagedDestination,
+    SourceDescriptor, StagedDestination, VerifyRequest,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -120,27 +120,47 @@ async fn a_fresh_stage_publishes_and_leaves_no_artifact() -> TestResult {
 /// the dead writer's pointer recorded, because recovery revealed an acknowledged tail.
 #[tokio::test]
 async fn a_new_process_resumes_from_the_recovered_length() -> TestResult {
-    let protocol = Arc::new(MemoryHdfs::default());
-    interrupted(&protocol, 4).await?;
-    protocol
-        .reveal_tail_during_lease_recovery(Bytes::copy_from_slice(&PAYLOAD[..6]))
-        .await;
-    let second = adapter(&protocol)?;
-    let stage = second
-        .prepare_at_destination(request(BINDING, ResumeMode::Discover, true)?)
-        .await?;
-    assert_eq!(protocol.stabilize_calls(), 1);
-    assert_eq!(stage.prepare_fact(), PrepareFact::Resumed { bytes: 6 });
-    assert_eq!(stage.write_offset, 6);
-    second.write(&stage, input(&PAYLOAD[6..])).await?;
-    publish(&second, &stage)
-        .await
-        .map_err(|failure| failure.error)?;
-    assert_eq!(
-        protocol.get("dir/final.bin").await.as_deref(),
-        Some(PAYLOAD)
-    );
-    assert!(no_artifacts(&protocol).await);
+    for use_cursor in [false, true] {
+        let protocol = Arc::new(MemoryHdfs::default());
+        if use_cursor {
+            protocol.enable_read_cursor();
+        }
+        interrupted(&protocol, 4).await?;
+        protocol
+            .reveal_tail_during_lease_recovery(Bytes::copy_from_slice(&PAYLOAD[..6]))
+            .await;
+        let second = adapter(&protocol)?;
+        let stage = second
+            .prepare_at_destination(request(BINDING, ResumeMode::Discover, true)?)
+            .await?;
+        assert_eq!(protocol.stabilize_calls(), 1);
+        assert_eq!(stage.prepare_fact(), PrepareFact::Resumed { bytes: 6 });
+        assert_eq!(stage.write_offset, 6);
+        second.write(&stage, input(&PAYLOAD[6..])).await?;
+        second
+            .verify(
+                &stage,
+                VerifyRequest {
+                    expected_size: PAYLOAD.len() as u64,
+                    expected_blake3: *blake3::hash(PAYLOAD).as_bytes(),
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                    published: None,
+                },
+            )
+            .await?;
+        assert_eq!(
+            protocol.reader_counts(),
+            if use_cursor { (1, 1) } else { (0, 0) }
+        );
+        publish(&second, &stage)
+            .await
+            .map_err(|failure| failure.error)?;
+        assert_eq!(
+            protocol.get("dir/final.bin").await.as_deref(),
+            Some(PAYLOAD)
+        );
+        assert!(no_artifacts(&protocol).await);
+    }
     Ok(())
 }
 
@@ -217,21 +237,30 @@ async fn a_stage_taken_over_by_another_writer_is_left_to_it() -> TestResult {
 /// goes.
 #[tokio::test]
 async fn a_lost_publication_reply_still_removes_the_pointer() -> TestResult {
-    let protocol = Arc::new(MemoryHdfs::default());
-    let destination = adapter(&protocol)?;
-    let stage = destination
-        .prepare_at_destination(request(BINDING, ResumeMode::Discover, true)?)
-        .await?;
-    destination.write(&stage, input(PAYLOAD)).await?;
-    protocol.fail_rename_after_commit();
-    publish(&destination, &stage)
-        .await
-        .map_err(|failure| failure.error)?;
-    assert_eq!(
-        protocol.get("dir/final.bin").await.as_deref(),
-        Some(PAYLOAD)
-    );
-    assert!(no_artifacts(&protocol).await);
+    for use_cursor in [false, true] {
+        let protocol = Arc::new(MemoryHdfs::default());
+        if use_cursor {
+            protocol.enable_read_cursor();
+        }
+        let destination = adapter(&protocol)?;
+        let stage = destination
+            .prepare_at_destination(request(BINDING, ResumeMode::Discover, true)?)
+            .await?;
+        destination.write(&stage, input(PAYLOAD)).await?;
+        protocol.fail_rename_after_commit();
+        publish(&destination, &stage)
+            .await
+            .map_err(|failure| failure.error)?;
+        assert_eq!(
+            protocol.get("dir/final.bin").await.as_deref(),
+            Some(PAYLOAD)
+        );
+        assert!(no_artifacts(&protocol).await);
+        assert_eq!(
+            protocol.reader_counts(),
+            if use_cursor { (1, 1) } else { (0, 0) }
+        );
+    }
     Ok(())
 }
 
@@ -259,28 +288,94 @@ async fn final_paths_with_empty_dot_or_artifact_segments_are_refused() -> TestRe
 /// content: a same-sized older file there is not ours.
 #[tokio::test]
 async fn a_lost_publication_reply_with_other_content_is_not_published() -> TestResult {
+    for use_cursor in [false, true] {
+        let protocol = Arc::new(MemoryHdfs::default());
+        if use_cursor {
+            protocol.enable_read_cursor();
+        }
+        let destination = adapter(&protocol)?;
+        let stage = destination
+            .prepare_at_destination(request(BINDING, ResumeMode::Discover, true)?)
+            .await?;
+        destination.write(&stage, input(PAYLOAD)).await?;
+        // Another writer removed the stage; an older file of the same size is the final file.
+        protocol
+            .delete(
+                &StoragePath::new(name(ArtifactKind::Stage))?,
+                EntryKind::File,
+            )
+            .await?;
+        protocol
+            .insert("dir/final.bin", Bytes::from_static(b"XXXXXXXXXX"))
+            .await;
+        let failed = publish(&destination, &stage)
+            .await
+            .err()
+            .ok_or("other content must not count as published")?;
+        assert!(failed.final_destination_changed);
+        assert!(protocol.get(&name(ArtifactKind::Pointer)).await.is_some());
+        assert_eq!(
+            protocol.reader_counts(),
+            if use_cursor { (1, 1) } else { (0, 0) }
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cursor_readback_failures_retain_unpublished_recovery_state() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
+    protocol.enable_read_cursor();
     let destination = adapter(&protocol)?;
     let stage = destination
         .prepare_at_destination(request(BINDING, ResumeMode::Discover, true)?)
         .await?;
     destination.write(&stage, input(PAYLOAD)).await?;
-    // Another writer removed the stage; an older file of the same size is the final file.
-    protocol
-        .delete(
-            &StoragePath::new(name(ArtifactKind::Stage))?,
-            EntryKind::File,
+    protocol.fail_cursor_reads(true);
+    for cancel in [false, true] {
+        let token = tokio_util::sync::CancellationToken::new();
+        if cancel {
+            token.cancel();
+        }
+        let error = destination
+            .verify(
+                &stage,
+                VerifyRequest {
+                    expected_size: PAYLOAD.len() as u64,
+                    expected_blake3: *blake3::hash(PAYLOAD).as_bytes(),
+                    cancel: token,
+                    published: None,
+                },
+            )
+            .await
+            .err()
+            .ok_or("failed readback unexpectedly verified")?;
+        let expected = if cancel {
+            FailureClass::Cancelled
+        } else {
+            FailureClass::Connectivity
+        };
+        assert!(matches!(error, StorageRoleFailure::Entry(error) if error.class() == expected));
+        assert!(protocol.get("dir/final.bin").await.is_none());
+        assert!(protocol.get(&name(ArtifactKind::Stage)).await.is_some());
+        assert!(protocol.get(&name(ArtifactKind::Pointer)).await.is_some());
+    }
+    protocol.fail_cursor_reads(false);
+    destination
+        .verify(
+            &stage,
+            VerifyRequest {
+                expected_size: PAYLOAD.len() as u64,
+                expected_blake3: *blake3::hash(PAYLOAD).as_bytes(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                published: None,
+            },
         )
         .await?;
-    protocol
-        .insert("dir/final.bin", Bytes::from_static(b"XXXXXXXXXX"))
-        .await;
-    let failed = publish(&destination, &stage)
+    publish(&destination, &stage)
         .await
-        .err()
-        .ok_or("other content must not count as published")?;
-    assert!(failed.final_destination_changed);
-    assert!(protocol.get(&name(ArtifactKind::Pointer)).await.is_some());
+        .map_err(|failure| failure.error)?;
+    assert!(no_artifacts(&protocol).await);
     Ok(())
 }
 

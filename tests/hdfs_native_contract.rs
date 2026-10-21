@@ -13,6 +13,8 @@ use hdfs_native::{Client, ClientBuilder, WriteOptions};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+#[path = "hdfs_native_contract/cleanup.rs"]
+mod cleanup;
 #[path = "hdfs_native_contract/policy_runtime.rs"]
 mod policy_runtime;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -375,13 +377,7 @@ async fn nightly_lab_reads_root_status_without_mutation() -> Result<(), Box<dyn 
 async fn nightly_lab_cleanup_confined_run_root() -> Result<(), Box<dyn std::error::Error>> {
     let root = hdfs_lab_root()?;
     let (client, _) = build_hdfs_client(&std::env::var("LAB_HDFS_RUN_ROOT")?, &hdfs_lab_config())?;
-    for _ in 0..2 {
-        match client.delete(root.root(), true).await {
-            Ok(_) | Err(hdfs_native::HdfsError::FileNotFound(_)) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
+    cleanup::delete_with_recovery_wait(|| client.delete(root.root(), true)).await
 }
 
 #[tokio::test]

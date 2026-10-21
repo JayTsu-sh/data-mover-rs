@@ -54,7 +54,14 @@ impl HDFSStorage {
                 if attempt == 0 {
                     reader.read_range(offset, length).await
                 } else {
-                    client.read(&path).await?.read_range(offset, length).await
+                    let refreshed = client.read(&path).await?;
+                    // A verification retry may observe a truncated stage. Do not pass a
+                    // range planned against the old length to the native reader (it panics).
+                    let length = length.min(refreshed.file_length().saturating_sub(offset));
+                    if length == 0 {
+                        return Ok(bytes::Bytes::new());
+                    }
+                    refreshed.read_range(offset, length).await
                 }
             }
         })

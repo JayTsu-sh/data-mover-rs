@@ -92,6 +92,14 @@ pub(crate) trait HdfsProtocol: Send + Sync {
         let _ = path;
         Ok(None)
     }
+    /// Verification may refresh block locations after a transient read failure: its caller
+    /// validates the complete digest. Source readers must keep their original observation.
+    async fn open_verification_reader(
+        &self,
+        path: &StoragePath,
+    ) -> Result<Option<Arc<dyn HdfsReadCursor>>, StorageRoleFailure> {
+        self.open_reader(path).await
+    }
     async fn stat(&self, path: &StoragePath) -> Result<HdfsEntryFacts, StorageRoleFailure>;
     /// Starts a listing of `path`'s immediate children. Nothing is asked of the name node before
     /// its first page; a failure of the directory itself (missing, not a directory, the listing

@@ -363,6 +363,16 @@ pub(crate) trait S3Protocol: Send + Sync {
         range: Range<u64>,
         observed: &S3ObjectFacts,
     ) -> S3Result<Bytes>;
+    /// Exactly one GET attempt. The source owns `QoS` retries and charges every attempt;
+    /// SDK implementations must disable their internal retry loop for this operation.
+    async fn get_range_once(
+        &self,
+        key: &str,
+        range: Range<u64>,
+        observed: &S3ObjectFacts,
+    ) -> S3Result<Bytes> {
+        self.get_range(key, range, observed).await
+    }
     /// One `PutObject` of `body` to `key`, carrying `content_md5_base64` so the server rejects a
     /// body corrupted in flight (`BadDigest`, a transient `Corruption` entry failure).
     async fn put_object(

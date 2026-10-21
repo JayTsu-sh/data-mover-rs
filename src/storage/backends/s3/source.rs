@@ -323,7 +323,7 @@ async fn next_range<P: S3Protocol + 'static>(
         let requested = state.chunk_size.min(state.limit - state.next_issue);
         let granted = if let Some(budget) = &state.qos {
             budget
-                .admit_read(requested, &state.cancel)
+                .admit_request(requested, &state.cancel)
                 .await
                 .map_err(|_| cancelled(path, Operation::Read))?
         } else {
@@ -335,11 +335,12 @@ async fn next_range<P: S3Protocol + 'static>(
         let facts = state.facts.clone();
         let path = path.clone();
         let cancel = state.cancel.clone();
+        let qos = state.qos.clone();
         state.inflight.push_back(Box::pin(async move {
             let bytes = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(cancelled(&path, Operation::Read)),
-                result = protocol.get_range(path.as_str(), offset..end, &facts) =>
+                result = read_range(&*protocol, &path, offset..end, &facts, qos.as_ref(), &cancel) =>
                     result.map_err(|e| role_failure(&path, Operation::Read, e))?,
             };
             if bytes.len() as u64 != granted {
@@ -368,6 +369,53 @@ async fn next_range<P: S3Protocol + 'static>(
     }
     state.offset += bytes.len() as u64;
     Ok(Some((bytes, state)))
+}
+
+/// `QoS` GETs use one SDK attempt at a time. A replay is pinned to the same observed object and
+/// range, gets a fresh admission, and is bounded to three attempts. Metadata uses its own budget.
+async fn read_range<P: S3Protocol>(
+    protocol: &P,
+    path: &StoragePath,
+    range: std::ops::Range<u64>,
+    facts: &S3ObjectFacts,
+    qos: Option<&SourceQosBudget>,
+    cancel: &CancellationToken,
+) -> super::S3Result<Bytes> {
+    let Some(budget) = qos else {
+        return protocol.get_range(path.as_str(), range, facts).await;
+    };
+    for attempt in 0..3 {
+        let result = protocol
+            .get_range_once(path.as_str(), range.clone(), facts)
+            .await;
+        let retryable = matches!(
+            &result,
+            Err(S3ProtocolFailure::Entry {
+                transience: Transience::Transient,
+                ..
+            } | S3ProtocolFailure::Session {
+                transience: Transience::Transient,
+                ..
+            })
+        );
+        if !retryable || attempt == 2 {
+            return result;
+        }
+        // The outer cancellation select also covers this backoff and admission.
+        tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)).await;
+        if budget
+            .admit_request(range.end - range.start, cancel)
+            .await
+            .is_err()
+        {
+            return Err(S3ProtocolFailure::entry(
+                FailureClass::Cancelled,
+                Transience::Transient,
+                "S3 read retry cancelled",
+            ));
+        }
+    }
+    unreachable!("the bounded retry loop returns on its final attempt")
 }
 
 /// After the last range of an unpinned read: the object must still be the one described

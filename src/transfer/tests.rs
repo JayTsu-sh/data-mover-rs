@@ -647,6 +647,10 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     let Err(failure) = result else {
         return Err("partially cancelled transfer unexpectedly succeeded".into());
     };
+    assert!(
+        failure.has_recoverable_stage(),
+        "a cancellation after the durable checkpoint must retain a recoverable stage"
+    );
     drop(failure);
     let writes_before = destination_role.write_completion_count();
     assert_eq!(writes_before, 1);

@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Static safety contract for the destructive nightly HDFS fault harness."""
 
+import os
+import shutil
 from pathlib import Path
+import subprocess
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +96,138 @@ def test_cluster_recovery_is_followed_by_a_real_write_probe() -> None:
     assert 'readiness_path="readiness-${BASHPID}-${attempt}.bin"' in RUNNER
     assert '--path "$readiness_path" --phase seed' in RUNNER
     assert RUNNER.count("wait_for_hdfs_write") >= 4
+
+
+def test_killed_append_explicitly_recovers_its_lease_before_exact_content_validation() -> None:
+    killed = RUNNER.index("kill_mutation_at_checkpoint append datanodes append-killed.bin")
+    recover = RUNNER.index("recover_killed_append append-killed.bin", killed)
+    inspect = RUNNER.index("wait_for_inspect append-killed.bin", recover)
+    assert killed < recover < inspect
+    assert '[[ "$after_append" == "$before_append" ]]' in RUNNER
+    assert '--phase recover-lease' in RUNNER
+    assert "--kill-after=1s" in RUNNER
+    assert 'redact_log "$log_file" | tee -a "$artifact" >&2' in RUNNER
+
+
+def test_recovery_helpers_execute_in_order_and_preserve_failure_evidence() -> None:
+    # Execute the actual shell functions, not a Python copy of their logic.
+    functions = ""
+    for name in ("redact_log", "recover_killed_append", "wait_for_inspect"):
+        start = RUNNER.index(f"{name}() {{")
+        end = RUNNER.index("\n}", start) + 2
+        functions += RUNNER[start:end] + "\n"
+    script = "set -euo pipefail\n" + functions + r'''
+artifact="$local_root/artifact"
+hdfs_storage=hdfs://private-principal@example.invalid/isolated-root
+mutation_binary=mutation_probe
+inspect_binary=inspect_probe
+timeout() { printf '%s\n' "$*" >>"$local_root/timeouts"; shift 2; "$@"; }
+sleep() { SECONDS=$((SECONDS + 100)); }
+mutation_probe() {
+  [[ "$*" == *"--phase recover-lease"* ]]
+  if [[ "$failure_mode" == recovery ]]; then
+    echo 'recovery diagnostic hdfs://private-principal@example.invalid/isolated-root'
+    return 7
+  fi
+  touch "$local_root/recovered"
+}
+inspect_probe() {
+  test -f "$local_root/recovered"
+  touch "$local_root/inspected"
+  if [[ "$failure_mode" == inspection ]]; then
+    echo 'inspection diagnostic hdfs://private-principal@example.invalid/isolated-root' >&2
+    return 8
+  fi
+  printf '4194321\tseed-digest\n'
+}
+recover_killed_append append-killed.bin
+output="$(wait_for_inspect append-killed.bin)"
+[[ "$output" == $'4194321\tseed-digest' ]]
+'''
+    for mode in ("none", "recovery", "inspection"):
+        with tempfile.TemporaryDirectory(prefix="hdfs-fault-contract-") as directory:
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=5,
+                env={**os.environ, "local_root": directory, "failure_mode": mode},
+            )
+            root = Path(directory)
+            if mode == "none":
+                assert result.returncode == 0, result.stderr
+                assert (root / "inspected").exists()
+            else:
+                assert result.returncode != 0
+                assert f"{mode} diagnostic" in (root / "artifact").read_text()
+                assert "private-principal" not in (root / "artifact").read_text()
+                if mode == "recovery":
+                    assert not (root / "inspected").exists()
+            assert "--kill-after=1s 125s" in (root / "timeouts").read_text()
+
+
+def test_independent_cleanup_restores_only_fault_marked_runs_before_any_deletion() -> None:
+    cleanup = (ROOT / "tests/lab/cleanup-run.sh").read_text()
+    for mode in ("ordinary", "interrupted", "restore-failed"):
+        with tempfile.TemporaryDirectory(prefix="hdfs-cancel-cleanup-") as directory:
+            sandbox = Path(directory)
+            run_id = f"nightly-cancel-contract-{sandbox.name}"
+            run_root = Path("/tmp/data-mover-lab") / run_id
+            run_root.mkdir(parents=True, exist_ok=False)
+            try:
+                if mode != "ordinary":
+                    marker = run_root / "hdfs-fault/restore-required"
+                    marker.parent.mkdir()
+                    marker.touch()
+                (sandbox / "cleanup-run.sh").write_text(cleanup)
+                (sandbox / "common.sh").write_text(r'''
+LAB_SOURCE_MGMT=source LAB_DEST_MGMT=dest LAB_WORKER_MGMT=worker
+LAB_NFS3_EXPORT=/v3 LAB_NFS41_EXPORT=/v4
+LAB_S3_ACCESS_KEY= LAB_S3_SECRET_KEY=
+validate_run_id() { [[ "$1" == nightly-cancel-contract-* ]]; }
+prepare_hdfs_kerberos() { :; }
+hdfs_run_root() { printf '/tmp/data-mover-nightly/%s/hdfs' "$1"; }
+ssh_lab() { echo remote-delete >>"$TRACE"; }
+ssh_lab_root() { echo remote-delete >>"$TRACE"; }
+cargo() {
+  echo hdfs-delete >>"$TRACE"
+  [[ "$MODE" == ordinary ]] || test -f "$RESTORED"
+}
+''')
+                (sandbox / "hdfs-fault-common.sh").write_text(r'''
+restore_hdfs_services() {
+  echo restore >>"$TRACE"
+  [[ "$RUN_ID" == "$run_id" ]] || return 2
+  [[ "$MODE" != restore-failed ]] || return 1
+  touch "$RESTORED"
+}
+''')
+                result = subprocess.run(
+                    ["bash", str(sandbox / "cleanup-run.sh"), run_id],
+                    capture_output=True, text=True, timeout=5,
+                    env={**os.environ, "MODE": mode, "RUN_ID": "different-inherited-run",
+                         "TRACE": str(sandbox / "trace"),
+                         "RESTORED": str(sandbox / "restored")},
+                )
+                trace = (sandbox / "trace").read_text().splitlines()
+                if mode == "restore-failed":
+                    assert result.returncode != 0
+                    assert trace == ["restore"]
+                    assert run_root.exists()
+                else:
+                    assert result.returncode == 0, result.stderr
+                    assert "hdfs-delete" in trace
+                    assert not run_root.exists()
+                    if mode == "ordinary":
+                        assert "restore" not in trace
+                    else:
+                        assert trace[0] == "restore"
+            finally:
+                if run_root.exists():
+                    shutil.rmtree(run_root)
+
+
+def test_fault_recovery_marker_precedes_service_changes() -> None:
+    marker = RUNNER.index('touch "$local_root/restore-required"')
+    mutations = RUNNER.index("for target in namenode datanode1 datanode2;")
+    assert marker < mutations
 
 
 if __name__ == "__main__":

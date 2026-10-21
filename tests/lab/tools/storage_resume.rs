@@ -1,14 +1,16 @@
 //! Fresh-process recovery through the ordinary transfer engine. The state file is an
 //! observation guard, never an exported destination handle or an estimated durable prefix.
+use std::error::Error as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use data_mover::model::StoragePath;
-use data_mover::storage::Storage;
+use data_mover::model::{FailureClass, StoragePath};
+use data_mover::storage::{Storage, StorageRoleFailure};
 use data_mover::transfer::{
-    PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferRequest, move_file, transfer,
+    PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferFailure, TransferRequest,
+    move_file, transfer,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -77,13 +79,28 @@ fn validate_prior_state(path: Option<&Path>, current: &ResumeState) -> Result {
         return Ok(());
     };
     let prior: ResumeState = serde_json::from_slice(&fs::read(path)?)?;
-    if prior.schema != 2
-        || !prior.recovery_at_destination
-        || prior.size != current.size
-        || prior.identity != current.identity
-        || prior.source_observation != current.source_observation
-    {
+    if prior.schema != 2 || !prior.recovery_at_destination {
         return Err("source or transfer identity changed since interruption".into());
+    }
+    validate_observation(
+        &prior,
+        Some(current.size),
+        &current.identity,
+        &current.source_observation,
+    )
+}
+
+fn validate_observation(
+    expected: &ResumeState,
+    size: Option<u64>,
+    identity: &str,
+    observation: &str,
+) -> Result {
+    if size != Some(expected.size)
+        || identity != expected.identity
+        || observation != expected.source_observation
+    {
+        return Err("source or transfer identity changed between interruption attempts".into());
     }
     Ok(())
 }
@@ -117,7 +134,7 @@ async fn main() -> Result {
         reused_bytes: None,
     };
     match args.phase {
-        Phase::Interrupt => interrupt(&args, request, cancel, &mut state).await?,
+        Phase::Interrupt => interrupt(&args, &path, &mut state).await?,
         Phase::Resume => resume(&args, &source, &destination, &path, request, &mut state).await?,
     }
     Ok(())
@@ -138,7 +155,10 @@ async fn resume(
         transfer(request).await?
     };
     if outcome.reused_bytes == 0 || outcome.reused_bytes >= state.size {
-        return Err("resume did not reuse a partial transfer from the destination".into());
+        return Err(format!(
+            "resume did not reuse a partial transfer from the destination: reused={} size={} prepare={:?}",
+            outcome.reused_bytes, state.size, outcome.prepare,
+        ).into());
     }
     let verified = if args.delete_source {
         // The move verified content and metadata before deleting its bound source.
@@ -161,58 +181,156 @@ async fn resume(
     Ok(())
 }
 
-async fn interrupt(
-    args: &Args,
-    request: TransferRequest,
-    cancel: CancellationToken,
-    state: &mut ResumeState,
-) -> Result {
-    // Automatic checkpoints start after 64 MiB. Leave room for a durable checkpoint and
-    // bounded in-flight reads before cancellation; never call streamed bytes durable bytes.
-    if state.size < 96 << 20 {
+async fn interrupt(args: &Args, path: &StoragePath, state: &mut ResumeState) -> Result {
+    for (attempt, delay) in interruption_delays(state.size)?.into_iter().enumerate() {
+        // This is a new job attempt, not a protocol retry. A cancelled NFS read can leave
+        // in-flight RPCs on the old session; do not carry that transport into the next try.
+        let source = connect_with_options(&args.source, false, Some(CHUNK)).await?;
+        let destination = connect_with_options(&args.destination, true, Some(CHUNK)).await?;
+        let observation = copy_support::observe(&source, path).await?;
+        let cancel = CancellationToken::new();
+        let request = TransferRequest::new(
+            source.clone(),
+            path.clone(),
+            destination.clone(),
+            cancel.clone(),
+        )
+        .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
+        let observation_guard = blake3::hash(observation.encode_snapshot().as_bytes())
+            .to_hex()
+            .to_string();
+        validate_observation(
+            state,
+            observation.size(),
+            &request.identity().to_string(),
+            &observation_guard,
+        )?;
+        let timer_cancel = cancel.clone();
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            timer_cancel.cancel();
+        });
+        let qos = SourceQosGroup::new(SourceQosPolicy::new(
+            Some((BANDWIDTH, BANDWIDTH, Duration::ZERO)),
+            CHUNK,
+            None,
+        )?);
+        let result = transfer(request.with_source_qos(qos)).await;
+        timer.abort();
+        let _ = timer.await;
+        let failure = result
+            .err()
+            .ok_or("transfer completed before interruption")?;
+        if !is_expected_interruption(
+            cancel.is_cancelled(),
+            failure.final_destination_changed(),
+            transfer_failure_class(&failure),
+        ) {
+            return Err(failure.into());
+        }
+        if !failure.has_recoverable_stage() {
+            eprintln!(
+                "interruption attempt {} stopped before a durable checkpoint; retrying",
+                attempt + 1
+            );
+            drop(failure); // The next prepare cleans or resumes the below-threshold stage.
+            continue;
+        }
+        state.recovery_at_destination = true;
+        state.source_streamed_bytes = failure.source_qos().client_streamed_shaped_bytes;
+        drop(failure); // Release the destination lease; the retained recovery state stays there.
+        write_state(args.state_file.as_deref(), state)?;
+        println!(
+            "interrupted after {} streamed bytes; recoverable state retained at destination",
+            state.source_streamed_bytes
+        );
+        if args.hold_after_interrupt {
+            std::future::pending::<()>().await;
+        }
+        return Ok(());
+    }
+    Err("unable to establish a durable recovery checkpoint after repeated interruptions".into())
+}
+
+fn transfer_failure_class(failure: &TransferFailure) -> Option<FailureClass> {
+    match failure
+        .source()
+        .and_then(|cause| cause.downcast_ref::<StorageRoleFailure>())
+    {
+        Some(StorageRoleFailure::Entry(error)) => Some(error.class()),
+        Some(StorageRoleFailure::Session(error)) => Some(error.class()),
+        None => None,
+    }
+}
+
+const fn is_expected_interruption(
+    timer_cancelled: bool,
+    final_destination_changed: bool,
+    failure_class: Option<FailureClass>,
+) -> bool {
+    timer_cancelled
+        && !final_destination_changed
+        && matches!(failure_class, Some(FailureClass::Cancelled))
+}
+
+fn interruption_delays(size: u64) -> Result<[Duration; 6]> {
+    if size < 96 << 20 {
         return Err("resume fixture must be at least 96 MiB for automatic checkpoints".into());
     }
-    let stop_after_bytes = (state.size / 2).saturating_add(32 << 20);
+    // At 8 MiB/s the 96 MiB fixture leaves a partial-upload window at 10 seconds
+    // (80 MiB plus a 2 MiB admission burst). Repeating a slow attempt is valid;
+    // extending it to 14 seconds is not: S3 may then retain every part, so the
+    // next process correctly reuses the entire file instead of a partial prefix.
+    // Keep the bounded window on EVERY retry; source bytes are not durable bytes.
+    let stop_after_bytes = (size / 2).saturating_add(32 << 20);
     let delay = Duration::from_millis(stop_after_bytes.saturating_mul(1000) / BANDWIDTH);
-    let timer_cancel = cancel.clone();
-    let timer = tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        timer_cancel.cancel();
-    });
-    let qos = SourceQosGroup::new(SourceQosPolicy::new(
-        Some((BANDWIDTH, BANDWIDTH, Duration::ZERO)),
-        CHUNK,
-        None,
-    )?);
-    let result = transfer(request.with_source_qos(qos)).await;
-    timer.abort();
-    let _ = timer.await;
-    let failure = result
-        .err()
-        .ok_or("transfer completed before interruption")?;
-    if !cancel.is_cancelled()
-        || !failure.has_recoverable_stage()
-        || failure.final_destination_changed()
-    {
-        return Err(failure.into());
-    }
-    state.recovery_at_destination = true;
-    state.source_streamed_bytes = failure.source_qos().client_streamed_shaped_bytes;
-    drop(failure); // Release the destination lease; the retained recovery state stays there.
-    write_state(args.state_file.as_deref(), state)?;
-    println!(
-        "interrupted after {} streamed bytes; recoverable state retained at destination",
-        state.source_streamed_bytes
-    );
-    if args.hold_after_interrupt {
-        std::future::pending::<()>().await;
-    }
-    Ok(())
+    Ok([delay; 6])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_cancelled_failure_is_an_expected_interruption() {
+        assert!(is_expected_interruption(
+            true,
+            false,
+            Some(FailureClass::Cancelled),
+        ));
+        for class in [
+            None,
+            Some(FailureClass::Connectivity),
+            Some(FailureClass::Protocol),
+            Some(FailureClass::Corruption),
+        ] {
+            assert!(!is_expected_interruption(true, false, class));
+        }
+        assert!(!is_expected_interruption(
+            false,
+            false,
+            Some(FailureClass::Cancelled),
+        ));
+        assert!(!is_expected_interruption(
+            true,
+            true,
+            Some(FailureClass::Cancelled),
+        ));
+    }
+
+    #[test]
+    fn retries_preserve_a_partial_upload_window() -> Result {
+        for (size, expected_seconds) in [(96 << 20, 10), (128 << 20, 12), (192 << 20, 16)] {
+            let delays = interruption_delays(size)?;
+            assert_eq!(delays, [Duration::from_secs(expected_seconds); 6]);
+            for delay in delays {
+                // Include the admitted source burst, not just the sustained byte rate.
+                assert!(delay.as_secs() * BANDWIDTH + CHUNK < size);
+            }
+        }
+        assert!(interruption_delays((96 << 20) - 1).is_err());
+        Ok(())
+    }
 
     #[test]
     fn prior_state_rejects_changed_identity_size_and_source() -> Result {

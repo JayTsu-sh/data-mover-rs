@@ -144,7 +144,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: hdfs-memory-${{ github.run_id }}
-          path: hdfs-memory.csv
+          path: |
+            hdfs-memory.csv
+            hdfs-memory.csv.samples.csv
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"

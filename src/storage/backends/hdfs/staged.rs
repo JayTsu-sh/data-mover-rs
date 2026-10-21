@@ -302,25 +302,44 @@ pub(super) async fn hash_file(
     size: u64,
     cancel: &CancellationToken,
 ) -> Result<[u8; 32], StorageRoleFailure> {
-    let mut offset = 0;
     let mut hasher = Hasher::new();
-    while offset < size {
-        if cancel.is_cancelled() {
-            return Err(cancelled(diagnostic_path, Operation::Verify));
-        }
-        let end = (offset + 1024 * 1024).min(size);
-        let bytes = protocol.read_range(native, offset..end).await?;
-        if bytes.len() as u64 != end - offset {
-            return Err(failure(
-                diagnostic_path,
-                Operation::Verify,
-                FailureClass::Corruption,
-            ));
-        }
-        hasher.update(&bytes);
-        offset = end;
+    if size == 0 {
+        return Ok(*hasher.finalize().as_bytes());
     }
-    Ok(*hasher.finalize().as_bytes())
+    let readback = async {
+        // Native HDFS opens fetch all block locations. Keep one reader for the entire
+        // verification instead of repeating that metadata work for every bounded chunk.
+        let cursor = protocol.open_verification_reader(native).await?;
+        let maximum = protocol
+            .maximum_read_chunk_bytes()
+            .clamp(1, 2 * 1024 * 1024) as u64;
+        let mut offset = 0_u64;
+        while offset < size {
+            if cancel.is_cancelled() {
+                return Err(cancelled(diagnostic_path, Operation::Verify));
+            }
+            let end = offset.saturating_add(maximum).min(size);
+            let bytes = match &cursor {
+                Some(cursor) => cursor.read_range(offset..end).await?,
+                None => protocol.read_range(native, offset..end).await?,
+            };
+            if bytes.len() as u64 != end - offset {
+                return Err(failure(
+                    diagnostic_path,
+                    Operation::Verify,
+                    FailureClass::Corruption,
+                ));
+            }
+            hasher.update(&bytes);
+            offset = end;
+        }
+        Ok(*hasher.finalize().as_bytes())
+    };
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(cancelled(diagnostic_path, Operation::Verify)),
+        result = readback => result,
+    }
 }
 
 /// Publishes a stage kept at the destination by renaming it over the final file; a direct stage
