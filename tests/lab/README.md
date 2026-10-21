@@ -104,6 +104,20 @@ streaming integrity, in-flight cancellation, restart upload, reconnect recovery,
 recovery claims. Named attributes must return typed `Unsupported` until the adapter implements
 that operation.
 
+For NFSv4 cancellation, restart is a new transfer attempt on freshly connected
+source and destination handles. The native client can fence session slots whose
+outcome became unknown when an RPC future was dropped; the gate must not assume
+that the canceled session remains reusable. A post-cancel source probe accepts
+only success or a session-scoped `Connectivity` failure, never a generic entry
+error. Source LOOKUP preserves native failure classification through the role's
+typed lookup path rather than the legacy string wrapper.
+The gate still requires exactly an unpublished, non-recoverable stage and its
+explicit discard, unchanged source identity/size/mtime across reconnect, a Fresh
+restart, the complete 512 KiB upload, matching BLAKE3 with read-back enabled,
+and an independent read/hash of the published destination. Subsequent recovery
+checks use the reconnected handles as well; reconnect does not swallow failed
+cleanup, permanent errors, or content mismatches.
+
 The nightly workflow runs this matrix three times: with protocol defaults,
 strictly serial read/write pipelines, and higher read/write concurrency. Release
 validation runs the defaults and higher-concurrency profiles. The integrity and

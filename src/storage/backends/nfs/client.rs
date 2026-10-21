@@ -1107,10 +1107,7 @@ impl NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<(Bytes, Attr), NfsProtocolFailure> {
-        let object = self
-            .lookup_fh(Path::new(path.as_str()))
-            .await
-            .map_err(classify_role_error)?;
+        let object = self.role_lookup_fh(Path::new(path.as_str())).await?;
         let file_handle = object.fh;
         let attrs = if let Some(attrs) = object.attr {
             attrs

@@ -478,6 +478,11 @@ fn a_failed_parent_lookup_keeps_the_role_classification() {
             FailureClass::Connectivity,
             Transience::Transient,
         ),
+        (
+            NfsError::Rpc("session slot table closed".to_owned()),
+            FailureClass::Connectivity,
+            Transience::Unknown,
+        ),
     ] {
         let classified = lookup_failure(component(error));
         assert_eq!(
