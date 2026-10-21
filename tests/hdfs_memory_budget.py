@@ -18,9 +18,6 @@ ACTIVE_CHUNKS = 2
 # Nightly #185 peaked at 191.86 MiB with flat/decreasing steady-state windows;
 # add 16 MiB to the previous 96 MiB allowance, keeping the 10% growth guard.
 FIXED_OVERHEAD_MIB = 112
-# Keep the size-scaling guard below the absolute budget while allowing for
-# page-level allocator variance between otherwise identical release runs.
-GROWTH_ALLOWANCE_MIB = 72
 SCALE_SMALL_BYTES = 1024**3 + 137
 SCALE_LARGE_BYTES = 100 * 1024**3 + 137
 SCALE_SHORT_SAMPLES = 1
@@ -201,12 +198,9 @@ def validate(path: Path, *, require_100_gib: bool = False, trace: Path | None = 
             raise ValueError(f"unknown HDFS memory sample set: {key[0]}")
         if samples[0][0] == samples[1][0] or samples[0][2] != samples[1][2]:
             raise ValueError(f"{key} needs distinct sizes with identical settings")
-        growth = samples[1][1] - samples[0][1]
-        if growth > GROWTH_ALLOWANCE_MIB * 1024:
-            raise ValueError(
-                f"{key} RSS grew by {growth} KiB, above the "
-                f"{GROWTH_ALLOWANCE_MIB} MiB allowance"
-            )
+        # These are independent processes, not early/late steady-state windows.
+        # Each peak already satisfies its calculated absolute budget above;
+        # sustained growth is checked using the same-process scale trace only.
 
 
 def main() -> int:

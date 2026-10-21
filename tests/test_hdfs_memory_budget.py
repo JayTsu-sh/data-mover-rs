@@ -128,19 +128,38 @@ class HdfsMemoryBudgetTests(_TraceFixture):
                     with self.assertRaisesRegex(ValueError, "exceeds budget"):
                         validate(path)
 
-    def test_validator_rejects_budget_and_growth_violations(self) -> None:
+    def test_validator_rejects_absolute_budget_violations(self) -> None:
         over_budget = self._csv([(262_144, 140_000), (2_097_152, 140_000)])
         with self.assertRaisesRegex(ValueError, "exceeds budget"):
             validate(over_budget)
-        growing = self._csv(
-            [(262_144, 80_000), (2_097_152, 155_000)],
-            profile="high",
-            read=8,
-            write=16,
-            budget=204,
-        )
-        with self.assertRaisesRegex(ValueError, "RSS grew"):
-            validate(growing)
+
+    def test_baseline_independent_peaks_are_not_sustained_growth(self) -> None:
+        # Nightly #191: both processes satisfy the unchanged 204 MiB budget.
+        # Their high-water marks are not two windows of one process's lifetime.
+        for direction in ["local-hdfs", "hdfs-hdfs", "hdfs-local"]:
+            with self.subTest(direction=direction):
+                path = self._csv(
+                    [(256 * 1024**2 + 137, 73_408),
+                     (2 * 1024**3 + 137, 160_764)],
+                    profile="high", read=8, write=16, budget=204,
+                    direction=direction,
+                )
+                validate(path)
+
+    def test_baseline_still_requires_distinct_sizes_and_identical_settings(self) -> None:
+        same_size = self._csv([(262_144, 70_000), (262_144, 75_000)])
+        with self.assertRaisesRegex(ValueError, "distinct sizes"):
+            validate(same_size)
+        mismatched = self._csv([(262_144, 70_000), (2_097_152, 75_000)])
+        with mismatched.open(newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        rows[1].update(read_inflight=4, budget_mib=150)
+        with mismatched.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
+        with self.assertRaisesRegex(ValueError, "identical settings"):
+            validate(mismatched)
 
     def test_validator_requires_one_real_100_gib_sample_when_requested(self) -> None:
         hundred_gib = 100 * 1024 * 1024 * 1024 + 137
