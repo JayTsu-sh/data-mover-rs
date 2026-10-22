@@ -329,6 +329,13 @@ The run-root delete additionally retries only the NameNode restart
 immediately. This does not force SafeMode off or broaden deletion authority:
 the same validated run root is deleted, and repeated deletion remains idempotent.
 
+Fault cleanup also restores the direct NameNode to HA active. A systemd service can be active
+before its RPC/HA ports accept requests, so restoration retries state queries and failed
+failovers under one 120-second administration deadline, including blocked CLI calls. Each
+attempt queries the current state; only a successful `active` observation completes restoration.
+Node validation and credential failures still fail restoration, and the temporary Kerberos
+cache is destroyed on exit.
+
 Runner transport failures are separate from storage test failures. For example,
 nightly #188's runner exhausted ten broker long-poll retries and canceled its
 worker; its 150-minute job limit had not elapsed. On the dedicated

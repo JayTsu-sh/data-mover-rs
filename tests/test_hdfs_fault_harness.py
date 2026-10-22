@@ -62,6 +62,105 @@ def test_ha_restore_restarts_zkfc_and_returns_the_direct_namenode_to_active() ->
     assert "hdfs_service_action start namenode\nrestore_hdfs_services" in RUNNER
 
 
+def test_ha_restore_waits_for_rpc_startup_and_confirms_the_active_state() -> None:
+    # Run the actual remote administration script, including its shell error handling.
+    start = COMMON.index("restore_hdfs_ha_primary() {")
+    end = COMMON.index("\n}", start) + 2
+    restore_template = COMMON[start:end]
+    for mode in (
+        "active", "startup", "failover", "unavailable", "stalled", "authentication", "topology",
+    ):
+        with tempfile.TemporaryDirectory(prefix="hdfs-ha-restore-") as directory:
+            root = Path(directory)
+            hdfs = root / "hdfs"
+            hdfs.write_text(r'''#!/usr/bin/env bash
+set -eu
+case "$*" in
+  *getconf*principal*) echo test-principal ;;
+  *getconf*nameservices*) echo test-nameservice ;;
+  *getServiceState*)
+    echo query >>"$TRACE"
+    if [[ "$MODE" == stalled ]]; then command sleep 5; fi
+    if [[ "$MODE" == unavailable || ( "$MODE" == startup && ! -e "$RECOVERED" ) ]]; then
+      touch "$RECOVERED"
+      echo 'HA RPC connection refused during startup' >&2
+      exit 1
+    fi
+    if [[ "$MODE" == failover && ! -e "$ACTIVE" ]]; then
+      echo standby
+    else
+      echo active
+    fi ;;
+  *-failover*)
+    echo failover >>"$TRACE"
+    if [[ "$MODE" == startup ]]; then
+      echo 'HA service RPC connection refused during startup' >&2
+      exit 1
+    fi
+    if [[ ! -e "$RECOVERED" ]]; then
+      touch "$RECOVERED"
+      echo 'HA failover RPC not ready' >&2
+      exit 1
+    fi
+    touch "$ACTIVE" ;;
+  *) exit 2 ;;
+esac
+''')
+            hdfs.chmod(0o755)
+            # Keep the real outer timeout but shorten it in deadline tests.
+            restore = restore_template.replace("/opt/hadoop/bin/hdfs", str(hdfs))
+            script = r'''set -euo pipefail
+LAB_HDFS_HA_NAMENODE1_HOST=primary LAB_HDFS_HA_NAMENODE2_HOST=secondary
+LAB_HDFS_HA_NAMENODE1_ID=nn1 LAB_HDFS_HA_NAMENODE2_ID=nn2
+LAB_HDFS_HA_NAMENODE1_NAME=hdfs-namenode LAB_HDFS_HA_NAMENODE2_NAME=hdfs-namenode2
+RUN_ID=nightly-ha-restore-contract
+kinit() { [[ "$MODE" != authentication ]]; }
+kdestroy() { echo credentials-cleaned >>"$TRACE"; }
+sleep() { command sleep 0.01; }
+export -f kinit kdestroy sleep
+ssh_hdfs() {
+  local command="$2"
+  if [[ "$command" != *haadmin* ]]; then
+    [[ "$MODE" != topology ]]
+    return
+  fi
+  # Replace sudo's user switch with a local invocation of the same env/timeout/bash chain.
+  command="${command/sudo -n -u hdfs /}"
+  if [[ "$MODE" == unavailable || "$MODE" == stalled ]]; then
+    command="${command/120s/1s}"
+  fi
+  bash -c "$command"
+}
+'''
+            # restore_hdfs_services catches this function's status, disabling the caller's errexit.
+            script += restore + "\nstatus=0; restore_hdfs_ha_primary || status=$?; exit \"$status\"\n"
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=5,
+                env={**os.environ, "MODE": mode, "TRACE": str(root / "trace"),
+                     "RECOVERED": str(root / "recovered"), "ACTIVE": str(root / "active")},
+            )
+            trace = (root / "trace").read_text().splitlines() if (root / "trace").exists() else []
+            if mode in ("active", "startup", "failover"):
+                assert result.returncode == 0, (mode, result.stderr)
+                assert trace[-1] == "credentials-cleaned", (mode, trace)
+                if mode == "startup":
+                    assert trace.count("query") >= 2, trace
+                    assert "failover" not in trace, trace
+                if mode == "failover":
+                    assert trace.count("failover") == 2, trace
+                    assert trace[-2] == "query", trace
+            else:
+                assert result.returncode != 0, (mode, trace)
+                if mode in ("authentication", "topology"):
+                    assert "query" not in trace, trace
+                elif mode == "unavailable":
+                    assert trace.count("query") > 1, trace
+                    assert "within 120 seconds" in result.stderr
+                else:
+                    assert trace.count("query") == 1, trace
+                    assert "within 120 seconds" in result.stderr
+
+
 def test_failure_commands_must_finish_before_their_deadline() -> None:
     assert "status == 124" in RUNNER
     assert "did not return within" in RUNNER
