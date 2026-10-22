@@ -222,6 +222,14 @@ fixtures with a 1 MiB producer buffer, then measures only the release
 serial/default/high inflight profiles. A separate `storage_inspect` process
 reopens and fully hashes every destination. The CSV records sizes, profile,
 windows, chunk/channel/file concurrency, duration, throughput and peak RSS.
+Every measured child uses exactly four Tokio runtime workers, recorded as `runtime_workers`
+in the CSV. The runner overrides an inherited `TOKIO_WORKER_THREADS` value, and the validator
+rejects missing or different worker counts. Runtime workers are independent of the configured
+asynchronous read/write windows: the high profile still runs with read=8 and write=16.
+Without this fixed runtime profile, Tokio defaults to the runner's CPU count (24 on the lab
+runner), and per-thread allocator arenas make the fixed process allowance non-reproducible.
+Nightly `39711328550` reached 217.3 MiB despite decreasing transfer RSS and flat verification RSS.
+The gate now fixes that previously unspecified variable rather than increasing its budgets.
 HDFS read-back verification reuses one opened reader across bounded chunks of at most
 2 MiB. It still reads and hashes the complete file; increasing the application chunk is
 not required to avoid reopening the file and refetching block locations for every range.

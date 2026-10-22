@@ -14,6 +14,8 @@ from pathlib import Path
 MIB = 1024 * 1024
 COPY_CHANNEL_CHUNKS = 4
 ACTIVE_CHUNKS = 2
+# Keep runtime/allocator overhead reproducible independently of runner CPU count.
+RUNTIME_WORKERS = 4
 # Runtime/allocator headroom is fixed per process, not per file or payload byte.
 # Nightly #185 peaked at 191.86 MiB with flat/decreasing steady-state windows;
 # add 16 MiB to the previous 96 MiB allowance, keeping the 10% growth guard.
@@ -136,6 +138,8 @@ def validate(path: Path, *, require_100_gib: bool = False, trace: Path | None = 
     grouped: dict[tuple[str, str, str], list[tuple[int, int, tuple[int, ...]]]] = defaultdict(list)
     has_100_gib = False
     for row in rows:
+        if row.get("runtime_workers") != str(RUNTIME_WORKERS):
+            raise ValueError(f"HDFS memory profile requires {RUNTIME_WORKERS} runtime workers")
         size = int(row["bytes"])
         has_100_gib |= row["sample_set"] == "scale" and size == SCALE_LARGE_BYTES
         measured = int(row["max_rss_kib"])

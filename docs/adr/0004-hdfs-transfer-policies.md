@@ -110,6 +110,10 @@ The absolute budget remains derived from fixed chunk/concurrency windows. Its
 fixed per-process runtime/allocator allowance is 112 MiB (formerly 96 MiB), making
 the one-file high-profile budget 204 MiB without changing the payload window terms.
 This adds 16 MiB of peak headroom; it does not relax the steady-state growth limit.
+Measured children use four Tokio runtime workers regardless of the runner's CPU count;
+the CSV records `runtime_workers` and the validator rejects incompatible runtime profiles.
+This fixes per-thread allocator variability while retaining all read/write inflight windows,
+including read=8/write=16 for the high profile. Library consumers retain control of their runtime.
 The 100 GiB release copy is additionally sampled within a single process, separately
 for transfer and independent content comparison; early and late steady-state RSS
 windows must remain within 10%. A short-process peak is not a statistically valid
