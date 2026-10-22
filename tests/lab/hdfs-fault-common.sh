@@ -87,25 +87,37 @@ restore_hdfs_ha_primary() {
     "test \"\$(hostname)\" = '$primary_name' && \
      sudo -n systemctl cat hadoop-zkfc.service >/dev/null && \
      sudo -n systemctl reset-failed hadoop-zkfc.service && \
-     sudo -n systemctl start hadoop-zkfc.service"
+     sudo -n systemctl start hadoop-zkfc.service" || return
   ssh_hdfs "$secondary_host" \
     "test \"\$(hostname)\" = '$secondary_name' && \
      sudo -n systemctl cat hadoop-zkfc.service >/dev/null && \
      sudo -n systemctl reset-failed hadoop-zkfc.service && \
-     sudo -n systemctl start hadoop-zkfc.service"
+     sudo -n systemctl start hadoop-zkfc.service" || return
 
-  ssh_hdfs "$primary_host" \
+  # systemd active does not mean the NameNode's RPC/HA ports are ready. Query again
+  # after startup or a failed failover, and confirm active before declaring recovery.
+  # The shared deadline includes authentication, every Java CLI call, and sleeps.
+  if ssh_hdfs "$primary_host" \
     "sudo -n -u hdfs env JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
       HADOOP_CONF_DIR=/etc/hadoop HADOOP_LOG_DIR=/var/log/hadoop \
-      KRB5CCNAME='FILE:$remote_cache' bash -c \
+      KRB5CCNAME='FILE:$remote_cache' timeout --kill-after=1s 120s bash -e -c \
       'trap \"kdestroy >/dev/null 2>&1 || true\" EXIT; \
        principal=\"\$(/opt/hadoop/bin/hdfs getconf -confKey dfs.namenode.kerberos.principal)\"; \
        nameservice=\"\$(/opt/hadoop/bin/hdfs getconf -confKey dfs.nameservices)\"; \
        kinit -kt /etc/security/keytabs/hdfs.service.keytab \"\$principal\"; \
-       state=\"\$(/opt/hadoop/bin/hdfs haadmin -ns \"\$nameservice\" -getServiceState '$primary_id')\"; \
-       [[ \"\$state\" == active ]] || \
-         /opt/hadoop/bin/hdfs haadmin -ns \"\$nameservice\" -failover '$secondary_id' '$primary_id''" \
-    >/dev/null
+       while true; do \
+         if state=\"\$(/opt/hadoop/bin/hdfs haadmin -ns \"\$nameservice\" -getServiceState '$primary_id')\"; then \
+           if [[ \"\$state\" == active ]]; then exit 0; fi; \
+           if [[ \"\$state\" == standby ]]; then \
+             /opt/hadoop/bin/hdfs haadmin -ns \"\$nameservice\" -failover '$secondary_id' '$primary_id' || true; \
+           fi; \
+         fi; \
+         sleep 1; \
+       done'" >/dev/null; then
+    return 0
+  fi
+  echo "HDFS primary did not become active within 120 seconds (or administration failed)" >&2
+  return 1
 }
 
 restore_hdfs_services() {

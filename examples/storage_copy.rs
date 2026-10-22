@@ -4,8 +4,7 @@ use clap::Parser;
 use data_mover::model::StoragePath;
 use data_mover::qos::parse_bandwidth_string;
 use data_mover::transfer::{
-    PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, SourceQosStats, TransferRequest,
-    move_file, transfer,
+    SourceQosGroup, SourceQosPolicy, SourceQosStats, TransferRequest, move_file, transfer,
 };
 use num_traits::ToPrimitive as _;
 use tokio_util::sync::CancellationToken;
@@ -127,9 +126,7 @@ async fn main() -> Result<()> {
         CancellationToken::new(),
     );
     if let Some(qos) = qos {
-        request = request
-            .with_source_qos(qos)
-            .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
+        request = request.with_source_qos(qos);
     }
     let started = Instant::now();
     report_phase(args.report_phases, "transfer")?;

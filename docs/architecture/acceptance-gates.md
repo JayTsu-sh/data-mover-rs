@@ -347,7 +347,8 @@ Terrasync gates additionally verify:
 Every directed cell verifies client-streamed payload is shaped and counted once. S3 native
 copy remains eligible: its logical/native bytes and native requests are separate, its
 server-internal payload is reported unshaped, and no opaque source/destination IOPS are
-invented. A strict client-shaped request explicitly disables native transfer.
+invented. Streaming coverage uses a connected pair without native affinity; payload route is not
+caller-configurable.
 
 Terrasync single-process and two-process gates verify the shared limiter is applied on the
 source/Sender side only and remains consistent with QUIC backpressure.

@@ -24,9 +24,9 @@ use crate::storage::backends::s3::{S3Protocol as _, connect, connect_native_at_d
 use crate::storage::{Storage, StorageRoleFailure};
 use crate::transfer::{
     EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest,
-    ExpertSourceSession, PayloadShapingPolicy, ReadBackMethod, ReadBackVerification,
-    TransferFailure, TransferPhase, TransferPolicy, TransferRequest, TransferRoute, TransferSide,
-    UnpinnedReadReason, UploadDigest, UploadDigestGap, transfer,
+    ExpertSourceSession, ReadBackMethod, ReadBackVerification, TransferFailure, TransferPhase,
+    TransferPolicy, TransferRequest, TransferRoute, TransferSide, UnpinnedReadReason, UploadDigest,
+    UploadDigestGap, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -201,7 +201,6 @@ async fn a_checkpointed_transfer_to_a_nas_bucket_reports_unsupported_by_destinat
         bucket(&protocol)?,
     )?
     .with_transfer_policy(TransferPolicy::Checkpointed)
-    .with_payload_shaping(PayloadShapingPolicy::AllowUnshapedNative)
     .with_read_back_verification(ReadBackVerification::Disabled);
     let outcome = transfer(native).await?;
     assert_eq!(outcome.route, TransferRoute::Native);
@@ -441,7 +440,6 @@ async fn a_native_copy_confirms_no_upload_digest() -> TestResult {
         };
         let outcome = transfer(
             request(source_storage(&protocol, "src")?, "file", connect()?)?
-                .with_payload_shaping(PayloadShapingPolicy::AllowUnshapedNative)
                 .with_read_back_verification(ReadBackVerification::Disabled),
         )
         .await
@@ -477,8 +475,7 @@ async fn a_native_copy_within_a_nas_bucket_is_one_copy_object() -> TestResult {
     };
     let outcome = transfer(
         request(source_storage(&protocol, "src")?, "big", connect()?)?
-            .with_transfer_policy(TransferPolicy::Checkpointed)
-            .with_payload_shaping(PayloadShapingPolicy::AllowUnshapedNative),
+            .with_transfer_policy(TransferPolicy::Checkpointed),
     )
     .await?;
     assert_eq!(outcome.route, TransferRoute::Native);

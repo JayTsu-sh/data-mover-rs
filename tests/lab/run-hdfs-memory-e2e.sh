@@ -25,6 +25,8 @@ destination_root="$local_root/destination"
 target_directory="$(cargo metadata --locked --no-deps --format-version 1 | \
   python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 commit="$(git rev-parse HEAD)"
+runtime_workers="$(python3 -c \
+  'import sys; sys.path.insert(0, "tests"); from hdfs_memory_budget import RUNTIME_WORKERS; print(RUNTIME_WORKERS)')"
 binary="$target_directory/release/examples/storage_copy"
 inspector="$target_directory/release/examples/storage_inspect"
 mkdir -p "$source_root" "$destination_root"
@@ -87,7 +89,7 @@ for specification in "scale-1g:$scale_small_size" "scale-100g:$scale_large_size"
 done
 
 printf '%s\n' \
-  'run_id,commit,sample_set,profile,direction,payload,bytes,read_inflight,write_inflight,chunk_mib,channel_chunks,file_concurrency,budget_mib,elapsed_s,max_rss_kib,throughput_mib_s' \
+  'run_id,commit,sample_set,profile,direction,payload,bytes,read_inflight,write_inflight,chunk_mib,channel_chunks,file_concurrency,budget_mib,elapsed_s,max_rss_kib,throughput_mib_s,runtime_workers' \
   > "$output"
 
 run_case() {
@@ -114,7 +116,8 @@ run_case() {
   metrics="$(mktemp -d)/metrics"
   log="$(mktemp)"
   local -a copy_command=(
-    env DATA_MOVER_READ_INFLIGHT="$read" DATA_MOVER_WRITE_INFLIGHT="$write"
+    env TOKIO_WORKER_THREADS="$runtime_workers"
+      DATA_MOVER_READ_INFLIGHT="$read" DATA_MOVER_WRITE_INFLIGHT="$write"
       DATA_MOVER_HDFS_READ_INFLIGHT="$read" DATA_MOVER_HDFS_WRITE_INFLIGHT="$write"
       "$binary" --source "$source" --destination "$destination"
         --path "$payload.bin" --report-phases
@@ -141,9 +144,9 @@ run_case() {
   budget="$(python3 -c \
     'import sys; sys.path.insert(0, "tests"); from hdfs_memory_budget import budget_mib; print(budget_mib(1, 2, int(sys.argv[1]), int(sys.argv[2])))' \
     "$read" "$write")"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,2,4,1,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,2,4,1,%s,%s,%s,%s,%s\n' \
     "$run_id" "$commit" "$sample_set" "$profile" "$direction" "$payload" "$size" "$read" "$write" \
-    "$budget" "$elapsed" "$rss" "$throughput" | tee -a "$output"
+    "$budget" "$elapsed" "$rss" "$throughput" "$runtime_workers" | tee -a "$output"
 }
 
 for profile_spec in serial:1:1 default:4:1 high:8:16; do

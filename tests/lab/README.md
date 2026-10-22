@@ -222,6 +222,14 @@ fixtures with a 1 MiB producer buffer, then measures only the release
 serial/default/high inflight profiles. A separate `storage_inspect` process
 reopens and fully hashes every destination. The CSV records sizes, profile,
 windows, chunk/channel/file concurrency, duration, throughput and peak RSS.
+Every measured child uses exactly four Tokio runtime workers, recorded as `runtime_workers`
+in the CSV. The runner overrides an inherited `TOKIO_WORKER_THREADS` value, and the validator
+rejects missing or different worker counts. Runtime workers are independent of the configured
+asynchronous read/write windows: the high profile still runs with read=8 and write=16.
+Without this fixed runtime profile, Tokio defaults to the runner's CPU count (24 on the lab
+runner), and per-thread allocator arenas make the fixed process allowance non-reproducible.
+Nightly `39711328550` reached 217.3 MiB despite decreasing transfer RSS and flat verification RSS.
+The gate now fixes that previously unspecified variable rather than increasing its budgets.
 HDFS read-back verification reuses one opened reader across bounded chunks of at most
 2 MiB. It still reads and hashes the complete file; increasing the application chunk is
 not required to avoid reopening the file and refetching block locations for every range.
@@ -329,6 +337,13 @@ The run-root delete additionally retries only the NameNode restart
 immediately. This does not force SafeMode off or broaden deletion authority:
 the same validated run root is deleted, and repeated deletion remains idempotent.
 
+Fault cleanup also restores the direct NameNode to HA active. A systemd service can be active
+before its RPC/HA ports accept requests, so restoration retries state queries and failed
+failovers under one 120-second administration deadline, including blocked CLI calls. Each
+attempt queries the current state; only a successful `active` observation completes restoration.
+Node validation and credential failures still fail restoration, and the temporary Kerberos
+cache is destroyed on exit.
+
 Runner transport failures are separate from storage test failures. For example,
 nightly #188's runner exhausted ten broker long-poll retries and canceled its
 worker; its 150-minute job limit had not elapsed. On the dedicated
@@ -390,9 +405,8 @@ committed, printed, or written to artifacts.
 ArchitectureReady roles. It exercises multipart staging, interruption and
 reconnect resume, stale-upload restart, verification, publication, tags,
 cancellation, range readback, connected-pair native CopyObject into an unpublished stage,
-copy-time BLAKE3 verification, unshaped native QoS reporting, and strict client-shaped streaming
-fallback through standard `s3://` requests. Automated request contracts fix the 5 GiB strategy
-boundary, and the real gate forces multi-part `UploadPartCopy` over the contract fixture with a
+copy-time BLAKE3 verification, and unshaped native QoS reporting. Automated request contracts fix
+the 5 GiB strategy boundary, and the real gate forces multi-part `UploadPartCopy` over the contract fixture with a
 5 MiB test part size while retaining the production 1 GiB part size. The gate removes
 both published objects and unfinished multipart uploads on exit. A successful
 legacy S3 copy run does not certify this gate: the configured service must
@@ -404,8 +418,8 @@ the `?compat=dxn` profile and requires `LAB_DXN_S3_ACCESS_KEY` plus
 but can be overridden with `LAB_DXN_S3_ENDPOINT` and `LAB_DXN_S3_BUCKET`.
 Credentials remain process-local. The gate covers multipart interruption,
 service-enumerated recovery after outstanding requests settle, restart,
-readback, cancellation, conditional native transfer, client-shaped fallback,
-the explicit tag-unsupported result, the DXN delete checksum contract, and a
+readback, cancellation, connected-pair route selection, the explicit tag-unsupported result, the
+DXN delete checksum contract, and a
 standard-S3 isolation control.
 Every run writes `dxn-s3-evidence.json`, including the exact candidate SHA,
 run ID, environment fingerprint, timestamps, gate ID, and outcome. Nightly and

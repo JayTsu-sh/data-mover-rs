@@ -204,7 +204,8 @@ impl TransferVerification {
 /// Access time and change time are not part of any copy. ACLs and extended attributes are not
 /// part of the default one either, but a caller can ask for them with
 /// [`TransferRequest::with_copied_metadata`]; whether they are carried then depends on what both
-/// ends can do. See `.claude/docs/metadata-negotiation.md`.
+/// ends can do. S3-to-S3 transfers always carry object tags when both ends support them; other
+/// backend pairs omit tags. See `.claude/docs/metadata-negotiation.md`.
 ///
 /// # Errors
 /// Returns a phase- and side-attributed failure while retaining an owned staged state whenever

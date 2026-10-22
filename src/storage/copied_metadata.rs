@@ -6,8 +6,9 @@ use crate::model::{AclEncoding, MetadataObservations, TimePrecision};
 /// Destination capabilities used by the copied metadata families.
 ///
 /// `timestamps` and `ownership` describe the baseline every copy carries; a caller cannot turn
-/// them off. `acl`, `xattrs` and `tags` describe families a caller has to ask for — what a
-/// destination reports here is only its ability to accept them, never a decision to copy them.
+/// them off. `acl` and `xattrs` describe caller-selected families. `tags` is selected
+/// automatically for S3-to-S3 transfers. What a destination reports here is only its ability to
+/// accept a family, never the decision to copy it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CopiedMetadataTarget {
     /// Whether the modification time is stored, and how finely.

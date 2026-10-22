@@ -10,11 +10,7 @@ use crate::storage::{
 };
 
 pub(super) fn eligible_native_pair(request: &TransferRequest) -> Option<NativePair> {
-    if request.payload_shaping == super::super::PayloadShapingPolicy::RequireClientShaped {
-        None
-    } else {
-        request.source.native_pair(&request.destination)
-    }
+    request.source.native_pair(&request.destination)
 }
 
 pub(super) struct NativeTransferInput {

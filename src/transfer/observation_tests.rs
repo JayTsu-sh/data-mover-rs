@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use super::{PayloadShapingPolicy, TransferPhase, TransferRequest, TransferRoute, transfer};
+use super::{TransferPhase, TransferRequest, TransferRoute, transfer};
 use crate::model::{EntryKind, ObservedEntry, SourceVersion, StoragePath};
 use crate::storage::backends::s3::tests::{
     MemoryS3, Versioning, endpoint_of, native_context, source_storage,
@@ -65,15 +65,9 @@ async fn bucket(histories: bool) -> TestResult<(Arc<MemoryS3>, Storage, Observed
 
 #[tokio::test]
 async fn observed_version_is_pinned_for_streaming_and_native_copy() -> TestResult {
-    for (shaping, route) in [
-        (
-            PayloadShapingPolicy::RequireClientShaped,
-            TransferRoute::Streaming,
-        ),
-        (
-            PayloadShapingPolicy::AllowUnshapedNative,
-            TransferRoute::Native,
-        ),
+    for (native, route) in [
+        (false, TransferRoute::Streaming),
+        (true, TransferRoute::Native),
     ] {
         let (protocol, storage, observed) = bucket(true).await?;
         let request = request(
@@ -82,10 +76,9 @@ async fn observed_version_is_pinned_for_streaming_and_native_copy() -> TestResul
             &s3::connect(
                 protocol.clone(),
                 endpoint_of(&protocol),
-                Some(native_context()),
+                native.then(native_context),
             )?,
-        )?
-        .with_payload_shaping(shaping);
+        )?;
         assert_eq!(request.source_version(), &SourceVersion::Id("v2".into()));
         let expected_identity = TransferRequest::new(
             storage.clone(),
@@ -93,7 +86,7 @@ async fn observed_version_is_pinned_for_streaming_and_native_copy() -> TestResul
             s3::connect(
                 protocol.clone(),
                 endpoint_of(&protocol),
-                Some(native_context()),
+                native.then(native_context),
             )?,
             CancellationToken::new(),
         )

@@ -1,6 +1,6 @@
 use data_mover::transfer::{
-    EffectiveRecovery, PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, SourceQosStats,
-    SourceQosValueError, TransferFailure, TransferPolicy, TransferRoute,
+    EffectiveRecovery, SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError,
+    TransferFailure, TransferPolicy, TransferRoute,
 };
 
 #[allow(dead_code)]
@@ -42,10 +42,6 @@ fn transfer_failure_cleanup_contract_is_public() {
     ];
     assert_eq!(effective.len(), 5);
     assert_ne!(TransferRoute::Streaming, TransferRoute::Native);
-    assert_eq!(
-        PayloadShapingPolicy::default(),
-        PayloadShapingPolicy::AllowUnshapedNative
-    );
     let policy: Result<SourceQosPolicy, SourceQosValueError> =
         SourceQosPolicy::new(None, 64 * 1024, None);
     assert!(policy.map(SourceQosGroup::new).is_ok());

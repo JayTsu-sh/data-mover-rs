@@ -9,8 +9,7 @@ use data_mover::storage::{
     SourceDescriptor, Storage, VerifyRequest, connect_backend,
 };
 use data_mover::transfer::{
-    PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferRequest,
-    transfer,
+    SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferRequest, transfer,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -41,7 +40,7 @@ async fn standard_s3_architecture_roles_stage_publish_and_read_back() -> TestRes
     let (storage, stage) = stage_with_reconnect(&url, &path, &identity, &payload).await?;
     verify_publish_and_metadata(&storage, &stage, &path, &payload, true).await?;
     verify_range_and_cancellation(&storage, &path, &payload).await?;
-    verify_native_and_shaped_fallback(&url, &storage, &path, &payload).await?;
+    verify_native_route(&url, &storage, &path, &payload).await?;
     verify_stale_upload_restart(&url, &path, &identity, payload.len()).await
 }
 
@@ -55,11 +54,11 @@ async fn dxn_s3_architecture_roles_and_known_limits() -> TestResult {
     let (storage, stage) = stage_with_reconnect(&url, &path, &identity, &payload).await?;
     verify_publish_and_metadata(&storage, &stage, &path, &payload, false).await?;
     verify_range_and_cancellation(&storage, &path, &payload).await?;
-    verify_native_and_shaped_fallback(&url, &storage, &path, &payload).await?;
+    verify_native_route(&url, &storage, &path, &payload).await?;
     verify_stale_upload_restart(&url, &path, &identity, payload.len()).await
 }
 
-async fn verify_native_and_shaped_fallback(
+async fn verify_native_route(
     url: &str,
     storage: &Storage,
     source: &StoragePath,
@@ -85,12 +84,6 @@ async fn verify_native_and_shaped_fallback(
     );
     assert!(!native.source_qos.native_payload_shaped);
 
-    let shaped = transfer(
-        transfer_request(storage, &destination, source, "shaped")?
-            .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped),
-    )
-    .await?;
-    assert_eq!(shaped.source_qos.native_requests, 0);
     Ok(())
 }
 

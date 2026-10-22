@@ -3,9 +3,7 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use data_mover::model::StoragePath;
-use data_mover::transfer::{
-    PayloadShapingPolicy, ReadBackVerification, TransferPolicy, TransferRequest, transfer,
-};
+use data_mover::transfer::{ReadBackVerification, TransferPolicy, TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
 
 #[allow(dead_code)]
@@ -57,7 +55,6 @@ async fn main() -> Result {
         destination.clone(),
         CancellationToken::new(),
     )
-    .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped)
     .with_read_back_verification(ReadBackVerification::Disabled)
     .with_transfer_policy(match args.policy {
         Policy::AtomicReplace => TransferPolicy::AtomicReplace,

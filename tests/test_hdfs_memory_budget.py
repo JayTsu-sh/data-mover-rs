@@ -1,4 +1,6 @@
 import csv
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,6 +80,61 @@ class HdfsMemoryTraceTests(_TraceFixture):
 
 
 class HdfsMemoryBudgetTests(_TraceFixture):
+    def test_runtime_workers_are_bound_to_the_memory_profile(self) -> None:
+        for workers in (None, "", "0", "24"):
+            with self.subTest(workers=workers):
+                path = self._csv([(262_144, 70_000), (2_097_152, 75_000)])
+                with path.open(newline="") as stream:
+                    rows = list(csv.DictReader(stream))
+                for row in rows:
+                    if workers is None:
+                        row.pop("runtime_workers", None)
+                    else:
+                        row["runtime_workers"] = workers
+                with path.open("w", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
+                    writer.writeheader()
+                    writer.writerows(rows)
+                with self.assertRaisesRegex(ValueError, "runtime workers"):
+                    validate(path)
+
+    def test_measured_child_overrides_inherited_runtime_workers(self) -> None:
+        runner = (Path(__file__).parent / "lab/run-hdfs-memory-e2e.sh").read_text()
+        start = runner.index("run_case() {")
+        end = runner.index("\n}", start) + 2
+        with tempfile.TemporaryDirectory(prefix="hdfs-memory-workers-") as directory:
+            root = Path(directory)
+            child = root / "copy"
+            child.write_text(
+                "#!/usr/bin/env python3\nimport os\n"
+                "assert os.environ['TOKIO_WORKER_THREADS'] == '4'\n"
+                "assert os.environ['DATA_MOVER_READ_INFLIGHT'] == '8'\n"
+                "assert os.environ['DATA_MOVER_WRITE_INFLIGHT'] == '16'\n"
+            )
+            child.chmod(0o755)
+            script = r'''set -euo pipefail
+run_id=unit-test commit=0000000000000000000000000000000000000000
+runtime_workers=4
+source_root="$ROOT" destination_root="$ROOT" LAB_HDFS_RUN_ROOT=hdfs://test/run
+output="$ROOT/output" trace_output="$ROOT/trace"
+binary="$ROOT/copy" inspector=inspect_probe
+inspect_probe() { printf '1024\tdigest\n'; }
+'''
+            script += runner[start:end] + "\nrun_case baseline high hdfs-hdfs small 1024 8 16\n"
+            result = subprocess.run(
+                ["bash", "-c", script], cwd=Path(__file__).resolve().parents[1],
+                env={**os.environ, "ROOT": directory, "TMPDIR": directory,
+                     "TOKIO_WORKER_THREADS": "24"},
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Parse using the actual CSV header emitted by the runner.
+            header = next(line.split("'")[1] for line in runner.splitlines()
+                          if "run_id,commit,sample_set" in line)
+            row = next(csv.DictReader([header, (root / "output").read_text().strip()]))
+            self.assertEqual(row["runtime_workers"], "4")
+            self.assertEqual((row["read_inflight"], row["write_inflight"]), ("8", "16"))
+
     def test_real_runner_wires_the_exact_scale_pair(self) -> None:
         runner = (Path(__file__).parent / "lab" / "run-hdfs-memory-e2e.sh").read_text()
         self.assertIn("scale_small_size=$((1024 * 1024 * 1024 + 137))", runner)
@@ -244,6 +301,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
                     "run_id", "commit", "profile", "sample_set", "direction",
                     "bytes", "max_rss_kib", "budget_mib", "file_concurrency",
                     "chunk_mib", "read_inflight", "write_inflight",
+                    "runtime_workers",
                 ],
             )
             for profile, (read, write, budget) in profiles.items():
@@ -256,6 +314,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
                             "max_rss_kib": 70_000, "budget_mib": budget,
                             "file_concurrency": 1, "chunk_mib": 2,
                             "read_inflight": read, "write_inflight": write,
+                            "runtime_workers": 4,
                         })
 
     def _csv(
@@ -286,6 +345,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
                 "chunk_mib",
                 "read_inflight",
                 "write_inflight",
+                "runtime_workers",
             ],
         )
         writer.writeheader()
@@ -304,6 +364,7 @@ class HdfsMemoryBudgetTests(_TraceFixture):
                     "chunk_mib": 2,
                     "read_inflight": read,
                     "write_inflight": write,
+                    "runtime_workers": 4,
                 }
             )
         temporary.close()

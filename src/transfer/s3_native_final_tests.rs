@@ -12,12 +12,11 @@ use tokio_util::sync::CancellationToken;
 use crate::model::{FailureClass, StoragePath, Transience};
 use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, source_storage};
 use crate::storage::backends::s3::{
-    S3Protocol as _, S3ProtocolFailure, connect_native_at_destination,
+    S3Protocol as _, S3ProtocolFailure, connect_at_destination, connect_native_at_destination,
 };
 use crate::storage::{PrepareFact, RestartReason, Storage};
 use crate::transfer::{
-    EffectiveRecovery, PayloadShapingPolicy, TransferPolicy, TransferRequest, TransferRoute,
-    transfer,
+    EffectiveRecovery, TransferPolicy, TransferRequest, TransferRoute, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -80,10 +79,12 @@ fn native(protocol: &Arc<MemoryS3>, final_key: &str) -> TestResult<TransferReque
 }
 
 fn streamed(protocol: &Arc<MemoryS3>, final_key: &str) -> TestResult<TransferRequest> {
-    Ok(
-        native(protocol, final_key)?
-            .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped),
-    )
+    Ok(TransferRequest::new(
+        source_storage(protocol, "source")?,
+        StoragePath::new(final_key)?,
+        connect_at_destination(protocol.clone(), endpoint_of(protocol), INTERVAL as u64)?,
+        CancellationToken::new(),
+    ))
 }
 
 /// Nothing but sources and final objects: no pointer, no temp key, no upload on `final_key`.
@@ -372,17 +373,14 @@ async fn a_native_copy_cleans_up_what_it_cannot_resume() -> TestResult {
             "key",
         )
         .await;
-        let leftover = request_with(
-            &protocol,
-            ("big", "key"),
-            TransferPolicy::Checkpointed,
+        let streamed_leftover = TransferRequest::new(
+            source_storage(&protocol, "big")?,
+            StoragePath::new("key")?,
+            connect_at_destination(protocol.clone(), endpoint_of(&protocol), INTERVAL as u64)?,
             CancellationToken::new(),
-        )?;
-        cut_at_part_three(
-            &protocol,
-            leftover.with_payload_shaping(PayloadShapingPolicy::RequireClientShaped),
         )
-        .await?;
+        .with_transfer_policy(TransferPolicy::Checkpointed);
+        cut_at_part_three(&protocol, streamed_leftover).await?;
         let request = request_with(&protocol, (source, "key"), policy, CancellationToken::new())?;
         let outcome = transfer(request).await?;
         assert_eq!(outcome.route, TransferRoute::Native, "{source}");

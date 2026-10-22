@@ -8,8 +8,8 @@ use crate::storage::PrepareFact;
 use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context, source_storage};
 use crate::storage::backends::s3::{S3NativeContext, S3Protocol as _, S3ProtocolFailure, connect};
 use crate::transfer::{
-    EffectiveRecovery, PayloadShapingPolicy, ReadBackVerification, SourceQosGroup, SourceQosPolicy,
-    TransferIdentity, TransferPolicy, TransferRequest, TransferRoute, transfer,
+    EffectiveRecovery, ReadBackVerification, SourceQosGroup, SourceQosPolicy, TransferIdentity,
+    TransferPolicy, TransferRequest, TransferRoute, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -156,7 +156,7 @@ async fn native_copy_never_enables_streaming_recovery() -> TestResult {
 }
 
 #[tokio::test]
-async fn strict_shaping_falls_back_before_native_mutation() -> TestResult {
+async fn a_pair_without_native_affinity_streams_before_native_mutation() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     protocol
         .objects
@@ -164,16 +164,8 @@ async fn strict_shaping_falls_back_before_native_mutation() -> TestResult {
         .await
         .insert("src/final".into(), Bytes::from_static(b"stream me"));
     let source = source_storage(&protocol, "src")?;
-    let destination = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
-    let outcome = transfer(
-        request(source, destination)?
-            .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped),
-    )
-    .await?;
+    let destination = connect(protocol.clone(), endpoint_of(&protocol), None)?;
+    let outcome = transfer(request(source, destination)?).await?;
 
     assert_eq!(outcome.source_qos.native_bytes, 0);
     assert_eq!(*protocol.native_copies.lock().await, 0);
