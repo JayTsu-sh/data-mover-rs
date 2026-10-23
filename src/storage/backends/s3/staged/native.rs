@@ -27,10 +27,11 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         cancel: CancellationToken,
     ) -> Result<NativeStageEvidence, NativeStageFailure> {
         match self.fill_native_stage(stage, &source, &cancel).await {
-            // A resumed upload already held `write_offset` bytes; `bytes` is what this copy added.
+            // `bytes` counts only this attempt's copies. Recovered islands also belong to the
+            // complete staged object, beyond the contiguous `write_offset` prefix.
             Ok(copy) => Ok(NativeStageEvidence {
                 write: WriteEvidence {
-                    persisted_bytes: stage.write_offset + copy.bytes,
+                    persisted_bytes: source.size,
                 },
                 native_bytes: copy.bytes,
                 native_requests: copy.requests,

@@ -1,4 +1,4 @@
-//! Positioned SMB writes; only acknowledged contiguous bytes can become recoverable.
+//! Positioned SMB writes; acknowledged ranges become recoverable after FLUSH.
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -31,6 +31,18 @@ impl Frontier {
             prefix,
             pending: BTreeMap::new(),
         }
+    }
+
+    fn recovered(stage: &PreparedStage) -> Self {
+        let mut value = Self::new(stage.write_offset);
+        value.pending.extend(
+            stage
+                .checkpoint_ranges()
+                .into_iter()
+                .filter(|range| range.start >= value.prefix && range.end > value.prefix)
+                .map(|range| (range.start, range.end)),
+        );
+        value
     }
 
     fn insert(&mut self, start: u64, length: usize) -> Result<(), ()> {
@@ -136,8 +148,8 @@ impl<'a> Writer<'a> {
             stage,
             file,
             maximum,
-            received: Frontier::new(stage.write_offset),
-            completed: Frontier::new(stage.write_offset),
+            received: Frontier::recovered(stage),
+            completed: Frontier::recovered(stage),
             writes: FuturesUnordered::new(),
             pending: None,
             done: false,
@@ -181,11 +193,13 @@ impl<'a> Writer<'a> {
 
     fn accept_write(&mut self, offset: u64, length: usize, result: smb_domain::Result<()>) {
         let error = match result {
-            Ok(()) => self
-                .completed
-                .insert(offset, length)
-                .err()
-                .map(|()| self.invalid()),
+            Ok(()) => {
+                self.stage.confirmed_write(offset, length as u64);
+                self.completed
+                    .insert(offset, length)
+                    .err()
+                    .map(|()| self.invalid())
+            }
             Err(error) => Some(classify(
                 self.stage.final_destination.path(),
                 Operation::Write,
@@ -265,16 +279,8 @@ impl<'a> Writer<'a> {
 
     async fn finish(mut self) -> Result<u64, StorageRoleFailure> {
         // Preserve the original input failure, but await every issued write before closing.
-        while let Some((_, _, result)) = self.writes.next().await {
-            if let Err(error) = result {
-                self.failure.get_or_insert_with(|| {
-                    classify(
-                        self.stage.final_destination.path(),
-                        Operation::Write,
-                        &error,
-                    )
-                });
-            }
+        while let Some((offset, length, result)) = self.writes.next().await {
+            self.accept_write(offset, length, result);
         }
         if let Some(error) = self.failure.take() {
             return Err(error);
@@ -294,6 +300,7 @@ impl<'a> Writer<'a> {
                     &error,
                 )
             })?;
+            super::at_destination::checkpoint_barrier(self.stage, self.completed.prefix).await?;
         }
         if self.stage.recovery_enabled() {
             write_pointer(self.adapter, self.stage, self.completed.prefix, false).await?;

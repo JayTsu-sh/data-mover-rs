@@ -31,7 +31,8 @@ use crate::model::{EntryKind, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::artifacts::{
     ArtifactKind, artifact_temporary_name, is_artifact_path, sibling_artifact,
 };
-use crate::storage::discovery::{DestinationArtifacts, discover};
+use crate::storage::checkpoint::CheckpointPhase;
+use crate::storage::discovery::{DestinationArtifacts, ResumePoint, discover};
 use crate::storage::pointer::{DestinationPointer, MAX_POINTER_BYTES};
 use crate::storage::{
     DestinationPrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
@@ -256,7 +257,41 @@ impl DestinationArtifacts for HdfsArtifacts<'_> {
         Ok(facts.size)
     }
 
+    async fn observe_final(
+        &self,
+        final_path: &StoragePath,
+    ) -> Result<Option<u64>, StorageRoleFailure> {
+        if !self.request.checkpoint_hash {
+            return Ok(None);
+        }
+        match self.protocol.stat(final_path).await {
+            Ok(facts) if facts.kind == EntryKind::File => Ok(facts.size),
+            Ok(_) => Err(failure(
+                final_path,
+                Operation::Prepare,
+                FailureClass::Conflict,
+            )),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn remove_pointer(&self, _final_path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        let hash_pointer = self
+            .found_pointer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            .and_then(|bytes| DestinationPointer::decode(bytes).ok())
+            .is_some_and(|pointer| pointer.checkpoint.is_some());
+        if self.request.resume == ResumeMode::Discover && hash_pointer {
+            // An incompatible hash root needs an explicit restart, never legacy cleanup.
+            return Err(failure(
+                self.request.prepare.final_destination.path(),
+                Operation::Prepare,
+                FailureClass::Unsupported,
+            ));
+        }
         delete_if_present(self.protocol, &self.pointer).await?;
         delete_if_present(self.protocol, &self.pointer_temporary).await
     }
@@ -311,10 +346,70 @@ pub(super) async fn prepare(
     let Some(point) = found.resume else {
         return start(adapter, stage, &artifacts.stage, request.recoverable).await;
     };
-    restore_owner_write(&*adapter.protocol, &artifacts.stage).await?;
-    write_pointer(adapter, &stage, point.prefix, true).await?;
+    resume(adapter, stage, &artifacts.stage, point, expected_size).await
+}
+
+async fn resume(
+    adapter: &HdfsStagedDestination,
+    mut stage: PreparedStage,
+    path: &StoragePath,
+    point: ResumePoint,
+    expected_size: u64,
+) -> Result<PreparedStage, StorageRoleFailure> {
+    let final_path = stage.final_destination.path().clone();
+    // Restore H before takeover replaces the only durable copy of its intent. Lease recovery
+    // proves an ordered prefix, including a possible tail beyond the old pointer's D; the
+    // engine validates that saved H covers that tail before allowing further writes.
+    restore_checkpoint(
+        &stage,
+        point.pointer.checkpoint,
+        point.prefix,
+        expected_size,
+    )?;
     stage.write_offset = point.prefix;
+    if point.published {
+        let checkpoint = stage
+            .restored_checkpoint()
+            .ok_or_else(|| failure(&final_path, Operation::Prepare, FailureClass::Corruption))?;
+        stage.enable_checkpoint(checkpoint.size, checkpoint.hash);
+        stage.checkpoint_set_phase(CheckpointPhase::Published);
+        stage.recovered_publication = Some(PublicationEvidence {
+            final_destination: final_path,
+            disposition: PublicationDisposition::Published,
+            version: None,
+        });
+    } else {
+        restore_owner_write(&*adapter.protocol, path).await?;
+    }
+    write_pointer(adapter, &stage, point.prefix, true).await?;
     Ok(stage)
+}
+
+fn restore_checkpoint(
+    stage: &PreparedStage,
+    encoded: Option<Bytes>,
+    prefix: u64,
+    expected_size: u64,
+) -> Result<(), StorageRoleFailure> {
+    let final_path = stage.final_destination.path();
+    let invalid = || failure(final_path, Operation::Prepare, FailureClass::Corruption);
+    stage.restore_checkpoint(encoded).map_err(|_| invalid())?;
+    if let Some(mut checkpoint) = stage.restored_checkpoint() {
+        if checkpoint.size != expected_size {
+            return Err(invalid());
+        }
+        // Restore stays unarmed until the ordinary engine opts in. Record lease-recovered D
+        // without arming expert callers, and retain H across the nonce rewrite below.
+        checkpoint.ranges = if prefix == 0 {
+            Vec::new()
+        } else {
+            std::iter::once(0..prefix).collect()
+        };
+        stage
+            .restore_checkpoint(Some(checkpoint.encode()))
+            .map_err(|_| invalid())?;
+    }
+    Ok(())
 }
 
 /// Metadata applied before a crash may have taken the owner's write permission; it is given back
@@ -401,16 +496,46 @@ pub(super) async fn write_pointer(
     prefix: u64,
     take_over: bool,
 ) -> Result<(), StorageRoleFailure> {
+    let _checkpoint = stage.checkpoint_guard().await;
+    save_pointer(adapter, stage, prefix, take_over).await
+}
+
+/// Promotes an append prefix only after the caller has proved its hsync/close barrier. The
+/// promotion and snapshot share the stage gate with hash-only persistence.
+pub(super) async fn record_checkpoint(
+    adapter: &HdfsStagedDestination,
+    stage: &PreparedStage,
+    prefix: u64,
+) -> Result<(), StorageRoleFailure> {
+    let _checkpoint = stage.checkpoint_guard().await;
+    stage.checkpoint_confirmed_prefix(prefix);
+    save_pointer(adapter, stage, prefix, false).await
+}
+
+async fn save_pointer(
+    adapter: &HdfsStagedDestination,
+    stage: &PreparedStage,
+    prefix: u64,
+    take_over: bool,
+) -> Result<(), StorageRoleFailure> {
     let final_path = stage.final_destination.path();
     if !take_over && !still_ours(adapter, stage).await? {
         return Err(taken_over(final_path, Operation::Write));
     }
     let fence = fence(stage)?;
+    let checkpoint = stage.checkpoint_snapshot();
+    let private = checkpoint.is_some();
+    let prefix = if checkpoint.is_some() {
+        stage.checkpoint_prefix()
+    } else {
+        prefix
+    };
     let bytes = DestinationPointer {
         binding: stage.recovery_binding,
         transfer_identity: fence.transfer_identity,
         durable_prefix: Some(prefix),
         extension: fence.extension(),
+        checkpoint,
     }
     .encode()
     .map_err(|_| failure(final_path, Operation::Write, FailureClass::Internal))?;
@@ -418,7 +543,9 @@ pub(super) async fn write_pointer(
     let temporary = artifact_path(final_path, ArtifactKind::Pointer, true)?;
     let protocol = &*adapter.protocol;
     delete_if_present(protocol, &temporary).await?;
-    if let Err(error) = write_temporary(protocol, &temporary, Bytes::from(bytes.clone())).await {
+    if let Err(error) =
+        write_temporary(protocol, &temporary, Bytes::from(bytes.clone()), private).await
+    {
         let _ = protocol.delete(&temporary, EntryKind::File).await;
         return Err(error);
     }
@@ -441,11 +568,14 @@ async fn write_temporary(
     protocol: &dyn HdfsProtocol,
     path: &StoragePath,
     bytes: Bytes,
+    private: bool,
 ) -> Result<(), StorageRoleFailure> {
-    protocol
-        .create_empty_stage_exclusive(path)
-        .await
-        .map_err(|error| transient_collision(path, error))?;
+    let created = if private {
+        protocol.create_private_checkpoint_exclusive(path).await
+    } else {
+        protocol.create_empty_stage_exclusive(path).await
+    };
+    created.map_err(|error| transient_collision(path, error))?;
     let mut writer = protocol.open_stage_writer(path, 0, false).await?;
     let length = bytes.len();
     let written = writer.write(bytes).await;
@@ -456,7 +586,8 @@ async fn write_temporary(
     closed
 }
 
-/// The durable prefix of this stage: its length, once the pointer is confirmed still its own.
+/// The durable prefix of this stage once its pointer is fenced. Armed transfers expose only
+/// barrier/lease-recovery evidence; a visible append tail is not promoted during observation.
 pub(super) async fn reobserve(
     adapter: &HdfsStagedDestination,
     stage: &PreparedStage,
@@ -468,7 +599,21 @@ pub(super) async fn reobserve(
     }
     let facts = adapter.protocol.stat(path).await?;
     match (facts.kind, facts.size) {
-        (EntryKind::File, Some(size)) => Ok(size),
+        (EntryKind::File, Some(size)) => {
+            if stage.checkpoint_enabled() {
+                let prefix = stage.checkpoint_prefix();
+                if size < prefix {
+                    return Err(failure(
+                        final_path,
+                        Operation::Observe,
+                        FailureClass::Corruption,
+                    ));
+                }
+                Ok(prefix)
+            } else {
+                Ok(size)
+            }
+        }
         _ => Err(failure(
             final_path,
             Operation::Observe,
@@ -495,12 +640,23 @@ pub(super) async fn publish(
     {
         return Err(publication_may_have_changed(error));
     }
-    remove_pointer(adapter, stage)
-        .await
-        .map_err(|error| PublicationFailure {
-            error,
-            final_destination_changed: true,
-        })?;
+    if stage.checkpoint_enabled() {
+        let _checkpoint = stage.checkpoint_guard().await;
+        stage.checkpoint_set_phase(CheckpointPhase::Published);
+        save_pointer(adapter, stage, stage.checkpoint_prefix(), false)
+            .await
+            .map_err(|error| PublicationFailure {
+                error,
+                final_destination_changed: true,
+            })?;
+    } else {
+        remove_pointer(adapter, stage)
+            .await
+            .map_err(|error| PublicationFailure {
+                error,
+                final_destination_changed: true,
+            })?;
+    }
     Ok(PublicationEvidence {
         final_destination: final_path.clone(),
         disposition: PublicationDisposition::Published,
@@ -569,12 +725,46 @@ pub(super) async fn remove_pointer(
     Ok(())
 }
 
+/// Releases transient hash evidence after publication/verification. A missing pointer makes a
+/// retried release a no-op, while a new owner's pointer must remain untouched.
+pub(super) async fn release_checkpoint(
+    adapter: &HdfsStagedDestination,
+    stage: &PreparedStage,
+) -> Result<(), StorageRoleFailure> {
+    let _checkpoint = stage.checkpoint_guard().await;
+    let path = artifact_path(stage.final_destination.path(), ArtifactKind::Pointer, false)?;
+    if read_regular(&*adapter.protocol, &path, MAX_POINTER_BYTES + 1)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+    if !still_ours(adapter, stage).await? {
+        return Err(taken_over(
+            stage.final_destination.path(),
+            Operation::Publish,
+        ));
+    }
+    if stage.checkpoint_phase() != CheckpointPhase::Published {
+        return Err(taken_over(
+            stage.final_destination.path(),
+            Operation::Publish,
+        ));
+    }
+    remove_pointer(adapter, stage).await
+}
+
 /// Removes the stage and its pointer, the pointer first. A stage another writer took over is left
 /// alone: its names are that writer's now.
 pub(super) async fn discard(
     adapter: &HdfsStagedDestination,
     stage: &PreparedStage,
 ) -> Result<(), StorageRoleFailure> {
+    let _checkpoint = stage.checkpoint_guard().await;
+    if stage.recovered_publication.is_some() {
+        // An unsuccessful final verification must retain the source root for another attempt.
+        return Ok(());
+    }
     let path = artifact_path(stage.final_destination.path(), ArtifactKind::Stage, false)?;
     if still_ours(adapter, stage).await? {
         remove_pointer(adapter, stage).await?;

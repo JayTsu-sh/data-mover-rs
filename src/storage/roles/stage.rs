@@ -7,6 +7,8 @@ use bytes::Bytes;
 use super::FinalDestination;
 use crate::storage::PrepareFact;
 
+mod checkpoint;
+
 /// Opaque linear prepared destination state bound to one backend and final destination.
 pub struct PreparedStage {
     pub(crate) owner: crate::model::BackendIdentity,
@@ -30,6 +32,12 @@ pub struct PreparedStage {
     /// An exclusivity lease held for as long as the stage lives (the engine's per-key guard).
     pub(crate) exclusive: Option<Box<dyn std::any::Any + Send + Sync>>,
     pub(crate) write_observer: Option<crate::storage::WriteProgressObserver>,
+    pub(crate) checkpoint: std::sync::Mutex<crate::storage::checkpoint::StageCheckpoint>,
+    pub(crate) checkpoint_io: tokio::sync::Mutex<()>,
+    pub(crate) checkpoint_window: std::sync::atomic::AtomicUsize,
+    pub(crate) checkpoint_active: std::sync::atomic::AtomicBool,
+    /// A retained hash-ready root reconciled against the final name after publication.
+    pub(crate) recovered_publication: Option<super::PublicationEvidence>,
 }
 
 #[allow(dead_code)]
@@ -62,6 +70,11 @@ impl PreparedStage {
             at_destination: false,
             exclusive: None,
             write_observer: None,
+            checkpoint: std::sync::Mutex::default(),
+            checkpoint_io: tokio::sync::Mutex::new(()),
+            checkpoint_window: std::sync::atomic::AtomicUsize::new(32 * 1024 * 1024),
+            checkpoint_active: std::sync::atomic::AtomicBool::new(false),
+            recovered_publication: None,
         }
     }
 
@@ -73,6 +86,7 @@ impl PreparedStage {
     }
 
     pub(crate) fn confirmed_write(&self, offset: u64, bytes: u64) {
+        self.checkpoint_confirmed(offset, bytes);
         if let Some(observer) = &self.write_observer {
             observer.confirmed(offset, bytes);
         }
@@ -144,7 +158,7 @@ impl fmt::Debug for PreparedStage {
             .field("at_destination", &self.at_destination)
             .field("exclusive", &self.exclusive.is_some())
             .field("write_observer", &self.write_observer.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

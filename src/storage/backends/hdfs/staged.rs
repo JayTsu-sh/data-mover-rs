@@ -123,10 +123,86 @@ impl HdfsStagedDestination {
         }
         Ok(path)
     }
+
+    async fn verification_path(
+        &self,
+        stage: &PreparedStage,
+        request: &VerifyRequest,
+    ) -> Result<StoragePath, StorageRoleFailure> {
+        let part = self.part(stage)?;
+        let Some(publication) = request
+            .published
+            .as_ref()
+            .or(stage.recovered_publication.as_ref())
+        else {
+            return Ok(part);
+        };
+        if publication.final_destination != *stage.final_destination.path() {
+            return Err(failure(
+                stage.final_destination.path(),
+                Operation::Verify,
+                FailureClass::Conflict,
+            ));
+        }
+        self.check_final_size(stage, request.expected_size).await?;
+        Ok(stage.final_destination.path().clone())
+    }
+
+    async fn check_final_size(
+        &self,
+        stage: &PreparedStage,
+        expected_size: u64,
+    ) -> Result<(), StorageRoleFailure> {
+        let path = stage.final_destination.path();
+        let facts = self.protocol.stat(path).await?;
+        if facts.kind != EntryKind::File || facts.size != Some(expected_size) {
+            return Err(failure(path, Operation::Verify, FailureClass::Corruption));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl StagedDestination for HdfsStagedDestination {
+    fn supports_hash_checkpoint(&self) -> bool {
+        true
+    }
+
+    fn requires_hash_intent(&self) -> bool {
+        true
+    }
+
+    async fn persist_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        self.part(stage)?;
+        if !resident(stage) || !stage.checkpoint_enabled() {
+            return Err(failure(
+                stage.final_destination.path(),
+                Operation::Write,
+                FailureClass::Unsupported,
+            ));
+        }
+        // H may run ahead of D. Saving intent must not adopt buffered/acknowledged data.
+        super::at_destination::write_pointer(self, stage, stage.checkpoint_prefix(), false).await?;
+        stage
+            .recovery_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    async fn release_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        self.part(stage)?;
+        if stage.checkpoint_enabled() {
+            super::at_destination::release_checkpoint(self, stage).await?;
+        }
+        Ok(())
+    }
+
     fn supports_direct(&self) -> bool {
         true
     }
@@ -212,7 +288,9 @@ impl StagedDestination for HdfsStagedDestination {
         stage: &PreparedStage,
     ) -> Result<CheckpointObservation, StorageRoleFailure> {
         let part = self.part(stage)?;
-        let durable_prefix = if resident(stage) {
+        let durable_prefix = if stage.recovered_publication.is_some() {
+            super::at_destination::reobserve(self, stage, stage.final_destination.path()).await?
+        } else if resident(stage) {
             super::at_destination::reobserve(self, stage, &part).await?
         } else {
             direct_length(self, stage, &part).await?
@@ -225,7 +303,7 @@ impl StagedDestination for HdfsStagedDestination {
         stage: &PreparedStage,
         request: VerifyRequest,
     ) -> Result<VerificationEvidence, StorageRoleFailure> {
-        let part = self.part(stage)?;
+        let part = self.verification_path(stage, &request).await?;
         let digest = hash_file(
             &*self.protocol,
             &part,
@@ -241,6 +319,9 @@ impl StagedDestination for HdfsStagedDestination {
                 FailureClass::Corruption,
             ));
         }
+        if request.published.is_some() || stage.recovered_publication.is_some() {
+            self.check_final_size(stage, request.expected_size).await?;
+        }
         Ok(VerificationEvidence {
             verified_bytes: request.expected_size,
             blake3: digest,
@@ -254,6 +335,17 @@ impl StagedDestination for HdfsStagedDestination {
         cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
         let path = self.part(stage)?;
+        if stage.recovered_publication.is_some() {
+            // ReadyToPublish is persisted after metadata succeeds; never mutate a recovered final.
+            return if cancel.is_cancelled() {
+                Err(cancelled(
+                    stage.final_destination.path(),
+                    Operation::Metadata,
+                ))
+            } else {
+                Ok(())
+            };
+        }
         let metadata = self.metadata.as_ref().ok_or_else(|| {
             failure(
                 stage.final_destination.path(),
@@ -356,6 +448,12 @@ async fn publish(
         )));
     }
     let part = adapter.part(stage).map_err(publication_failure)?;
+    if let Some(publication) = &stage.recovered_publication {
+        super::at_destination::before_publication(adapter, stage)
+            .await
+            .map_err(publication_failure)?;
+        return Ok(publication.clone());
+    }
     if resident(stage) {
         return super::at_destination::publish(adapter, stage, &part, &request).await;
     }

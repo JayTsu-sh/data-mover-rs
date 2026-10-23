@@ -126,6 +126,7 @@ impl MemoryDestination {
             transfer_identity: identity,
             durable_prefix: Some(prefix),
             extension: Bytes::new(),
+            checkpoint: None,
         };
         if let (Ok(path), Ok(bytes)) = (
             Self::artifact(final_path, ArtifactKind::Pointer),

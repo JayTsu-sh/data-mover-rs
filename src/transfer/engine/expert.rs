@@ -530,6 +530,7 @@ async fn prepare_destination_stage(
         identity: request.identity,
         resumable: request.transfer_policy == TransferPolicy::Checkpointed && recovery_enabled,
         recoverable: recovery_enabled,
+        checkpoint_hash: false,
         cancel: request.cancel.clone(),
     };
     let prepare = PrepareRequest {

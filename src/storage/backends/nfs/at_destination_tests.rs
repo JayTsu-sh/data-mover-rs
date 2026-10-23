@@ -11,6 +11,9 @@ use crate::storage::{
     SourceDescriptor, StagedDestination,
 };
 
+#[path = "hash_checkpoint_tests.rs"]
+mod hash_checkpoint_tests;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const IDENTITY: [u8; 32] = [4; 32];

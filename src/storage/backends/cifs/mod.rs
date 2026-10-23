@@ -1,6 +1,7 @@
 //! CIFS adapter facade.
 
 mod at_destination;
+mod checkpoint_acl;
 mod connection;
 mod directory;
 mod listing;

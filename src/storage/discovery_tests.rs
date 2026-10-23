@@ -41,6 +41,7 @@ fn pointer(binding: [u8; 32], identity: [u8; 32], prefix: Option<u64>) -> Destin
         transfer_identity: identity,
         durable_prefix: prefix,
         extension: Bytes::new(),
+        checkpoint: None,
     }
 }
 
@@ -178,6 +179,7 @@ fn an_unknown_source_size_skips_the_beyond_source_row() -> TestResult {
 struct Memory {
     pointer: Mutex<Option<Vec<u8>>>,
     stage: Mutex<Option<u64>>,
+    final_size: Option<u64>,
     removed: Mutex<Vec<&'static str>>,
     fail_stage_removal: bool,
     /// Refuses a pointer without a durable prefix, as a backend that only confirms its stage does.
@@ -186,6 +188,9 @@ struct Memory {
 
 #[async_trait]
 impl DestinationArtifacts for Memory {
+    async fn observe_final(&self, _path: &StoragePath) -> Result<Option<u64>, StorageRoleFailure> {
+        Ok(self.final_size)
+    }
     async fn read_pointer(
         &self,
         _final_path: &StoragePath,
@@ -257,6 +262,172 @@ fn memory(pointer: Option<Vec<u8>>, stage: Option<u64>) -> Memory {
     }
 }
 
+fn hash_pointer(phase: CheckpointPhase) -> Result<DestinationPointer, Box<dyn std::error::Error>> {
+    let mut hash = RangeHash::new(SOURCE_SIZE);
+    hash.observe(0, &vec![42; usize::try_from(SOURCE_SIZE)?])?;
+    let data = CheckpointData {
+        size: SOURCE_SIZE,
+        phase,
+        hash: Bytes::from(hash.encode()?),
+        ranges: std::iter::once(0..SOURCE_SIZE).collect(),
+        ..CheckpointData::default()
+    };
+    Ok(DestinationPointer {
+        checkpoint: Some(data.encode()),
+        ..pointer(BINDING, IDENTITY, Some(SOURCE_SIZE))
+    })
+}
+
+#[tokio::test]
+async fn published_hash_root_is_reconciled_without_legacy_cleanup() -> TestResult {
+    for phase in [CheckpointPhase::ReadyToPublish, CheckpointPhase::Published] {
+        let written = hash_pointer(phase)?;
+        let mut destination = memory(Some(written.encode().map_err(|_| "encode")?), None);
+        destination.final_size = Some(SOURCE_SIZE);
+        let found = discover(
+            &destination,
+            &request(ResumeMode::Discover)?.with_checkpoint_hash(true),
+        )
+        .await?;
+        assert_eq!(found.fact, PrepareFact::Resumed { bytes: SOURCE_SIZE });
+        assert!(found.resume.is_some_and(|point| point.published));
+        assert!(
+            destination
+                .removed
+                .lock()
+                .map_err(|_| "poisoned")?
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn hash_roots_fail_closed_on_interface_mismatch_or_missing_final() -> TestResult {
+    let written = hash_pointer(CheckpointPhase::ReadyToPublish)?;
+    for allowed in [false, true] {
+        let destination = memory(Some(written.encode().map_err(|_| "encode")?), None);
+        assert!(
+            discover(
+                &destination,
+                &request(ResumeMode::Discover)?.with_checkpoint_hash(allowed)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            destination
+                .removed
+                .lock()
+                .map_err(|_| "poisoned")?
+                .is_empty()
+        );
+    }
+    let corrupt = DestinationPointer {
+        checkpoint: Some(Bytes::from_static(b"not a hash checkpoint")),
+        ..written
+    };
+    let destination = memory(
+        Some(corrupt.encode().map_err(|_| "encode")?),
+        Some(SOURCE_SIZE),
+    );
+    assert!(
+        discover(
+            &destination,
+            &request(ResumeMode::Discover)?.with_checkpoint_hash(true)
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        destination
+            .removed
+            .lock()
+            .map_err(|_| "poisoned")?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_changed_v2_binding_requires_an_explicit_restart() -> TestResult {
+    for changed_identity in [false, true] {
+        let mut written = hash_pointer(CheckpointPhase::Receiving)?;
+        if changed_identity {
+            written.transfer_identity = [7; 32];
+        } else {
+            written.binding = [7; 32];
+        }
+        let destination = memory(
+            Some(written.encode().map_err(|_| "encode")?),
+            Some(SOURCE_SIZE),
+        );
+        let request = request(ResumeMode::Discover)?.with_checkpoint_hash(true);
+        assert!(discover(&destination, &request).await.is_err());
+        assert!(
+            destination
+                .removed
+                .lock()
+                .map_err(|_| "poisoned")?
+                .is_empty()
+        );
+        let restarted = discover(&destination, &request.with_resume(ResumeMode::Restart)).await?;
+        assert_eq!(
+            restarted.fact,
+            PrepareFact::Restarted {
+                reason: RestartReason::Requested
+            }
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn v2_reused_bytes_count_islands_without_moving_the_write_prefix() -> TestResult {
+    let mut written = hash_pointer(CheckpointPhase::Receiving)?;
+    let mut data = CheckpointData::decode(written.checkpoint.as_deref().ok_or("checkpoint")?)?;
+    data.ranges = vec![0..17, 31..72];
+    written.checkpoint = Some(data.encode());
+    written.durable_prefix = Some(17);
+    let destination = memory(Some(written.encode().map_err(|_| "encode")?), Some(72));
+    let found = discover(
+        &destination,
+        &request(ResumeMode::Discover)?.with_checkpoint_hash(true),
+    )
+    .await?;
+    assert_eq!(found.fact, PrepareFact::Resumed { bytes: 58 });
+    assert_eq!(found.resume.ok_or("resume")?.prefix, 17);
+    Ok(())
+}
+
+#[tokio::test]
+async fn hash_only_discovery_preserves_the_original_legacy_restart_decision() -> TestResult {
+    let legacy = pointer(BINDING, IDENTITY, Some(PREFIX));
+    let destination = memory(Some(legacy.encode().map_err(|_| "encode")?), Some(PREFIX));
+    let request = request(ResumeMode::Discover)?
+        .with_checkpoint_hash(true)
+        .with_legacy_restart(true);
+    let found = discover(&destination, &request).await?;
+    assert_eq!(
+        found.fact,
+        PrepareFact::Restarted {
+            reason: RestartReason::Requested
+        }
+    );
+    let v2 = hash_pointer(CheckpointPhase::Receiving)?;
+    let destination = memory(Some(v2.encode().map_err(|_| "encode")?), Some(SOURCE_SIZE));
+    let found = discover(&destination, &request).await?;
+    assert_eq!(found.fact, PrepareFact::Resumed { bytes: SOURCE_SIZE });
+    assert!(
+        destination
+            .removed
+            .lock()
+            .map_err(|_| "poisoned")?
+            .is_empty()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_equal_binding_resumes_from_the_recorded_prefix() -> TestResult {
     let written = pointer(BINDING, IDENTITY, Some(PREFIX));
@@ -270,7 +441,8 @@ async fn an_equal_binding_resumes_from_the_recorded_prefix() -> TestResult {
         found.resume,
         Some(ResumePoint {
             prefix: PREFIX,
-            pointer: written
+            pointer: written,
+            published: false,
         })
     );
     assert!(
@@ -296,7 +468,8 @@ async fn a_pointer_without_a_prefix_resumes_from_the_proven_stage() -> TestResul
         found.resume,
         Some(ResumePoint {
             prefix: PREFIX,
-            pointer: written
+            pointer: written,
+            published: false,
         })
     );
     Ok(())

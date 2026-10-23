@@ -408,6 +408,22 @@ const fn resource_kind(resource: &smb_domain::Resource) -> Option<EntryKind> {
 
 #[async_trait]
 impl CifsStagedProtocol for SmbDomainProtocol {
+    async fn protect_checkpoint(
+        &self,
+        pointer: &StoragePath,
+        payload: &StoragePath,
+    ) -> smb_domain::Result<()> {
+        super::checkpoint_acl::copy(self, pointer, payload).await
+    }
+    async fn open_read(&self, path: &StoragePath) -> smb_domain::Result<Box<dyn CifsStageFile>> {
+        let path = self.share_path(path)?;
+        let file = self
+            .share
+            .open_file(&path, smb_domain::FileOpenOptions::open_existing())
+            .await?;
+        Ok(Box::new(DomainStageFile { file }))
+    }
+
     async fn create_empty(&self, path: &StoragePath) -> smb_domain::Result<()> {
         let path = self.share_path(path)?;
         let file = self

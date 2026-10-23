@@ -3,10 +3,12 @@
 //! the `.upload` pointer object beside that key (see [`upload_pointer`](super::upload_pointer)).
 //!
 //! The pointer names the upload and carries no durable prefix: the parts `ListParts` reports are
-//! the durable record. A resume continues from their **contiguous prefix** — parts `1..=k`, each
+//! the durable record. A legacy resume continues from their **contiguous prefix** — parts `1..=k`, each
 //! exactly the pointer's part size, the last one shorter only when it ends exactly at the source's
 //! size. A gap is not corruption (parts finish out of order, so a process killed mid-write leaves
 //! some): the parts after it are uploaded again, and uploading a part number again replaces it.
+//! Hash checkpoints also adopt validated complete parts beyond gaps, bound to anchored source H
+//! and a compact fingerprint of previously committed part receipts.
 //!
 //! As on NFS, CIFS and HDFS, every prepare draws a nonce and records it in the pointer (a resume
 //! rewrites the pointer with its own); before it writes the pointer, completes the upload, or
@@ -38,7 +40,8 @@ use super::direct::is_composite;
 use super::final_upload::FinalUpload;
 pub(super) use super::final_upload::of;
 use super::parts::{PartTarget, PartsCheckpoint};
-use super::upload_discovery::{S3Artifacts, leftover_reason};
+use super::single_prepare::Leftover;
+use super::upload_discovery::S3Artifacts;
 use super::upload_pointer::{self, pointer_path};
 use super::{
     S3StagedDestination, cleanup_result, limits, metadata_unavailable, planned_part_size, single,
@@ -53,7 +56,7 @@ use crate::storage::{
 };
 
 /// Whether the pointer is still this stage's.
-enum Fence {
+pub(super) enum Fence {
     /// Present with our nonce (`pointer`), or — before we wrote one — absent.
     Ours {
         pointer: bool,
@@ -71,7 +74,7 @@ fn failure(path: &StoragePath, operation: Operation, class: FailureClass) -> Sto
     )
 }
 
-fn taken_over(path: &StoragePath, operation: Operation) -> StorageRoleFailure {
+pub(super) fn taken_over(path: &StoragePath, operation: Operation) -> StorageRoleFailure {
     // Another writer holds the upload now; retrying would take it back and forth.
     classified_entry(
         path,
@@ -149,7 +152,12 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         let single = self.single_put_size(&path, size)?;
         let pointer = pointer_path(&path)?;
         if let Some(size) = single {
-            let fact = self.clear_leftover(&request, &pointer).await?;
+            let fact = match self.clear_leftover(&request, &pointer).await? {
+                Leftover::Cleared(fact) => fact,
+                Leftover::Resume(found) => {
+                    return self.resume_single_upload(request, pointer, found).await;
+                }
+            };
             let previous = self.previous_object(&path).await?;
             let mut stage = self.prepare_single(request.prepare, size, previous);
             stage.mark_at_destination(fact);
@@ -160,7 +168,12 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             // a bucket without multipart uploads, §14.2): nothing to resume, and what an earlier
             // writer left is cleaned up as for a buffered one (nothing to look for where the bucket
             // keeps no progress).
-            let fact = self.clear_leftover(&request, &pointer).await?;
+            let fact = match self.clear_leftover(&request, &pointer).await? {
+                Leftover::Cleared(fact) => fact,
+                Leftover::Resume(found) => {
+                    return self.resume_single_upload(request, pointer, found).await;
+                }
+            };
             let mut stage = self.prepare_streaming(request.prepare, size, false).await?;
             stage.mark_at_destination(fact);
             return Ok(stage);
@@ -177,9 +190,21 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         part_size: usize,
         pointer: StoragePath,
     ) -> Result<PreparedStage, StorageRoleFailure> {
+        self.prepare_final_upload_preloaded(request, part_size, pointer, None)
+            .await
+    }
+
+    pub(super) async fn prepare_final_upload_preloaded(
+        &self,
+        request: DestinationPrepareRequest,
+        part_size: usize,
+        pointer: StoragePath,
+        preloaded: Option<upload_pointer::StoredPointer>,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
         let path = request.prepare.final_destination.path().clone();
         limits::refuse_multipart(self.protocol.bucket_capabilities(), &path)?;
-        let artifacts = S3Artifacts::new(&*self.protocol, &path, &pointer, &request);
+        let artifacts =
+            S3Artifacts::new(&*self.protocol, &path, &pointer, &request).with_preloaded(preloaded);
         let found = discover(&artifacts, &request).await?;
         let Some(point) = found.resume else {
             let held = artifacts.held_pointer();
@@ -193,7 +218,43 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             .ok_or_else(|| failure(&path, Operation::Prepare, FailureClass::Internal))?;
         let upload = FinalUpload::new(&request, record.upload_id, record.part_size, pointer)?;
         upload.lock().parts = left.prefix;
-        let stage = self.upload_stage(&request, upload, point.prefix, found.fact);
+        if point.published {
+            return self
+                .restore_published_upload(
+                    &request,
+                    upload,
+                    point,
+                    found.fact,
+                    left.pointer,
+                    left.published,
+                )
+                .await;
+        }
+        let mut stage = self.upload_stage(&request, upload, point.prefix, found.fact);
+        stage
+            .restore_checkpoint(point.pointer.checkpoint)
+            .map_err(|error| {
+                classified_entry(
+                    &path,
+                    Operation::Prepare,
+                    FailureClass::Corruption,
+                    Transience::Permanent,
+                    format!("invalid S3 source hash checkpoint: {error:?}"),
+                )
+            })?;
+        if stage.restored_checkpoint().is_some() {
+            let upload = of(&stage)
+                .ok_or_else(|| failure(&path, Operation::Prepare, FailureClass::Internal))?;
+            Self::validate_checkpoint_receipts(&stage, upload, &point.pointer.extension)?;
+            Self::restore_upload_ranges(&stage, upload)?;
+            stage.prepare_fact = PrepareFact::Resumed {
+                bytes: stage
+                    .checkpoint_ranges()
+                    .iter()
+                    .map(|range| range.end - range.start)
+                    .sum(),
+            };
+        }
         let upload =
             of(&stage).ok_or_else(|| failure(&path, Operation::Prepare, FailureClass::Internal))?;
         // Take the upload over first, then abort whatever else an earlier writer left on the key.
@@ -212,33 +273,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         Ok(stage)
     }
 
-    /// Before an object written in one request (a single `PutObject`, C14b, or one `CopyObject`,
-    /// C18) only the pointer is looked at — no listing, for cost: a leftover one is removed with
-    /// the uploads on the key, and the prepare reports the restart. A bucket that keeps no
-    /// progress (P7 §14.2) holds no pointer to look for: nothing is asked, and the stage is fresh.
-    pub(super) async fn clear_leftover(
-        &self,
-        request: &DestinationPrepareRequest,
-        pointer: &StoragePath,
-    ) -> Result<PrepareFact, StorageRoleFailure> {
-        if !self.protocol.bucket_capabilities().resumable {
-            return Ok(PrepareFact::Fresh);
-        }
-        let path = request.prepare.final_destination.path();
-        let Some(found) =
-            upload_pointer::read(&*self.protocol, pointer, MAX_POINTER_BYTES + 1).await?
-        else {
-            return Ok(PrepareFact::Fresh);
-        };
-        let reason = leftover_reason(request, &found.bytes);
-        let stale = [found.bytes.as_slice()];
-        let version = found.version.as_deref();
-        upload_pointer::delete(&*self.protocol, pointer, version, &stale).await?;
-        upload_pointer::abort_uploads(&*self.protocol, path, None).await?;
-        Ok(PrepareFact::Restarted { reason })
-    }
-
-    fn upload_stage(
+    pub(super) fn upload_stage(
         &self,
         request: &DestinationPrepareRequest,
         upload: FinalUpload,
@@ -328,6 +363,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     /// on at the checkpoint: a failure or cancellation before it discards the upload and pointer.
     fn pointer_before_checkpoint(&self, request: &DestinationPrepareRequest) -> bool {
         request.resume == ResumeMode::Discover
+            && !request.legacy_restart
             && request
                 .prepare
                 .source
@@ -335,7 +371,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 .is_some_and(|size| size > self.checkpoint_interval)
     }
 
-    async fn fence(&self, upload: &FinalUpload) -> Result<Fence, StorageRoleFailure> {
+    pub(super) async fn fence(&self, upload: &FinalUpload) -> Result<Fence, StorageRoleFailure> {
         let found =
             upload_pointer::read(&*self.protocol, &upload.pointer, MAX_POINTER_BYTES + 1).await?;
         Ok(match found {
@@ -350,7 +386,13 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             }
             Some(stored)
                 if DestinationPointer::decode(&stored.bytes)
-                    .is_ok_and(|found| Some(found.extension) == upload.extension()) =>
+                    .ok()
+                    .and_then(|found| upload_pointer::accepted(&found))
+                    .is_some_and(|record| {
+                        record.nonce == upload.nonce
+                            && record.upload_id == upload.upload_id
+                            && record.part_size == upload.part_size as u64
+                    }) =>
             {
                 Fence::Ours { pointer: true }
             }
@@ -359,28 +401,54 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     }
 
     /// Writes the pointer: unless `take_over`, only while the pointer is still this stage's.
-    async fn write_pointer(
+    pub(super) async fn write_pointer(
         &self,
         stage: &PreparedStage,
         upload: &FinalUpload,
         take_over: bool,
     ) -> Result<(), StorageRoleFailure> {
+        let _guard = stage.checkpoint_guard().await;
         let path = stage.final_destination.path();
         if !take_over && matches!(self.fence(upload).await?, Fence::TakenOver) {
             return Err(taken_over(path, Operation::Write));
         }
         let internal = || failure(path, Operation::Write, FailureClass::Internal);
+        // Restore does not arm low-level/expert stages. Still retain recovered H while taking
+        // ownership: the ordinary engine enables the checkpoint only after prepare returns.
+        let checkpoint = stage
+            .checkpoint_snapshot()
+            .or_else(|| stage.restored_checkpoint().map(|data| data.encode()));
+        let anchored = super::hash_checkpoint::source_hash(stage, checkpoint.as_deref())?;
+        let extension = super::checkpoint_record::extension(stage, upload, checkpoint.is_some())?;
+        let previous = (checkpoint.is_some() && !take_over && upload.pointer_written())
+            .then(|| upload.lock().latest_pointer_version.clone())
+            .flatten();
         let bytes = DestinationPointer {
             binding: stage.recovery_binding,
             transfer_identity: upload.transfer_identity,
-            durable_prefix: None,
-            extension: upload.extension().ok_or_else(internal)?,
+            durable_prefix: checkpoint.as_ref().map(|_| stage.checkpoint_prefix()),
+            checkpoint,
+            extension,
         }
         .encode()
         .map_err(|_| internal())?;
         let version = upload_pointer::put(&*self.protocol, &upload.pointer, bytes.clone()).await?;
         upload.record_pointer(version, bytes);
+        upload.lock().anchored_hash = anchored;
         upload.pointer_written.store(true, Ordering::Release);
+        if previous.is_some() {
+            let current = upload.lock().latest_pointer_version.clone();
+            if !upload_pointer::delete_replaced(
+                &*self.protocol,
+                &upload.pointer,
+                previous.as_deref(),
+                current.as_deref(),
+            )
+            .await
+            {
+                upload.hide_pointer_versions();
+            }
+        }
         Ok(())
     }
 
@@ -475,6 +543,11 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     ) -> Result<PublicationEvidence, PublicationFailure> {
         let path = stage.final_destination.path();
         self.validate(stage).map_err(unchanged)?;
+        if let Some(evidence) = &stage.recovered_publication {
+            return self
+                .publish_recovered_upload(stage, upload, request, evidence)
+                .await;
+        }
         if request.cancel.is_cancelled() {
             return Err(unchanged(cancelled(path, Operation::Publish)));
         }
@@ -500,7 +573,16 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             .complete_final_upload(path, upload, &parts, md5_etags, request.expected_size)
             .await?;
         upload.lock().published = Some(facts.clone());
-        self.finish_published(path, upload, tags, pointer).await?;
+        self.finish_published(path, upload, tags, pointer && !stage.checkpoint_enabled())
+            .await?;
+        if stage.checkpoint_enabled() {
+            stage.checkpoint_set_phase(crate::storage::checkpoint::CheckpointPhase::Published);
+            // Bind the retained source root to the exact completion facts before returning.
+            // A failed rewrite still leaves ReadyToPublish for ambiguous-commit reconciliation.
+            self.write_pointer(stage, upload, false)
+                .await
+                .map_err(changed)?;
+        }
         Ok(PublicationEvidence {
             final_destination: path.clone(),
             disposition: PublicationDisposition::Published,
@@ -632,6 +714,18 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         stage: &PreparedStage,
         upload: &FinalUpload,
     ) -> Result<(), StorageRoleFailure> {
+        let _guard = stage.checkpoint_guard().await;
+        if stage.checkpoint_enabled() {
+            self.cleanup_hash_pointer(stage, upload).await?;
+            upload.lock().checkpoint_released = true;
+            let path = stage.final_destination.path();
+            return cleanup_result(
+                path,
+                self.protocol
+                    .abort_multipart(path.as_str(), &upload.upload_id)
+                    .await,
+            );
+        }
         let Fence::Ours { pointer } = self.fence(upload).await? else {
             return Ok(());
         };
@@ -653,7 +747,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     }
 
     /// Deletes the pointer this stage wrote, by the version its write reported (ADR-0006 C17).
-    async fn delete_own_pointer(
+    pub(super) async fn delete_own_pointer(
         &self,
         upload: &FinalUpload,
     ) -> Result<upload_pointer::Removal, StorageRoleFailure> {

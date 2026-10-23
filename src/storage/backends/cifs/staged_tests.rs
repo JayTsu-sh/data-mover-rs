@@ -21,6 +21,9 @@ use crate::storage::{
 
 #[derive(Default)]
 struct MemoryProtocol {
+    checkpoint_protections: Mutex<Vec<(String, String)>>,
+    fail_checkpoint_protection: AtomicBool,
+    readonly_opens: AtomicUsize,
     files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     flushes: Arc<AtomicUsize>,
     fail_flush: Arc<AtomicBool>,
@@ -154,6 +157,46 @@ impl CifsStageFile for MemoryFile {
 
 #[async_trait]
 impl CifsStagedProtocol for MemoryProtocol {
+    async fn protect_checkpoint(
+        &self,
+        pointer: &StoragePath,
+        payload: &StoragePath,
+    ) -> smb_domain::Result<()> {
+        if self.fail_checkpoint_protection.load(Ordering::SeqCst) {
+            return Err(smb_domain::Error::UnsupportedOperation(
+                "injected DACL refusal".into(),
+            ));
+        }
+        let files = self
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = files
+            .get(pointer.as_str())
+            .ok_or_else(|| smb_domain::Error::NotFound(pointer.as_str().into()))?;
+        if std::path::Path::new(pointer.as_str()).extension() == Some(std::ffi::OsStr::new("tmp")) {
+            assert!(
+                bytes.is_empty(),
+                "source fragments preceded DACL protection"
+            );
+        }
+        if !files.contains_key(payload.as_str()) {
+            return Err(smb_domain::Error::NotFound(payload.as_str().into()));
+        }
+        self.checkpoint_protections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((pointer.as_str().into(), payload.as_str().into()));
+        Ok(())
+    }
+
+    async fn open_read(&self, path: &StoragePath) -> smb_domain::Result<Box<dyn CifsStageFile>> {
+        if !path.as_str().contains(".pointer") {
+            self.readonly_opens.fetch_add(1, Ordering::SeqCst);
+        }
+        self.open(path).await
+    }
+
     async fn create_empty(&self, path: &StoragePath) -> smb_domain::Result<()> {
         let mut files = self
             .files

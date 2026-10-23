@@ -1,5 +1,10 @@
 schema_version: 1
 authority: backend-capability-facts
+# Eligible ordinary Checkpointed transfers bind durable ranges to saved standard BLAKE3 H.
+# Local/NFS/CIFS may retain sparse ranges; HDFS retains only its proven append prefix;
+# S3 retains complete parts in frozen geometry. These are not new guarantees for NAS,
+# single-operation stages, AtomicReplace/Direct, or the expert ordered transport.
+# Release evidence is tracked in docs/design/checkpointed-range-hash-recovery.md.
 backend_kinds: [local, nfs, cifs, s3, hdfs]
 states: [required, unsupported, uncertified, not_applicable, instance_operation_result]
 

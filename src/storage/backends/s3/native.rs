@@ -88,6 +88,10 @@ impl<P> S3NativeEndpoint<P> {
 
 #[async_trait]
 impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
+    fn supports_hash_checkpoint(&self, source: &SourceDescriptor) -> bool {
+        self.staged.native_hash_checkpoint_eligible(source)
+    }
+
     fn affinity(&self) -> NativeAffinity {
         self.context.affinity
     }

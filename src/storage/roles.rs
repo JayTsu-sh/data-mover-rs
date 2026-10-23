@@ -300,6 +300,65 @@ pub enum VerificationPoint {
 /// Destination role owning prepare, write, checkpoint, verify, publish, and discard.
 #[async_trait]
 pub trait StagedDestination: Send + Sync {
+    /// Whether this adapter can retain source-derived hash evidence with recovery state.
+    /// Only the ordinary eligible Checkpointed engine selects this optional interface.
+    fn supports_hash_checkpoint(&self) -> bool {
+        false
+    }
+
+    /// Refines the capability for the actual prepared operation (notably single PUT vs MPU).
+    fn stage_supports_hash_checkpoint(&self, stage: &PreparedStage) -> bool {
+        self.supports_hash_checkpoint() && !stage.direct
+    }
+
+    /// Whether payload may become recoverable independently of a committed prefix pointer.
+    fn requires_hash_intent(&self) -> bool {
+        false
+    }
+
+    /// Anchors the stage's frozen source hash revision without advancing destination durability.
+    /// The engine does not mutate source hash evidence until this call settles. All pointer
+    /// updates for an armed stage serialize through its checkpoint gate.
+    async fn persist_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        Err(super::checkpoint_stream::failure(
+            stage.final_destination.path(),
+            FailureClass::Unsupported,
+            "source hash checkpoints are unsupported",
+        ))
+    }
+
+    /// Writes missing logical ranges. Other transfer policies never call this interface.
+    async fn write_checkpointed(
+        &self,
+        stage: &PreparedStage,
+        input: PositionedByteStream,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        if !stage.checkpoint_enabled() {
+            return Err(super::checkpoint_stream::failure(
+                stage.final_destination.path(),
+                FailureClass::Unsupported,
+                "checkpointed writes were not armed",
+            ));
+        }
+        if self.supports_positioned_write() {
+            self.write_positioned(stage, input).await
+        } else {
+            self.write(stage, super::checkpoint_stream::ordered(stage, input))
+                .await
+        }
+    }
+
+    /// Releases only owned recovery metadata after publication and required verification.
+    async fn release_hash_checkpoint(
+        &self,
+        _stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        Ok(())
+    }
+
     /// Whether the destination accepts nonoverlapping chunks in completion order.
     fn supports_positioned_write(&self) -> bool {
         false
@@ -462,6 +521,19 @@ pub trait StagedDestination: Send + Sync {
         )
         .unwrap_or_else(|_| unreachable!("the static staged-metadata diagnostic is valid"));
         Err(StorageRoleFailure::Entry(failure))
+    }
+    /// Checks metadata that a backend applies after publishing, without changing the final.
+    ///
+    /// The default needs no extra observation: rename-based backends finish staged metadata
+    /// before anchoring `ReadyToPublish`. Backends with deferred publication metadata must
+    /// override this to reject recovery when those mutations have not actually committed.
+    async fn validate_recovered_metadata(
+        &self,
+        _stage: &PreparedStage,
+        _mutations: Vec<MetadataMutation>,
+        _cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        Ok(())
     }
     /// Applies an ordered metadata batch to the same unpublished staged object.
     ///

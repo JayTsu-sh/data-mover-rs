@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::negotiation;
 use super::{TransferPhase, TransferSide};
 use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
+use crate::storage::checkpoint::CheckpointPhase;
 use crate::storage::{PreparedStage, SourceQosStats, StagedDestination, StorageRoleFailure};
 
 /// Structured failure from the unified transfer lifecycle.
@@ -218,7 +219,19 @@ impl TransferFailure {
             .committed_cleanup
             .take()
             .ok_or_else(|| source_failure(&StoragePath::root(), FailureClass::InvalidInput))?;
-        pending.destination.discard(pending.stage).await
+        if pending.stage.checkpoint_enabled()
+            && pending.stage.checkpoint_phase() == CheckpointPhase::Published
+        {
+            // The payload already committed: release only the owned transient root. In
+            // particular, an S3 Object Lock retry must not hide retained hash versions behind
+            // another delete marker through the legacy discard path.
+            pending
+                .destination
+                .release_hash_checkpoint(&pending.stage)
+                .await
+        } else {
+            pending.destination.discard(pending.stage).await
+        }
     }
 }
 

@@ -9,14 +9,18 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
+use super::s3_at_destination_tests::{
+    assert_uploaded_parts, completed_parts, expert_run, hash_batches, stored_pointer,
+};
+
 use crate::model::{FailureClass, StoragePath, Transience};
-use crate::storage::PrepareFact;
 use crate::storage::artifacts::{ArtifactKind, is_artifact_path, sibling_artifact};
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, endpoint_of, source_storage};
 use crate::storage::backends::s3::{
     S3Protocol as _, S3ProtocolFailure, S3VersionFacts, connect_at_destination,
     connect_native_at_destination,
 };
+use crate::storage::{PrepareFact, StorageRoleFailure};
 use crate::transfer::{
     SourceVersion, TransferOutcome, TransferPolicy, TransferRequest, TransferRoute, transfer,
 };
@@ -73,6 +77,24 @@ async fn entries(protocol: &MemoryS3, key: &str) -> TestResult<Vec<S3VersionFact
         .list_versions(key)
         .await
         .map_err(|failure| format!("{failure:?}"))?)
+}
+
+async fn assert_legacy_pointer_versions(protocol: &MemoryS3, key: &str) -> TestResult {
+    for version in entries(protocol, key).await? {
+        if version.delete_marker {
+            continue;
+        }
+        let bytes = stored(protocol, key, &version.version_id)
+            .await
+            .ok_or("pointer version")?;
+        let pointer = crate::storage::pointer::DestinationPointer::decode(&bytes)
+            .map_err(|_| "pointer decode")?;
+        assert!(
+            pointer.checkpoint.is_none(),
+            "legacy success cannot retain a v2 root"
+        );
+    }
+    Ok(())
 }
 
 fn pointer_of(final_key: &str) -> TestResult<String> {
@@ -135,7 +157,14 @@ async fn every_write_path_reports_the_version_it_made() -> TestResult {
     ] {
         let data = payload(size, 1);
         let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &[final_key]).await;
-        let outcome = transfer(request(&protocol, final_key, policy)?).await?;
+        let request = request(&protocol, final_key, policy)?;
+        let puts = if final_key == "multipart" {
+            hash_batches(&request, size)? + 5
+        } else {
+            u32::from(size <= PART)
+        };
+        let outcome = transfer(request).await?;
+        assert_eq!(*protocol.puts.lock().await, puts, "{final_key}");
         assert_eq!(outcome.blake3, Some(*blake3::hash(&data).as_bytes()));
         clean_versions(&protocol, final_key, 1, Some(version(&outcome)?)).await?;
         let pointer = pointer_of(final_key)?;
@@ -218,7 +247,13 @@ async fn native_copies_by_id_arrive_in_order_and_resume_into_one_version() -> Te
         Some(v2.clone())
     );
 
-    let outcome = cut_then_resume(&protocol, by_id("cut", "s1")?, by_id("cut", "s1")?).await?;
+    let outcome = cut_then_resume(
+        &protocol,
+        by_id("cut", "s1")?,
+        by_id("cut", "s1")?,
+        v1.len(),
+    )
+    .await?;
     let resumed = version(&outcome)?.to_string();
     clean_versions(&protocol, "cut", 1, Some(&resumed)).await?;
     assert_eq!(stored(&protocol, "cut", &resumed).await, Some(v1));
@@ -255,6 +290,7 @@ async fn cut_then_resume(
     protocol: &Arc<MemoryS3>,
     request: TransferRequest,
     retry: TransferRequest,
+    size: usize,
 ) -> TestResult<TransferOutcome> {
     *protocol.part_failure.lock().await = Some((3, reset()));
     *protocol.part_failure_waits.lock().await = true;
@@ -265,20 +301,53 @@ async fn cut_then_resume(
     assert!(failure.has_recoverable_stage());
     drop(failure);
     *protocol.part_failure.lock().await = None;
+    let completed = completed_parts(protocol, retry.final_path().as_str()).await?;
+    completed.assert_third_failed();
+    let missing = completed.missing(size, PART);
+    *protocol.body_fragments.lock().await = Some(Vec::new());
+    let uploaded = *protocol.part_uploads.lock().await;
+    let copied = *protocol.part_copies.lock().await;
     let outcome = transfer(retry).await?;
     assert_eq!(
         outcome.prepare,
         PrepareFact::Resumed {
-            bytes: 2 * PART as u64
+            bytes: completed.bytes()
         }
     );
-    assert_eq!(outcome.reused_bytes, 2 * PART as u64);
+    assert_eq!(outcome.reused_bytes, completed.bytes());
+    let count = u32::try_from(missing.len())?;
+    assert_eq!(
+        *protocol.part_uploads.lock().await - uploaded,
+        if outcome.route == TransferRoute::Streaming {
+            count
+        } else {
+            0
+        },
+        "no completed part may be reuploaded"
+    );
+    assert_eq!(
+        *protocol.part_copies.lock().await - copied,
+        if outcome.route == TransferRoute::Native {
+            count
+        } else {
+            0
+        },
+        "no completed part may be recopied"
+    );
+    assert_uploaded_parts(
+        protocol,
+        if outcome.route == TransferRoute::Streaming {
+            &missing
+        } else {
+            &[]
+        },
+    )
+    .await?;
     Ok(outcome)
 }
 
-/// An interrupted copy leaves its upload and one pointer version; the resume takes the upload
-/// over (replacing the pointer and deleting the replaced version) and completes it once: the key
-/// gains one version, and neither pointer version nor delete marker is left.
+/// An interrupted copy leaves its upload and hash intent; takeover and final phases remove
+/// their owned pointer versions. The final key gains one version and no artifact remains.
 #[tokio::test]
 async fn an_interrupted_and_resumed_copy_adds_one_version() -> TestResult {
     let data = payload(3 * PART, 2);
@@ -288,6 +357,7 @@ async fn an_interrupted_and_resumed_copy_adds_one_version() -> TestResult {
         &protocol,
         request(&protocol, "resumed", policy)?,
         request(&protocol, "resumed", policy)?,
+        data.len(),
     )
     .await?;
     assert_eq!(outcome.blake3, Some(*blake3::hash(&data).as_bytes()));
@@ -365,7 +435,7 @@ async fn an_interrupted_id_copy_resumes_into_one_version() -> TestResult {
         request(&protocol, "history-cut", TransferPolicy::Checkpointed)
             .map(|request| request.with_source_version(SourceVersion::Id("s1".into())))
     };
-    let outcome = cut_then_resume(&protocol, by_id()?, by_id()?).await?;
+    let outcome = cut_then_resume(&protocol, by_id()?, by_id()?, v1.len()).await?;
     assert!(outcome.reused_bytes > 0);
     let made = version(&outcome)?.to_string();
     clean_versions(&protocol, "history-cut", 1, Some(&made)).await?;
@@ -397,15 +467,15 @@ async fn suspended_versioning_reports_no_version() -> TestResult {
     Ok(())
 }
 
-/// Object Lock refusing to delete the pointer's version is a warning, not a failure: the transfer
-/// succeeds and names its version, and the pointer is hidden behind a delete marker.
+/// The explicit expert v1 route retains its Object Lock warning contract, with one pointer PUT.
 #[tokio::test]
 async fn a_locked_pointer_does_not_fail_the_transfer() -> TestResult {
     let data = payload(3 * PART, 9);
-    let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["locked"]).await;
+    let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["source"]).await;
     let pointer = pointer_of("locked")?;
     protocol.lock_versions(&pointer);
-    let outcome = transfer(request(&protocol, "locked", TransferPolicy::Checkpointed)?).await?;
+    let outcome = expert_run(&protocol, INTERVAL as u64, "locked").await?;
+    assert_eq!(*protocol.puts.lock().await, 1, "legacy v1 pointer only");
     let finals = entries(&protocol, "locked").await?;
     assert_eq!(finals.len(), 1);
     assert_eq!(finals[0].version_id, version(&outcome)?);
@@ -419,6 +489,7 @@ async fn a_locked_pointer_does_not_fail_the_transfer() -> TestResult {
         .map(|entry| entry.delete_marker)
         .collect();
     assert_eq!(kept, [true, false], "a marker over the locked version");
+    assert_legacy_pointer_versions(&protocol, &pointer).await?;
     assert_eq!(protocol.plain_deletes_of_final_keys(), Vec::<String>::new());
     Ok(())
 }
@@ -429,19 +500,24 @@ async fn a_locked_pointer_does_not_fail_the_transfer() -> TestResult {
 #[tokio::test]
 async fn a_pointer_held_against_markers_does_not_fail_the_transfer() -> TestResult {
     let data = payload(3 * PART, 16);
-    let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["held"]).await;
+    let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["source"]).await;
     protocol.lock_refuses_delete_markers();
     let pointer = pointer_of("held")?;
     protocol.lock_versions(&pointer);
     for made in 1..=2 {
-        let request = request(&protocol, "held", TransferPolicy::Checkpointed)?;
-        let outcome = transfer(request).await?;
+        let outcome = expert_run(&protocol, INTERVAL as u64, "held").await?;
+        assert_eq!(
+            *protocol.puts.lock().await,
+            u32::try_from(made)?,
+            "one legacy pointer per transfer"
+        );
         let finals = entries(&protocol, "held").await?;
         assert_eq!(finals.len(), made);
         assert_eq!(finals[0].version_id, version(&outcome)?);
         let kept = entries(&protocol, &pointer).await?;
         assert_eq!(kept.len(), made, "one held pointer version per transfer");
         assert!(kept.iter().all(|entry| !entry.delete_marker), "{kept:?}");
+        assert_legacy_pointer_versions(&protocol, &pointer).await?;
     }
     assert_eq!(
         protocol
@@ -452,6 +528,56 @@ async fn a_pointer_held_against_markers_does_not_fail_the_transfer() -> TestResu
         0
     );
     assert_eq!(protocol.plain_deletes_of_final_keys(), Vec::<String>::new());
+    Ok(())
+}
+
+/// A v2 hold is a committed failure with cleanup authority, not success retaining raw hash
+/// fragments indefinitely. The reversible refusal models a legal hold until explicitly lifted.
+#[tokio::test]
+async fn a_held_hash_checkpoint_requires_cleanup_after_the_hold_is_removed() -> TestResult {
+    let data = payload(3 * PART, 17);
+    let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["hash-held"]).await;
+    let pointer = pointer_of("hash-held")?;
+    *protocol.delete_failure.lock().await = Some((
+        pointer.clone(),
+        S3ProtocolFailure::entry(
+            FailureClass::PermissionDenied,
+            Transience::Permanent,
+            "Object Lock legal hold",
+        ),
+    ));
+    let request = request(&protocol, "hash-held", TransferPolicy::Checkpointed)?;
+    let puts = hash_batches(&request, data.len())? + 5;
+    let failure = transfer(request)
+        .await
+        .err()
+        .ok_or("a held v2 hash root must not report success")?;
+    assert!(failure.final_destination_changed());
+    assert!(failure.has_pending_cleanup());
+    assert!(!failure.has_unpublished_stage());
+    assert!(
+        matches!(failure.source().and_then(|error| error.downcast_ref::<StorageRoleFailure>()), Some(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::PermissionDenied)
+    );
+    assert_eq!(
+        *protocol.puts.lock().await,
+        puts,
+        "bounded intent and lifecycle versions"
+    );
+    assert_eq!(protocol.objects.lock().await.get("hash-held"), Some(&data));
+    assert!(
+        stored_pointer(&protocol, "hash-held")
+            .await?
+            .checkpoint
+            .is_some()
+    );
+    let roots = entries(&protocol, &pointer).await?;
+    assert_eq!(roots.len(), usize::try_from(puts)?);
+    assert!(roots.iter().all(|root| !root.delete_marker));
+    assert_eq!(entries(&protocol, "hash-held").await?.len(), 1);
+    *protocol.delete_failure.lock().await = None;
+    failure.cleanup_published_stage().await?;
+    clean_versions(&protocol, "hash-held", 1, None).await?;
+    assert_eq!(protocol.objects.lock().await.get("hash-held"), Some(&data));
     Ok(())
 }
 

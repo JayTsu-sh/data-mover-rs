@@ -202,6 +202,23 @@ metadata mutation of unpublished state, and publication mechanics. Its private s
 handle, or object key never leaves the backend. `FinalDestination` is never a partial-write or
 metadata-mutation target.
 
+Eligible ordinary `Checkpointed` transfers additionally preserve source-derived standard BLAKE3
+evidence (H) independently of backend-proven reusable payload ranges (D). Recovery skips only
+D covered by H; hash-only write-ahead intent is never payload completion. Reads may complete
+out of order in bounded logical windows; adapters retain their own read/write/part geometry and
+prove durability before committing D. HDFS remains an ordered append destination, and S3 reuses
+only complete parts in the upload's frozen geometry. The internal hooks neither expose protocol
+handles nor add request-level hash/shaping policies.
+
+The destination pointer owns the transient hash/range envelope and publication phase. A hash-ready
+pointer left after rename/Complete is reconciled and the final bytes are verified against saved H
+without rereading source payload; its final is never an unpublished cleanup target. Metadata must
+already have completed before ReadyToPublish. Successful publication/required verification releases
+the pointer; no permanent result manifest is created. The existing one-writer-per-key contract
+still applies. Unknown/corrupt new formats fail closed; legacy pointers have no no-prefix-reread
+guarantee. `AtomicReplace`, `Direct`, expert ordered transport, and ineligible checkpointed stages
+retain their existing behavior. See [the detailed design](../design/checkpointed-range-hash-recovery.md).
+
 For NFS, the common adapter consumes the dialect and negotiated `rsize`/`wsize` facts from
 `nfs-rs`. Mount/session concurrency, protocol request scheduling, and protocol-level retry remain
 owned by `nfs-rs`; data-mover adds no second mount semaphore or blanket request retry. The adapter

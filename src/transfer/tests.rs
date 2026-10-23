@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::engine::{TransferDataPath, TransferPhase, TransferSide, run_until_transferred};
@@ -12,18 +13,21 @@ use crate::metadata::{
     MetadataTarget, OwnershipTarget, TimestampTargetCapability, ValueTarget, compile_metadata_plan,
 };
 use crate::model::{
-    ExtendedAttribute, MetadataObservation, MetadataObservations, MetadataProvenance, ObjectTag,
-    ObservedEntry,
+    ExtendedAttribute, FailureClass, MetadataObservation, MetadataObservations, MetadataProvenance,
+    ObjectTag, ObservedEntry,
 };
 
 use crate::model::StoragePath;
 use crate::storage::Storage;
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
 use crate::storage::backends::local::{
-    source::LocalReadSource, test_destination_storage, test_destination_storage_with_role,
-    test_source_storage, test_unsupported_storage,
+    source::{LocalReadSource, ReadGate},
+    test_destination_storage, test_destination_storage_with_role, test_source_storage,
+    test_unsupported_storage,
 };
-use crate::storage::{PrepareFact, PublicationDisposition, RestartReason};
+use crate::storage::checkpoint::CheckpointData;
+use crate::storage::pointer::DestinationPointer;
+use crate::storage::{PrepareFact, PublicationDisposition, RestartReason, StorageRoleFailure};
 
 fn observed<T>(value: T) -> MetadataObservation<T> {
     MetadataObservation::Value {
@@ -623,7 +627,6 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     let payload = vec![0x73; 3 * 64 * 1024];
     std::fs::write(source_root.path().join("final.bin"), &payload)?;
     let (source, source_role) = test_source_storage(source_root.path(), "transfer-source")?;
-    let second_read = source_role.gate_read_at(64 * 1024);
     let (destination, destination_role) =
         test_destination_storage_with_role(destination_root.path(), "transfer-destination")?;
     destination_role.set_automatic_checkpoint_interval(64 * 1024);
@@ -633,33 +636,29 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
         None,
     );
     let interrupted_identity = request.identity();
-    let task = tokio::spawn(transfer(request));
-    second_read.wait_started().await;
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while destination_role.write_completion_count() < 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
-    cancel.cancel();
-    second_read.release();
-    let result = task.await?;
-    let Err(failure) = result else {
-        return Err("partially cancelled transfer unexpectedly succeeded".into());
-    };
-    assert!(
-        failure.has_recoverable_stage(),
-        "a cancellation after the durable checkpoint must retain a recoverable stage"
-    );
-    drop(failure);
+    let saved =
+        interrupt_after_hash_checkpoint(request, &source_role, destination_root.path()).await?;
+    let reused: u64 = saved
+        .ranges
+        .iter()
+        .map(|range| range.end - range.start)
+        .sum();
+    let missing =
+        crate::storage::checkpoint::missing_ranges(&saved.ranges, 0..payload.len() as u64);
+    let expected_reads: Vec<u64> = missing
+        .iter()
+        .flat_map(|range| range.clone().step_by(64 * 1024))
+        .collect();
     let writes_before = destination_role.write_completion_count();
-    assert_eq!(writes_before, 1);
+    assert_eq!(writes_before, usize::try_from(reused / (64 * 1024))?);
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 64 * 1024, None)?);
+    let (resume_source, resume_reader) =
+        test_source_storage(source_root.path(), "transfer-source")?;
 
     let outcome = transfer(
         recoverable_request(
             derived_transfer_request(
-                local_source(source_root.path())?,
+                resume_source,
                 destination,
                 tokio_util::sync::CancellationToken::new(),
             )?,
@@ -670,16 +669,25 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     .await?;
     assert_eq!(outcome.transferred_bytes, payload.len() as u64);
     // A request built afresh, with no label, derives the interrupted transfer's identity and
-    // resumes it: only the two chunks after the durable prefix are written.
+    // resumes it: writes and source READs cover exactly the complement of persisted D.
     assert_eq!(outcome.identity, interrupted_identity);
-    assert_eq!(outcome.prepare, PrepareFact::Resumed { bytes: 64 * 1024 });
-    assert_eq!(destination_role.write_completion_count() - writes_before, 2);
+    assert_eq!(outcome.prepare, PrepareFact::Resumed { bytes: reused });
+    assert_eq!(
+        destination_role.write_completion_count() - writes_before,
+        expected_reads.len()
+    );
     assert_eq!(outcome.source_qos.logical_bytes, payload.len() as u64);
     assert_eq!(
         outcome.source_qos.client_streamed_shaped_bytes,
-        payload.len() as u64
+        payload.len() as u64 - reused
     );
-    assert_eq!(outcome.source_qos.source_read_operations, 3);
+    assert_eq!(
+        outcome.source_qos.source_read_operations,
+        expected_reads.len() as u64
+    );
+    let mut observed_reads = resume_reader.read_completion_order();
+    observed_reads.sort_unstable();
+    assert_eq!(observed_reads, expected_reads);
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
         payload
@@ -699,7 +707,6 @@ async fn recovery_restarts_after_same_size_source_edit() -> Result<(), Box<dyn s
         std::fs::write(&path, &payload)?;
         let original_mtime = std::fs::metadata(&path)?.modified()?;
         let (source, source_role) = test_source_storage(source_root.path(), "transfer-source")?;
-        let second_read = source_role.gate_read_at(64 * 1024);
         let (destination, destination_role) =
             test_destination_storage_with_role(destination_root.path(), "transfer-destination")?;
         destination_role.set_automatic_checkpoint_interval(64 * 1024);
@@ -709,30 +716,12 @@ async fn recovery_restarts_after_same_size_source_edit() -> Result<(), Box<dyn s
             None,
         )
         .with_read_back_verification(verification);
-        let task = tokio::spawn(transfer(request));
-        second_read.wait_started().await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while destination_role.write_completion_count() < 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?;
-        // The checkpoint's pointer lands after the write completes; cancelling before it does
-        // leaves a stage without a pointer, which restarts for that reason instead.
+        interrupt_after_hash_checkpoint(request, &source_role, destination_root.path()).await?;
         let pointer = destination_root
             .path()
             .join(artifact_name("final.bin", ArtifactKind::Pointer));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !pointer.exists() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await?;
-        cancel.cancel();
-        second_read.release();
-        assert!(task.await?.is_err());
+        let retained_pointer = std::fs::read(&pointer)?;
         let writes_before = destination_role.write_completion_count();
-        assert_eq!(writes_before, 1);
 
         // Keep the inode and length, and on Unix restore mtime to exercise ctime.
         let replacement = vec![0xa5; payload.len()];
@@ -744,22 +733,32 @@ async fn recovery_restarts_after_same_size_source_edit() -> Result<(), Box<dyn s
             .set_modified(original_mtime)?;
         #[cfg(not(unix))]
         let _ = original_mtime;
-        let outcome = transfer(
-            recoverable_request(
-                transfer_request(
-                    local_source(source_root.path())?,
-                    destination,
-                    tokio_util::sync::CancellationToken::new(),
-                )?,
-                None,
-            )
-            .with_read_back_verification(verification),
+        let request = recoverable_request(
+            transfer_request(
+                local_source(source_root.path())?,
+                destination.clone(),
+                tokio_util::sync::CancellationToken::new(),
+            )?,
+            None,
         )
-        .await?;
+        .with_read_back_verification(verification);
+        let failure = transfer(request.clone())
+            .await
+            .err()
+            .ok_or("changed v2 binding must fail closed")?;
+        assert_eq!(failure.phase(), TransferPhase::Prepare);
+        let role = std::error::Error::source(&failure)
+            .and_then(|cause| cause.downcast_ref::<StorageRoleFailure>());
+        assert!(
+            matches!(role, Some(StorageRoleFailure::Entry(entry)) if entry.class() == FailureClass::Unsupported)
+        );
+        assert_eq!(std::fs::read(&pointer)?, retained_pointer);
+        assert_eq!(destination_role.write_completion_count(), writes_before);
+        let outcome = transfer(request.with_transfer_policy(TransferPolicy::AtomicReplace)).await?;
         assert_eq!(
             outcome.prepare,
             PrepareFact::Restarted {
-                reason: RestartReason::BindingChanged
+                reason: RestartReason::Requested
             }
         );
         assert_eq!(destination_role.write_completion_count() - writes_before, 3);
@@ -1235,6 +1234,82 @@ fn derived_transfer_request(
 
 fn recoverable_request(request: TransferRequest, _resume_marker: Option<()>) -> TransferRequest {
     request.with_transfer_policy(TransferPolicy::Checkpointed)
+}
+
+struct HeldReadGate {
+    gate: Arc<ReadGate>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for HeldReadGate {
+    fn drop(&mut self) {
+        // A failed assertion/timeout must not strand a blocking source read at runtime shutdown.
+        self.cancel.cancel();
+        self.gate.release();
+    }
+}
+
+async fn interrupt_after_hash_checkpoint(
+    request: TransferRequest,
+    source: &LocalReadSource,
+    destination_root: &Path,
+) -> Result<CheckpointData, Box<dyn std::error::Error>> {
+    let held = HeldReadGate {
+        gate: source.gate_read_at(64 * 1024),
+        cancel: request.cancel.clone(),
+    };
+    let task = tokio::spawn(transfer(request));
+    tokio::time::timeout(Duration::from_secs(5), held.gate.wait_started()).await?;
+    wait_for_hash_checkpoint(destination_root, 64 * 1024).await?;
+    held.cancel.cancel();
+    held.gate.release();
+    let failure = tokio::time::timeout(Duration::from_secs(5), task)
+        .await??
+        .err()
+        .ok_or("partially cancelled transfer unexpectedly succeeded")?;
+    assert!(
+        failure.has_recoverable_stage(),
+        "durable checkpoint lost on cancellation: {failure:?}"
+    );
+    drop(failure); // release the claim before a new prepare
+    let data =
+        read_hash_checkpoint(destination_root)?.ok_or("cancelled transfer lost its v2 pointer")?;
+    assert_eq!(data.prefix(), 64 * 1024);
+    Ok(data)
+}
+
+fn read_hash_checkpoint(root: &Path) -> io::Result<Option<CheckpointData>> {
+    let path = root.join(artifact_name("final.bin", ArtifactKind::Pointer));
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let pointer = DestinationPointer::decode(&bytes)
+        .map_err(|error| io::Error::other(format!("invalid checkpoint pointer: {error:?}")))?;
+    let encoded = pointer
+        .checkpoint
+        .ok_or_else(|| io::Error::other("expected a v2 hash checkpoint"))?;
+    CheckpointData::decode(&encoded)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+async fn wait_for_hash_checkpoint(
+    root: &Path,
+    minimum: u64,
+) -> Result<CheckpointData, Box<dyn std::error::Error>> {
+    Ok(tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(data) = read_hash_checkpoint(root)?
+                && data.prefix() >= minimum
+            {
+                return Ok::<_, io::Error>(data);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await??)
 }
 
 async fn wait_for_read(source: &LocalReadSource) -> Result<(), Box<dyn std::error::Error>> {

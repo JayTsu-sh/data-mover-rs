@@ -9,22 +9,20 @@ use crate::storage::{
     CheckpointObservation, NativePair, PrepareFact, PreparedStage, PublicationDisposition,
     PublicationEvidence, ReadBackMethod, ReadRequest, ReadSource, SourceDescriptor,
     SourceQosBudget, SourceQosStats, StagedDestination, StorageRoleFailure, UploadDigest,
-    VerificationPoint, WriteEvidence,
+    WriteEvidence,
 };
 use failure::source_failure;
-use negotiation::{CopiedMetadataPlan, apply_copied_metadata, copied_metadata_plan};
+use negotiation::{CopiedMetadataPlan, copied_metadata_plan};
 use payload::{TransferEvidence, transfer_stage};
 use plan::{
     TransferRoles, describe_source, final_recovery, lend_transfer_roles, plan_request,
     recovery_binding, recovery_binding_for,
 };
 use producer::{ProducerRequest, produce, read_exact_range};
-use publication::{
-    content_mismatch, discard_stale_stage, publish_transferred, verify_published,
-    verify_transferred,
-};
+use publication::{content_mismatch, discard_stale_stage, verify_published};
 
 mod at_destination;
+mod checkpointed;
 mod delete_marker;
 mod directory_object;
 mod expert;
@@ -215,22 +213,9 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
     let read_back = request.read_back;
     let cancel = request.cancel.clone();
     let transferred = run_until_transferred(request).await?;
-    let identity = transferred.identity;
-    let route = transfer_route(transferred.data_path);
-    let recovery = transferred.effective_recovery;
     let source_qos = transferred_source_qos(&transferred);
-    let verify_after = read_back == ReadBackVerification::Enabled
-        && transferred
-            .destination
-            .verification_point(&transferred.stage)
-            == VerificationPoint::AfterPublish;
-    let transferred = if read_back == ReadBackVerification::Enabled && !verify_after {
-        verify_transferred(transferred, cancel.clone(), source_qos)
-            .await?
-            .0
-    } else {
-        transferred
-    };
+    let (evidence, transferred, metadata) =
+        publication::complete_transfer(transferred, read_back, cancel, source_qos).await?;
     let expected_size = transferred.checkpoint.durable_prefix;
     let source_digest = transferred.source_blake3;
     let prepare = transferred.stage.prepare_fact;
@@ -239,50 +224,6 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
     } else {
         None
     };
-    let metadata = match apply_copied_metadata(
-        &transferred,
-        transferred.copied_metadata_plan.as_ref(),
-        cancel.clone(),
-    )
-    .await
-    {
-        Ok(report) => report,
-        Err(error) => {
-            return Err(TransferFailure::metadata(error)
-                .with_stage(Arc::clone(&transferred.destination), transferred.stage)
-                .with_source_qos(source_qos));
-        }
-    };
-    if verify_after && (cancel.is_cancelled() || source_digest.is_none()) {
-        // Nothing is published yet: stop here, keeping the stage, rather than publish content
-        // that could not be verified afterwards.
-        return Err(TransferFailure::orchestration(
-            TransferPhase::Verify,
-            "transfer was cancelled, or has no source digest, before publication",
-        )
-        .with_stage(Arc::clone(&transferred.destination), transferred.stage)
-        .with_source_qos(source_qos));
-    }
-    let (evidence, transferred) = publish_transferred(
-        transferred,
-        expected_size,
-        source_digest,
-        cancel.clone(),
-        source_qos,
-    )
-    .await?;
-    if verify_after {
-        verify_published(
-            &transferred.destination,
-            &transferred.stage,
-            &evidence,
-            expected_size,
-            source_digest,
-            cancel,
-        )
-        .await
-        .map_err(|failure| failure.with_source_qos(source_qos))?;
-    }
     let verification = TransferVerification::of(
         &*transferred.destination,
         &transferred.stage,
@@ -295,7 +236,7 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         ..
     } = evidence;
     Ok(TransferOutcome {
-        identity,
+        identity: transferred.identity,
         final_destination,
         prepare,
         reused_bytes: prepare.reused_bytes(),
@@ -305,8 +246,8 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         read_back,
         source_qos,
         metadata,
-        route,
-        recovery,
+        route: transfer_route(transferred.data_path),
+        recovery: transferred.effective_recovery,
         destination_version,
         verification,
     })
@@ -397,7 +338,6 @@ mod plan_tests {
     use crate::storage::backends::local::{
         test_destination_storage_with_role, test_source_storage,
     };
-    use crate::storage::{PublishRequest, RestartReason};
 
     fn descriptor(size: u64) -> Result<SourceDescriptor, Box<dyn std::error::Error>> {
         let backend = BackendIdentity::new("local".parse()?, "source-chunk-plan")?;
@@ -443,10 +383,10 @@ mod plan_tests {
         Ok(())
     }
 
-    /// A publication that committed but failed before removing its pointer leaves a pointer
-    /// without a stage; the next transfer restarts instead of stranding on it.
+    /// A hash-ready root survives a committed rename and lets a new attempt verify the final
+    /// without reading the source again.
     #[tokio::test]
-    async fn a_pointer_left_after_publication_restarts_instead_of_stranding()
+    async fn a_hash_ready_pointer_left_after_publication_resumes_without_source_reads()
     -> Result<(), Box<dyn std::error::Error>> {
         let nonce = uuid::Uuid::new_v4();
         let source_root = std::env::temp_dir().join(format!("data-mover-publish-source-{nonce}"));
@@ -456,7 +396,7 @@ mod plan_tests {
         std::fs::create_dir(&destination_root)?;
         let payload = vec![0x6a; 2 * 64 * 1024 + 1];
         std::fs::write(source_root.join("final.bin"), &payload)?;
-        let (source, _) = test_source_storage(&source_root, "publishing-source")?;
+        let (source, reader) = test_source_storage(&source_root, "publishing-source")?;
         let (destination, role) =
             test_destination_storage_with_role(&destination_root, "publishing-destination")?;
         role.set_automatic_checkpoint_interval(64 * 1024);
@@ -470,36 +410,29 @@ mod plan_tests {
 
         let transferred = run_until_transferred(request.clone()).await?;
         let source_qos = transferred_source_qos(&transferred);
-        let (transferred, verification) = verify_transferred(
+        role.fail_after_publication_commit();
+        let failed = publication::complete_transfer(
             transferred,
+            ReadBackVerification::Enabled,
             tokio_util::sync::CancellationToken::new(),
             source_qos,
         )
-        .await?;
-        role.fail_after_publication_commit();
-        let failed = transferred
-            .destination
-            .publish(
-                &transferred.stage,
-                PublishRequest {
-                    expected_size: verification.verified_bytes,
-                    expected_blake3: Some(verification.blake3),
-                    cancel: tokio_util::sync::CancellationToken::new(),
-                },
-            )
-            .await
-            .err()
-            .ok_or("the injected post-commit failure")?;
-        assert!(failed.final_destination_changed);
-        drop(transferred);
+        .await
+        .err()
+        .ok_or("the injected post-commit failure")?;
+        assert!(failed.final_destination_changed());
+        assert!(failed.has_pending_cleanup());
+        drop(failed);
+        let reads_before = reader.read_call_count();
 
         let outcome = transfer(request).await?;
         assert_eq!(
             outcome.prepare,
-            PrepareFact::Restarted {
-                reason: RestartReason::PointerWithoutStage
+            PrepareFact::Resumed {
+                bytes: payload.len() as u64
             }
         );
+        assert_eq!(reader.read_call_count(), reads_before);
         assert_eq!(outcome.transferred_bytes, payload.len() as u64);
         assert_eq!(std::fs::read(destination_root.join("final.bin"))?, payload);
         // The unlocked claim the dropped stage left goes with the restarted run's artifacts.

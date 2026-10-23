@@ -34,6 +34,7 @@ impl std::ops::Deref for MemoryHdfs {
 #[derive(Default)]
 pub(crate) struct MemoryHdfsState {
     objects: Mutex<HashMap<String, Bytes>>,
+    file_modes: Mutex<HashMap<String, u32>>,
     metadata_calls: Mutex<Vec<String>>,
     stat_calls: AtomicUsize,
     use_read_cursor: std::sync::atomic::AtomicBool,
@@ -49,6 +50,8 @@ pub(crate) struct MemoryHdfsState {
     stabilize_calls: AtomicUsize,
     recovered_tail: Mutex<Option<Bytes>>,
     hsync_calls: AtomicUsize,
+    pointer_writes: AtomicUsize,
+    data_closes: AtomicUsize,
     fail_after_hsync: std::sync::atomic::AtomicBool,
     fail_pointer_write: std::sync::atomic::AtomicBool,
     hsync_completed: std::sync::atomic::AtomicBool,
@@ -197,6 +200,13 @@ impl MemoryHdfs {
     pub(crate) fn hsync_calls(&self) -> usize {
         self.hsync_calls.load(Ordering::SeqCst)
     }
+    pub(crate) fn checkpoint_io_counts(&self) -> (usize, usize, usize) {
+        (
+            self.pointer_writes.load(Ordering::SeqCst),
+            self.hsync_calls.load(Ordering::SeqCst),
+            self.data_closes.load(Ordering::SeqCst),
+        )
+    }
     pub(crate) async fn reveal_tail_during_lease_recovery(&self, tail: Bytes) {
         *self.recovered_tail.lock().await = Some(tail);
     }
@@ -262,6 +272,10 @@ impl MemoryHdfs {
 
     pub(crate) async fn metadata_calls(&self) -> Vec<String> {
         self.metadata_calls.lock().await.clone()
+    }
+
+    pub(crate) async fn file_mode(&self, path: &str) -> Option<u32> {
+        self.file_modes.lock().await.get(path).copied()
     }
 
     pub(crate) fn stat_calls(&self) -> usize {
@@ -413,6 +427,7 @@ impl HdfsProtocol for MemoryHdfs {
 
     async fn delete(&self, path: &StoragePath, _kind: EntryKind) -> Result<(), StorageRoleFailure> {
         self.objects.lock().await.remove(path.as_str());
+        self.file_modes.lock().await.remove(path.as_str());
         Ok(())
     }
 
@@ -435,6 +450,12 @@ impl HdfsProtocol for MemoryHdfs {
             .remove(from.as_str())
             .ok_or_else(|| Self::missing(from, Operation::Publish))?;
         objects.insert(to.as_str().into(), value);
+        let mut modes = self.file_modes.lock().await;
+        if let Some(mode) = modes.remove(from.as_str()) {
+            modes.insert(to.as_str().into(), mode);
+        } else {
+            modes.remove(to.as_str());
+        }
         if self.fail_rename_after_commit.load(Ordering::SeqCst) {
             return Err(entry_failure(
                 to,
@@ -543,6 +564,10 @@ impl HdfsProtocol for MemoryHdfs {
     }
 
     async fn set_mode(&self, path: &StoragePath, mode: u32) -> Result<(), StorageRoleFailure> {
+        self.file_modes
+            .lock()
+            .await
+            .insert(path.as_str().into(), mode);
         self.metadata_calls
             .lock()
             .await
@@ -570,10 +595,28 @@ struct MemoryWriteSession<'a> {
     offset: u64,
 }
 
+impl MemoryWriteSession<'_> {
+    async fn check_checkpoint_privacy(&self, data: &[u8]) {
+        if crate::storage::pointer::DestinationPointer::decode(data)
+            .is_ok_and(|pointer| pointer.checkpoint.is_some())
+        {
+            assert_eq!(
+                self.storage.file_mode(self.path.as_str()).await,
+                Some(0o600),
+                "hash fragments must be private before the first write"
+            );
+        }
+    }
+}
+
 #[async_trait]
 impl HdfsWriteSession for MemoryWriteSession<'_> {
     async fn write(&mut self, data: Bytes) -> Result<usize, StorageRoleFailure> {
         let pointer = is_pointer(&self.path);
+        if pointer {
+            self.check_checkpoint_privacy(&data).await;
+            self.storage.pointer_writes.fetch_add(1, Ordering::SeqCst);
+        }
         if (pointer
             && self
                 .storage
@@ -623,6 +666,9 @@ impl HdfsWriteSession for MemoryWriteSession<'_> {
     }
 
     async fn close(self: Box<Self>) -> Result<(), StorageRoleFailure> {
+        if !is_pointer(&self.path) {
+            self.storage.data_closes.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 }

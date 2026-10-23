@@ -258,15 +258,14 @@ async fn deferred_recovery_requires_more_than_one_interval()
 }
 
 #[tokio::test]
-async fn deferred_recovery_skips_checkpoint_at_end_of_file()
+async fn deferred_hash_recovery_commits_its_final_root_without_an_extra_data_sync()
 -> Result<(), Box<dyn std::error::Error>> {
     for policy in [TransferPolicy::Checkpointed] {
         // The first interval is crossed by the final 64 KiB source chunk.
         // The second case saves progress at 128 KiB and updates the existing record
-        // after final synchronization, without an extra periodic checkpoint at EOF.
-        for (size, interval, failed_checkpoint) in
-            [(128 * 1024, 96 * 1024, 1), (256 * 1024, 128 * 1024, 3)]
-        {
+        // after final synchronization. A v2 hash-ready publication also requires its final
+        // root, unlike a legacy deferred transfer that could leave recovery disabled at EOF.
+        for (size, interval) in [(128 * 1024, 96 * 1024), (256 * 1024, 128 * 1024)] {
             let source_root = TestRoot::new("eof-checkpoint-source")?;
             let destination_root = TestRoot::new("eof-checkpoint-destination")?;
             let payload = vec![0x82; size];
@@ -274,7 +273,6 @@ async fn deferred_recovery_skips_checkpoint_at_end_of_file()
             let (destination, role) =
                 test_destination_storage_with_role(destination_root.path(), "eof-checkpoint")?;
             role.set_automatic_checkpoint_interval(interval);
-            role.fail_checkpoint_at(failed_checkpoint);
             transfer(
                 transfer_request(
                     local_source(source_root.path())?,
@@ -284,6 +282,7 @@ async fn deferred_recovery_skips_checkpoint_at_end_of_file()
                 .with_transfer_policy(policy),
             )
             .await?;
+            assert_eq!(role.final_sync_counts(), (1, 1));
             assert_eq!(
                 std::fs::read(destination_root.path().join("final.bin"))?,
                 payload

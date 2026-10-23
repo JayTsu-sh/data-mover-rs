@@ -9,6 +9,9 @@ use crate::storage::{
     SourceDescriptor, StagedDestination, VerifyRequest,
 };
 
+#[path = "hash_checkpoint_tests.rs"]
+mod hash_checkpoint_tests;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const IDENTITY: [u8; 32] = [4; 32];
@@ -530,5 +533,123 @@ async fn a_direct_stage_writes_and_publishes_the_final_path() -> TestResult {
         Some(PAYLOAD)
     );
     assert_eq!(protocol.len().await, 1);
+    Ok(())
+}
+
+/// Expert stages never opt into hash recovery implicitly. Their old pointer versions, hsync
+/// spacing and final-close behavior also cover the ordinary ineligible/AtomicReplace paths.
+#[tokio::test]
+async fn unarmed_stages_preserve_the_old_checkpoint_io() -> TestResult {
+    for (recoverable, deferred, expected_io) in [
+        (false, false, (0, 0, 1)),
+        (true, false, (1, 0, 1)),
+        (false, true, (2, 2, 1)),
+    ] {
+        let protocol = Arc::new(MemoryHdfs::default());
+        let destination = adapter(&protocol)?;
+        let mut stage = destination
+            .prepare_at_destination(request(BINDING, ResumeMode::Discover, recoverable)?)
+            .await?;
+        if deferred {
+            stage.deferred_checkpoint = Some(crate::storage::DeferredCheckpoint {
+                interval_bytes: 4,
+                source_size: PAYLOAD.len() as u64,
+            });
+        }
+        assert!(!stage.checkpoint_enabled());
+        assert!(stage.checkpoint_snapshot().is_none());
+        destination.write(&stage, input(PAYLOAD)).await?;
+        assert_eq!(protocol.checkpoint_io_counts(), expected_io);
+        assert!(
+            protocol.metadata_calls().await.is_empty(),
+            "legacy checkpoints must not add chmod"
+        );
+        if let Some(bytes) = protocol.get(&name(ArtifactKind::Pointer)).await {
+            let pointer = DestinationPointer::decode(&bytes).map_err(|_| "decode")?;
+            assert!(pointer.checkpoint.is_none());
+            assert_eq!(pointer.encode().map_err(|_| "encode")?, bytes);
+        }
+        let before = protocol.checkpoint_io_counts();
+        assert!(destination.persist_hash_checkpoint(&stage).await.is_err());
+        destination.release_hash_checkpoint(&stage).await?;
+        assert_eq!(protocol.checkpoint_io_counts(), before);
+        publish(&destination, &stage)
+            .await
+            .map_err(|failure| failure.error)?;
+        assert!(no_artifacts(&protocol).await);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_stages_do_not_add_hash_checkpoint_io() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    let destination = adapter(&protocol)?;
+    let stage = destination
+        .prepare_direct(
+            request(BINDING, ResumeMode::Discover, false)?.prepare,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+    assert!(!stage.checkpoint_enabled());
+    assert!(destination.persist_hash_checkpoint(&stage).await.is_err());
+    destination.release_hash_checkpoint(&stage).await?;
+    destination.write(&stage, input(PAYLOAD)).await?;
+    publish(&destination, &stage)
+        .await
+        .map_err(|failure| failure.error)?;
+    assert_eq!(protocol.checkpoint_io_counts(), (0, 0, 1));
+    assert!(protocol.metadata_calls().await.is_empty());
+    assert!(no_artifacts(&protocol).await);
+    Ok(())
+}
+
+/// Decoding a valid outer pointer must retain even a hash intent larger than the old v1
+/// extension limit. The backend's fence remains independent of the opaque checkpoint.
+#[test]
+fn hash_pointer_roundtrip_preserves_intent_and_fence() -> TestResult {
+    let fence = Fence::new(IDENTITY);
+    for checkpoint in [None, Some(Bytes::from(vec![0x5a; 8192]))] {
+        let pointer = DestinationPointer {
+            binding: BINDING,
+            transfer_identity: IDENTITY,
+            durable_prefix: Some(4),
+            extension: fence.extension(),
+            checkpoint,
+        };
+        let encoded = pointer.encode().map_err(|_| "encode")?;
+        let decoded = DestinationPointer::decode(&encoded).map_err(|_| "decode")?;
+        assert!(accepts(&decoded));
+        assert_eq!(decoded, pointer);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_hash_intent_is_not_erased_by_pointer_takeover() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    interrupted(&protocol, 4).await?;
+    let path = name(ArtifactKind::Pointer);
+    let bytes = protocol.get(&path).await.ok_or("pointer")?;
+    let mut pointer = DestinationPointer::decode(&bytes).map_err(|_| "decode")?;
+    pointer.checkpoint = Some(Bytes::from_static(b"invalid hash checkpoint"));
+    let bytes = Bytes::from(pointer.encode().map_err(|_| "encode")?);
+    protocol.insert(&path, bytes.clone()).await;
+    let destination = adapter(&protocol)?;
+    let error = destination
+        .prepare_at_destination(
+            request(BINDING, ResumeMode::Discover, true)?.with_checkpoint_hash(true),
+        )
+        .await
+        .err()
+        .ok_or("invalid hash intent must fail before takeover")?;
+    assert!(
+        matches!(error, StorageRoleFailure::Entry(entry) if entry.class() == FailureClass::Unsupported)
+    );
+    assert_eq!(protocol.get(&path).await, Some(bytes));
+    assert_eq!(
+        protocol.get(&name(ArtifactKind::Stage)).await.as_deref(),
+        Some(&PAYLOAD[..4])
+    );
     Ok(())
 }

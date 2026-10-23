@@ -58,6 +58,7 @@ pub(super) struct Spec {
     pub(super) resumable: bool,
     /// Whether a fresh stage writes its pointer from the start.
     pub(super) recoverable: bool,
+    pub(super) checkpoint_hash: bool,
     pub(super) cancel: CancellationToken,
 }
 
@@ -81,6 +82,9 @@ pub(super) async fn prepare(
         resumable: request.transfer_policy == TransferPolicy::Checkpointed
             && (plan.recovery_enabled || plan.automatic_interval.is_some()),
         recoverable: plan.recovery_enabled,
+        checkpoint_hash: request.transfer_policy == TransferPolicy::Checkpointed
+            && destination.supports_hash_checkpoint()
+            && destination.resumable_at_destination(),
         cancel: request.cancel.clone(),
     };
     let prepare = PrepareRequest {
@@ -106,12 +110,14 @@ pub(super) async fn prepare_with(
         destination
             .prepare_at_destination(
                 DestinationPrepareRequest::new(prepare, *spec.identity.as_bytes())
-                    .with_resume(if spec.resumable {
+                    .with_resume(if spec.resumable || spec.checkpoint_hash {
                         ResumeMode::Discover
                     } else {
                         ResumeMode::Restart
                     })
-                    .with_recoverable(spec.recoverable),
+                    .with_recoverable(spec.recoverable)
+                    .with_checkpoint_hash(spec.checkpoint_hash)
+                    .with_legacy_restart(!spec.resumable),
             )
             .await
     };
@@ -160,6 +166,12 @@ pub(super) async fn run_until_transferred(
         lease,
     )
     .await?;
+    if super::checkpointed::eligible(request, destination.as_ref(), &stage, plan) {
+        let binding =
+            super::negotiation::checkpoint_metadata_binding(request, copied_metadata_plan.as_ref());
+        stage =
+            super::publication::bind_prepared_checkpoint_metadata(stage, &destination, binding)?;
+    }
     stage.durable_publication = request.transfer_policy == TransferPolicy::Checkpointed;
     if let Some(interval_bytes) = plan.automatic_interval {
         // The destination writes its own pointer at the deferred checkpoint.

@@ -123,6 +123,26 @@ pub(super) fn part_ranges(
 }
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
+    pub(in crate::storage::backends::s3) fn native_hash_checkpoint_eligible(
+        &self,
+        source: &crate::storage::SourceDescriptor,
+    ) -> bool {
+        let capabilities = self.protocol.bucket_capabilities();
+        capabilities.multipart
+            && capabilities.resumable
+            && !source.path.names_directory_object()
+            && source
+                .size
+                .is_some_and(|size| size > self.native.single_max)
+            && limits::refusal(capabilities, &source.path, source.size).is_none()
+            && native_part_size(
+                source.size.unwrap_or(0),
+                self.native.part_size,
+                &source.path,
+            )
+            .is_ok()
+    }
+
     /// Prepares a native copy at the destination: one `CopyObject` up to the single-copy limit —
     /// for a directory object one request carries (P7 D13), and at any size its limits allow on a
     /// bucket without multipart uploads (P7 §14.2) — after cleaning up a leftover pointer (and,
@@ -152,7 +172,12 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         // at any size its limits allow (5 GiB, refused above), never `UploadPartCopy` (P7 §14.2).
         let multipart = self.protocol.bucket_capabilities().multipart;
         if one_request || size <= self.native.single_max || !multipart {
-            let fact = self.clear_leftover(&request, &pointer).await?;
+            let fact = match self.clear_leftover(&request, &pointer).await? {
+                super::single_prepare::Leftover::Cleared(fact) => fact,
+                super::single_prepare::Leftover::Resume(found) => {
+                    return self.resume_single_upload(request, pointer, found).await;
+                }
+            };
             let previous = self.previous_object(&path).await?;
             let mut stage = self.prepare_single(request.prepare, size, previous);
             stage.mark_at_destination(fact);
@@ -185,12 +210,32 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         };
         let resumed = parts.len();
         let first = i32::try_from(resumed + 1).map_err(|_| fail("S3 part number overflow"))?;
-        let ranges = part_ranges(
-            stage.write_offset,
-            source.size,
-            upload.part_size as u64,
-            first,
-        );
+        let ranges = if stage.checkpoint_enabled() {
+            let present: std::collections::BTreeSet<_> = parts.iter().map(|part| part.0).collect();
+            let missing: Vec<_> = part_ranges(0, source.size, upload.part_size as u64, 1)
+                .into_iter()
+                .filter(|(number, _)| !present.contains(number))
+                .collect();
+            if missing.iter().any(|(_, range)| {
+                !upload
+                    .lock()
+                    .anchored_hash
+                    .as_ref()
+                    .is_some_and(|hash| hash.covers(range.clone()))
+            }) {
+                return Err(fail(
+                    "native S3 part dispatch requires persisted source hash intent",
+                ));
+            }
+            missing
+        } else {
+            part_ranges(
+                stage.write_offset,
+                source.size,
+                upload.part_size as u64,
+                first,
+            )
+        };
         let copied = self
             .copy_parts(stage, upload, source, ranges, cancel)
             .await?;
@@ -205,9 +250,22 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             bytes: copied.bytes,
         };
         upload.lock().native = true;
+        let size = if stage.checkpoint_enabled() {
+            source.size
+        } else {
+            stage.write_offset + copied.bytes
+        };
+        let _guard = if stage.checkpoint_enabled() {
+            Some(stage.checkpoint_guard().await)
+        } else {
+            None
+        };
         upload
-            .record_written(path, sent, resumed, stage.write_offset + copied.bytes)
+            .record_written(path, sent, resumed, size)
             .map_err(|error| copied.failure(error))?;
+        if stage.checkpoint_enabled() {
+            stage.checkpoint_barrier(size);
+        }
         Ok(S3NativeCopyEvidence {
             bytes: copied.bytes,
             requests: copied.requests,
@@ -255,6 +313,15 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 .map_err(|error| copied.failure(role_failure(path, Operation::Write, error)))?;
             copied.parts.push((number, etag));
             copied.bytes += length;
+            if stage.checkpoint_enabled() {
+                let _guard = stage.checkpoint_guard().await;
+                let offset = u64::try_from(number - 1).unwrap_or(0) * upload.part_size as u64;
+                stage.confirmed_write(offset, length);
+                if let Some((_, etag)) = copied.parts.last() {
+                    upload.lock().parts.push((number, etag.clone()));
+                }
+                stage.checkpoint_barrier(0);
+            }
             self.native_checkpoint(stage, upload, copied.bytes);
         }
         if copied.parts.len() < total {

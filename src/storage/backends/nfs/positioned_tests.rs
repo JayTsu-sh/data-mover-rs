@@ -12,6 +12,50 @@ fn positioned_input(parts: &[(u64, &'static [u8])]) -> crate::storage::Positione
 }
 
 #[tokio::test]
+async fn hash_checkpoint_larger_than_legacy_pointer_uses_negotiated_io_and_restores()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::Ordering;
+    let (first, protocol, identity) = adapter();
+    protocol.maximum_read_chunk.store(1024, Ordering::SeqCst);
+    protocol.maximum_write_chunk.store(1024, Ordering::SeqCst);
+    let mut request = prepare_request(&identity);
+    request.source.size = Some(512 * 1024);
+    let stage = prepare_ephemeral_stage(&first, request.clone()).await?;
+    let mut hash = crate::storage::range_hash::RangeHash::new(512 * 1024);
+    // Each distinct incomplete leaf retains a one-byte fragment (12 encoded bytes).
+    // 512 fragments exceed the legacy pointer limit even before the outer envelope.
+    for index in 0..512_u64 {
+        hash.observe(index * 1024, &[7])?;
+    }
+    let encoded = Bytes::from(hash.encode()?);
+    assert!(encoded.len() > 4212);
+    stage.enable_checkpoint(512 * 1024, encoded.clone());
+    assert!(
+        stage
+            .checkpoint_snapshot()
+            .is_some_and(|bytes| bytes.len() > 4212)
+    );
+    first.persist_hash_checkpoint(&stage).await?;
+    assert!(protocol.pointer_writes.load(Ordering::SeqCst) > 1);
+    drop(stage);
+    drop(first);
+    let second = NfsStagedDestinationAdapter::new(protocol.clone(), identity);
+    let stage = second
+        .prepare_at_destination(
+            at_destination(request, ResumeMode::Discover, true).with_checkpoint_hash(true),
+        )
+        .await?;
+    assert!(!stage.checkpoint_enabled());
+    assert_eq!(
+        stage.restored_checkpoint().ok_or("checkpoint")?.hash,
+        encoded
+    );
+    assert!(stage.checkpoint_ranges().is_empty());
+    second.discard(stage).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn positioned_nfs_writes_completed_later_read_before_prefix_arrives()
 -> Result<(), Box<dyn std::error::Error>> {
     let (adapter, protocol, identity) = adapter();
@@ -194,7 +238,10 @@ async fn wait_positioned_nfs_writes(protocol: &FakeProtocol, count: usize) {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len();
             if started >= count
-                && protocol.active_writes.load(std::sync::atomic::Ordering::SeqCst) == 0
+                && protocol
+                    .active_writes
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 0
             {
                 break;
             }
@@ -244,10 +291,15 @@ async fn positioned_nfs_checkpoint_coalesces_thresholds_and_rebases_next_interva
                 (0, &b"abcd"[..], 12),
                 (12, &b"mn"[..], 12),
                 (14, &b"opqr"[..], 18),
-            ].into_iter().enumerate() {
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 tx.send(Ok(crate::storage::PositionedChunk {
-                    offset, data: Bytes::from_static(data),
-                })).await?;
+                    offset,
+                    data: Bytes::from_static(data),
+                }))
+                .await?;
                 wait_positioned_nfs_writes(&protocol, index + 1).await;
                 if prefix == 0 {
                     assert!(!stage.recovery_enabled());
@@ -255,12 +307,17 @@ async fn positioned_nfs_checkpoint_coalesces_thresholds_and_rebases_next_interva
                     assert_eq!(protocol.checkpoints.load(Ordering::SeqCst), 0);
                 } else {
                     wait_positioned_nfs_checkpoint(&adapter, &stage, prefix).await;
-                    assert_eq!(protocol.checkpoints.load(Ordering::SeqCst), if prefix == 12 { 1 } else { 2 });
+                    assert_eq!(
+                        protocol.checkpoints.load(Ordering::SeqCst),
+                        if prefix == 12 { 1 } else { 2 }
+                    );
                 }
             }
             tx.send(Ok(crate::storage::PositionedChunk {
-                offset: 18, data: Bytes::from_static(b"stuvwx"),
-            })).await?;
+                offset: 18,
+                data: Bytes::from_static(b"stuvwx"),
+            }))
+            .await?;
             drop(tx);
             Ok::<_, Box<dyn std::error::Error>>(())
         };

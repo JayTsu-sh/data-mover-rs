@@ -21,6 +21,7 @@ use bytes::Bytes;
 use cap_std::fs::MetadataExt as _;
 use cap_std::fs::{Dir, OpenOptions};
 
+pub(super) use super::hash_checkpoint::cleanup;
 use super::{LocalStagedDestination, failure, failure_with_transience, io_failure, publication};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::artifacts::{ArtifactKind, artifact_name, artifact_temporary_name};
@@ -73,6 +74,7 @@ pub(super) fn pointer(
         transfer_identity,
         durable_prefix: Some(durable_prefix),
         extension: Bytes::from_static(POINTER_TAG),
+        checkpoint: stage.checkpoint_snapshot(),
     }
 }
 
@@ -106,18 +108,18 @@ fn not_regular() -> io::Error {
 }
 
 #[cfg(unix)]
-fn same_file(seen: &cap_std::fs::Metadata, opened: &std::fs::Metadata) -> bool {
+pub(super) fn same_file(seen: &cap_std::fs::Metadata, opened: &std::fs::Metadata) -> bool {
     seen.dev() == opened.dev() && seen.ino() == opened.ino()
 }
 
 #[cfg(not(unix))]
-fn same_file(_seen: &cap_std::fs::Metadata, _opened: &std::fs::Metadata) -> bool {
+pub(super) fn same_file(_seen: &cap_std::fs::Metadata, _opened: &std::fs::Metadata) -> bool {
     true
 }
 
 /// Opens `name` only if it is a regular file, never through a symlink: the name is looked at
 /// without following, opened, and the opened file must be the one looked at. `None` if absent.
-fn open_regular(
+pub(super) fn open_regular(
     directory: &Dir,
     name: &OsStr,
     options: &OpenOptions,
@@ -183,12 +185,45 @@ fn give_back_claim(stage: &PreparedStage, claim: std::fs::File) {
     *stage.claim.lock().unwrap_or_else(PoisonError::into_inner) = Some(claim);
 }
 
-fn holds_claim(stage: &PreparedStage) -> bool {
+pub(super) fn holds_claim(stage: &PreparedStage) -> bool {
     stage
         .claim
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .is_some()
+}
+
+/// Check the locked inode still owns the claim name before an armed pointer replacement.
+pub(super) async fn fence_claim(
+    stage: &PreparedStage,
+    directory: Arc<Dir>,
+) -> Result<(), StorageRoleFailure> {
+    let path = stage.final_destination.path();
+    let name = artifact(path, ArtifactKind::Claim, false)?;
+    let file = stage
+        .claim
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .ok_or_else(not_regular)
+        .and_then(std::fs::File::try_clone)
+        .map_err(|error| io_failure(path, Operation::Verify, &error))?;
+    tokio::task::spawn_blocking(move || {
+        let seen = directory.symlink_metadata(name).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                not_regular()
+            } else {
+                error
+            }
+        })?;
+        if !seen.is_file() || !super::hash_checkpoint::claim_matches(&seen, &file)? {
+            return Err(not_regular());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| failure(path, Operation::Verify, FailureClass::Internal))?
+    .map_err(|error| io_failure(path, Operation::Verify, &error))
 }
 
 /// A final file's artifacts in its directory, as the discovery driver looks at them.
@@ -261,6 +296,13 @@ impl DestinationArtifacts for LocalArtifacts {
         .await
     }
 
+    async fn observe_final(
+        &self,
+        final_path: &StoragePath,
+    ) -> Result<Option<u64>, StorageRoleFailure> {
+        super::published_recovery::observe_final(Arc::clone(&self.directory), final_path).await
+    }
+
     async fn remove_stage(&self, final_path: &StoragePath) -> Result<(), StorageRoleFailure> {
         let stage = self.stage.clone();
         self.blocking(final_path, move |directory| {
@@ -313,7 +355,35 @@ pub(super) async fn prepare(
     let Some(point) = found.resume else {
         return start(adapter, stage, &artifacts, &request).await;
     };
-    let reopened = reopen_stage(&artifacts, &final_path, point.prefix)
+    if point.pointer.durable_prefix != Some(point.prefix)
+        || stage.restore_checkpoint(point.pointer.checkpoint).is_err()
+        || stage.restored_checkpoint().is_some_and(|data| {
+            data.prefix() != point.prefix
+                || request
+                    .prepare
+                    .source
+                    .size
+                    .is_some_and(|size| data.size != size)
+        })
+    {
+        let error = failure(&final_path, Operation::Prepare, FailureClass::Corruption);
+        return Err(abandon(&stage, &directory, error).await);
+    }
+    if point.published {
+        if let Err(error) = super::published_recovery::recover(
+            &mut stage,
+            Arc::clone(&directory),
+            request.transfer_identity,
+        )
+        .await
+        {
+            return Err(abandon(&stage, &directory, error).await);
+        }
+        return Ok(stage);
+    }
+    let ranges = stage.checkpoint_ranges();
+    let retained_end = ranges.iter().map(|range| range.end).max();
+    let reopened = reopen_stage(&artifacts, &final_path, point.prefix, retained_end)
         .await
         .and_then(|file| {
             cache(
@@ -513,6 +583,7 @@ async fn reopen_stage(
     artifacts: &LocalArtifacts,
     final_path: &StoragePath,
     prefix: u64,
+    retained_end: Option<u64>,
 ) -> Result<std::fs::File, StorageRoleFailure> {
     let name = artifacts.stage.clone();
     artifacts
@@ -527,7 +598,16 @@ async fn reopen_stage(
                 other => other?,
             }
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-            file.set_len(prefix)?;
+            if let Some(end) = retained_end {
+                if file.metadata()?.len() < end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "stage is shorter than its checkpoint ranges",
+                    ));
+                }
+            } else {
+                file.set_len(prefix)?;
+            }
             Ok(file)
         })
         .await
@@ -609,7 +689,8 @@ async fn start(
 /// pointer to resume from; the claim last, while still held. A stage that no longer holds its
 /// claim (its publication finished and let it go) removes nothing: the names may be another
 /// process's by now.
-pub(super) async fn cleanup(
+/// Armed callers must hold the checkpoint gate and have fenced the claim before entering.
+pub(super) async fn cleanup_locked(
     adapter: &LocalStagedDestination,
     stage: &PreparedStage,
     operation: Operation,
@@ -669,6 +750,13 @@ pub(super) async fn finish_publication(
     final_destination: StoragePath,
     disposition: PublicationDisposition,
 ) -> Result<PublicationEvidence, PublicationFailure> {
+    if stage.checkpoint_enabled() {
+        return Ok(PublicationEvidence {
+            final_destination,
+            disposition,
+            version: None,
+        });
+    }
     let committed = |error| PublicationFailure {
         error,
         final_destination_changed: true,

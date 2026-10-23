@@ -109,6 +109,7 @@ pub(super) async fn write(
         file.flush()
             .await
             .map_err(|e| classify(path, Operation::Write, &e))?;
+        super::at_destination::checkpoint_barrier(stage, offset).await?;
     }
     if stage.recovery_enabled() {
         write_pointer(adapter, stage, offset, false).await?;
@@ -126,6 +127,7 @@ pub(super) async fn save(
     file.flush()
         .await
         .map_err(|e| classify(stage.final_destination.path(), Operation::Write, &e))?;
+    super::at_destination::checkpoint_barrier(stage, offset).await?;
     // The pointer is the whole recovery record: nothing registers where data-mover runs.
     write_pointer(adapter, stage, offset, false).await?;
     stage.recovery_enabled.store(true, Ordering::Release);

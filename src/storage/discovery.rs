@@ -21,9 +21,11 @@
 
 use async_trait::async_trait;
 
-use super::pointer::{DestinationPointer, MAX_POINTER_BYTES};
+use super::checkpoint::{CheckpointData, CheckpointPhase, insert_range};
+use super::pointer::{DestinationPointer, MAX_POINTER_BYTES, is_checkpoint_pointer};
+use super::range_hash::RangeHash;
 use super::{PrepareRequest, StorageRoleFailure};
-use crate::model::StoragePath;
+use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 
 /// Whether prepare may resume what it finds at the destination.
 #[non_exhaustive]
@@ -102,6 +104,10 @@ pub struct DestinationPrepareRequest {
     /// that checkpoint and is not discarded can still be resumed. A resumed stage keeps its
     /// pointer either way.
     pub recoverable: bool,
+    /// Ordinary eligible Checkpointed transfer, never an expert or non-checkpointed request.
+    pub(crate) checkpoint_hash: bool,
+    /// Permit v2 discovery after planning changes without resuming legacy small-file state.
+    pub(crate) legacy_restart: bool,
 }
 
 impl DestinationPrepareRequest {
@@ -113,6 +119,8 @@ impl DestinationPrepareRequest {
             transfer_identity,
             resume: ResumeMode::Discover,
             recoverable: true,
+            checkpoint_hash: false,
+            legacy_restart: false,
         }
     }
 
@@ -127,6 +135,16 @@ impl DestinationPrepareRequest {
     #[must_use]
     pub const fn with_recoverable(mut self, recoverable: bool) -> Self {
         self.recoverable = recoverable;
+        self
+    }
+
+    pub(crate) const fn with_checkpoint_hash(mut self, enabled: bool) -> Self {
+        self.checkpoint_hash = enabled;
+        self
+    }
+
+    pub(crate) const fn with_legacy_restart(mut self, restart: bool) -> Self {
+        self.legacy_restart = restart;
         self
     }
 }
@@ -165,7 +183,11 @@ pub(crate) fn decide(found: &Found, request: &DestinationPrepareRequest) -> Deci
     if !anything {
         return Decision::Fresh;
     }
-    if request.resume == ResumeMode::Restart {
+    if request.resume == ResumeMode::Restart
+        || (request.legacy_restart
+            && !matches!(&found.pointer,
+            FoundPointer::Present(pointer) if pointer.checkpoint.is_some()))
+    {
         return Decision::Clean {
             reason: RestartReason::Requested,
         };
@@ -201,6 +223,7 @@ pub(crate) fn decide(found: &Found, request: &DestinationPrepareRequest) -> Deci
     Decision::Resume(ResumePoint {
         prefix,
         pointer: pointer.clone(),
+        published: false,
     })
 }
 
@@ -222,6 +245,14 @@ pub(crate) trait DestinationArtifacts: Send + Sync {
         &self,
         final_path: &StoragePath,
     ) -> Result<Option<u64>, StorageRoleFailure>;
+    /// Only queried for a matching hash-ready root whose stage has disappeared. This is a
+    /// candidate, not proof: the engine must verify its bytes against the saved source hash.
+    async fn observe_final(
+        &self,
+        _final_path: &StoragePath,
+    ) -> Result<Option<u64>, StorageRoleFailure> {
+        Ok(None)
+    }
     async fn remove_pointer(&self, final_path: &StoragePath) -> Result<(), StorageRoleFailure>;
     async fn remove_stage(&self, final_path: &StoragePath) -> Result<(), StorageRoleFailure>;
     /// Whether a pointer that decodes is one this backend wrote. A refused one is cleaned up as
@@ -245,6 +276,7 @@ pub(crate) trait DestinationArtifacts: Send + Sync {
 pub(crate) struct ResumePoint {
     pub(crate) prefix: u64,
     pub(crate) pointer: DestinationPointer,
+    pub(crate) published: bool,
 }
 
 /// The outcome of looking: the fact to report and, when resuming, where from.
@@ -269,15 +301,38 @@ pub(crate) async fn discover(
     {
         None => FoundPointer::Absent,
         Some(bytes) => match DestinationPointer::decode(&bytes) {
+            Err(_) if is_checkpoint_pointer(&bytes) => return Err(checkpoint_refused(final_path)),
+            Ok(pointer)
+                if pointer.checkpoint.is_some()
+                    && !request.checkpoint_hash
+                    && request.resume == ResumeMode::Discover =>
+            {
+                return Err(checkpoint_refused(final_path));
+            }
             Ok(pointer) if artifacts.accepts_pointer(&pointer) => FoundPointer::Present(pointer),
+            Ok(pointer) if pointer.checkpoint.is_some() => {
+                return Err(checkpoint_refused(final_path));
+            }
             _ => FoundPointer::Corrupt,
         },
     };
+    validate_hash_pointer(&pointer, final_path)?;
+    if let FoundPointer::Present(pointer) = &pointer
+        && pointer.checkpoint.is_some()
+        && request.resume == ResumeMode::Discover
+        && (pointer.transfer_identity != request.transfer_identity
+            || pointer.binding != request.prepare.recovery_binding)
+    {
+        return Err(checkpoint_refused(final_path));
+    }
     let found = Found {
         pointer,
         stage_bytes: artifacts.observe_stage(final_path).await?,
         continues_from_stage: artifacts.continues_from_stage(),
     };
+    if let Some(published) = published_candidate(artifacts, request, &found).await? {
+        return Ok(published);
+    }
     match decide(&found, request) {
         Decision::Fresh => Ok(Discovery {
             fact: PrepareFact::Fresh,
@@ -285,7 +340,7 @@ pub(crate) async fn discover(
         }),
         Decision::Resume(point) => Ok(Discovery {
             fact: PrepareFact::Resumed {
-                bytes: point.prefix,
+                bytes: reused_bytes(&point),
             },
             resume: Some(point),
         }),
@@ -298,6 +353,89 @@ pub(crate) async fn discover(
             })
         }
     }
+}
+
+fn reused_bytes(point: &ResumePoint) -> u64 {
+    let Some(mut data) = point
+        .pointer
+        .checkpoint
+        .as_deref()
+        .and_then(|bytes| CheckpointData::decode(bytes).ok())
+    else {
+        return point.prefix;
+    };
+    // The append adapter may independently prove a tail longer than the saved pointer.
+    // Sparse adapters retain all committed islands, not just the contiguous write offset.
+    insert_range(&mut data.ranges, 0..point.prefix);
+    data.ranges
+        .iter()
+        .map(|range| range.end - range.start)
+        .sum()
+}
+
+fn validate_hash_pointer(
+    pointer: &FoundPointer,
+    path: &StoragePath,
+) -> Result<(), StorageRoleFailure> {
+    let FoundPointer::Present(pointer) = pointer else {
+        return Ok(());
+    };
+    let Some(encoded) = &pointer.checkpoint else {
+        return Ok(());
+    };
+    let data = CheckpointData::decode(encoded).map_err(|_| checkpoint_refused(path))?;
+    let hash = RangeHash::decode(&data.hash, data.size).map_err(|_| checkpoint_refused(path))?;
+    if pointer
+        .durable_prefix
+        .is_some_and(|prefix| prefix != data.prefix())
+        || data.ranges.iter().any(|range| !hash.covers(range.clone()))
+        || (data.phase != CheckpointPhase::Receiving
+            && (!hash.covers(0..data.size) || data.prefix() != data.size))
+    {
+        return Err(checkpoint_refused(path));
+    }
+    Ok(())
+}
+
+async fn published_candidate(
+    artifacts: &dyn DestinationArtifacts,
+    request: &DestinationPrepareRequest,
+    found: &Found,
+) -> Result<Option<Discovery>, StorageRoleFailure> {
+    let FoundPointer::Present(pointer) = &found.pointer else {
+        return Ok(None);
+    };
+    if found.stage_bytes.is_some()
+        || request.resume != ResumeMode::Discover
+        || !request.checkpoint_hash
+        || pointer.binding != request.prepare.recovery_binding
+        || pointer.transfer_identity != request.transfer_identity
+    {
+        return Ok(None);
+    }
+    let Some(encoded) = &pointer.checkpoint else {
+        return Ok(None);
+    };
+    let path = request.prepare.final_destination.path();
+    let data = CheckpointData::decode(encoded).map_err(|_| checkpoint_refused(path))?;
+    if data.phase == CheckpointPhase::Receiving
+        || request.prepare.source.size != Some(data.size)
+        || artifacts.observe_final(path).await? != Some(data.size)
+    {
+        return Err(checkpoint_refused(path));
+    }
+    Ok(Some(Discovery {
+        fact: PrepareFact::Resumed { bytes: data.size },
+        resume: Some(ResumePoint {
+            prefix: data.size,
+            pointer: pointer.clone(),
+            published: true,
+        }),
+    }))
+}
+
+fn checkpoint_refused(path: &StoragePath) -> StorageRoleFailure {
+    StorageRoleFailure::Entry(EntryOperationFailure::new(path.clone(), Operation::Prepare, FailureClass::Unsupported, Transience::Permanent, "checkpoint hash state is corrupt, unsupported, or incompatible with this recovery interface").unwrap_or_else(|_| unreachable!("static checkpoint diagnostic")))
 }
 
 #[cfg(test)]

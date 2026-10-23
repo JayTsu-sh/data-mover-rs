@@ -15,6 +15,9 @@ use crate::storage::{
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+#[path = "hash_checkpoint_tests.rs"]
+mod hash_checkpoint_tests;
+
 const IDENTITY: [u8; 32] = [4; 32];
 /// The Local test checkpoint interval: four 64 KiB pieces.
 const CHECKPOINT: usize = 4 * 64 * 1024;

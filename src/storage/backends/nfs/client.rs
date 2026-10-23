@@ -957,6 +957,8 @@ impl NfsStagedProtocol for NFSStorage {
         path: &crate::model::StoragePath,
     ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
         let native = Path::new(path.as_str());
+        // Pointer temporaries can carry raw source fragments in checkpoint v2. Keep
+        // this restriction in CREATE itself, before any bytes, and after payload chmod.
         let Some(handle) = self.role_create_file_exclusive(native, Some(0o600)).await? else {
             return Err(NfsProtocolFailure::new(
                 crate::model::FailureClass::Conflict,
