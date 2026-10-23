@@ -181,7 +181,8 @@ async fn resuming_a_real_tree_from_any_checkpoint_loses_nothing() -> io::Result<
 async fn a_chain_of_cancels_and_resumes_covers_a_real_tree() -> io::Result<()> {
     let root = tempfile::tempdir()?;
     tree(root.path(), 30)?;
-    let source = source(root.path())?;
+    // Force cancellation while work remains, regardless of how quickly the producer runs.
+    let source = source(root.path())?.output_capacity(NonZeroUsize::MIN);
     let (items, _) = run(&source, request(TraversalOrder::Blocks, 4), None).await?;
     let full = set(&entries(&items));
     for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
