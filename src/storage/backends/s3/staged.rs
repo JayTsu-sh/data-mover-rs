@@ -17,14 +17,18 @@ use bytes::Bytes;
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
     ByteStream, CheckpointObservation, DestinationPrepareRequest, Metadata, MetadataMutation,
-    PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest,
-    ReadBackMethod, StagedDestination, StorageRoleFailure, UnpinnedReadReason, UploadDigest,
-    UploadDigestGap, VerificationEvidence, VerificationPoint, VerifyRequest, WriteEvidence,
+    PositionedByteStream, PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure,
+    PublishRequest, ReadBackMethod, StagedDestination, StorageRoleFailure, UnpinnedReadReason,
+    UploadDigest, UploadDigestGap, VerificationEvidence, VerificationPoint, VerifyRequest,
+    WriteEvidence,
 };
 
 use super::source::{classified_entry, entry, role_failure};
 
 mod at_destination;
+mod checkpoint_cleanup;
+mod checkpoint_record;
+mod checkpointed_parts;
 mod completion;
 mod delete_marker;
 mod direct;
@@ -32,6 +36,9 @@ mod directory_object;
 #[cfg(test)]
 mod directory_object_tests;
 mod final_upload;
+mod hash_checkpoint;
+#[cfg(test)]
+mod hash_checkpoint_tests;
 mod limits;
 #[cfg(test)]
 mod nas_tests;
@@ -40,8 +47,10 @@ mod native_final;
 #[cfg(test)]
 mod native_final_tests;
 mod parts;
+mod published_recovery;
 mod settle;
 mod single;
+mod single_prepare;
 #[cfg(test)]
 mod single_tests;
 #[cfg(test)]
@@ -253,6 +262,65 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         self.protocol.bucket_capabilities().resumable
     }
 
+    fn supports_hash_checkpoint(&self) -> bool {
+        self.protocol.bucket_capabilities().resumable
+    }
+
+    fn stage_supports_hash_checkpoint(&self, stage: &PreparedStage) -> bool {
+        self.supports_hash_checkpoint() && !stage.direct && at_destination::of(stage).is_some()
+    }
+
+    fn requires_hash_intent(&self) -> bool {
+        true
+    }
+
+    async fn persist_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        self.validate(stage)?;
+        let upload = at_destination::of(stage)
+            .filter(|_| stage.checkpoint_enabled() && !stage.direct)
+            .ok_or_else(|| {
+                classified_entry(
+                    stage.final_destination.path(),
+                    Operation::Write,
+                    FailureClass::Unsupported,
+                    Transience::Permanent,
+                    "S3 hash checkpoints require a recoverable multipart stage",
+                )
+            })?;
+        // H-only persistence must never promote acknowledged payload into D.
+        self.write_pointer(stage, upload, false).await
+    }
+
+    /// Armed v2 roots return cleanup failures, including Object Lock that leaves the root
+    /// discoverable. Legacy stages never enter this release path and retain warning-only cleanup.
+    async fn release_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        self.validate(stage)?;
+        if !stage.checkpoint_enabled() {
+            return Ok(());
+        }
+        let upload =
+            at_destination::of(stage).ok_or_else(|| foreign(stage, Operation::Namespace))?;
+        self.release_upload_checkpoint(stage, upload).await
+    }
+
+    async fn write_checkpointed(
+        &self,
+        stage: &PreparedStage,
+        input: PositionedByteStream,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        self.validate(stage)?;
+        let upload = at_destination::of(stage)
+            .filter(|_| stage.checkpoint_enabled() && !stage.direct)
+            .ok_or_else(|| foreign(stage, Operation::Write))?;
+        self.write_checkpointed_parts(stage, upload, input).await
+    }
+
     /// The bucket's own limits ([`limits`]): an ONTAP NAS bucket refuses objects over 5 GiB and
     /// keys it would store under another name.
     fn final_refusal(&self, path: &StoragePath, size: Option<u64>) -> Option<String> {
@@ -395,6 +463,11 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         }
         let upload =
             at_destination::of(stage).ok_or_else(|| foreign(stage, Operation::Metadata))?;
+        if stage.recovered_publication.is_some() {
+            return self
+                .apply_recovered_upload_metadata(stage, upload, mutation, &cancel)
+                .await;
+        }
         self.apply_final_upload_metadata(stage, upload, mutation, &cancel)
     }
 

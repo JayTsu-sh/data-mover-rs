@@ -3,6 +3,10 @@
 pub(crate) mod artifacts;
 pub(crate) mod backends;
 mod capability;
+pub(crate) mod checkpoint;
+pub(crate) mod checkpoint_stream;
+#[cfg(test)]
+mod checkpoint_stream_tests;
 mod copied_metadata;
 mod create_dir;
 mod delete_tree;
@@ -17,6 +21,7 @@ mod native;
 mod permissions;
 pub use permissions::{PermissionFacts, PrincipalIdentity};
 pub(crate) mod pointer;
+pub(crate) mod range_hash;
 mod roles;
 mod write_progress;
 pub use write_progress::{WriteProgress, WriteProgressObserver};

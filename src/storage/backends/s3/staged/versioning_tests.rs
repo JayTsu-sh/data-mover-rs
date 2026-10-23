@@ -28,6 +28,7 @@ async fn put_pointer(protocol: &MemoryS3, binding: [u8; 32], extension: Bytes) -
             binding,
             transfer_identity: IDENTITY,
             durable_prefix: None,
+            checkpoint: None,
             extension,
         }
         .encode()

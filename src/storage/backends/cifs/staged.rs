@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::at_destination::{Fence, remove_pointer};
+use super::at_destination::Fence;
 use super::source::{classify, entry_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath};
 use crate::storage::artifacts::is_artifact_path;
@@ -31,6 +31,20 @@ pub(super) trait CifsStageFile: Send + Sync {
 pub(super) trait CifsStagedProtocol: Send + Sync {
     async fn create_empty(&self, path: &StoragePath) -> smb_domain::Result<()>;
     async fn open(&self, path: &StoragePath) -> smb_domain::Result<Box<dyn CifsStageFile>>;
+    /// A recovered final may already have metadata that denies writes.
+    async fn open_read(&self, path: &StoragePath) -> smb_domain::Result<Box<dyn CifsStageFile>> {
+        self.open(path).await
+    }
+    /// Copy and verify the payload DACL before a v2 pointer receives source fragments.
+    async fn protect_checkpoint(
+        &self,
+        _pointer: &StoragePath,
+        _payload: &StoragePath,
+    ) -> smb_domain::Result<()> {
+        Err(smb_domain::Error::UnsupportedOperation(
+            "checkpoint DACL protection is unavailable".into(),
+        ))
+    }
     async fn size(&self, path: &StoragePath) -> smb_domain::Result<u64>;
     /// Whether `path` is a regular file (not a directory or reparse point), and its size. The
     /// default treats whatever `size` answers for as a file.
@@ -147,12 +161,14 @@ impl CifsStagedDestination {
         path: &StoragePath,
         expected_size: u64,
         cancel: &tokio_util::sync::CancellationToken,
+        readonly: bool,
     ) -> Result<[u8; 32], StorageRoleFailure> {
-        let file = self
-            .protocol
-            .open(path)
-            .await
-            .map_err(|error| classify(path, Operation::Verify, &error))?;
+        let opened = if readonly {
+            self.protocol.open_read(path).await
+        } else {
+            self.protocol.open(path).await
+        };
+        let file = opened.map_err(|error| classify(path, Operation::Verify, &error))?;
         let mut offset = 0;
         let mut hasher = blake3::Hasher::new();
         while offset < expected_size {
@@ -218,7 +234,7 @@ impl CifsStagedDestination {
                 .is_ok_and(|size| size == request.expected_size)
             && match request.expected_blake3 {
                 Some(expected) => self
-                    .hash(final_path, request.expected_size, &request.cancel)
+                    .hash(final_path, request.expected_size, &request.cancel, false)
                     .await
                     .is_ok_and(|hash| hash == expected),
                 None => true,
@@ -228,13 +244,12 @@ impl CifsStagedDestination {
                 .map_err(publication_unchanged)?
                 .published
                 .store(true, Ordering::Release);
-            remove_pointer(self, stage)
+            super::at_destination::finish_publication(self, stage)
                 .await
                 .map_err(|error| PublicationFailure {
                     error,
                     final_destination_changed: true,
                 })?;
-            self.release(&stage.token);
             return Ok(published(final_path));
         }
         Err(PublicationFailure {
@@ -246,6 +261,29 @@ impl CifsStagedDestination {
 
 #[async_trait]
 impl StagedDestination for CifsStagedDestination {
+    fn supports_hash_checkpoint(&self) -> bool {
+        true
+    }
+
+    async fn persist_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        self.stage_path(stage)?;
+        if stage.checkpoint_enabled() {
+            super::at_destination::write_pointer(self, stage, stage.checkpoint_prefix(), false)
+                .await?;
+            stage.recovery_enabled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    async fn release_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        super::at_destination::release_hash_checkpoint(self, stage).await
+    }
     fn copied_metadata_target(&self) -> Option<crate::storage::CopiedMetadataTarget> {
         self.metadata
             .as_ref()
@@ -341,6 +379,12 @@ impl StagedDestination for CifsStagedDestination {
         request: VerifyRequest,
     ) -> Result<VerificationEvidence, StorageRoleFailure> {
         let path = self.stage_path(stage)?;
+        let path = if stage.recovered_publication.is_some() {
+            super::at_destination::before_publication(self, stage).await?;
+            stage.final_destination.path().clone()
+        } else {
+            path
+        };
         let size =
             self.protocol.size(&path).await.map_err(|error| {
                 classify(stage.final_destination.path(), Operation::Verify, &error)
@@ -352,7 +396,25 @@ impl StagedDestination for CifsStagedDestination {
                 FailureClass::Corruption,
             ));
         }
-        let hash = self.hash(&path, size, &request.cancel).await?;
+        let hash = self
+            .hash(
+                &path,
+                size,
+                &request.cancel,
+                stage.recovered_publication.is_some(),
+            )
+            .await?;
+        if stage.recovered_publication.is_some()
+            && self.protocol.size(&path).await.map_err(|error| {
+                classify(stage.final_destination.path(), Operation::Verify, &error)
+            })? != size
+        {
+            return Err(entry_failure(
+                &path,
+                Operation::Verify,
+                FailureClass::Corruption,
+            ));
+        }
         if hash != request.expected_blake3 {
             return Err(entry_failure(
                 stage.final_destination.path(),
@@ -373,6 +435,10 @@ impl StagedDestination for CifsStagedDestination {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
         let path = self.stage_path(stage)?;
+        // Metadata preceded the rename whose checkpoint this recovery is reconciling.
+        if stage.recovered_publication.is_some() {
+            return Ok(());
+        }
         let metadata = self.metadata.as_ref().ok_or_else(|| {
             entry_failure(
                 stage.final_destination.path(),
@@ -380,7 +446,22 @@ impl StagedDestination for CifsStagedDestination {
                 FailureClass::Unsupported,
             )
         })?;
+        let checkpoint_acl =
+            stage.checkpoint_enabled() && matches!(&mutation, MetadataMutation::Acl(_));
+        if checkpoint_acl {
+            super::checkpoint_acl::before_payload_acl(
+                self,
+                stage,
+                metadata.as_ref(),
+                &mutation,
+                cancel.clone(),
+            )
+            .await?;
+        }
         metadata.apply(&path, mutation, cancel.clone()).await?;
+        if checkpoint_acl {
+            super::checkpoint_acl::refresh(self, stage, &path).await?;
+        }
         if stage.durable_publication {
             if cancel.is_cancelled() {
                 return Err(entry_failure(
@@ -418,6 +499,9 @@ impl StagedDestination for CifsStagedDestination {
         super::at_destination::before_publication(self, stage)
             .await
             .map_err(publication_unchanged)?;
+        if let Some(evidence) = &stage.recovered_publication {
+            return Ok(evidence.clone());
+        }
         let rename = self
             .protocol
             .rename(&path, stage.final_destination.path(), true)
@@ -429,13 +513,12 @@ impl StagedDestination for CifsStagedDestination {
             .map_err(publication_unchanged)?
             .published
             .store(true, Ordering::Release);
-        remove_pointer(self, stage)
+        super::at_destination::finish_publication(self, stage)
             .await
             .map_err(|error| PublicationFailure {
                 error,
                 final_destination_changed: true,
             })?;
-        self.release(&stage.token);
         Ok(published(stage.final_destination.path()))
     }
 

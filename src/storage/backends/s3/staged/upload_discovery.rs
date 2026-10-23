@@ -5,11 +5,12 @@
 use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
-use super::super::source::role_failure;
+use super::super::source::{classified_entry, role_failure};
 use super::super::{S3PartFacts, S3Protocol, S3ProtocolFailure};
 use super::upload_pointer::{self, Removal, StoredPointer, UploadRecord, accepted};
-use crate::model::{FailureClass, Operation, StoragePath};
+use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::discovery::DestinationArtifacts;
 use crate::storage::pointer::DestinationPointer;
 use crate::storage::{DestinationPrepareRequest, RestartReason, ResumeMode, StorageRoleFailure};
@@ -53,14 +54,52 @@ pub(super) fn contiguous_prefix(
     (bytes, prefix)
 }
 
+/// Full, unambiguous parts in the frozen geometry, including islands past a gap. An opaque
+/// `ETag` is a receipt, not a content hash. Malformed or duplicate part facts fail closed.
+pub(super) fn validated_parts(
+    mut parts: Vec<S3PartFacts>,
+    part_size: u64,
+    source_size: Option<u64>,
+) -> Option<(u64, Vec<(i32, String)>)> {
+    parts.sort_by_key(|part| part.number);
+    let mut accepted = Vec::with_capacity(parts.len());
+    let mut prefix = 0;
+    let mut previous = 0;
+    for part in parts {
+        if !(1..=10_000).contains(&part.number) || part.number == previous || part.etag.is_empty() {
+            return None;
+        }
+        let start = u64::try_from(part.number - 1)
+            .ok()?
+            .checked_mul(part_size)?;
+        let end = start.checked_add(part.size)?;
+        let full = part.size == part_size && source_size.is_none_or(|size| end <= size);
+        let tail = part.size > 0 && part.size < part_size && source_size == Some(end);
+        if !(full || tail) {
+            return None;
+        }
+        if start == prefix {
+            prefix = end;
+        }
+        previous = part.number;
+        accepted.push((part.number, part.etag));
+    }
+    Some((prefix, accepted))
+}
+
 /// A final key's pointer and uploads, as the discovery driver looks at them.
 pub(super) struct S3Artifacts<'a, P> {
     protocol: &'a P,
     final_path: &'a StoragePath,
     pointer: &'a StoragePath,
     request: &'a DestinationPrepareRequest,
+    /// A single-request prepare already read this pointer. Discovery consumes it once instead
+    /// of issuing a second HEAD/GET, then follows the ordinary validation path.
+    preloaded: Mutex<Option<StoredPointer>>,
     /// The upload record of the pointer `read_pointer` found, when this backend accepts it.
     found: Mutex<Option<UploadRecord>>,
+    checkpoint: Mutex<Option<Bytes>>,
+    published: Mutex<Option<super::super::S3WriteFacts>>,
     /// That upload's contiguous prefix, as `observe_stage` listed it.
     prefix: Mutex<Vec<(i32, String)>>,
     /// The pointer `read_pointer` found (bytes and version), whether accepted or not: a clean-up
@@ -76,6 +115,7 @@ pub(super) struct Found {
     pub(super) record: Option<UploadRecord>,
     pub(super) pointer: Option<StoredPointer>,
     pub(super) prefix: Vec<(i32, String)>,
+    pub(super) published: Option<super::super::S3WriteFacts>,
 }
 
 impl<'a, P> S3Artifacts<'a, P> {
@@ -90,11 +130,19 @@ impl<'a, P> S3Artifacts<'a, P> {
             final_path,
             pointer,
             request,
+            preloaded: Mutex::new(None),
             found: Mutex::new(None),
+            checkpoint: Mutex::new(None),
+            published: Mutex::new(None),
             prefix: Mutex::new(Vec::new()),
             found_pointer: Mutex::new(None),
             held: Mutex::new(None),
         }
+    }
+
+    pub(super) fn with_preloaded(mut self, pointer: Option<StoredPointer>) -> Self {
+        self.preloaded = Mutex::new(pointer);
+        self
     }
 
     /// The bytes of a leftover pointer the clean-up could not remove: Object Lock holds it and
@@ -109,6 +157,10 @@ impl<'a, P> S3Artifacts<'a, P> {
     /// What discovery left: what a resume continues.
     pub(super) fn into_found(self) -> Found {
         Found {
+            published: self
+                .published
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
             record: self
                 .found
                 .into_inner()
@@ -143,12 +195,58 @@ impl<P: S3Protocol> DestinationArtifacts for S3Artifacts<'_, P> {
         _final_path: &StoragePath,
         limit: usize,
     ) -> Result<Option<Vec<u8>>, StorageRoleFailure> {
-        let stored = upload_pointer::read(self.protocol, self.pointer, limit).await?;
+        let preloaded = self
+            .preloaded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let stored = match preloaded {
+            Some(mut pointer) => {
+                pointer.bytes.truncate(limit);
+                Some(pointer)
+            }
+            None => upload_pointer::read(self.protocol, self.pointer, limit).await?,
+        };
         let bytes = stored.as_ref().map(|stored| stored.bytes.clone());
-        let record = bytes
+        let decoded = bytes
             .as_deref()
-            .and_then(|bytes| DestinationPointer::decode(bytes).ok())
-            .and_then(|pointer| self.accepts(&pointer));
+            .and_then(|bytes| DestinationPointer::decode(bytes).ok());
+        let record = decoded.as_ref().and_then(|pointer| self.accepts(pointer));
+        if let Some(pointer) = &decoded
+            && pointer.checkpoint.is_some()
+            && pointer.binding == self.request.prepare.recovery_binding
+            && pointer.transfer_identity == self.request.transfer_identity
+            && self.request.resume == ResumeMode::Discover
+        {
+            let valid = pointer
+                .checkpoint
+                .as_deref()
+                .and_then(|bytes| crate::storage::checkpoint::CheckpointData::decode(bytes).ok())
+                .is_some_and(|data| {
+                    Some(data.size) == self.request.prepare.source.size
+                        && crate::storage::range_hash::RangeHash::decode(&data.hash, data.size)
+                            .is_ok()
+                });
+            if !valid || record.is_none() {
+                return Err(classified_entry(
+                    self.final_path,
+                    Operation::Prepare,
+                    FailureClass::Corruption,
+                    Transience::Permanent,
+                    "invalid S3 source hash checkpoint or multipart evidence",
+                ));
+            }
+        }
+        *self
+            .checkpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = decoded
+            .filter(|pointer| {
+                self.request.resume == ResumeMode::Discover
+                    && pointer.binding == self.request.prepare.recovery_binding
+                    && pointer.transfer_identity == self.request.transfer_identity
+            })
+            .and_then(|pointer| pointer.checkpoint);
         *self.found.lock().unwrap_or_else(PoisonError::into_inner) = record;
         *self
             .found_pointer
@@ -180,7 +278,44 @@ impl<P: S3Protocol> DestinationArtifacts for S3Artifacts<'_, P> {
         match self.protocol.list_parts(key, &record.upload_id).await {
             Ok(parts) => {
                 let size = self.request.prepare.source.size;
-                let (bytes, prefix) = contiguous_prefix(parts, record.part_size, size);
+                let checkpointed = self
+                    .checkpoint
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some();
+                let (bytes, prefix) = if checkpointed {
+                    validated_parts(parts, record.part_size, size).ok_or_else(|| {
+                        classified_entry(
+                            self.final_path,
+                            Operation::Prepare,
+                            FailureClass::Corruption,
+                            Transience::Permanent,
+                            "S3 ListParts contradicts the checkpoint's frozen geometry",
+                        )
+                    })?
+                } else {
+                    contiguous_prefix(parts, record.part_size, size)
+                };
+                if checkpointed
+                    && let Some(data) = self
+                        .checkpoint
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .as_deref()
+                        .and_then(|bytes| {
+                            crate::storage::checkpoint::CheckpointData::decode(bytes).ok()
+                        })
+                    && bytes < data.prefix()
+                    && self.request.resume == ResumeMode::Discover
+                {
+                    return Err(classified_entry(
+                        self.final_path,
+                        Operation::Prepare,
+                        FailureClass::Corruption,
+                        Transience::Permanent,
+                        "S3 ListParts lost the committed checkpoint prefix",
+                    ));
+                }
                 *self.prefix.lock().unwrap_or_else(PoisonError::into_inner) = prefix;
                 Ok(Some(bytes))
             }
@@ -219,6 +354,36 @@ impl<P: S3Protocol> DestinationArtifacts for S3Artifacts<'_, P> {
     fn accepts_pointer(&self, pointer: &DestinationPointer) -> bool {
         self.accepts(pointer).is_some()
     }
+
+    fn continues_from_stage(&self) -> bool {
+        self.checkpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    async fn observe_final(&self, _path: &StoragePath) -> Result<Option<u64>, StorageRoleFailure> {
+        let Some(found) = self.found_pointer() else {
+            return Ok(None);
+        };
+        let pointer = DestinationPointer::decode(&found.bytes).map_err(|_| {
+            classified_entry(
+                self.final_path,
+                Operation::Prepare,
+                FailureClass::Corruption,
+                Transience::Permanent,
+                "invalid S3 published checkpoint",
+            )
+        })?;
+        let facts =
+            super::published_recovery::observe_final(self.protocol, self.final_path, &pointer)
+                .await?;
+        *self
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(facts);
+        Ok(self.request.prepare.source.size)
+    }
 }
 
 /// Why a leftover pointer beside a small object is cleaned up: a single `PutObject` resumes
@@ -244,7 +409,7 @@ pub(super) fn leftover_reason(request: &DestinationPrepareRequest, bytes: &[u8])
 
 #[cfg(test)]
 mod tests {
-    use super::contiguous_prefix;
+    use super::{contiguous_prefix, validated_parts};
     use crate::storage::backends::s3::S3PartFacts;
 
     const PART: u64 = 8 * 1024 * 1024;
@@ -277,5 +442,38 @@ mod tests {
             contiguous_prefix(vec![part(1, 0), part(2, PART)], PART, Some(PART)),
             (0, vec![])
         );
+    }
+
+    #[test]
+    fn checkpoint_parts_keep_islands_after_gaps() {
+        let observed = validated_parts(
+            vec![part(4, 17), part(1, PART), part(3, PART)],
+            PART,
+            Some(3 * PART + 17),
+        );
+        assert_eq!(
+            observed,
+            Some((
+                PART,
+                vec![
+                    (1, "etag-1".to_string()),
+                    (3, "etag-3".to_string()),
+                    (4, "etag-4".to_string())
+                ]
+            ))
+        );
+    }
+
+    #[test]
+    fn checkpoint_parts_reject_duplicate_numbers_and_invalid_geometry() {
+        for parts in [
+            vec![part(1, PART), part(1, PART)],
+            vec![part(0, PART)],
+            vec![part(10_001, PART)],
+            vec![part(2, PART - 1)],
+            vec![part(3, PART)],
+        ] {
+            assert!(validated_parts(parts, PART, Some(2 * PART)).is_none());
+        }
     }
 }

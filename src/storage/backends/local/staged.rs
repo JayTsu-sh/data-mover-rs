@@ -35,11 +35,13 @@ mod at_destination;
 mod checkpoint;
 mod direct;
 mod directory_sync;
+mod hash_checkpoint;
 #[cfg(unix)]
 mod owner_privilege;
 mod positioned;
 mod probe;
 mod publication;
+mod published_recovery;
 mod verification;
 
 #[cfg(unix)]
@@ -453,6 +455,13 @@ impl LocalStagedDestination {
         operation: Operation,
         _acl_access: bool,
     ) -> Result<Arc<std::fs::File>, StorageRoleFailure> {
+        if stage.recovered_publication.is_some() {
+            return Err(failure(
+                stage.final_destination.path(),
+                operation,
+                FailureClass::Conflict,
+            ));
+        }
         stage.validate_owner(&self.identity).map_err(|_| {
             failure(
                 stage.final_destination.path(),
@@ -622,6 +631,14 @@ impl LocalStagedDestination {
                         self.persist_synced_progress(stage, Arc::clone(file), issued)
                             .boxed(),
                     );
+                    // Freeze confirmed ranges across fsync and snapshotting. The unarmed path
+                    // retains its existing overlap between writes and pointer persistence.
+                    if stage.checkpoint_enabled()
+                        && let Some(pending) = checkpoint.take()
+                        && let Err(error) = pending.await
+                    {
+                        return (issued, persisted, Some(error), true);
+                    }
                     next_checkpoint = interval.and_then(|bytes| issued.checked_add(bytes));
                 }
             }
@@ -696,6 +713,7 @@ impl LocalStagedDestination {
             .map_err(|error| {
                 io_failure(stage.final_destination.path(), Operation::Write, &error)
             })?;
+        hash_checkpoint::barrier(stage, prefix).await?;
         self.persist_progress(stage, prefix).await
     }
 
@@ -802,6 +820,24 @@ impl LocalStagedDestination {
 
 #[async_trait]
 impl StagedDestination for LocalStagedDestination {
+    fn supports_hash_checkpoint(&self) -> bool {
+        true
+    }
+
+    async fn persist_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        hash_checkpoint::persist(self, stage).await
+    }
+
+    async fn release_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        hash_checkpoint::release(self, stage).await
+    }
+
     fn supports_direct(&self) -> bool {
         cfg!(unix)
     }
@@ -864,7 +900,10 @@ impl StagedDestination for LocalStagedDestination {
         stage: &PreparedStage,
         data: Bytes,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
-        if data.len() > self.write_chunk_bytes || stage.recovery_enabled() {
+        if data.len() > self.write_chunk_bytes
+            || stage.recovery_enabled()
+            || stage.checkpoint_enabled()
+        {
             return self
                 .write(
                     stage,
@@ -969,10 +1008,13 @@ impl StagedDestination for LocalStagedDestination {
                     Arc::clone(&file),
                     issued,
                     stage.final_destination.path(),
-                    true,
+                    !stage.checkpoint_enabled(),
                     stage.durable_publication,
                 )
                 .await?;
+                if stage.durable_publication {
+                    hash_checkpoint::barrier(stage, persisted).await?;
+                }
                 if stage.recovery_enabled() {
                     self.persist_checkpoint(stage, persisted).await?;
                 }
@@ -1002,6 +1044,9 @@ impl StagedDestination for LocalStagedDestination {
             )
             .await?;
         }
+        if stage.durable_publication {
+            hash_checkpoint::barrier(stage, persisted).await?;
+        }
         if stage.recovery_enabled() {
             self.persist_checkpoint(stage, persisted).await?;
         }
@@ -1014,6 +1059,12 @@ impl StagedDestination for LocalStagedDestination {
         &self,
         stage: &PreparedStage,
     ) -> Result<CheckpointObservation, StorageRoleFailure> {
+        if stage.recovered_publication.is_some() {
+            published_recovery::validate(self, stage).await?;
+            return Ok(CheckpointObservation {
+                durable_prefix: stage.checkpoint_prefix(),
+            });
+        }
         if !stage.recovery_enabled() {
             return Err(failure(
                 stage.final_destination.path(),
@@ -1030,10 +1081,15 @@ impl StagedDestination for LocalStagedDestination {
         stage: &PreparedStage,
         request: VerifyRequest,
     ) -> Result<VerificationEvidence, StorageRoleFailure> {
+        if stage.recovered_publication.is_some() {
+            published_recovery::validate(self, stage).await?;
+        }
         let name = self.stage_name(stage, Operation::Verify)?;
         let staging = self.stage_directory(stage, Operation::Verify).await?;
         let path = stage.final_destination.path().clone();
-        let direct_file = if stage.direct {
+        let direct_file = if stage.recovered_publication.is_some() {
+            Some(published_recovery::file(stage)?)
+        } else if stage.direct {
             Some(
                 self.open_stage_file_for(stage, Operation::Verify, false)
                     .await?,
@@ -1042,7 +1098,7 @@ impl StagedDestination for LocalStagedDestination {
             None
         };
         let probe = Arc::clone(&self.write_probe);
-        tokio::task::spawn_blocking(move || {
+        let verified = tokio::task::spawn_blocking(move || {
             if let Some(file) = direct_file {
                 use std::io::Seek as _;
                 let mut file = file.try_clone()?;
@@ -1062,7 +1118,11 @@ impl StagedDestination for LocalStagedDestination {
                 return io_failure(&path, Operation::Verify, &error);
             };
             failure(&path, Operation::Verify, class)
-        })
+        })?;
+        if stage.recovered_publication.is_some() {
+            published_recovery::validate(self, stage).await?;
+        }
+        Ok(verified)
     }
 
     async fn apply_metadata(
@@ -1084,6 +1144,10 @@ impl StagedDestination for LocalStagedDestination {
                 Operation::Metadata,
                 FailureClass::Unsupported,
             ));
+        }
+        // ReadyToPublish was recorded after metadata application; a recovered final is immutable.
+        if stage.recovered_publication.is_some() {
+            return published_recovery::validate(self, stage).await;
         }
         let file = self
             .open_stage_file_for(
@@ -1116,6 +1180,13 @@ impl StagedDestination for LocalStagedDestination {
             return Ok(());
         }
         refuse_before_applying(stage, &mutations, &cancel)?;
+        if stage.recovered_publication.is_some() {
+            return published_recovery::validate(self, stage)
+                .await
+                .map_err(|error| {
+                    StagedMetadataApplicationFailure::whole_batch(mutations.len(), 0, Some(error))
+                });
+        }
         let file = self
             .open_stage_file_for(
                 stage,
@@ -1162,6 +1233,26 @@ impl StagedDestination for LocalStagedDestination {
         stage: &PreparedStage,
         request: PublishRequest,
     ) -> Result<PublicationEvidence, PublicationFailure> {
+        if let Some(evidence) = &stage.recovered_publication {
+            let changed = |error| PublicationFailure {
+                error,
+                final_destination_changed: true,
+            };
+            if request.cancel.is_cancelled() {
+                return Err(changed(failure(
+                    stage.final_destination.path(),
+                    Operation::Publish,
+                    FailureClass::Cancelled,
+                )));
+            }
+            published_recovery::validate(self, stage)
+                .await
+                .map_err(changed)?;
+            hash_checkpoint::published(self, stage)
+                .await
+                .map_err(changed)?;
+            return Ok(evidence.clone());
+        }
         if stage.direct {
             return self.finish_direct(stage, request).await;
         }
@@ -1172,8 +1263,7 @@ impl StagedDestination for LocalStagedDestination {
         let stage_name = self
             .stage_name(stage, Operation::Publish)
             .map_err(precommit)?;
-        // The pointer may exist even before recovery was enabled (one written just before a failed
-        // directory sync), so publication always removes it.
+        // Armed stages retain their pointer through verification and release.
         let checkpoint_name = self
             .checkpoint_name(stage, Operation::Publish)
             .map_err(precommit)?;
@@ -1193,6 +1283,7 @@ impl StagedDestination for LocalStagedDestination {
             == final_relative.parent();
         let directory_sync = Arc::clone(&self.directory_sync);
         let durable = stage.durable_publication;
+        let retain_checkpoint = stage.checkpoint_enabled();
         let result = tokio::task::spawn_blocking(move || {
             publication::publish_local(
                 publication::Directories {
@@ -1203,7 +1294,7 @@ impl StagedDestination for LocalStagedDestination {
                     durable,
                 },
                 &stage_name,
-                Some(checkpoint_name.as_os_str()),
+                (!retain_checkpoint).then_some(checkpoint_name.as_os_str()),
                 &final_relative,
                 &request,
                 &probe,
@@ -1220,6 +1311,14 @@ impl StagedDestination for LocalStagedDestination {
         })?;
         match result {
             Ok(disposition) => {
+                if stage.checkpoint_enabled() {
+                    hash_checkpoint::published(self, stage)
+                        .await
+                        .map_err(|error| PublicationFailure {
+                            error,
+                            final_destination_changed: true,
+                        })?;
+                }
                 at_destination::finish_publication(self, stage, final_destination, disposition)
                     .await
             }

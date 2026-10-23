@@ -30,9 +30,15 @@ use crate::storage::discovery::{DestinationArtifacts, discover};
 use crate::storage::pointer::{DestinationPointer, MAX_POINTER_BYTES};
 use crate::storage::{DestinationPrepareRequest, PreparedStage, StorageRoleFailure};
 
+#[path = "hash_checkpoint.rs"]
+mod hash_checkpoint;
+pub(super) use hash_checkpoint::{checkpoint_barrier, finish_publication, release_hash_checkpoint};
+
 /// The tag every NFS pointer's extension starts with; the fence nonce follows it.
 const POINTER_TAG: &[u8; 8] = b"DMNSTG01";
 const NONCE_BYTES: usize = 16;
+// Keep legacy pointer I/O unchanged on unarmed role/expert paths.
+const LEGACY_POINTER_BYTES: usize = 84 + 4096 + 32;
 
 /// What a destination-kept NFS stage knows about its own pointer.
 pub(super) struct Fence {
@@ -118,22 +124,45 @@ async fn read_regular(
     path: &StoragePath,
     limit: usize,
 ) -> Result<Option<Vec<u8>>, NfsProtocolFailure> {
-    match adapter.protocol.stat(path).await {
-        Ok((true, _)) => {}
+    let size = match adapter.protocol.stat(path).await {
+        Ok((true, size)) => size,
         Ok((false, _)) => return Err(not_regular()),
         Err(error) if is_not_found(&error) => return Ok(None),
         Err(error) => return Err(error),
-    }
+    };
     let handle = match adapter.protocol.open_read(path).await {
         Ok(handle) => handle,
         Err(error) if is_not_found(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let read = handle.read_at(0, limit).await;
+    let read = async {
+        if size <= LEGACY_POINTER_BYTES as u64 {
+            return handle
+                .read_at(0, LEGACY_POINTER_BYTES + 1)
+                .await
+                .map(|bytes| bytes.to_vec());
+        }
+        let wanted = usize::try_from(size).unwrap_or(limit).min(limit);
+        let maximum = adapter.protocol.maximum_read_chunk_bytes().max(1);
+        let mut bytes = Vec::with_capacity(wanted);
+        while bytes.len() < wanted {
+            let count = (wanted - bytes.len()).min(maximum);
+            let part = handle.read_at(bytes.len() as u64, count).await?;
+            if part.is_empty() {
+                break;
+            }
+            if part.len() > count {
+                return Err(NfsProtocolFailure::protocol());
+            }
+            bytes.extend_from_slice(&part);
+        }
+        Ok(bytes)
+    }
+    .await;
     let closed = handle.close().await;
     let bytes = read?;
     closed?;
-    Ok(Some(bytes.to_vec()))
+    Ok(Some(bytes))
 }
 
 fn not_regular() -> NfsProtocolFailure {
@@ -160,6 +189,17 @@ struct NfsArtifacts<'a> {
 
 #[async_trait]
 impl DestinationArtifacts for NfsArtifacts<'_> {
+    async fn observe_final(
+        &self,
+        final_path: &StoragePath,
+    ) -> Result<Option<u64>, StorageRoleFailure> {
+        match self.adapter.protocol.stat(final_path).await {
+            Ok((true, size)) => Ok(Some(size)),
+            Ok((false, _)) => Err(role_failure(final_path, Operation::Prepare, not_regular())),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(role_failure(final_path, Operation::Prepare, error)),
+        }
+    }
     async fn read_pointer(
         &self,
         final_path: &StoragePath,
@@ -245,13 +285,35 @@ pub(super) async fn prepare(
         }
         return Ok(stage);
     };
+    stage
+        .restore_checkpoint(point.pointer.checkpoint)
+        .map_err(|_| invalid(&final_path, FailureClass::Corruption))?;
+    if point.published {
+        hash_checkpoint::recover_publication(adapter, &mut stage, point.prefix).await?;
+        return Ok(stage);
+    }
+    if stage.restored_checkpoint().is_some() {
+        let size = adapter
+            .protocol
+            .size(&artifacts.stage)
+            .await
+            .map_err(|error| role_failure(&final_path, Operation::Prepare, error))?;
+        if stage.checkpoint_prefix() != point.prefix
+            || stage
+                .checkpoint_ranges()
+                .iter()
+                .any(|range| range.end > size)
+        {
+            return Err(invalid(&final_path, FailureClass::Corruption));
+        }
+    }
     let handle = reopen(adapter, &artifacts.stage, &final_path).await?;
     let took_over = match write_pointer(adapter, &stage, point.prefix, true).await {
-        Ok(()) => handle
+        Ok(()) if stage.restored_checkpoint().is_none() => handle
             .set_len(point.prefix)
             .await
             .map_err(|error| role_failure(&final_path, Operation::Prepare, error)),
-        Err(error) => Err(error),
+        other => other,
     };
     if let Err(error) = took_over {
         // Before the take-over the stage is still the previous writer's; after it, a retry
@@ -351,15 +413,22 @@ pub(super) async fn write_pointer(
     take_over: bool,
 ) -> Result<(), StorageRoleFailure> {
     let final_path = stage.final_destination.path();
+    let fence = fence(stage)?;
+    let _guard = stage.checkpoint_guard().await;
     if !take_over && !still_ours(adapter, stage).await? {
         return Err(taken_over(final_path));
     }
-    let fence = fence(stage)?;
+    let prefix = if stage.checkpoint_enabled() {
+        stage.checkpoint_prefix()
+    } else {
+        prefix
+    };
     let bytes = DestinationPointer {
         binding: stage.recovery_binding,
         transfer_identity: fence.transfer_identity,
         durable_prefix: Some(prefix),
         extension: fence.extension(),
+        checkpoint: stage.checkpoint_snapshot(),
     }
     .encode()
     .map_err(|_| invalid(final_path, FailureClass::Internal))?;
@@ -396,7 +465,28 @@ async fn write_temporary(
         .create_empty_open(temporary)
         .await
         .map_err(transient_collision)?;
-    let written = handle.write_at(0, Bytes::copy_from_slice(bytes)).await;
+    let written = async {
+        if bytes.starts_with(b"DMDPTR01") {
+            return handle.write_at(0, Bytes::copy_from_slice(bytes)).await;
+        }
+        let maximum = adapter.protocol.maximum_write_chunk_bytes().max(1);
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let end = (offset + maximum).min(bytes.len());
+            let count = handle
+                .write_at(offset as u64, Bytes::copy_from_slice(&bytes[offset..end]))
+                .await?;
+            if count != (end - offset) as u64 {
+                return Err(NfsProtocolFailure::new(
+                    FailureClass::Corruption,
+                    Transience::Unknown,
+                ));
+            }
+            offset = end;
+        }
+        Ok(offset as u64)
+    }
+    .await;
     let closed = handle.close().await;
     let outcome = match (written, closed) {
         (Ok(count), Ok(())) if count == bytes.len() as u64 => return Ok(()),
@@ -431,13 +521,26 @@ pub(super) async fn reobserve(
                 && found.transfer_identity == fence.transfer_identity
         })
         .ok_or_else(|| invalid(final_path, FailureClass::Corruption))?;
+    let native = adapter.validate(stage)?;
+    let observed = if stage.recovered_publication.is_some() {
+        final_path
+    } else {
+        &native
+    };
     let (regular, size) = adapter
         .protocol
-        .stat(&adapter.validate(stage)?)
+        .stat(observed)
         .await
         .map_err(|error| role_failure(final_path, Operation::Verify, error))?;
     if !regular || size < prefix {
         return Err(invalid(final_path, FailureClass::Corruption));
+    }
+    if let Some(encoded) = &found.checkpoint {
+        let data = crate::storage::checkpoint::CheckpointData::decode(encoded)
+            .map_err(|_| invalid(final_path, FailureClass::Corruption))?;
+        if data.prefix() != prefix || data.ranges.iter().any(|range| range.end > size) {
+            return Err(invalid(final_path, FailureClass::Corruption));
+        }
     }
     Ok(prefix)
 }

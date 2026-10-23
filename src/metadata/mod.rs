@@ -13,6 +13,7 @@ use crate::storage::{
     StorageRoleFailure,
 };
 
+mod checkpoint_binding;
 mod compile;
 mod errors;
 

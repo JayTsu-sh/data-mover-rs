@@ -53,6 +53,11 @@ pub(crate) struct NativeStageFailure {
 pub(crate) trait NativeEndpoint: Send + Sync {
     fn affinity(&self) -> NativeAffinity;
 
+    /// Whether this exact source is prepared as a resumable multipart operation.
+    fn supports_hash_checkpoint(&self, _source: &super::SourceDescriptor) -> bool {
+        false
+    }
+
     async fn bind_source(
         &self,
         source: &super::SourceDescriptor,
@@ -81,6 +86,9 @@ pub(crate) struct NativePair {
 }
 
 impl NativePair {
+    pub(crate) fn supports_hash_checkpoint(&self, source: &super::SourceDescriptor) -> bool {
+        self.destination.supports_hash_checkpoint(source)
+    }
     pub(crate) fn new(
         source: Arc<dyn NativeEndpoint>,
         destination: Arc<dyn NativeEndpoint>,

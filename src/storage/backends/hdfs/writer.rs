@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use futures::StreamExt as _;
 
-use super::at_destination::{resident, write_pointer};
+use super::at_destination::{record_checkpoint, resident};
 use super::protocol::entry_failure;
 use super::staged::{HdfsStagedDestination, expected_size};
 use crate::model::{FailureClass, Operation, Transience};
@@ -45,6 +45,12 @@ pub(super) async fn write(
     let observed = adapter.protocol.stat(&path).await?;
     if observed.size != Some(offset) {
         return Err(invalid(stage));
+    }
+    if stage.checkpoint_enabled() {
+        // The pinned replicated writer closes with an acknowledged sync-marked last packet.
+        // Preserve full D before the final hash-ready pointer can be published.
+        record_checkpoint(adapter, stage, offset).await?;
+        stage.checkpoint_recorded(offset);
     }
     Ok(WriteEvidence {
         persisted_bytes: offset,
@@ -134,7 +140,7 @@ async fn record_durable_prefix(
     if observed.size != Some(expected_prefix) {
         return Err(invalid(stage));
     }
-    write_pointer(adapter, stage, expected_prefix, false).await?;
+    record_checkpoint(adapter, stage, expected_prefix).await?;
     stage.recovery_enabled.store(true, Ordering::Release);
     stage.checkpoint_recorded(expected_prefix);
     Ok(())

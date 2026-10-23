@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::FuturesOrdered;
 
-use super::at_destination::{remove_pointer, write_pointer};
+use super::at_destination::write_pointer;
 use super::source::{NfsProtocolFailure, entry_failure, role_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::artifacts::is_artifact_native;
@@ -287,7 +287,11 @@ impl NfsStagedDestinationAdapter {
         } else {
             persisted
         };
-        let truncate_failure = if write_failed && retained_prefix < issued {
+        let truncate_failure = if write_failed
+            && retained_prefix < issued
+            && !stage.checkpoint_enabled()
+            && stage.restored_checkpoint().is_none()
+        {
             handle.set_len(retained_prefix).await.err()
         } else {
             None
@@ -303,6 +307,9 @@ impl NfsStagedDestinationAdapter {
                 Operation::Write,
                 error,
             ));
+        }
+        if checkpoint_required {
+            super::at_destination::checkpoint_barrier(stage, persisted).await?;
         }
         Ok(())
     }
@@ -334,10 +341,10 @@ impl NfsStagedDestinationAdapter {
                 Transience::Unknown,
             ));
         }
-        handle
-            .checkpoint()
-            .await
-            .map_err(|error| role_failure(stage.final_destination.path(), Operation::Write, error))
+        handle.checkpoint().await.map_err(|error| {
+            role_failure(stage.final_destination.path(), Operation::Write, error)
+        })?;
+        super::at_destination::checkpoint_barrier(stage, persisted).await
     }
 
     async fn hash(
@@ -460,13 +467,12 @@ impl NfsStagedDestinationAdapter {
                 ..
             }) => {
                 if final_equivalent {
-                    remove_pointer(self, stage)
+                    super::at_destination::finish_publication(self, stage)
                         .await
                         .map_err(|error| PublicationFailure {
                             error,
                             final_destination_changed: true,
                         })?;
-                    self.release_authority(stage);
                     Ok(PublicationEvidence {
                         final_destination: stage.final_destination.path().clone(),
                         disposition: PublicationDisposition::Published,
@@ -495,13 +501,12 @@ impl NfsStagedDestinationAdapter {
                         ),
                         final_destination_changed: true,
                     })?;
-                remove_pointer(self, stage)
+                super::at_destination::finish_publication(self, stage)
                     .await
                     .map_err(|error| PublicationFailure {
                         error,
                         final_destination_changed: true,
                     })?;
-                self.release_authority(stage);
                 Ok(PublicationEvidence {
                     final_destination: stage.final_destination.path().clone(),
                     disposition: PublicationDisposition::Published,
@@ -526,6 +531,30 @@ impl NfsStagedDestinationAdapter {
 
 #[async_trait]
 impl StagedDestination for NfsStagedDestinationAdapter {
+    fn supports_hash_checkpoint(&self) -> bool {
+        true
+    }
+
+    async fn persist_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        self.validate(stage)?;
+        if stage.checkpoint_enabled() {
+            write_pointer(self, stage, stage.checkpoint_prefix(), false).await?;
+            stage
+                .recovery_enabled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
+    async fn release_hash_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<(), StorageRoleFailure> {
+        super::at_destination::release_hash_checkpoint(self, stage).await
+    }
     fn copied_metadata_target(&self) -> Option<crate::storage::CopiedMetadataTarget> {
         self.metadata
             .as_ref()
@@ -667,6 +696,12 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             ));
         }
         let native = self.validate(stage)?;
+        let native = if stage.recovered_publication.is_some() {
+            super::at_destination::before_publication(self, stage).await?;
+            stage.final_destination.path().clone()
+        } else {
+            native
+        };
         let hash = self
             .hash(
                 stage.final_destination.path(),
@@ -695,6 +730,10 @@ impl StagedDestination for NfsStagedDestinationAdapter {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
         let path = self.validate(stage)?;
+        // Metadata preceded the rename whose checkpoint this recovery is reconciling.
+        if stage.recovered_publication.is_some() {
+            return Ok(());
+        }
         let metadata = self.metadata.as_ref().ok_or_else(|| {
             failure(
                 stage.final_destination.path(),
@@ -724,18 +763,20 @@ impl StagedDestination for NfsStagedDestinationAdapter {
                 error,
                 final_destination_changed: false,
             })?;
+        if let Some(evidence) = &stage.recovered_publication {
+            return Ok(evidence.clone());
+        }
         if let Err(rename_error) = self.protocol.rename(&staged, &final_path).await {
             return self
                 .reconcile_rename_failure(stage, final_path, &request, rename_error)
                 .await;
         }
-        remove_pointer(self, stage)
+        super::at_destination::finish_publication(self, stage)
             .await
             .map_err(|error| PublicationFailure {
                 error,
                 final_destination_changed: true,
             })?;
-        self.release_authority(stage);
         Ok(PublicationEvidence {
             final_destination: stage.final_destination.path().clone(),
             disposition: PublicationDisposition::Published,

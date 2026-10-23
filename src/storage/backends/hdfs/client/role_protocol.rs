@@ -178,40 +178,14 @@ impl RoleHdfsProtocol for HDFSStorage {
         &self,
         path: &RoleStoragePath,
     ) -> Result<(), RoleFailure> {
-        let native = Path::new(path.as_str());
-        if let Some(parent) = native.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            self.create_dir_all(parent, 0o755)
-                .await
-                .map_err(|error| hdfs_role_error(path, RoleOperation::Prepare, error))?;
-        }
-        let resolved = self
-            .resolve_path(native)
-            .map_err(|error| hdfs_role_error(path, RoleOperation::Prepare, error))?;
-        let options = hdfs_native::WriteOptions::default()
-            .block_size(self.block_size)
-            .permission(0o644)
-            .overwrite(false);
-        let mut writer = self
-            .client
-            .create(&resolved, options)
-            .await
-            .map_err(|error| {
-                hdfs_role_error(
-                    path,
-                    RoleOperation::Prepare,
-                    hdfs_operation_error("create exclusive stage", Some(native), &error),
-                )
-            })?;
-        Box::pin(writer.close()).await.map_err(|error| {
-            hdfs_role_error(
-                path,
-                RoleOperation::Prepare,
-                hdfs_operation_error("close exclusive stage", Some(native), &error),
-            )
-        })?;
-        validate_empty_stage(self, path, native).await
+        create_exclusive_stage(self, path, 0o644).await
+    }
+
+    async fn create_private_checkpoint_exclusive(
+        &self,
+        path: &RoleStoragePath,
+    ) -> Result<(), RoleFailure> {
+        create_exclusive_stage(self, path, 0o600).await
     }
 
     async fn open_stage_writer(
@@ -381,6 +355,48 @@ impl RoleHdfsWriteSession for RoleWriteSession {
             )
         })
     }
+}
+
+async fn create_exclusive_stage(
+    storage: &HDFSStorage,
+    path: &RoleStoragePath,
+    permission: u32,
+) -> Result<(), RoleFailure> {
+    let native = Path::new(path.as_str());
+    if let Some(parent) = native.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        storage
+            .create_dir_all(parent, 0o755)
+            .await
+            .map_err(|error| hdfs_role_error(path, RoleOperation::Prepare, error))?;
+    }
+    let resolved = storage
+        .resolve_path(native)
+        .map_err(|error| hdfs_role_error(path, RoleOperation::Prepare, error))?;
+    let options = hdfs_native::WriteOptions::default()
+        .block_size(storage.block_size)
+        .permission(permission)
+        .overwrite(false);
+    let mut writer = storage
+        .client
+        .create(&resolved, options)
+        .await
+        .map_err(|error| {
+            hdfs_role_error(
+                path,
+                RoleOperation::Prepare,
+                hdfs_operation_error("create exclusive stage", Some(native), &error),
+            )
+        })?;
+    Box::pin(writer.close()).await.map_err(|error| {
+        hdfs_role_error(
+            path,
+            RoleOperation::Prepare,
+            hdfs_operation_error("close exclusive stage", Some(native), &error),
+        )
+    })?;
+    validate_empty_stage(storage, path, native).await
 }
 
 async fn validate_empty_stage(

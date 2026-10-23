@@ -31,6 +31,8 @@ pub use model::{
 #[cfg(test)]
 mod at_destination_tests;
 #[cfg(test)]
+mod checkpoint_policy_tests;
+#[cfg(test)]
 mod delete_marker_tests;
 #[cfg(test)]
 mod directory_object_tests;

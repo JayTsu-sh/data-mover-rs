@@ -9,6 +9,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
+use super::s3_at_destination_tests::{
+    assert_uploaded_parts, completed_parts, hash_batches, legacy_upload, stored_pointer,
+};
+
 use crate::model::{FailureClass, StoragePath, Transience};
 use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, source_storage};
 use crate::storage::backends::s3::{
@@ -160,23 +164,18 @@ async fn a_small_native_copy_is_one_copy_object_to_the_final_key() -> TestResult
 }
 
 /// Above it, an upload on the final key filled with `UploadPartCopy` and completed at
-/// publication; a checkpointed copy writes its pointer once and reports `Checkpointed`, as a
+/// publication; a checkpointed copy anchors bounded H and lifecycle snapshots and reports `Checkpointed`, as a
 /// streamed one would, an atomic one writes none and reports `Disabled`.
 #[tokio::test]
 async fn a_large_native_copy_fills_an_upload_on_the_final_key() -> TestResult {
     let size = 4 * PART + 3 * MIB;
     let (protocol, payloads) = seeded(&[("source", size)], "large").await;
-    for (policy, pointers, recovery) in [
+    for (policy, recovery) in [
         (
             TransferPolicy::Checkpointed,
-            1,
             EffectiveRecovery::Checkpointed,
         ),
-        (
-            TransferPolicy::AtomicReplace,
-            0,
-            EffectiveRecovery::Disabled,
-        ),
+        (TransferPolicy::AtomicReplace, EffectiveRecovery::Disabled),
     ] {
         let puts = *protocol.puts.lock().await;
         let request = request_with(
@@ -185,6 +184,11 @@ async fn a_large_native_copy_fills_an_upload_on_the_final_key() -> TestResult {
             policy,
             CancellationToken::new(),
         )?;
+        let pointers = if policy == TransferPolicy::Checkpointed {
+            hash_batches(&request, size)? + 5
+        } else {
+            0
+        };
         let outcome = transfer(request).await?;
         assert_eq!(outcome.route, TransferRoute::Native, "{policy:?}");
         assert_eq!(outcome.recovery, recovery, "{policy:?}");
@@ -205,23 +209,39 @@ async fn a_large_native_copy_fills_an_upload_on_the_final_key() -> TestResult {
     Ok(())
 }
 
-/// A copy cut at part 3 of 5 is resumed by a fresh `transfer`, with nothing kept where
-/// data-mover runs: the two listed parts are reused and only parts 3–5 are copied again.
+/// A copy cut at part 3 of 5 reuses every listed part, including completed islands after
+/// the gap; only the exact missing part numbers are copied again.
 #[tokio::test]
 async fn an_interrupted_native_copy_resumes_from_the_parts_it_copied() -> TestResult {
     let (protocol, payloads) = seeded(&[("source", 4 * PART + 3 * MIB)], "cut").await;
+    let batches = hash_batches(&native(&protocol, "cut")?, payloads[0].len())?;
     cut_at_part_three(&protocol, native(&protocol, "cut")?).await?;
-    assert_eq!(*protocol.puts.lock().await, 1, "one pointer");
+    assert_eq!(
+        *protocol.puts.lock().await,
+        batches + 2,
+        "prepare and full source H before native copy"
+    );
     assert!(!protocol.objects.lock().await.contains_key("cut"));
     let copied = *protocol.part_copies.lock().await;
+    let completed = completed_parts(&protocol, "cut").await?;
+    completed.assert_third_failed();
+    let missing = completed.missing(payloads[0].len(), PART);
 
     let outcome = transfer(native(&protocol, "cut")?).await?;
-    let reused = 2 * PART as u64;
+    let reused = completed.bytes();
     assert_eq!(outcome.prepare, PrepareFact::Resumed { bytes: reused });
     assert_eq!(outcome.reused_bytes, reused);
     assert_eq!(outcome.route, TransferRoute::Native);
     assert_eq!(outcome.recovery, EffectiveRecovery::Checkpointed);
-    assert_eq!(*protocol.part_copies.lock().await, copied + 3);
+    assert_eq!(
+        *protocol.part_copies.lock().await,
+        copied + u32::try_from(missing.len())?,
+        "only missing parts {missing:?}"
+    );
+    assert_eq!(
+        outcome.source_qos.native_bytes,
+        payloads[0].len() as u64 - completed.bytes()
+    );
     assert_eq!(protocol.objects.lock().await.get("cut"), Some(&payloads[0]));
     assert!(leaves_nothing_behind(&protocol, "cut").await?);
     Ok(())
@@ -285,6 +305,13 @@ async fn a_cancelled_native_copy_keeps_the_parts_in_flight() -> TestResult {
     drop(failure);
     let copied = u64::from(*protocol.part_copies.lock().await);
     assert!((6..11).contains(&copied), "{copied} parts copied");
+    let completed = completed_parts(&protocol, "cancelled").await?;
+    let missing = completed.missing(size, PART);
+    assert_eq!(
+        copied,
+        u64::try_from(completed.0.len())?,
+        "issued cancellation work must settle"
+    );
 
     let outcome = transfer(native(&protocol, "cancelled")?).await?;
     let PrepareFact::Resumed { bytes } = outcome.prepare else {
@@ -294,6 +321,16 @@ async fn a_cancelled_native_copy_keeps_the_parts_in_flight() -> TestResult {
     // The six parts started before the cancellation (a seventh may follow part 1) all finished.
     assert!(bytes >= 6 * PART as u64 && bytes < size as u64, "{bytes}");
     assert_eq!(bytes % PART as u64, 0);
+    assert_eq!(bytes, completed.bytes());
+    assert_eq!(
+        u64::from(*protocol.part_copies.lock().await),
+        copied + u64::try_from(missing.len())?,
+        "all completed parts must be reused"
+    );
+    assert_eq!(
+        outcome.source_qos.native_bytes,
+        size as u64 - completed.bytes()
+    );
     assert_eq!(
         protocol.objects.lock().await.get("cancelled"),
         Some(&payloads[0])
@@ -308,13 +345,24 @@ async fn a_native_copy_resumes_a_streamed_upload_at_its_part_size() -> TestResul
     let size = 3 * STREAMED_PART + 2 * MIB;
     let (protocol, payloads) = seeded(&[("source", size)], "mixed").await;
     cut_at_part_three(&protocol, streamed(&protocol, "mixed")?).await?;
+    let completed = completed_parts(&protocol, "mixed").await?;
+    completed.assert_third_failed();
+    let missing = completed.missing(size, STREAMED_PART);
+    let copied = *protocol.part_copies.lock().await;
 
     let outcome = transfer(native(&protocol, "mixed")?).await?;
-    let reused = 2 * STREAMED_PART as u64;
+    let reused = completed.bytes();
     assert_eq!(outcome.route, TransferRoute::Native);
     assert_eq!(outcome.prepare, PrepareFact::Resumed { bytes: reused });
-    assert_eq!(outcome.source_qos.native_bytes, size as u64 - reused);
-    assert_eq!(*protocol.part_copies.lock().await, 2, "8 MiB and 2 MiB");
+    assert_eq!(
+        outcome.source_qos.native_bytes,
+        size as u64 - completed.bytes()
+    );
+    assert_eq!(
+        *protocol.part_copies.lock().await,
+        copied + u32::try_from(missing.len())?,
+        "only missing parts {missing:?}"
+    );
     assert_eq!(
         protocol.objects.lock().await.get("mixed"),
         Some(&payloads[0])
@@ -328,16 +376,22 @@ async fn a_native_copy_resumes_a_streamed_upload_at_its_part_size() -> TestResul
 async fn a_streamed_attempt_resumes_a_native_upload_at_its_part_size() -> TestResult {
     let (protocol, payloads) = seeded(&[("source", 4 * PART + 3 * MIB)], "back").await;
     cut_at_part_three(&protocol, native(&protocol, "back")?).await?;
+    let completed = completed_parts(&protocol, "back").await?;
+    completed.assert_third_failed();
+    let missing = completed.missing(payloads[0].len(), PART);
+    let uploaded = *protocol.part_uploads.lock().await;
+    *protocol.body_fragments.lock().await = Some(Vec::new());
 
     let outcome = transfer(streamed(&protocol, "back")?).await?;
-    let reused = 2 * PART as u64;
+    let reused = completed.bytes();
     assert_eq!(outcome.route, TransferRoute::Streaming);
     assert_eq!(outcome.prepare, PrepareFact::Resumed { bytes: reused });
     assert_eq!(
         *protocol.part_uploads.lock().await,
-        3,
-        "parts 3 to 5 of 5 MiB"
+        uploaded + u32::try_from(missing.len())?,
+        "only missing parts {missing:?}"
     );
+    assert_uploaded_parts(&protocol, &missing).await?;
     assert_eq!(
         protocol.objects.lock().await.get("back"),
         Some(&payloads[0])
@@ -346,8 +400,7 @@ async fn a_streamed_attempt_resumes_a_native_upload_at_its_part_size() -> TestRe
     Ok(())
 }
 
-/// What a native copy may not resume — another transfer's upload and pointer, or anything when
-/// the policy is atomic — is cleaned up in place before it copies, for both copy shapes.
+/// Legacy v1 artifacts retain their restart protocol. V2 source changes fail closed separately.
 #[tokio::test]
 async fn a_native_copy_cleans_up_what_it_cannot_resume() -> TestResult {
     let big = 4 * PART + 3 * MIB;
@@ -373,14 +426,7 @@ async fn a_native_copy_cleans_up_what_it_cannot_resume() -> TestResult {
             "key",
         )
         .await;
-        let streamed_leftover = TransferRequest::new(
-            source_storage(&protocol, "big")?,
-            StoragePath::new("key")?,
-            connect_at_destination(protocol.clone(), endpoint_of(&protocol), INTERVAL as u64)?,
-            CancellationToken::new(),
-        )
-        .with_transfer_policy(TransferPolicy::Checkpointed);
-        cut_at_part_three(&protocol, streamed_leftover).await?;
+        legacy_upload(&protocol, "big", "key", INTERVAL).await?;
         let request = request_with(&protocol, (source, "key"), policy, CancellationToken::new())?;
         let outcome = transfer(request).await?;
         assert_eq!(outcome.route, TransferRoute::Native, "{source}");
@@ -455,8 +501,7 @@ async fn native_part_copies_stay_within_the_backend_window() -> TestResult {
 }
 
 /// A streamed upload cut and left with its pointer, then a source replaced by other bytes of the
-/// same size: a native attempt must not resume the old parts (the binding changed), and the final
-/// object is the new source.
+/// same size: v2 fails closed without aborting its old upload. `AtomicReplace` explicitly restarts.
 #[tokio::test]
 async fn a_native_copy_restarts_over_a_streamed_upload_of_a_changed_source() -> TestResult {
     let size = 3 * STREAMED_PART + 2 * MIB;
@@ -469,12 +514,30 @@ async fn a_native_copy_restarts_over_a_streamed_upload_of_a_changed_source() -> 
         .await
         .insert("source/changed".into(), replaced.clone());
 
-    let outcome = transfer(native(&protocol, "changed")?).await?;
+    let old_parts = completed_parts(&protocol, "changed").await?;
+    let old_pointer = stored_pointer(&protocol, "changed").await?;
+    let aborted = *protocol.aborts.lock().await;
+    let refused = transfer(native(&protocol, "changed")?)
+        .await
+        .err()
+        .ok_or("changed v2 source must fail closed")?;
+    assert!(!refused.final_destination_changed());
+    assert_eq!(*protocol.aborts.lock().await, aborted);
+    assert_eq!(completed_parts(&protocol, "changed").await?.0, old_parts.0);
+    assert_eq!(stored_pointer(&protocol, "changed").await?, old_pointer);
+    assert!(!protocol.objects.lock().await.contains_key("changed"));
+    let outcome = transfer(request_with(
+        &protocol,
+        ("source", "changed"),
+        TransferPolicy::AtomicReplace,
+        CancellationToken::new(),
+    )?)
+    .await?;
     assert_eq!(outcome.route, TransferRoute::Native);
     assert_eq!(
         outcome.prepare,
         PrepareFact::Restarted {
-            reason: RestartReason::BindingChanged
+            reason: RestartReason::Requested
         }
     );
     assert_eq!(outcome.reused_bytes, 0);

@@ -37,6 +37,8 @@ pub(super) struct FinalUpload {
 
 #[derive(Default)]
 pub(super) struct UploadState {
+    /// H from the last successful pointer PUT, never merely the producer's in-memory hash.
+    pub(super) anchored_hash: Option<crate::storage::range_hash::RangeHash>,
     /// Every part the completion names (number, `ETag`): the resumed prefix, then what `write`
     /// sent.
     pub(super) parts: Vec<(i32, String)>,
@@ -52,10 +54,17 @@ pub(super) struct UploadState {
     pub(super) tags: Option<Vec<ObjectTag>>,
     /// What the completion reported.
     pub(super) published: Option<S3WriteFacts>,
+    pub(super) checkpoint_released: bool,
+    /// Only explicitly authorized marker ids (for example, a known delete receipt). Never
+    /// infer ownership from surrounding payloads; new v2 cleanup creates no markers.
+    pub(super) checkpoint_cleanup_markers: Vec<String>,
+    pub(super) recovered_receipts: Option<[u8; 32]>,
     /// The version this stage's pointer write reported (`"null"` included), which deleting it
     /// names; `None` in an unversioned bucket — or when a resume could not delete the version it
     /// replaced, so that a plain delete hides both behind a marker.
     pub(super) pointer_version: Option<String>,
+    pub(super) latest_pointer_version: Option<String>,
+    pointer_hide: bool,
     /// Contents no pointer version may keep once ours is deleted: ours, and a replaced one's.
     pub(super) stale_pointers: Vec<Vec<u8>>,
 }
@@ -125,7 +134,21 @@ impl FinalUpload {
     /// Records the pointer this stage wrote: the version its write reported and its bytes.
     pub(super) fn record_pointer(&self, version: Option<String>, bytes: Vec<u8>) {
         let mut state = self.lock();
-        state.pointer_version = version;
+        state.latest_pointer_version.clone_from(&version);
+        state.pointer_version = if state.pointer_hide { None } else { version };
+        // Hash snapshots can approach 1 MiB; retaining one per intent batch is unbounded.
+        // The cleanup matcher recognizes all v2 generations with this nonce, so retain only
+        // the latest one and any previous owner's pointer needed by takeover cleanup.
+        if crate::storage::pointer::DestinationPointer::decode(&bytes)
+            .is_ok_and(|pointer| pointer.checkpoint.is_some())
+        {
+            state.stale_pointers.retain(|old| {
+                crate::storage::pointer::DestinationPointer::decode(old)
+                    .ok()
+                    .and_then(|pointer| super::upload_pointer::accepted(&pointer))
+                    .is_none_or(|record| record.nonce != self.nonce)
+            });
+        }
         state.stale_pointers.push(bytes);
     }
 
@@ -135,8 +158,20 @@ impl FinalUpload {
         let mut state = self.lock();
         state.stale_pointers.push(bytes);
         if !deleted {
+            state.pointer_hide = true;
             state.pointer_version = None;
         }
+    }
+
+    pub(super) fn hide_pointer_versions(&self) {
+        let mut state = self.lock();
+        state.pointer_hide = true;
+        state.pointer_version = None;
+    }
+
+    pub(super) fn has_pointer_history(&self) -> bool {
+        let current = self.lock();
+        current.pointer_hide || current.latest_pointer_version.is_some()
     }
 
     /// Parts a streamed `write` keeps in flight: the backend's configured maximum, unless the upload resumed

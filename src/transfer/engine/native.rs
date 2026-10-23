@@ -6,7 +6,8 @@ use super::{
     final_recovery, read_exact_range,
 };
 use crate::storage::{
-    DestinationPrepareRequest, FinalDestination, PrepareRequest, PreparedStage, ResumeMode,
+    DestinationPrepareRequest, FinalDestination, NativeSourceBinding, NativeStageEvidence,
+    PrepareRequest, PreparedStage, ResumeMode, WriteEvidence,
 };
 
 pub(super) fn eligible_native_pair(request: &TransferRequest) -> Option<NativePair> {
@@ -50,7 +51,8 @@ async fn prepare_native_stage(
         .prepare_native(
             DestinationPrepareRequest::new(prepare, *request.identity().as_bytes())
                 .with_resume(resume)
-                .with_recoverable(false),
+                .with_recoverable(false)
+                .with_checkpoint_hash(defer_source_hash(request, input)),
         )
         .await
         .map_err(|error| {
@@ -76,21 +78,99 @@ pub(super) async fn transfer_native(
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
         })?;
-    let digest = if request.needs_source_digest() {
-        Some(
-            hash_source(
-                &*input.source,
-                &input.descriptor,
-                request,
-                input.plan,
-                input.source_qos.clone(),
-            )
-            .await?,
-        )
-    } else {
-        None
+    let digest = initial_digest(request, &input).await?;
+    let mut stage = prepare_native_stage(request, &input, lease).await?;
+    if (stage.restored_checkpoint().is_some() || hash_checkpoint_eligible(request, &input))
+        && input.destination.stage_supports_hash_checkpoint(&stage)
+    {
+        let binding = super::negotiation::checkpoint_metadata_binding(
+            request,
+            input.copied_metadata_plan.as_ref(),
+        );
+        stage = super::publication::bind_prepared_checkpoint_metadata(
+            stage,
+            &input.destination,
+            binding,
+        )?;
+    }
+    let digest = match prepared_digest(request, &input, &stage, digest).await {
+        Ok(digest) => digest,
+        Err(error) => return Err(error.with_stage(input.destination, stage)),
     };
-    let stage = prepare_native_stage(request, &input, lease).await?;
+    copy_and_finish(request, input, stage, binding, digest).await
+}
+
+async fn initial_digest(
+    request: &TransferRequest,
+    input: &NativeTransferInput,
+) -> Result<Option<[u8; 32]>, TransferFailure> {
+    if request.needs_source_digest() && !defer_source_hash(request, input) {
+        return hash_source(
+            &*input.source,
+            &input.descriptor,
+            request,
+            input.plan,
+            input.source_qos.clone(),
+        )
+        .await
+        .map(Some);
+    }
+    Ok(None)
+}
+
+async fn prepared_digest(
+    request: &TransferRequest,
+    input: &NativeTransferInput,
+    stage: &PreparedStage,
+    digest: Option<[u8; 32]>,
+) -> Result<Option<[u8; 32]>, TransferFailure> {
+    let checkpoint_hash =
+        stage.restored_checkpoint().is_some() || hash_checkpoint_eligible(request, input);
+    if checkpoint_hash && input.destination.stage_supports_hash_checkpoint(stage) {
+        return super::checkpointed::hash_only(
+            request,
+            &input.source,
+            &input.destination,
+            &input.descriptor,
+            stage,
+            input.plan,
+            input.source_qos.clone(),
+        )
+        .await
+        .map(Some);
+    }
+    if defer_source_hash(request, input) && request.needs_source_digest() {
+        return hash_source(
+            &*input.source,
+            &input.descriptor,
+            request,
+            input.plan,
+            input.source_qos.clone(),
+        )
+        .await
+        .map(Some);
+    }
+    Ok(digest)
+}
+
+async fn copy_and_finish(
+    request: &TransferRequest,
+    input: NativeTransferInput,
+    stage: PreparedStage,
+    binding: NativeSourceBinding,
+    digest: Option<[u8; 32]>,
+) -> Result<Transferred, TransferFailure> {
+    if stage.recovered_publication.is_some() {
+        let native = NativeStageEvidence {
+            write: WriteEvidence {
+                persisted_bytes: input.plan.source_size,
+            },
+            native_bytes: 0,
+            native_requests: 0,
+            single_operation: false,
+        };
+        return finish_native(request, input, stage, native, digest).await;
+    }
     let native = match input
         .pair
         .copy_into_stage(binding, &stage, request.cancel.clone())
@@ -119,6 +199,25 @@ pub(super) async fn transfer_native(
     finish_native(request, input, stage, native, digest).await
 }
 
+fn hash_checkpoint_eligible(request: &TransferRequest, input: &NativeTransferInput) -> bool {
+    request.transfer_policy == TransferPolicy::Checkpointed
+        && input.destination.supports_hash_checkpoint()
+        && input.pair.supports_hash_checkpoint(&input.descriptor)
+        && input.descriptor.size.is_some_and(|size| {
+            size > input.source.maximum_read_chunk_bytes() as u64
+                && input
+                    .destination
+                    .automatic_checkpoint_interval_bytes()
+                    .is_none_or(|interval| size > interval)
+        })
+}
+
+fn defer_source_hash(request: &TransferRequest, input: &NativeTransferInput) -> bool {
+    request.transfer_policy == TransferPolicy::Checkpointed
+        && input.destination.supports_hash_checkpoint()
+        && input.destination.resumable_at_destination()
+}
+
 fn native_failure(
     failure: crate::storage::NativeStageFailure,
     destination: &Arc<dyn StagedDestination>,
@@ -141,6 +240,24 @@ async fn finish_native(
     native: crate::storage::NativeStageEvidence,
     digest: Option<[u8; 32]>,
 ) -> Result<Transferred, TransferFailure> {
+    if native.write.persisted_bytes != input.plan.source_size {
+        return Err(TransferFailure::orchestration(
+            TransferPhase::Checkpoint,
+            "native write evidence differs from source size",
+        )
+        .with_stage(input.destination, stage));
+    }
+    if stage.checkpoint_enabled() {
+        stage.checkpoint_barrier(input.plan.source_size);
+        if let Err(error) = input.destination.persist_hash_checkpoint(&stage).await {
+            return Err(TransferFailure::role(
+                TransferPhase::Checkpoint,
+                TransferSide::Destination,
+                error,
+            )
+            .with_stage(input.destination, stage));
+        }
+    }
     let native_stats = SourceQosStats {
         logical_bytes: input.plan.source_size,
         native_bytes: native.native_bytes,

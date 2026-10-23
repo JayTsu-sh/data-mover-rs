@@ -6,6 +6,8 @@ use std::sync::atomic::Ordering;
 
 use crate::storage::durability::sync_directory;
 use cap_std::fs::OpenOptions;
+#[cfg(unix)]
+use cap_std::fs::OpenOptionsExt as _;
 
 use super::{LocalStagedDestination, at_destination, failure, io_failure, publication};
 use crate::model::{FailureClass, Operation};
@@ -18,8 +20,22 @@ pub(super) async fn persist(
     stage: &PreparedStage,
     durable_prefix: u64,
 ) -> Result<(), StorageRoleFailure> {
+    // Source hash intent and data barriers may both update the pointer. Encode only after
+    // acquiring the same lock, so an older snapshot cannot overwrite a newer one.
+    let _guard = if stage.checkpoint_enabled() {
+        Some(super::hash_checkpoint::lock(stage).await?)
+    } else {
+        None
+    };
+    let durable_prefix = if stage.checkpoint_enabled() {
+        stage.checkpoint_prefix()
+    } else {
+        durable_prefix
+    };
     let checkpoint = adapter.checkpoint_name(stage, Operation::Verify)?;
     let (temporary, record) = record_for(stage, durable_prefix)?;
+    #[cfg(unix)]
+    let private = crate::storage::pointer::is_checkpoint_pointer(&record);
     let staging = adapter.stage_directory(stage, Operation::Verify).await?;
     let probe = Arc::clone(&adapter.write_probe);
     #[cfg(test)]
@@ -39,6 +55,13 @@ pub(super) async fn persist(
             publication::remove_if_present(&staging, &temporary)?;
             let mut options = OpenOptions::new();
             options.create_new(true).write(true);
+            // V2 may contain literal source fragments. Creation must be private even when
+            // the process umask permits world reads; v1 retains its existing permissions.
+            #[cfg(unix)]
+            if private {
+                options.mode(0o600);
+            }
+            // Windows keeps the parent directory's inherited security descriptor.
             let mut file = staging.open_with(&temporary, &options)?.into_std();
             file.write_all(&record)?;
             file.sync_all()?;

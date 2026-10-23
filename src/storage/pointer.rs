@@ -15,19 +15,27 @@
 //! | 76 | 8 | durable prefix (0 when absent) |
 //! | 84 | E | extension |
 //! | 84 + E | 32 | `blake3` of every byte before it |
+//!
+//! `DMDPTR02` retains that header and extension, then appends a nonzero little-endian `u32`
+//! checkpoint length and its bounded bytes before the outer checksum. `None` always emits
+//! the frozen v1 encoding; the larger read ceiling does not change legacy writes.
 
 use std::ops::Range;
 
 use bytes::Bytes;
 
+use super::checkpoint::MAX_CHECKPOINT_BYTES;
+
 const MAGIC: &[u8; 8] = b"DMDPTR01";
+const CHECKPOINT_MAGIC: &[u8; 8] = b"DMDPTR02";
 const HAS_PREFIX: u8 = 0b1;
 const HEADER_BYTES: usize = 84;
 const CHECKSUM_BYTES: usize = 32;
 /// Largest backend extension a pointer carries.
 const MAX_EXTENSION_BYTES: usize = 4096;
 /// Largest encoded pointer; a reader never needs more.
-pub(crate) const MAX_POINTER_BYTES: usize = HEADER_BYTES + MAX_EXTENSION_BYTES + CHECKSUM_BYTES;
+pub(crate) const MAX_POINTER_BYTES: usize =
+    HEADER_BYTES + MAX_EXTENSION_BYTES + CHECKSUM_BYTES + 4 + MAX_CHECKPOINT_BYTES;
 
 /// A pointer that does not decode: wrong length, magic, flags, checksum, or an oversized extension.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +53,8 @@ pub(crate) struct DestinationPointer {
     pub(crate) durable_prefix: Option<u64>,
     /// Opaque backend state, at most 4 KiB.
     pub(crate) extension: Bytes,
+    /// Versioned source hash and recovery coverage; absent on every legacy/non-checkpoint path.
+    pub(crate) checkpoint: Option<Bytes>,
 }
 
 impl DestinationPointer {
@@ -59,7 +69,18 @@ impl DestinationPointer {
             .filter(|len| usize::from(*len) <= MAX_EXTENSION_BYTES)
             .ok_or(PointerCorrupt)?;
         let mut out = Vec::with_capacity(HEADER_BYTES + self.extension.len() + CHECKSUM_BYTES);
-        out.extend_from_slice(MAGIC);
+        if self
+            .checkpoint
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_CHECKPOINT_BYTES)
+        {
+            return Err(PointerCorrupt);
+        }
+        out.extend_from_slice(if self.checkpoint.is_some() {
+            CHECKPOINT_MAGIC
+        } else {
+            MAGIC
+        });
         out.push(if self.durable_prefix.is_some() {
             HAS_PREFIX
         } else {
@@ -71,6 +92,11 @@ impl DestinationPointer {
         out.extend_from_slice(&self.transfer_identity);
         out.extend_from_slice(&self.durable_prefix.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&self.extension);
+        if let Some(checkpoint) = &self.checkpoint {
+            let length = u32::try_from(checkpoint.len()).map_err(|_| PointerCorrupt)?;
+            out.extend_from_slice(&length.to_le_bytes());
+            out.extend_from_slice(checkpoint);
+        }
         let checksum = *blake3::hash(&out).as_bytes();
         out.extend_from_slice(&checksum);
         Ok(out)
@@ -87,14 +113,18 @@ impl DestinationPointer {
         let (body, checksum) = bytes.split_at(bytes.len() - CHECKSUM_BYTES);
         let extension_len = usize::from(u16::from_le_bytes([body[10], body[11]]));
         let flags = body[8];
-        if &body[..8] != MAGIC
+        if (&body[..8] != MAGIC && &body[..8] != CHECKPOINT_MAGIC)
             || flags & !HAS_PREFIX != 0
             || body[9] != 0
-            || body.len() != HEADER_BYTES + extension_len
+            || extension_len > MAX_EXTENSION_BYTES
             || blake3::hash(body).as_bytes() != checksum
         {
             return Err(PointerCorrupt);
         }
+        let extension_end = HEADER_BYTES
+            .checked_add(extension_len)
+            .ok_or(PointerCorrupt)?;
+        let checkpoint = decode_checkpoint(body, extension_end)?;
         let field = |range: Range<usize>| -> Result<[u8; 32], PointerCorrupt> {
             body[range].try_into().map_err(|_| PointerCorrupt)
         };
@@ -107,9 +137,36 @@ impl DestinationPointer {
             binding: field(12..44)?,
             transfer_identity: field(44..76)?,
             durable_prefix: (flags & HAS_PREFIX != 0).then_some(prefix),
-            extension: Bytes::copy_from_slice(&body[HEADER_BYTES..]),
+            extension: Bytes::copy_from_slice(&body[HEADER_BYTES..extension_end]),
+            checkpoint,
         })
     }
+}
+
+fn decode_checkpoint(body: &[u8], at: usize) -> Result<Option<Bytes>, PointerCorrupt> {
+    if &body[..8] == MAGIC {
+        return (body.len() == at).then_some(None).ok_or(PointerCorrupt);
+    }
+    let length = body.get(at..at + 4).ok_or(PointerCorrupt)?;
+    let length = usize::try_from(u32::from_le_bytes(
+        length.try_into().map_err(|_| PointerCorrupt)?,
+    ))
+    .map_err(|_| PointerCorrupt)?;
+    if length == 0
+        || length > MAX_CHECKPOINT_BYTES
+        || at
+            .checked_add(4)
+            .and_then(|start| start.checked_add(length))
+            != Some(body.len())
+    {
+        return Err(PointerCorrupt);
+    }
+    Ok(Some(Bytes::copy_from_slice(&body[at + 4..])))
+}
+
+/// New/unknown checkpoint formats must fail closed, not enter legacy destructive cleanup.
+pub(crate) fn is_checkpoint_pointer(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"DMDPTR") && !bytes.starts_with(MAGIC)
 }
 
 #[cfg(test)]
@@ -124,6 +181,7 @@ mod tests {
             transfer_identity: [0x22; 32],
             durable_prefix: prefix,
             extension: Bytes::from_static(extension),
+            checkpoint: None,
         }
     }
 
@@ -137,6 +195,40 @@ mod tests {
             let bytes = value.encode()?;
             assert_eq!(bytes.len(), 116 + value.extension.len());
             assert_eq!(DestinationPointer::decode(&bytes)?, value);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_v2_is_bounded_and_does_not_change_v1() -> Result<(), PointerCorrupt> {
+        let legacy = pointer(Some(17), b"backend");
+        let value = DestinationPointer {
+            checkpoint: Some(Bytes::from_static(b"hash-and-ranges")),
+            ..legacy.clone()
+        };
+        let encoded = value.encode()?;
+        assert_eq!(&encoded[..8], b"DMDPTR02");
+        assert_eq!(DestinationPointer::decode(&encoded)?, value);
+        assert_eq!(&legacy.encode()?[..8], b"DMDPTR01");
+        for checkpoint in [
+            Bytes::new(),
+            Bytes::from(vec![0; super::MAX_CHECKPOINT_BYTES + 1]),
+        ] {
+            assert_eq!(
+                DestinationPointer {
+                    checkpoint: Some(checkpoint),
+                    ..legacy.clone()
+                }
+                .encode(),
+                Err(PointerCorrupt)
+            );
+        }
+        let length_at = 84 + value.extension.len();
+        for length_byte in [0, 1, 255] {
+            assert!(
+                DestinationPointer::decode(&resealed(encoded.clone(), length_at, length_byte))
+                    .is_err()
+            );
         }
         Ok(())
     }
@@ -222,7 +314,7 @@ mod tests {
             ..pointer(None, b"")
         };
         let encoded = largest.encode()?;
-        assert_eq!(encoded.len(), MAX_POINTER_BYTES);
+        assert_eq!(encoded.len(), 116 + 4096);
         assert_eq!(DestinationPointer::decode(&encoded)?, largest);
         let oversized = DestinationPointer {
             extension: Bytes::from(vec![0; 4097]),

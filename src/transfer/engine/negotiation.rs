@@ -41,6 +41,32 @@ pub(super) struct CopiedMetadataPlan {
     plan: MetadataPlan,
 }
 
+impl CopiedMetadataPlan {
+    pub(super) fn checkpoint_binding(&self) -> [u8; 32] {
+        self.plan.checkpoint_binding()
+    }
+}
+
+/// Bind selectors even when capabilities yielded no plan or no mutations. Domain/version also
+/// pins the ordinary copy policy, not just the values it happened to produce this attempt.
+pub(super) fn checkpoint_metadata_binding(
+    request: &TransferRequest,
+    copied: Option<&CopiedMetadataPlan>,
+) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"data-mover ordinary copied metadata policy v1\0");
+    hash.update(&[
+        u8::from(request.copied_metadata.acl()),
+        u8::from(request.copied_metadata.xattrs()),
+        u8::from(request.copies_tags()),
+        u8::from(copied.is_some()),
+    ]);
+    if let Some(copied) = copied {
+        hash.update(&copied.checkpoint_binding());
+    }
+    *hash.finalize().as_bytes()
+}
+
 pub(super) async fn copied_metadata_plan(
     request: &TransferRequest,
     descriptor: &SourceDescriptor,

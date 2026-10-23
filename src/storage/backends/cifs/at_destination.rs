@@ -30,6 +30,10 @@ use crate::storage::discovery::{DestinationArtifacts, discover};
 use crate::storage::pointer::{DestinationPointer, MAX_POINTER_BYTES};
 use crate::storage::{DestinationPrepareRequest, PreparedStage, StorageRoleFailure};
 
+#[path = "hash_checkpoint.rs"]
+mod hash_checkpoint;
+pub(super) use hash_checkpoint::{checkpoint_barrier, finish_publication, release_hash_checkpoint};
+
 /// The tag every CIFS pointer's extension starts with; the fence nonce follows it.
 const POINTER_TAG: &[u8; 8] = b"DMCSTG01";
 const NONCE_BYTES: usize = 16;
@@ -137,6 +141,7 @@ async fn read_regular(
     path: &StoragePath,
     limit: usize,
     operation: Operation,
+    readonly: bool,
 ) -> Result<Option<Vec<u8>>, StorageRoleFailure> {
     let size = match adapter.protocol.stat(path).await {
         Ok((true, size)) => size,
@@ -144,7 +149,12 @@ async fn read_regular(
         Err(error) if is_not_found(&error) => return Ok(None),
         Err(error) => return Err(classify(path, operation, &error)),
     };
-    let file = match adapter.protocol.open(path).await {
+    let opened = if readonly {
+        adapter.protocol.open_read(path).await
+    } else {
+        adapter.protocol.open(path).await
+    };
+    let file = match opened {
         Ok(file) => file,
         Err(error) if is_not_found(&error) => return Ok(None),
         Err(error) => return Err(classify(path, operation, &error)),
@@ -189,16 +199,35 @@ struct CifsArtifacts<'a> {
     stage: StoragePath,
     pointer: StoragePath,
     pointer_temporary: StoragePath,
+    checkpoint_hash: bool,
 }
 
 #[async_trait]
 impl DestinationArtifacts for CifsArtifacts<'_> {
+    async fn observe_final(
+        &self,
+        final_path: &StoragePath,
+    ) -> Result<Option<u64>, StorageRoleFailure> {
+        match self.adapter.protocol.stat(final_path).await {
+            Ok((true, size)) => Ok(Some(size)),
+            Ok((false, _)) => Err(not_regular(final_path, Operation::Prepare)),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(classify(final_path, Operation::Prepare, &error)),
+        }
+    }
     async fn read_pointer(
         &self,
         _final_path: &StoragePath,
         limit: usize,
     ) -> Result<Option<Vec<u8>>, StorageRoleFailure> {
-        read_regular(self.adapter, &self.pointer, limit, Operation::Prepare).await
+        read_regular(
+            self.adapter,
+            &self.pointer,
+            limit,
+            Operation::Prepare,
+            self.checkpoint_hash,
+        )
+        .await
     }
 
     /// The stage's size confirms it exists and is not shorter than the pointer's prefix; it is
@@ -242,6 +271,7 @@ pub(super) async fn prepare(
         stage: artifact_path(&final_path, ArtifactKind::Stage, false)?,
         pointer: artifact_path(&final_path, ArtifactKind::Pointer, false)?,
         pointer_temporary: artifact_path(&final_path, ArtifactKind::Pointer, true)?,
+        checkpoint_hash: request.checkpoint_hash,
     };
     let found = discover(&artifacts, &request).await?;
     let token = Bytes::copy_from_slice(artifacts.stage.as_str().as_bytes());
@@ -261,6 +291,32 @@ pub(super) async fn prepare(
     let Some(point) = found.resume else {
         return start(adapter, stage, &artifacts.stage, request.recoverable).await;
     };
+    stage
+        .restore_checkpoint(point.pointer.checkpoint)
+        .map_err(|_| entry_failure(&final_path, Operation::Prepare, FailureClass::Corruption))?;
+    if point.published {
+        hash_checkpoint::recover_publication(adapter, &mut stage, point.prefix).await?;
+        return Ok(stage);
+    }
+    if stage.restored_checkpoint().is_some() {
+        let size = adapter
+            .protocol
+            .size(&artifacts.stage)
+            .await
+            .map_err(|error| classify(&final_path, Operation::Prepare, &error))?;
+        if stage.checkpoint_prefix() != point.prefix
+            || stage
+                .checkpoint_ranges()
+                .iter()
+                .any(|range| range.end > size)
+        {
+            return Err(entry_failure(
+                &final_path,
+                Operation::Prepare,
+                FailureClass::Corruption,
+            ));
+        }
+    }
     adapter.claim(token);
     if let Err(error) = write_pointer(adapter, &stage, point.prefix, true).await {
         // Whether or not the take-over landed, the stage stays for the next attempt to resume.
@@ -309,7 +365,15 @@ async fn still_ours(
     let fence = fence(stage)?;
     let pointer = artifact_path(stage.final_destination.path(), ArtifactKind::Pointer, false)?;
     Ok(
-        match read_regular(adapter, &pointer, MAX_POINTER_BYTES + 1, operation).await? {
+        match read_regular(
+            adapter,
+            &pointer,
+            MAX_POINTER_BYTES + 1,
+            operation,
+            stage.checkpoint_snapshot().is_some(),
+        )
+        .await?
+        {
             None => !fence.written.load(Ordering::Acquire),
             Some(bytes) => DestinationPointer::decode(&bytes)
                 .is_ok_and(|found| found.extension == fence.extension()),
@@ -332,30 +396,61 @@ pub(super) async fn write_pointer(
     take_over: bool,
 ) -> Result<(), StorageRoleFailure> {
     let final_path = stage.final_destination.path();
+    let fence = fence(stage)?;
+    let _guard = stage.checkpoint_guard().await;
     if !take_over && !still_ours(adapter, stage, Operation::Write).await? {
         return Err(taken_over(final_path, Operation::Write));
     }
-    let fence = fence(stage)?;
+    let prefix = if stage.checkpoint_enabled() {
+        stage.checkpoint_prefix()
+    } else {
+        prefix
+    };
+    let checkpoint = stage.checkpoint_snapshot();
+    let protected = checkpoint.is_some();
     let bytes = DestinationPointer {
         binding: stage.recovery_binding,
         transfer_identity: fence.transfer_identity,
         durable_prefix: Some(prefix),
         extension: fence.extension(),
+        checkpoint,
     }
     .encode()
     .map_err(|_| entry_failure(final_path, Operation::Write, FailureClass::Internal))?;
     let pointer = artifact_path(final_path, ArtifactKind::Pointer, false)?;
     let temporary = artifact_path(final_path, ArtifactKind::Pointer, true)?;
     delete_if_present(adapter, &temporary, Operation::Write).await?;
-    if let Err(error) = write_record(adapter, &temporary, Bytes::from(bytes.clone())).await {
+    let payload = if protected {
+        Some(if state(stage)?.published.load(Ordering::Acquire) {
+            final_path.clone()
+        } else {
+            stage_path(stage)?
+        })
+    } else {
+        None
+    };
+    if let Err(error) = write_record(
+        adapter,
+        &temporary,
+        Bytes::from(bytes.clone()),
+        payload.as_ref(),
+    )
+    .await
+    {
         let _ = adapter.protocol.delete(&temporary).await;
         return Err(error);
     }
     if let Err(rename_error) = adapter.protocol.rename(&temporary, &pointer, true).await {
         // RENAME can fail after the server committed it: read the pointer back before deciding.
-        let committed = read_regular(adapter, &pointer, MAX_POINTER_BYTES + 1, Operation::Write)
-            .await
-            .is_ok_and(|found| found.as_deref() == Some(bytes.as_slice()));
+        let committed = read_regular(
+            adapter,
+            &pointer,
+            MAX_POINTER_BYTES + 1,
+            Operation::Write,
+            protected,
+        )
+        .await
+        .is_ok_and(|found| found.as_deref() == Some(bytes.as_slice()));
         let _ = adapter.protocol.delete(&temporary).await;
         if !committed {
             return Err(classify(&pointer, Operation::Write, &rename_error));
@@ -373,9 +468,15 @@ pub(super) async fn reobserve(
     let final_path = stage.final_destination.path();
     let fence = fence(stage)?;
     let pointer = artifact_path(final_path, ArtifactKind::Pointer, false)?;
-    let bytes = read_regular(adapter, &pointer, MAX_POINTER_BYTES + 1, Operation::Observe)
-        .await?
-        .ok_or_else(|| taken_over(final_path, Operation::Observe))?;
+    let bytes = read_regular(
+        adapter,
+        &pointer,
+        MAX_POINTER_BYTES + 1,
+        Operation::Observe,
+        stage.checkpoint_snapshot().is_some(),
+    )
+    .await?
+    .ok_or_else(|| taken_over(final_path, Operation::Observe))?;
     let corrupt = || entry_failure(final_path, Operation::Observe, FailureClass::Corruption);
     let found = DestinationPointer::decode(&bytes).map_err(|_| corrupt())?;
     if found.extension != fence.extension() {
@@ -388,7 +489,12 @@ pub(super) async fn reobserve(
                 && found.transfer_identity == fence.transfer_identity
         })
         .ok_or_else(corrupt)?;
-    let stage_file = adapter.stage_path(stage)?;
+    let stage_file = if stage.recovered_publication.is_some() {
+        adapter.stage_path(stage)?;
+        final_path.clone()
+    } else {
+        adapter.stage_path(stage)?
+    };
     let (regular, size) = adapter
         .protocol
         .stat(&stage_file)
@@ -396,6 +502,13 @@ pub(super) async fn reobserve(
         .map_err(|error| classify(final_path, Operation::Observe, &error))?;
     if !regular || size < prefix {
         return Err(corrupt());
+    }
+    if let Some(encoded) = &found.checkpoint {
+        let data =
+            crate::storage::checkpoint::CheckpointData::decode(encoded).map_err(|_| corrupt())?;
+        if data.prefix() != prefix || data.ranges.iter().any(|range| range.end > size) {
+            return Err(corrupt());
+        }
     }
     Ok(prefix)
 }
@@ -405,6 +518,7 @@ async fn write_record(
     adapter: &CifsStagedDestination,
     path: &StoragePath,
     mut bytes: Bytes,
+    payload: Option<&StoragePath>,
 ) -> Result<(), StorageRoleFailure> {
     let failed = |error: &smb_domain::Error| classify(path, Operation::Write, error);
     adapter
@@ -418,6 +532,13 @@ async fn write_record(
         .await
         .map_err(|error| failed(&error))?;
     let result = async {
+        if let Some(payload) = payload {
+            adapter
+                .protocol
+                .protect_checkpoint(path, payload)
+                .await
+                .map_err(|error| failed(&error))?;
+        }
         let maximum = file.maximum_write_chunk() as usize;
         if maximum == 0 {
             return Err(entry_failure(

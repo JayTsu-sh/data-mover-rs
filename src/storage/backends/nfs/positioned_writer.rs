@@ -28,6 +28,18 @@ impl Frontier {
         }
     }
 
+    fn recovered(stage: &PreparedStage) -> Self {
+        let mut value = Self::new(stage.write_offset);
+        value.pending.extend(
+            stage
+                .checkpoint_ranges()
+                .into_iter()
+                .filter(|range| range.start >= value.prefix && range.end > value.prefix)
+                .map(|range| (range.start, range.end)),
+        );
+        value
+    }
+
     fn insert(&mut self, start: u64, length: u64) -> Result<(), ()> {
         let end = start.checked_add(length).ok_or(())?;
         if length == 0
@@ -154,10 +166,13 @@ impl<'a> Writer<'a> {
             concurrency,
             maximum_chunk_bytes,
             writes: FuturesUnordered::new(),
-            issued: stage.write_offset,
+            issued: stage
+                .checkpoint_ranges()
+                .last()
+                .map_or(stage.write_offset, |range| range.end),
             persisted: stage.write_offset,
-            completed: Frontier::new(stage.write_offset),
-            issued_frontier: Frontier::new(stage.write_offset),
+            completed: Frontier::recovered(stage),
+            issued_frontier: Frontier::recovered(stage),
             input_finished: false,
             pending_input: None,
             first_failure: None,
@@ -246,13 +261,17 @@ impl<'a> Writer<'a> {
         expected: u64,
         result: Result<u64, NfsProtocolFailure>,
     ) {
+        if let Ok(written) = result
+            && written <= expected
+        {
+            self.stage.confirmed_write(offset, written);
+        }
         let error = match result {
             Ok(written) if written == expected => {
                 if self.completed.insert(offset, written).is_err() {
                     Some(self.invalid())
                 } else {
                     self.persisted = self.completed.prefix;
-                    self.stage.confirmed_write(offset, written);
                     None
                 }
             }

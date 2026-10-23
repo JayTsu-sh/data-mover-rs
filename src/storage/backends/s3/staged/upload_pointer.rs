@@ -104,8 +104,12 @@ impl UploadRecord {
 /// The upload record of a pointer an S3 upload on the final key wrote: no durable prefix, and an
 /// extension that decodes exactly.
 pub(super) fn accepted(pointer: &DestinationPointer) -> Option<UploadRecord> {
-    if pointer.durable_prefix.is_some() {
+    if pointer.durable_prefix.is_some() && pointer.checkpoint.is_none() {
         return None;
+    }
+    if pointer.checkpoint.is_some() {
+        return super::checkpoint_record::CheckpointRecord::decode(&pointer.extension)
+            .map(|record| record.upload);
     }
     UploadRecord::decode(&pointer.extension)
 }
@@ -309,11 +313,18 @@ const MAX_SWEEPS: usize = 4;
 /// writer's pointer is left alone. Best effort: the object is already published or discarded, so a
 /// failure here is logged — the next prepare of the key cleans up what is left.
 async fn sweep<P: S3Protocol>(protocol: &P, pointer: &StoragePath, deleted: &str, stale: &[&[u8]]) {
-    let limit = stale.iter().map(|bytes| bytes.len()).max().unwrap_or(0) + 1;
+    let hash_checkpoint = stale.iter().any(|bytes| {
+        DestinationPointer::decode(bytes).is_ok_and(|pointer| pointer.checkpoint.is_some())
+    });
+    let limit = if hash_checkpoint {
+        crate::storage::pointer::MAX_POINTER_BYTES + 1
+    } else {
+        stale.iter().map(|bytes| bytes.len()).max().unwrap_or(0) + 1
+    };
     let mut last = deleted.to_string();
     for _ in 0..MAX_SWEEPS {
         let found = match read(protocol, pointer, limit).await {
-            Ok(Some(found)) if stale.contains(&found.bytes.as_slice()) => found,
+            Ok(Some(found)) if stale_pointer(&found.bytes, stale) => found,
             Ok(_) => return,
             Err(error) => {
                 tracing::warn!(pointer = %pointer.as_str(), ?error, "could not check the S3 upload pointer after deleting it");
@@ -333,6 +344,31 @@ async fn sweep<P: S3Protocol>(protocol: &P, pointer: &StoragePath, deleted: &str
         }
     }
     tracing::warn!(pointer = %pointer.as_str(), "stale S3 upload pointer versions remain after {MAX_SWEEPS} deletions");
+}
+
+/// A v2 intent rewrite changes H while retaining the owner nonce. Recognize those generations
+/// without keeping an unbounded history of source-hash snapshots in memory.
+fn stale_pointer(bytes: &[u8], stale: &[&[u8]]) -> bool {
+    if stale.contains(&bytes) {
+        return true;
+    }
+    let Ok(found) = DestinationPointer::decode(bytes) else {
+        return false;
+    };
+    if found.checkpoint.is_none() {
+        return false;
+    }
+    let Some(record) = accepted(&found) else {
+        return false;
+    };
+    stale.iter().any(|bytes| {
+        DestinationPointer::decode(bytes).is_ok_and(|old| {
+            old.checkpoint.is_some()
+                && old.binding == found.binding
+                && old.transfer_identity == found.transfer_identity
+                && accepted(&old).is_some_and(|old| old == record)
+        })
+    })
 }
 
 /// Deletes an earlier writer's pointer version after a take-over wrote a new one over it, so it
@@ -491,6 +527,7 @@ mod tests {
             binding: [1; 32],
             transfer_identity: [2; 32],
             durable_prefix: prefix,
+            checkpoint: None,
             extension,
         };
         assert!(accepted(&pointer(None, extension.clone())).is_some());

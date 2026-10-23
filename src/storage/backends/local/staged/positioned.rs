@@ -10,7 +10,7 @@ use futures::{
 use tokio::task::{JoinError, JoinSet};
 
 use super::{LOCAL_DURABLE_CHECKPOINT_INTERVAL_BYTES, LocalStagedDestination, failure, io_failure};
-use crate::model::{FailureClass, Operation, StoragePath};
+use crate::model::{FailureClass, Operation};
 use crate::storage::{
     PositionedByteStream, PositionedChunk, PreparedStage, StorageRoleFailure, WriteEvidence,
 };
@@ -70,13 +70,17 @@ type Writes = JoinSet<(u64, usize, io::Result<u64>)>;
 fn accept(
     result: Result<(u64, usize, io::Result<u64>), JoinError>,
     completed: &mut Frontier,
-    path: &StoragePath,
+    stage: &PreparedStage,
 ) -> Result<(), StorageRoleFailure> {
+    let path = stage.final_destination.path();
     let (offset, length, result) =
         result.map_err(|_| failure(path, Operation::Write, FailureClass::Internal))?;
     let count = result.map_err(|error| io_failure(path, Operation::Write, &error))?;
     if count != length as u64 || completed.insert(offset, length).is_err() {
         return Err(failure(path, Operation::Write, FailureClass::Corruption));
+    }
+    if stage.checkpoint_enabled() {
+        stage.confirmed_write(offset, count);
     }
     Ok(())
 }
@@ -84,11 +88,11 @@ fn accept(
 async fn drain(
     writes: &mut Writes,
     completed: &mut Frontier,
-    path: &StoragePath,
+    stage: &PreparedStage,
     error: &mut Option<StorageRoleFailure>,
 ) {
     while let Some(result) = writes.join_next().await {
-        if let Err(problem) = accept(result, completed, path) {
+        if let Err(problem) = accept(result, completed, stage) {
             error.get_or_insert(problem);
         }
     }
@@ -132,6 +136,21 @@ pub(super) async fn write(
         .await?;
     }
     let mut writer = Writer::new(adapter, stage, file, fresh);
+    for range in stage.checkpoint_ranges() {
+        if range.end <= stage.write_offset {
+            continue;
+        }
+        let start = range.start.max(stage.write_offset);
+        let length = usize::try_from(range.end - start).map_err(|_| writer.invalid())?;
+        writer
+            .received
+            .insert(start, length)
+            .map_err(|()| writer.invalid())?;
+        writer
+            .completed
+            .insert(start, length)
+            .map_err(|()| writer.invalid())?;
+    }
     writer.run(&mut input).await;
     writer.finish().await
 }
@@ -213,7 +232,7 @@ impl<'a> Writer<'a> {
         drain(
             &mut self.writes,
             &mut self.completed,
-            self.stage.final_destination.path(),
+            self.stage,
             &mut self.error,
         )
         .await;
@@ -233,6 +252,14 @@ impl<'a> Writer<'a> {
                     )
                     .boxed(),
             );
+            if self.stage.checkpoint_enabled()
+                && let Some(checkpoint) = self.checkpoint.take()
+                && let Err(error) = checkpoint.await
+            {
+                self.error = Some(error);
+                self.checkpoint_failed = true;
+                return;
+            }
         }
         self.checkpoint_at = self
             .interval
@@ -284,7 +311,7 @@ impl<'a> Writer<'a> {
                 if let Err(error) = result { self.error = Some(error); self.checkpoint_failed = true; }
             }
             result = self.writes.join_next(), if !self.writes.is_empty() => {
-                if let Some(result) = result && let Err(error) = accept(result, &mut self.completed, self.stage.final_destination.path()) { self.error = Some(error); }
+                if let Some(result) = result && let Err(error) = accept(result, &mut self.completed, self.stage) { self.error = Some(error); }
             }
             item = input.next(), if self.pending.is_none() && !self.done && self.writes.len() < self.adapter.write_concurrency => {
                 self.accept_input(item);
@@ -295,10 +322,15 @@ impl<'a> Writer<'a> {
     fn accept_input(&mut self, item: Option<Result<PositionedChunk, StorageRoleFailure>>) {
         match item {
             Some(Ok(chunk)) => {
-                if self
-                    .received
-                    .insert(chunk.offset, chunk.data.len())
-                    .is_err()
+                if (self.stage.checkpoint_enabled()
+                    && chunk
+                        .offset
+                        .checked_add(chunk.data.len() as u64)
+                        .is_none_or(|end| end > self.stage.checkpoint_size()))
+                    || self
+                        .received
+                        .insert(chunk.offset, chunk.data.len())
+                        .is_err()
                 {
                     self.error = Some(self.invalid());
                 } else {
@@ -314,7 +346,7 @@ impl<'a> Writer<'a> {
         drain(
             &mut self.writes,
             &mut self.completed,
-            self.stage.final_destination.path(),
+            self.stage,
             &mut self.error,
         )
         .await;
@@ -328,7 +360,9 @@ impl<'a> Writer<'a> {
         if self.error.is_none()
             && (!self.received.pending.is_empty()
                 || !self.completed.pending.is_empty()
-                || self.received.prefix != self.completed.prefix)
+                || self.received.prefix != self.completed.prefix
+                || (self.stage.checkpoint_enabled()
+                    && self.completed.prefix != self.stage.checkpoint_size()))
         {
             self.error = Some(self.invalid());
         }
@@ -337,6 +371,9 @@ impl<'a> Writer<'a> {
             return Err(error);
         }
         self.sync_finished_file().await?;
+        if self.stage.durable_publication {
+            super::hash_checkpoint::barrier(self.stage, self.completed.prefix).await?;
+        }
         if self.stage.recovery_enabled() {
             self.adapter
                 .persist_checkpoint(self.stage, self.completed.prefix)
@@ -353,10 +390,13 @@ impl<'a> Writer<'a> {
                 Arc::clone(&self.file),
                 self.completed.prefix,
                 self.stage.final_destination.path(),
-                true,
+                !self.stage.checkpoint_enabled(),
                 self.stage.durable_publication,
             )
             .await?;
+            if self.stage.durable_publication {
+                super::hash_checkpoint::barrier(self.stage, self.completed.prefix).await?;
+            }
             if self.stage.recovery_enabled() {
                 self.adapter
                     .persist_checkpoint(self.stage, self.completed.prefix)

@@ -20,6 +20,18 @@ pub(super) async fn transfer_stage(
     plan: TransferPlan,
     source_qos: Option<SourceQosBudget>,
 ) -> Result<TransferEvidence, TransferFailure> {
+    if super::checkpointed::eligible(request, destination.as_ref(), stage, plan) {
+        return super::checkpointed::transfer(
+            request,
+            &source,
+            destination,
+            descriptor,
+            stage,
+            plan,
+            source_qos,
+        )
+        .await;
+    }
     if plan.source_size <= plan.chunk_bytes as u64 && stage.write_offset == 0 {
         return single::transfer(request, source, destination, descriptor, stage, source_qos).await;
     }

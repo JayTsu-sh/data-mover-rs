@@ -28,6 +28,9 @@
 //! `source_streamed_bytes` is what the engine actually read from the source; it is counted only
 //! under a source budget, so a run that must report it passes `--bandwidth` (a high value if the
 //! run should not be slowed).
+//!
+//! `--source-block-size` / `--destination-block-size` pass optional byte ceilings through the
+//! existing endpoint connector. Actual I/O remains bounded by backend negotiation/capabilities.
 
 #[path = "../../../examples/support/endpoint.rs"]
 mod endpoint_support;
@@ -48,7 +51,7 @@ use data_mover::transfer::{
     ReadBackVerification, SourceQosGroup, SourceQosPolicy, SourceVersion, TransferFailure,
     TransferIdentity, TransferOutcome, TransferPolicy, TransferRequest, transfer,
 };
-use endpoint_support::{Result, artifacts, connect, remove_run};
+use endpoint_support::{Result, artifacts, connect_with_options, remove_run};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -62,6 +65,12 @@ struct Args {
     source: Option<String>,
     #[arg(long, required_unless_present_any = ["list_artifacts", "remove_run"])]
     source_path: Option<String>,
+    /// Optional source I/O block ceiling in bytes (backend negotiation may reduce it).
+    #[arg(long)]
+    source_block_size: Option<u64>,
+    /// Optional destination I/O block ceiling in bytes (backend-specific support).
+    #[arg(long)]
+    destination_block_size: Option<u64>,
     #[arg(long, required_unless_present_any = ["list_artifacts", "remove_run"])]
     destination_path: Option<String>,
     /// Create the local source file with this many deterministic bytes if it does not exist yet;
@@ -263,9 +272,15 @@ async fn inspect(args: &Args) -> Result<Option<Value>> {
 /// `--compare`: whether the destination file holds exactly the source file's bytes.
 async fn compare_content(args: &Args) -> Result<Value> {
     let report = compare(IntegrityRequest {
-        source: connect(args.source.as_deref().ok_or("--source")?).await?,
+        source: connect_with_options(
+            args.source.as_deref().ok_or("--source")?,
+            true,
+            args.source_block_size,
+        )
+        .await?,
         source_path: StoragePath::new(args.source_path.as_deref().ok_or("--source-path")?)?,
-        destination: connect(&args.destination).await?,
+        destination: connect_with_options(&args.destination, true, args.destination_block_size)
+            .await?,
         destination_path: StoragePath::new(
             args.destination_path
                 .as_deref()
@@ -328,8 +343,9 @@ async fn main() -> Result {
             bytes,
         )?;
     }
-    let source = connect(source_root).await?;
-    let destination = connect(&args.destination).await?;
+    let source = connect_with_options(source_root, true, args.source_block_size).await?;
+    let destination =
+        connect_with_options(&args.destination, true, args.destination_block_size).await?;
     // The endpoints data-mover derived (ADR-0006): a resume from a fresh process must print the same.
     let endpoints = json!({
         "source_endpoint": source.identity().stable_id(),
@@ -369,4 +385,40 @@ async fn main() -> Result {
         exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_size_options_are_independent_and_default_to_backend_settings() -> Result {
+        let base = [
+            "transfer_resume",
+            "--source",
+            "/tmp/source",
+            "--source-path",
+            "file",
+            "--destination",
+            "/tmp/destination",
+            "--destination-path",
+            "file",
+        ];
+        let defaults = Args::try_parse_from(base)?;
+        assert_eq!(defaults.source_block_size, None);
+        assert_eq!(defaults.destination_block_size, None);
+        let configured = Args::try_parse_from(base.into_iter().chain([
+            "--source-block-size",
+            "32771",
+            "--destination-block-size",
+            "65536",
+        ]))?;
+        assert_eq!(configured.source_block_size, Some(32771));
+        assert_eq!(configured.destination_block_size, Some(65536));
+        let source_only =
+            Args::try_parse_from(base.into_iter().chain(["--source-block-size", "49157"]))?;
+        assert_eq!(source_only.source_block_size, Some(49157));
+        assert_eq!(source_only.destination_block_size, None);
+        Ok(())
+    }
 }
