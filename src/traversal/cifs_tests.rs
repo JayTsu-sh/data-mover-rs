@@ -75,7 +75,6 @@ async fn traverse_in(
         TraversalRequest::new(StoragePath::root())
             .order(order)
             .max_inflight_operations(slots)
-            .max_buffered_items(slots)
             .cancel(CancellationToken::new()),
     );
     let mut items = Vec::new();

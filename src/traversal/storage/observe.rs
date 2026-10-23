@@ -34,119 +34,21 @@ use crate::model::{
 use crate::storage::{Metadata, Namespace, SourceDescriptor, StorageRoleFailure};
 use crate::traversal::TraversalTerminalFailure;
 
-/// Whether `plan` asks for any family no listing carries.
-fn optional_requested(plan: ObservationPlan) -> bool {
-    [
-        plan.acl(),
-        plan.xattrs(),
-        plan.tags(),
-        plan.ownership_mode(),
-    ]
-    .into_iter()
-    .any(|mode| mode != ObservationMode::Omit)
-}
+mod metadata;
+pub(super) use metadata::{dependency_without_io, without_io as metadata_without_io};
 
-/// Whether the metadata role must be consulted for `descriptor` under `plan`, or whether the
-/// listing already supplied everything the plan asks for.
-fn needs_metadata_role(plan: ObservationPlan, descriptor: &SourceDescriptor) -> bool {
-    optional_requested(plan)
-        || (plan.timestamps() != ObservationMode::Omit && descriptor.inline_timestamps.is_none())
-}
-
-/// Whether one record of a history must be observed under `plan`: a version, when the plan asks
-/// for more than its listing gave. A delete marker has nothing behind it.
+/// Only modes authorizing additional calls require a version to be observed.
 fn record_needs_role(plan: ObservationPlan, record: &VersionRecord) -> bool {
     !record.is_delete_marker()
-        && (optional_requested(plan)
-            || (plan.timestamps() != ObservationMode::Omit && record.modified().is_none()))
-}
-
-fn inline_observations(
-    plan: ObservationPlan,
-    descriptor: &SourceDescriptor,
-) -> Result<MetadataObservations, StorageRoleFailure> {
-    let timestamps = match (plan.timestamps(), descriptor.inline_timestamps) {
-        (ObservationMode::Omit, _) | (_, None) => MetadataObservation::NotRequested,
-        (_, Some(value)) => MetadataObservation::Value {
-            value,
-            provenance: MetadataProvenance::Inline,
-        },
-    };
-    MetadataObservations::new(
-        MetadataObservation::NotRequested,
-        MetadataObservation::NotRequested,
-        MetadataObservation::NotRequested,
-        MetadataObservation::NotRequested,
-        timestamps,
-    )
-    .map_err(|_| StorageRoleFailure::Entry(entry_failure(&descriptor.path, FailureClass::Protocol)))
-}
-
-/// A requested family of a child that has nothing behind it to observe (an S3 prefix, a delete
-/// marker): not applicable, rather than a failed lookup of an object that does not exist.
-fn nothing_behind<T>(mode: ObservationMode) -> MetadataObservation<T> {
-    if mode == ObservationMode::Omit {
-        MetadataObservation::NotRequested
-    } else {
-        MetadataObservation::NotApplicable
-    }
-}
-
-/// Observations of a listing-only child: what the listing gave, and nothing else.
-fn listed_observations(
-    plan: ObservationPlan,
-    descriptor: &SourceDescriptor,
-) -> Result<MetadataObservations, StorageRoleFailure> {
-    let timestamps = match (plan.timestamps(), descriptor.inline_timestamps) {
-        (ObservationMode::Omit, _) => MetadataObservation::NotRequested,
-        (_, Some(value)) => MetadataObservation::Value {
-            value,
-            provenance: MetadataProvenance::Inline,
-        },
-        (_, None) => MetadataObservation::NotApplicable,
-    };
-    MetadataObservations::new(
-        nothing_behind(plan.acl()),
-        nothing_behind(plan.xattrs()),
-        nothing_behind(plan.tags()),
-        nothing_behind(plan.ownership_mode()),
-        timestamps,
-    )
-    .map_err(|_| StorageRoleFailure::Entry(entry_failure(&descriptor.path, FailureClass::Protocol)))
-}
-
-/// The metadata of `descriptor` when the listing alone answers it: a listing-only child, a plan
-/// that asks for nothing the listing did not carry, or one the metadata role can answer from the
-/// listing's own attributes ([`Metadata::observe_listed`]). `None` means the metadata role must
-/// be asked, which is I/O. A key with its history is asked only for the records that need it
-/// ([`record_needs_role`]), each bound to its version.
-fn metadata_without_io(
-    metadata_role: &dyn Metadata,
-    plan: ObservationPlan,
-    descriptor: &SourceDescriptor,
-) -> Option<Result<MetadataObservations, StorageRoleFailure>> {
-    if let Some(history) = descriptor.listing.history.as_deref() {
-        let records = history.records();
-        return (!records.iter().any(|record| record_needs_role(plan, record)))
-            .then(|| listing_answer(plan, descriptor));
-    }
-    if descriptor.listing.listing_only || !needs_metadata_role(plan, descriptor) {
-        return Some(listing_answer(plan, descriptor));
-    }
-    metadata_role.observe_listed(descriptor, plan)
-}
-
-/// What the listing itself says of `descriptor`: nothing behind a listing-only child (a prefix, a
-/// key deleted now), the listed times of any other.
-fn listing_answer(
-    plan: ObservationPlan,
-    descriptor: &SourceDescriptor,
-) -> Result<MetadataObservations, StorageRoleFailure> {
-    if descriptor.listing.listing_only {
-        listed_observations(plan, descriptor)
-    } else {
-        inline_observations(plan, descriptor)
-    }
+        && ([
+            plan.acl(),
+            plan.xattrs(),
+            plan.tags(),
+            plan.ownership_mode(),
+        ]
+        .into_iter()
+        .any(ObservationMode::permits_io)
+            || (plan.timestamps().permits_io() && record.modified().is_none()))
 }
 
 /// What a record whose observation failed carries: the failure, in every family the plan asked
@@ -190,8 +92,15 @@ async fn observe_history(
     cancel: &CancellationToken,
 ) -> Result<ObservedEntry, StorageRoleFailure> {
     let path = &descriptor.path;
+    let capabilities = metadata_role.observation_capabilities();
     for record in history.records_mut() {
-        if !record_needs_role(plan, record) {
+        if record.is_delete_marker() {
+            continue;
+        }
+        let inline = metadata::record_inline(record.modified(), plan, capabilities);
+        let requested = metadata::io_plan(plan, &inline, capabilities);
+        if !requested.permits_io() {
+            record.set_metadata(inline);
             continue;
         }
         if cancel.is_cancelled() {
@@ -201,11 +110,18 @@ async fn observe_history(
             continue;
         };
         let observed = metadata_role
-            .observe_copy_bound_version(path, record.identity(), &version, plan)
+            .observe_copy_bound_version(path, record.identity(), &version, requested)
             .await
-            .map_err(|failure| throttling_scoped_to(path, Operation::Observe, failure));
+            .map_err(|failure| throttling_scoped_to(path, Operation::Observe, failure))
+            .and_then(|observed| {
+                metadata::validate(
+                    &descriptor,
+                    plan,
+                    metadata::merge(inline, observed.observations, requested),
+                )
+            });
         let mut metadata = match observed {
-            Ok(observed) => observed.observations,
+            Ok(observed) => observed,
             Err(StorageRoleFailure::Entry(failure)) => {
                 failed_observations(plan, path, failure.class(), failure.transience())?
             }
@@ -228,7 +144,7 @@ async fn observe_history(
     }
     let mut metadata = match history.current().and_then(VersionRecord::metadata) {
         Some(current) => current.clone(),
-        None => listing_answer(plan, &descriptor)?,
+        None => metadata::inline(metadata_role, &descriptor, plan)?,
     };
     // The current version's time could not be observed: the key keeps the one its listing gave,
     // as a key without a history would (its entry never goes without a time the listing had).
@@ -337,14 +253,30 @@ impl Listed {
 /// any.
 pub(super) fn observe_listed(
     metadata_role: &dyn Metadata,
-    descriptor: SourceDescriptor,
+    mut descriptor: SourceDescriptor,
     plan: ObservationPlan,
 ) -> Listed {
     if descriptor.kind == EntryKind::Symlink {
         return Listed::Unobserved(Box::new(descriptor));
     }
     match metadata_without_io(metadata_role, plan, &descriptor) {
-        Some(Ok(metadata)) => Listed::Observed(assemble(descriptor, metadata, None).map(Box::new)),
+        Some(Ok(metadata)) => {
+            if plan != ObservationPlan::default()
+                && let Some(history) = descriptor.listing.history.as_deref_mut()
+            {
+                let capabilities = metadata_role.observation_capabilities();
+                for record in history.records_mut() {
+                    if !record.is_delete_marker() {
+                        record.set_metadata(metadata::record_inline(
+                            record.modified(),
+                            plan,
+                            capabilities,
+                        ));
+                    }
+                }
+            }
+            Listed::Observed(assemble(descriptor, metadata, None).map(Box::new))
+        }
         Some(Err(failure)) => Listed::Observed(Err(failure)),
         None => Listed::Unobserved(Box::new(descriptor)),
     }
@@ -377,12 +309,20 @@ async fn observe_io(
 ) -> Result<(MetadataObservations, Option<SymlinkTarget>), StorageRoleFailure> {
     // A throttled request is this child's failure, never the traversal's end (P7 §8).
     let scoped = |failure| throttling_scoped_to(&descriptor.path, Operation::Observe, failure);
-    let metadata = match metadata_without_io(metadata_role, plan, descriptor) {
-        Some(metadata) => metadata?,
-        None => metadata_role
-            .observe(&descriptor.path, plan)
+    let metadata = if let Some(metadata) = metadata_without_io(metadata_role, plan, descriptor) {
+        metadata?
+    } else {
+        let inline = metadata::inline(metadata_role, descriptor, plan)?;
+        let requested = metadata::io_plan(plan, &inline, metadata_role.observation_capabilities());
+        let observed = metadata_role
+            .observe(&descriptor.path, requested)
             .await
-            .map_err(scoped)?,
+            .map_err(scoped)?;
+        metadata::validate(
+            descriptor,
+            plan,
+            metadata::merge(inline, observed, requested),
+        )?
     };
     let target = if descriptor.kind == EntryKind::Symlink {
         Some(

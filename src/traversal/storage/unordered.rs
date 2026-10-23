@@ -13,9 +13,10 @@
 //!   listing returned is counted exactly once, as in Blocks (§7).
 //! - **Bounds**: `K = min(max_inflight_operations, 64)` listings at once, each holding at most a
 //!   page in the worker, one in the backend's channel and one in its producer; the session holds
-//!   `max_buffered_items`, or one batch when a batch alone is larger. A namespace whose
-//!   open listing holds a server resource ([`Namespace::parked_listing_limit`]; CIFS: a directory
-//!   handle) caps `K` at its limit: a worker keeps its listing open while it waits for the
+//!   the traversal's internal output capacity, or one batch when a batch alone is larger. A
+//!   namespace whose open listing holds a server resource
+//!   ([`Namespace::parked_listing_limit`]; CIFS: a directory handle) caps `K` at its limit: a
+//!   worker keeps its listing open while it waits for the
 //!   consumer, so every open listing may be parked, and at most `K` are open.
 //! - **Ending**: a halt token (a child of the request's) stops every wait. It fires when the last
 //!   directory finishes, on the first terminal failure, or when the request is cancelled; a

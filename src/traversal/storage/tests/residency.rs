@@ -112,8 +112,12 @@ struct KeepAll {
 }
 
 impl TraversalFilter for KeepAll {
-    fn needs_modified(&self) -> bool {
-        self.needs_modified
+    fn required_metadata(&self) -> MetadataRequirements {
+        if self.needs_modified {
+            MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
+        } else {
+            MetadataRequirements::NONE
+        }
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
@@ -129,10 +133,6 @@ fn probed_request(root: &str, window: usize) -> TraversalRequest {
     TraversalRequest::new(path(root))
         .order(crate::traversal::TraversalOrder::Blocks)
         .max_inflight_operations(
-            NonZeroUsize::new(window)
-                .unwrap_or_else(|| unreachable!("callers pass a nonzero window")),
-        )
-        .max_buffered_items(
             NonZeroUsize::new(window)
                 .unwrap_or_else(|| unreachable!("callers pass a nonzero window")),
         )
@@ -255,6 +255,8 @@ async fn prefetched_listings_stay_within_their_budgets() {
 #[tokio::test]
 async fn a_deferred_filter_holds_one_decision_per_subdirectory() {
     let mut deferred = probed_request("wide", 4);
+    deferred.observation_plan =
+        ObservationPlan::default().with_timestamps(ObservationMode::Required);
     deferred.filter = Some(Arc::new(KeepAll {
         needs_modified: true,
     }));

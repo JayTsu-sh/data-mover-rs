@@ -26,14 +26,7 @@ pub use errors::{
     MetadataPlanErrorKind, RefusalCause, RefusalSide,
 };
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum MetadataFamily {
-    Acl,
-    Xattrs,
-    Tags,
-    OwnershipMode,
-    Timestamps,
-}
+pub use crate::model::MetadataFamily;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MetadataPolicy {

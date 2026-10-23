@@ -76,7 +76,6 @@ async fn traverse_with_totals(
         TraversalRequest::new(StoragePath::root())
             .order(crate::traversal::TraversalOrder::Blocks)
             .max_inflight_operations(slots)
-            .max_buffered_items(slots)
             .cancel(CancellationToken::new()),
     );
     let mut items = Vec::new();

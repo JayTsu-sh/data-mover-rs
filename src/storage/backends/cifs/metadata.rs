@@ -6,9 +6,10 @@ use binrw::{BinRead as _, BinWrite as _};
 
 use super::source::{CifsSourceFacts, classify, descriptor_from_facts, entry_failure};
 use crate::model::{
-    AclEncoding, AclMetadata, BackendIdentity, FailureClass, MetadataObservation,
-    MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan, Operation,
-    StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata,
+    AclEncoding, AclMetadata, BackendIdentity, FailureClass, MetadataCapabilities,
+    MetadataFamily as F, MetadataObservation, MetadataObservations, MetadataProvenance,
+    ObservationMode, ObservationPlan, ObservationSupport as S, Operation, StoragePath,
+    StorageTimestamp, TimePrecision, TimestampMetadata,
 };
 use crate::storage::{Metadata, MetadataMutation, StorageRoleFailure};
 
@@ -94,6 +95,15 @@ impl CifsMetadata {
 
 #[async_trait]
 impl Metadata for CifsMetadata {
+    fn observation_capabilities(&self) -> MetadataCapabilities {
+        MetadataCapabilities::default()
+            .with(F::Acl, S::Supported)
+            .with(F::Xattrs, S::Unsupported)
+            .with(F::Tags, S::NotApplicable)
+            .with(F::OwnershipMode, S::NotApplicable)
+            .with(F::Timestamps, S::Supported)
+    }
+
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
         Some(
             ObservationPlan::default()

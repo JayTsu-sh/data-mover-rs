@@ -60,7 +60,6 @@ async fn role_traversal_hides_artifacts() -> TestResult {
     for expression in [None, Some("name == \"y\" or name == \"b.txt\"")] {
         let request = TraversalRequest::new(StoragePath::root())
             .max_inflight_operations(slots)
-            .max_buffered_items(slots)
             .filter(Arc::new(DslTraversalFilter::parse(expression, None)?));
         let mut session = StorageTraversalSource::new(&storage)?.traverse(request);
         let mut traversed = Vec::new();

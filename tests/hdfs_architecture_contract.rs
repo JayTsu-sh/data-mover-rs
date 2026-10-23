@@ -100,7 +100,6 @@ async fn observes_nested_source(storage: &Storage) -> TestResult<bool> {
     let mut session = traversal.traverse(
         TraversalRequest::new(StoragePath::root())
             .max_inflight_operations(slots)
-            .max_buffered_items(slots)
             .cancel(CancellationToken::new()),
     );
     let mut observed = false;
@@ -386,8 +385,7 @@ fn traversal_request(order: TraversalOrder) -> TestResult<TraversalRequest> {
     let slots = NonZeroUsize::new(8).ok_or("zero")?;
     Ok(TraversalRequest::new(StoragePath::root())
         .order(order)
-        .max_inflight_operations(slots)
-        .max_buffered_items(slots))
+        .max_inflight_operations(slots))
 }
 
 async fn resume_chain(source: &StorageTraversalSource, order: TraversalOrder) -> TestResult {

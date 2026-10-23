@@ -17,7 +17,7 @@ use super::{
     TraversalDecision, TraversalFilter, TraversalItem, TraversalOrder, TraversalOutcome,
     TraversalRequest, TraversalSource, TraversalTerminalFailure,
 };
-use crate::model::{EntryKind, ObjectHistory, ObservedEntry};
+use crate::model::{EntryKind, MetadataRequirements, ObjectHistory, ObservedEntry};
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, identity};
 use crate::storage::backends::s3::{S3Protocol as _, S3VersioningAtConnect, connect};
 
@@ -123,10 +123,10 @@ async fn a_long_history_comes_in_consecutive_segments() -> TestResult {
     let protocol = bucket(20).await?;
     for order in ORDERS {
         for buffered in [1, 8] {
-            let request = request()
-                .order(order)
-                .max_buffered_items(NonZeroUsize::new(buffered).ok_or("nonzero")?);
-            let (items, outcome) = run(&source(&protocol, 3)?, request, None).await?;
+            let request = request().order(order);
+            let source = source(&protocol, 3)?
+                .output_capacity(NonZeroUsize::new(buffered).unwrap_or(NonZeroUsize::MIN));
+            let (items, outcome) = run(&source, request, None).await?;
             assert!(
                 matches!(outcome, Ok(TraversalOutcome::Completed(_))),
                 "{outcome:?}"
@@ -181,9 +181,9 @@ async fn a_cancelled_unordered_traversal_delivers_all_segments_or_none() -> Test
     for after in 1..=24 {
         let request = request()
             .order(TraversalOrder::Unordered)
-            .max_buffered_items(NonZeroUsize::MIN)
             .cancel(CancellationToken::new());
-        let (items, _) = run(&source(&protocol, 3)?, request, Some(after)).await?;
+        let bounded_source = source(&protocol, 3)?.output_capacity(NonZeroUsize::MIN);
+        let (items, _) = run(&bounded_source, request, Some(after)).await?;
         let found = entries(&items);
         let at: Vec<usize> = found
             .iter()
@@ -237,14 +237,14 @@ async fn a_cancel_among_segments_resumes_from_the_first_segment() -> TestResult 
     let full = records(&run(&source(&protocol, 3)?, request(), None).await?.0);
     let resumable = || {
         request()
-            .max_buffered_items(NonZeroUsize::MIN)
             .resumable(Resumable::On {
                 every: Duration::ZERO,
             })
             .cancel(CancellationToken::new())
     };
     // `d`, `d/a`, then `d/big`'s first segment: cancelled with its other segments to hand over.
-    let (items, outcome) = run(&source(&protocol, 3)?, resumable(), Some(3)).await?;
+    let bounded_source = source(&protocol, 3)?.output_capacity(NonZeroUsize::MIN);
+    let (items, outcome) = run(&bounded_source, resumable(), Some(3)).await?;
     assert!(
         matches!(outcome, Ok(TraversalOutcome::Cancelled)),
         "{outcome:?}"
@@ -342,8 +342,8 @@ async fn a_checkpoint_does_not_resume_across_a_versioning_change() -> TestResult
 struct HideBig;
 
 impl TraversalFilter for HideBig {
-    fn needs_modified(&self) -> bool {
-        false
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {

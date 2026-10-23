@@ -3,9 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::model::{
-    BackendIdentity, FailureClass, MetadataObservation, MetadataObservations, MetadataProvenance,
-    ObjectTag, ObservationMode, ObservationPlan, Operation, SourceIdentity, SourceVersion,
-    StoragePath, TimestampMetadata, Transience,
+    BackendIdentity, FailureClass, MetadataCapabilities, MetadataFamily as F, MetadataObservation,
+    MetadataObservations, MetadataProvenance, ObjectTag, ObservationMode, ObservationPlan,
+    ObservationSupport as S, Operation, SourceIdentity, SourceVersion, StoragePath,
+    TimestampMetadata, Transience,
 };
 use crate::storage::{CopiedMetadataObservation, Metadata, MetadataMutation, StorageRoleFailure};
 
@@ -196,6 +197,21 @@ impl<P: S3Protocol + 'static> S3Metadata<P> {
 
 #[async_trait]
 impl<P: S3Protocol + 'static> Metadata for S3Metadata<P> {
+    fn observation_capabilities(&self) -> MetadataCapabilities {
+        MetadataCapabilities::default()
+            .with(F::Acl, S::Unsupported)
+            .with(F::Xattrs, S::Unsupported)
+            .with(
+                F::Tags,
+                match self.tag_support {
+                    S3TagSupport::Supported => S::Supported,
+                    S3TagSupport::Unsupported => S::Unsupported,
+                },
+            )
+            .with(F::OwnershipMode, S::NotApplicable)
+            .with(F::Timestamps, S::Supported)
+    }
+
     /// Every copy from S3 carries the object's `Last-Modified` as the file's mtime; owner and mode
     /// are asked for only so the plan records that an object has none.
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {

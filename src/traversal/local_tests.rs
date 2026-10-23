@@ -45,14 +45,11 @@ fn fixture(root: &Path) -> io::Result<Fixture> {
     })
 }
 
-fn request(cancel: CancellationToken, inflight: usize, buffered: usize) -> TraversalRequest {
+fn request(cancel: CancellationToken, inflight: usize) -> TraversalRequest {
     TraversalRequest::new(StoragePath::root())
         .order(TraversalOrder::Blocks)
         .max_inflight_operations(
             NonZeroUsize::new(inflight).unwrap_or_else(|| unreachable!("test limit is nonzero")),
-        )
-        .max_buffered_items(
-            NonZeroUsize::new(buffered).unwrap_or_else(|| unreachable!("test limit is nonzero")),
         )
         .cancel(cancel)
 }
@@ -99,10 +96,9 @@ async fn traverses_recursively_and_returns_positive_completion() -> io::Result<(
     std::fs::create_dir(root.path().join("dir"))?;
     std::fs::write(root.path().join("first"), b"1")?;
     std::fs::write(root.path().join("dir/second"), b"22")?;
-    let mut session =
-        fixture(root.path())?
-            .source
-            .traverse(request(CancellationToken::new(), 2, 1));
+    let mut session = fixture(root.path())?
+        .source
+        .traverse(request(CancellationToken::new(), 2));
 
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
@@ -126,10 +122,9 @@ async fn literal_backslash_is_distinct_from_nested_path() -> io::Result<()> {
     std::fs::create_dir(root.path().join("a"))?;
     std::fs::write(root.path().join("a/b"), b"nested")?;
     std::fs::write(root.path().join(r"a\b"), b"literal")?;
-    let mut session =
-        fixture(root.path())?
-            .source
-            .traverse(request(CancellationToken::new(), 2, 1));
+    let mut session = fixture(root.path())?
+        .source
+        .traverse(request(CancellationToken::new(), 2));
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
     assert_eq!(completion.totals.failed_children, 0);
@@ -148,7 +143,7 @@ async fn traversal_applies_one_optional_metadata_plan_to_each_entry() -> io::Res
 
     let root = tempfile::tempdir()?;
     std::fs::write(root.path().join("file"), b"value")?;
-    let mut request = request(CancellationToken::new(), 1, 1);
+    let mut request = request(CancellationToken::new(), 1);
     request.observation_plan =
         ObservationPlan::default().with_ownership_mode(ObservationMode::InlineOnly);
     let mut session = fixture(root.path())?.source.traverse(request);
@@ -174,7 +169,8 @@ async fn cancellation_is_a_terminal_not_an_entry_failure() -> io::Result<()> {
     let cancel = CancellationToken::new();
     let mut session = fixture(root.path())?
         .source
-        .traverse(request(cancel.clone(), 1, 1));
+        .output_capacity(NonZeroUsize::MIN)
+        .traverse(request(cancel.clone(), 1));
     assert!(session.next_item().await.is_some());
     cancel.cancel();
     let items = drain(&mut session).await;
@@ -193,10 +189,13 @@ async fn cancellation_preempts_optional_metadata_observation() -> io::Result<()>
         .adapter
         .delay_optional_calls(std::time::Duration::from_millis(200));
     let cancel = CancellationToken::new();
-    let mut request = request(cancel.clone(), 1, 1);
+    let mut request = request(cancel.clone(), 1);
     request.observation_plan =
         ObservationPlan::default().with_acl(crate::model::ObservationMode::Required);
-    let mut session = fixture.source.traverse(request);
+    let mut session = fixture
+        .source
+        .output_capacity(NonZeroUsize::MIN)
+        .traverse(request);
     // Wait for the slow ACL read to start rather than assuming it has after a fixed delay: the
     // listing runs on the blocking pool first, which a loaded test run can hold up.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -222,7 +221,7 @@ async fn cancellation_preempts_optional_metadata_observation() -> io::Result<()>
 #[tokio::test]
 async fn an_invalid_root_is_an_ordered_listing_failure_with_completion() -> io::Result<()> {
     let root = tempfile::tempdir()?;
-    let mut request = request(CancellationToken::new(), 1, 1);
+    let mut request = request(CancellationToken::new(), 1);
     request.root = StoragePath::new("../escape").map_err(io::Error::other)?;
     let mut session = fixture(root.path())?.source.traverse(request);
     let items = drain(&mut session).await;
@@ -254,10 +253,9 @@ async fn a_real_tree_is_counted_exactly() -> io::Result<()> {
     std::fs::create_dir(root.path().join("sub"))?;
     std::fs::write(root.path().join("top.txt"), b"value")?;
     std::fs::write(root.path().join("sub/inner.txt"), b"value")?;
-    let mut session =
-        fixture(root.path())?
-            .source
-            .traverse(request(CancellationToken::new(), 4, 2));
+    let mut session = fixture(root.path())?
+        .source
+        .traverse(request(CancellationToken::new(), 4));
 
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
@@ -309,7 +307,7 @@ async fn directory_read_failure_is_ordered_and_siblings_continue() -> io::Result
         .fail_list_path(StoragePath::new("a").map_err(io::Error::other)?);
     let mut session = fixture
         .source
-        .traverse(request(CancellationToken::new(), 2, 2));
+        .traverse(request(CancellationToken::new(), 2));
 
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
@@ -351,7 +349,7 @@ async fn finish_before_eof_cannot_claim_completeness() -> io::Result<()> {
     std::fs::write(root.path().join("file"), b"x")?;
     let session = fixture(root.path())?
         .source
-        .traverse(request(CancellationToken::new(), 1, 1));
+        .traverse(request(CancellationToken::new(), 1));
     assert_eq!(
         session.finish().await,
         Err(TraversalTerminalFailure::Internal)
@@ -370,9 +368,12 @@ async fn out_of_order_completion_is_reordered_and_backpressured() -> io::Result<
         std::fs::write(root.path().join(format!("file-{index:02}")), b"x")?;
     }
     let fixture = fixture(root.path())?;
-    let mut request = request(CancellationToken::new(), 3, 1);
+    let mut request = request(CancellationToken::new(), 3);
     request.observation_plan = ObservationPlan::default().with_xattrs(ObservationMode::BestEffort);
-    let mut session = fixture.source.traverse(request);
+    let mut session = fixture
+        .source
+        .output_capacity(NonZeroUsize::MIN)
+        .traverse(request);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let (started_before_drain, _) = fixture.adapter.probe_orders();
     assert!(started_before_drain.len() <= 3);
@@ -395,10 +396,9 @@ async fn non_utf8_entry_failures_keep_distinct_lossless_identities() -> io::Resu
     let root = tempfile::tempdir()?;
     std::fs::write(root.path().join(OsString::from_vec(vec![0xff])), b"a")?;
     std::fs::write(root.path().join(OsString::from_vec(vec![0xfe])), b"b")?;
-    let mut session =
-        fixture(root.path())?
-            .source
-            .traverse(request(CancellationToken::new(), 1, 2));
+    let mut session = fixture(root.path())?
+        .source
+        .traverse(request(CancellationToken::new(), 1));
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
     let failures = items
@@ -452,10 +452,9 @@ async fn traversal_omits_reserved_local_transfer_artifacts() -> io::Result<()> {
         std::fs::write(root.path().join("dir").join(name), b"internal")?;
     }
     std::fs::write(root.path().join("dir/final.bin"), b"visible")?;
-    let mut session =
-        fixture(root.path())?
-            .source
-            .traverse(request(CancellationToken::new(), 2, 1));
+    let mut session = fixture(root.path())?
+        .source
+        .traverse(request(CancellationToken::new(), 2));
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
     assert_eq!(entry_paths(&items), ["dir", "dir/final.bin"]);
@@ -477,7 +476,7 @@ async fn a_source_without_versions_lists_no_histories() -> io::Result<()> {
     let fixture = fixture(temp.path())?;
     let mut session = fixture
         .source
-        .traverse(request(CancellationToken::new(), 4, 4));
+        .traverse(request(CancellationToken::new(), 4));
     let items = drain(&mut session).await;
     let entries: Vec<_> = items
         .iter()
@@ -559,7 +558,7 @@ async fn an_ownership_plan_costs_no_observation_per_entry() -> io::Result<()> {
         std::fs::write(root.path().join(name), b"x")?;
     }
     let fixture = fixture(root.path())?;
-    let mut request = request(CancellationToken::new(), 4, 4);
+    let mut request = request(CancellationToken::new(), 4);
     request.observation_plan = ObservationPlan::default()
         .with_ownership_mode(ObservationMode::Required)
         .with_timestamps(ObservationMode::InlineOnly);
@@ -615,7 +614,7 @@ async fn a_child_deleted_between_listing_and_observation_is_vanished() -> io::Re
         .before_read_link(remove_when(root.path(), "link"));
     let mut session = fixture
         .source
-        .traverse(request(CancellationToken::new(), 2, 4));
+        .traverse(request(CancellationToken::new(), 2));
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
     assert_eq!(entry_paths(&items), ["kept"]);
@@ -661,7 +660,7 @@ async fn a_subdirectory_removed_before_its_listing_is_a_vanished_listing() -> io
         }));
     let mut session = fixture
         .source
-        .traverse(request(CancellationToken::new(), 1, 4));
+        .traverse(request(CancellationToken::new(), 1));
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
     assert_eq!(entry_paths(&items), ["doomed"]);
@@ -727,7 +726,7 @@ async fn a_directory_read_failing_after_the_first_page_is_interrupted() -> io::R
         }));
     let mut session = fixture
         .source
-        .traverse(request(CancellationToken::new(), 4, 64));
+        .traverse(request(CancellationToken::new(), 4));
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
 

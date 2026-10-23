@@ -180,8 +180,12 @@ struct HideAndPrune {
 }
 
 impl TraversalFilter for HideAndPrune {
-    fn needs_modified(&self) -> bool {
-        self.needs_modified
+    fn required_metadata(&self) -> MetadataRequirements {
+        if self.needs_modified {
+            MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
+        } else {
+            MetadataRequirements::NONE
+        }
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {

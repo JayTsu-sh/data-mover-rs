@@ -6,9 +6,9 @@
 //! [`super::TraversalSession::next_item`] still hands out one item at a time.
 //!
 //! **Bounded in items, not batches.** A send first takes one permit per item from a semaphore of
-//! `max_buffered_items` permits, and the receiver returns a batch's permits only once the consumer
+//! `capacity` permits, and the receiver returns a batch's permits only once the consumer
 //! has taken its last item. So the items sent and not yet handed to the consumer never exceed
-//! `max_buffered_items`, whatever the batch sizes. A batch larger than the whole bound either goes
+//! `capacity`, whatever the batch sizes. A batch larger than the whole bound either goes
 //! over in pieces of the bound ([`ItemSender::send`]: the Blocks driver, the only sender, so its
 //! pieces stay in order), or whole ([`ItemSender::send_whole`]: it waits for the whole bound to be
 //! free, takes all of it, and goes over alone).

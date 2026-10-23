@@ -231,8 +231,8 @@ async fn a_missing_root_is_still_a_listing_failure() {
 struct Deferring;
 
 impl TraversalFilter for Deferring {
-    fn needs_modified(&self) -> bool {
-        true
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {

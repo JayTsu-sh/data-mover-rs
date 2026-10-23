@@ -155,8 +155,8 @@ async fn the_traversal_roots_own_object_is_reported_not_emitted() {
 struct Recording(Mutex<Vec<String>>);
 
 impl TraversalFilter for Recording {
-    fn needs_modified(&self) -> bool {
-        false
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {

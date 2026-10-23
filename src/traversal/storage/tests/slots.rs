@@ -163,9 +163,6 @@ async fn spelled(
             .max_inflight_operations(
                 NonZeroUsize::new(4).unwrap_or_else(|| unreachable!("constant is nonzero")),
             )
-            .max_buffered_items(
-                NonZeroUsize::new(4).unwrap_or_else(|| unreachable!("constant is nonzero")),
-            )
             .cancel(tokio_util::sync::CancellationToken::new()),
     );
     let mut items = Vec::new();

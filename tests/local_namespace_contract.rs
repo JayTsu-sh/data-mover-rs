@@ -80,7 +80,6 @@ async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
         TraversalRequest::new(path("tree")?)
             .order(TraversalOrder::Blocks)
             .max_inflight_operations(nonzero(4)?)
-            .max_buffered_items(nonzero(4)?)
             .cancel(CancellationToken::new()),
     );
     let mut paths = Vec::new();
@@ -222,7 +221,6 @@ async fn directories_are_listed_as_directories_not_files() -> Result {
         TraversalRequest::new(StoragePath::root())
             .order(TraversalOrder::Blocks)
             .max_inflight_operations(nonzero(1)?)
-            .max_buffered_items(nonzero(1)?)
             .cancel(CancellationToken::new()),
     );
     let Some(TraversalItem::Entry(entry)) = session.next_item().await else {
@@ -256,7 +254,6 @@ async fn blocks_are_contiguous_and_descended_by_name_for_a_caller_outside_the_cr
             TraversalRequest::new(path("ordered")?)
                 .order(TraversalOrder::Blocks)
                 .max_inflight_operations(nonzero(4)?)
-                .max_buffered_items(nonzero(4)?)
                 .cancel(CancellationToken::new()),
         );
         let mut blocks: Vec<(String, Vec<String>)> = Vec::new();

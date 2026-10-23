@@ -187,9 +187,6 @@ async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
             .max_inflight_operations(
                 NonZeroUsize::new(2).unwrap_or_else(|| unreachable!("constant is nonzero")),
             )
-            .max_buffered_items(
-                NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("constant is nonzero")),
-            )
             .cancel(tokio_util::sync::CancellationToken::new()),
     );
     let mut observed = Vec::new();
@@ -233,9 +230,6 @@ fn request(cancel: tokio_util::sync::CancellationToken) -> TraversalRequest {
         .order(crate::traversal::TraversalOrder::Blocks)
         .max_inflight_operations(
             NonZeroUsize::new(2).unwrap_or_else(|| unreachable!("constant is nonzero")),
-        )
-        .max_buffered_items(
-            NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("constant is nonzero")),
         )
         .observation_plan(
             ObservationPlan::default().with_timestamps(crate::model::ObservationMode::Required),
@@ -487,6 +481,7 @@ mod counts;
 mod directory_objects;
 mod events;
 mod filter;
+mod metadata;
 mod order;
 mod pages;
 mod prefetch;

@@ -28,11 +28,10 @@ fn source(root: &Path) -> io::Result<StorageTraversalSource> {
     StorageTraversalSource::new(&storage).map_err(io::Error::other)
 }
 
-fn request(order: TraversalOrder, inflight: usize, buffered: usize) -> TraversalRequest {
+fn request(order: TraversalOrder, inflight: usize) -> TraversalRequest {
     TraversalRequest::new(StoragePath::root())
         .order(order)
         .max_inflight_operations(NonZeroUsize::new(inflight).unwrap_or(NonZeroUsize::MIN))
-        .max_buffered_items(NonZeroUsize::new(buffered).unwrap_or(NonZeroUsize::MIN))
 }
 
 /// Runs to the end; with `cancel_after`, cancels after that many entries and drains.
@@ -133,9 +132,9 @@ async fn resuming_a_real_tree_from_any_checkpoint_loses_nothing() -> io::Result<
     tree(root.path(), DEFAULT_PAGE_HINT.get() + 50)?;
     let source = source(root.path())?;
     for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
-        for (inflight, buffered) in [(1, 1), (8, 16)] {
-            let case = format!("{order:?} c={inflight} b={buffered}");
-            let make = || request(order, inflight, buffered);
+        for inflight in [1, 8] {
+            let case = format!("{order:?} c={inflight}");
+            let make = || request(order, inflight);
             let (items, _) = run(&source, make(), None).await?;
             let full = set(&entries(&items));
             let every = Resumable::On {
@@ -182,11 +181,12 @@ async fn resuming_a_real_tree_from_any_checkpoint_loses_nothing() -> io::Result<
 async fn a_chain_of_cancels_and_resumes_covers_a_real_tree() -> io::Result<()> {
     let root = tempfile::tempdir()?;
     tree(root.path(), 30)?;
-    let source = source(root.path())?;
-    let (items, _) = run(&source, request(TraversalOrder::Blocks, 4, 4), None).await?;
+    // Force cancellation while work remains, regardless of how quickly the producer runs.
+    let source = source(root.path())?.output_capacity(NonZeroUsize::MIN);
+    let (items, _) = run(&source, request(TraversalOrder::Blocks, 4), None).await?;
     let full = set(&entries(&items));
     for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
-        let make = || request(order, 4, 1).resumable(Resumable::on());
+        let make = || request(order, 4).resumable(Resumable::on());
         let (mut delivered, mut rounds) = (Vec::new(), 0);
         let mut from: Option<Checkpoint> = None;
         loop {
@@ -235,7 +235,7 @@ async fn a_tree_changed_between_runs_resumes_like_a_scan_during_change() -> io::
         let root = tempfile::tempdir()?;
         tree(root.path(), DEFAULT_PAGE_HINT.get() + 50)?;
         let source = source(root.path())?;
-        let make = || request(order, 1, 1).resumable(Resumable::on());
+        let make = || request(order, 1).resumable(Resumable::on());
         let (items, _) = run(&source, make(), Some(25)).await?;
         let Some(TraversalItem::Checkpoint(last)) = items.last() else {
             panic!("{order:?}: no final checkpoint")
@@ -265,7 +265,7 @@ async fn a_tree_changed_between_runs_resumes_like_a_scan_during_change() -> io::
                 .iter()
                 .all(|(path, _)| !path.starts_with("chain/"))
         );
-        let (now, _) = run(&source, request(order, 4, 4), None).await?;
+        let (now, _) = run(&source, request(order, 4), None).await?;
         let unreached: Vec<_> = set(&entries(&now))
             .into_iter()
             .filter(|(path, _)| {
@@ -293,7 +293,7 @@ async fn a_checkpoint_of_another_root_is_refused() -> io::Result<()> {
     let source = source(root.path())?;
     let (items, _) = run(
         &source,
-        request(TraversalOrder::Unordered, 2, 1).resumable(Resumable::on()),
+        request(TraversalOrder::Unordered, 2).resumable(Resumable::on()),
         Some(10),
     )
     .await?;
@@ -302,7 +302,7 @@ async fn a_checkpoint_of_another_root_is_refused() -> io::Result<()> {
     };
     let subtree = TraversalRequest {
         root: StoragePath::new("t0").map_err(io::Error::other)?,
-        ..request(TraversalOrder::Unordered, 2, 1)
+        ..request(TraversalOrder::Unordered, 2)
     }
     .resume_from((**last).clone())
     .cancel(CancellationToken::new());
@@ -336,7 +336,7 @@ async fn checkpoint_size_follows_the_shape_of_a_real_tree() -> io::Result<()> {
     };
     let mut largest = Vec::new();
     for order in [TraversalOrder::Blocks, TraversalOrder::Unordered] {
-        let (items, _) = run(&source, request(order, 1, 64).resumable(every), None).await?;
+        let (items, _) = run(&source, request(order, 1).resumable(every), None).await?;
         let sizes: Vec<usize> = checkpoints(&items)
             .iter()
             .map(|(_, checkpoint)| checkpoint.as_bytes().len())

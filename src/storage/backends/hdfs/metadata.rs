@@ -5,9 +5,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::protocol::{HdfsProtocol, cancelled, entry_failure};
 use crate::model::{
-    FailureClass, MetadataObservation, MetadataObservations, MetadataProvenance, ObservationMode,
-    ObservationPlan, Operation, StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata,
-    Transience,
+    FailureClass, MetadataCapabilities, MetadataFamily as F, MetadataObservation,
+    MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan,
+    ObservationSupport as S, Operation, StoragePath, StorageTimestamp, TimePrecision,
+    TimestampMetadata, Transience,
 };
 use crate::storage::{Metadata, MetadataMutation, StorageRoleFailure};
 
@@ -27,6 +28,15 @@ impl HdfsMetadata {
 
 #[async_trait]
 impl Metadata for HdfsMetadata {
+    fn observation_capabilities(&self) -> MetadataCapabilities {
+        MetadataCapabilities::default()
+            .with(F::Acl, S::Unsupported)
+            .with(F::Xattrs, S::Unsupported)
+            .with(F::Tags, S::NotApplicable)
+            .with(F::OwnershipMode, S::Unsupported)
+            .with(F::Timestamps, S::Supported)
+    }
+
     async fn permissions(
         &self,
         described: &crate::storage::SourceDescriptor,

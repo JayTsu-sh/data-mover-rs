@@ -250,7 +250,6 @@ fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest,
     let request = TraversalRequest::new(StoragePath::new(path.clone())?)
         .order(TraversalOrder::from(*order))
         .max_inflight_operations(slots)
-        .max_buffered_items(slots)
         .observation_plan(plan)
         .max_depth(max_depth.and_then(NonZeroUsize::new));
     let request = match checkpoint_every {

@@ -26,8 +26,9 @@ use version::version_unsupported;
 
 use crate::model::{
     AclMetadata, BackendSessionFailure, EntryOperationFailure, ExtendedAttribute, FailureClass,
-    MappedOwnership, MetadataObservations, ObjectTag, ObservationPlan, Operation, OwnershipMode,
-    SourceIdentity, SourceVersion, StoragePath, TimestampMetadata, Transience,
+    MappedOwnership, MetadataCapabilities, MetadataObservations, ObjectTag, ObservationPlan,
+    Operation, OwnershipMode, SourceIdentity, SourceVersion, StoragePath, TimestampMetadata,
+    Transience,
 };
 
 /// A bounded payload stream. Implementations own request sizing and backpressure.
@@ -652,6 +653,12 @@ pub enum DeleteMarkerOutcome {
 /// Metadata observation and application role. It never implicitly refetches omitted facts.
 #[async_trait]
 pub trait Metadata: Send + Sync {
+    /// Instance-specific observation support, queried without backend I/O. Unknown by default
+    /// so external roles can continue to determine support while observing individual entries.
+    fn observation_capabilities(&self) -> MetadataCapabilities {
+        MetadataCapabilities::default()
+    }
+
     /// Removes one named extended attribute. This is distinct from applying `Xattrs`, which
     /// only sets the supplied values. Unsupported backends refuse before I/O; NFS requires a
     /// nonempty UTF-8 name and reports the server's missing-attribute or permission refusal.

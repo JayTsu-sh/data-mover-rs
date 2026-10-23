@@ -155,8 +155,7 @@ async fn unordered_delivers_what_blocks_does_on_a_mixed_tree() {
     for inline in [true, false] {
         for filtered in [false, true] {
             for (inflight, buffered) in [(1, 1), (3, 2), (64, 1024)] {
-                let request = mixed_request(TraversalOrder::Unordered, inflight, filtered)
-                    .max_buffered_items(window(buffered));
+                let request = mixed_request(TraversalOrder::Unordered, inflight, filtered);
                 let make = || {
                     StorageTraversalSource::with_roles(
                         Arc::new(MixedNamespace {
@@ -165,6 +164,7 @@ async fn unordered_delivers_what_blocks_does_on_a_mixed_tree() {
                         }),
                         Arc::new(TimesMetadata::default()),
                     )
+                    .output_capacity(window(buffered))
                 };
                 let (items, _) = same_as_blocks(make, &request).await;
                 assert!(items.len() > 100, "{}", items.len());
@@ -313,6 +313,8 @@ async fn the_descent_hint_reaches_the_listing_of_the_child() {
         let mut request = super::streaming::paged_request(4).order(TraversalOrder::Unordered);
         if needs_modified {
             // Every decision waits for the child's observation: the deferred path.
+            request.observation_plan =
+                ObservationPlan::default().with_timestamps(ObservationMode::Required);
             request = request.filter(Arc::new(HideFiles {
                 needs_modified: true,
             }));
@@ -413,9 +415,8 @@ async fn cancellation_ends_the_traversal_as_cancelled() {
     let source = synthetic(4, 4, 6, false);
     let request = TraversalRequest::new(StoragePath::root())
         .max_inflight_operations(window(8))
-        .max_buffered_items(window(1))
         .cancel(cancel.clone());
-    let mut session = source.0.traverse(request);
+    let mut session = source.0.output_capacity(window(1)).traverse(request);
     let mut items = Vec::new();
     for _ in 0..5 {
         items.extend(session.next_item().await);
@@ -451,10 +452,8 @@ async fn cancellation_ends_the_traversal_as_cancelled() {
 #[tokio::test]
 async fn a_consumer_that_walks_away_stops_every_listing() {
     let (source, counts) = synthetic(4, 4, 6, false);
-    let request = TraversalRequest::new(StoragePath::root())
-        .max_inflight_operations(window(16))
-        .max_buffered_items(window(2));
-    let mut session = source.traverse(request);
+    let request = TraversalRequest::new(StoragePath::root()).max_inflight_operations(window(16));
+    let mut session = source.output_capacity(window(2)).traverse(request);
     for _ in 0..10 {
         let _ = session.next_item().await;
     }
@@ -477,8 +476,8 @@ async fn a_consumer_that_walks_away_stops_every_listing() {
 struct HideAll;
 
 impl TraversalFilter for HideAll {
-    fn needs_modified(&self) -> bool {
-        false
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE
     }
 
     fn decide(&self, _candidate: &TraversalCandidate<'_>) -> TraversalDecision {
@@ -499,9 +498,8 @@ async fn a_consumer_that_walks_away_is_noticed_with_nothing_to_send() {
     let (source, counts) = synthetic(4, 5, 6, true);
     let request = TraversalRequest::new(StoragePath::root())
         .max_inflight_operations(window(4))
-        .max_buffered_items(window(2))
         .filter(Arc::new(HideAll));
-    drop(source.traverse(request));
+    drop(source.output_capacity(window(2)).traverse(request));
     tokio::time::timeout(Duration::from_secs(2), async {
         while counts.open.load(Ordering::SeqCst) > 0 || counts.opened.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -648,9 +646,9 @@ async fn every_shape_completes_exactly_under_many_workers() {
     {
         for repeat in 0..10 {
             let (source, counts) = synthetic(fanout, depth, files, true);
-            let request = TraversalRequest::new(StoragePath::root())
-                .max_inflight_operations(window(workers))
-                .max_buffered_items(window(buffered));
+            let source = source.output_capacity(window(buffered));
+            let request =
+                TraversalRequest::new(StoragePath::root()).max_inflight_operations(window(workers));
             let (items, outcome) = run(&source, request).await;
             let (directories, entries) = tree_size(fanout, depth, files);
             let context = format!("shape {round} repeat {repeat}");

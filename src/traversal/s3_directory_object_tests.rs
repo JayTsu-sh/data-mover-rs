@@ -34,7 +34,6 @@ fn request(root: &str, order: TraversalOrder) -> TestResult<TraversalRequest> {
     Ok(TraversalRequest::new(StoragePath::new(root)?)
         .order(order)
         .max_inflight_operations(limit)
-        .max_buffered_items(limit)
         .cancel(CancellationToken::new()))
 }
 

@@ -6,8 +6,9 @@ use super::acl;
 use super::namespace::inline_ownership;
 use super::source::NfsProtocolFailure;
 use crate::model::{
-    EntryKind, ExtendedAttribute, MetadataObservation, MetadataObservations, MetadataProvenance,
-    ObservationMode, ObservationPlan, OwnershipMode, StoragePath, StorageTimestamp, TimePrecision,
+    EntryKind, ExtendedAttribute, MetadataCapabilities, MetadataFamily as F, MetadataObservation,
+    MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan,
+    ObservationSupport as S, OwnershipMode, StoragePath, StorageTimestamp, TimePrecision,
     TimestampMetadata,
 };
 use crate::storage::{
@@ -249,6 +250,29 @@ fn listed_optional<T>(
 
 #[async_trait]
 impl Metadata for NfsMetadataAdapter {
+    fn observation_capabilities(&self) -> MetadataCapabilities {
+        MetadataCapabilities::default()
+            .with(
+                F::Acl,
+                if self.protocol.supports_acl() {
+                    S::Supported
+                } else {
+                    S::Unsupported
+                },
+            )
+            .with(
+                F::Xattrs,
+                if self.protocol.supports_xattrs() {
+                    S::Supported
+                } else {
+                    S::Unsupported
+                },
+            )
+            .with(F::Tags, S::NotApplicable)
+            .with(F::OwnershipMode, S::Supported)
+            .with(F::Timestamps, S::Supported)
+    }
+
     async fn remove_xattr(
         &self,
         path: &StoragePath,
