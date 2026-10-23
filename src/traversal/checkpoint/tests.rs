@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use super::*;
-use crate::model::{MetadataFamily, MetadataRequirements, ObservationMode, ObservationPlan};
+use crate::model::{MetadataRequirements, ObservationMode, ObservationPlan};
 use crate::storage::backends::{hdfs, local};
 use crate::traversal::{TraversalCandidate, TraversalDecision, TraversalFilter};
 

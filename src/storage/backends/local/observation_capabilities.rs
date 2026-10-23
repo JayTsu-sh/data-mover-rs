@@ -35,30 +35,10 @@ pub(super) fn observation_capabilities() -> MetadataCapabilities {
         .with(F::Timestamps, S::Supported)
 }
 
-pub(super) fn copied_metadata_observation_plan() -> Option<ObservationPlan> {
-    #[cfg(unix)]
-    {
-        Some(
-            ObservationPlan::default()
-                .with_ownership_mode(ObservationMode::InlineOnly)
-                .with_timestamps(ObservationMode::InlineOnly),
-        )
-    }
-    #[cfg(windows)]
-    {
-        // Ask explicitly so the observation records `NotApplicable` for
-        // Windows' non-numeric ownership model. Leaving this omitted
-        // would produce `NotRequested`, which AllowKnownLoss correctly
-        // refuses because it cannot distinguish unsupported ownership
-        // from an observation bug.
-        Some(
-            ObservationPlan::default()
-                .with_ownership_mode(ObservationMode::InlineOnly)
-                .with_timestamps(ObservationMode::InlineOnly),
-        )
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        None
-    }
+pub(super) fn copied_metadata_observation_plan() -> ObservationPlan {
+    // Explicit ownership also records NotApplicable on Windows, whose ownership is non-numeric.
+    // Omitting it would leave NotRequested and prevent AllowKnownLoss from accepting the result.
+    ObservationPlan::default()
+        .with_ownership_mode(ObservationMode::InlineOnly)
+        .with_timestamps(ObservationMode::InlineOnly)
 }

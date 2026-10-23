@@ -389,7 +389,7 @@ impl MetadataRole for LocalObservationAdapter {
     }
 
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
-        capabilities::copied_metadata_observation_plan()
+        cfg!(any(unix, windows)).then(capabilities::copied_metadata_observation_plan)
     }
 
     /// The listing's own `lstat` already answers ownership and timestamps; see
