@@ -6,10 +6,15 @@ const MAX_TAG_COUNT: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ObservationMode {
+    /// Do not request this family.
     #[default]
     Omit,
+    /// Reuse information already carried by the listing, without another metadata call.
     InlineOnly,
+    /// Allow additional observation and preserve optional failures as observation states.
     BestEffort,
+    /// Require a completed value or a not-applicable result. Traversal rejects known unsupported
+    /// requests before listing and reports other missing required results as child failures.
     Required,
 }
 

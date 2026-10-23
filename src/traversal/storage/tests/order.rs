@@ -61,9 +61,6 @@ fn ordered_request() -> TraversalRequest {
         .max_inflight_operations(
             NonZeroUsize::new(2).unwrap_or_else(|| unreachable!("constant is nonzero")),
         )
-        .max_buffered_items(
-            NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("constant is nonzero")),
-        )
         .cancel(tokio_util::sync::CancellationToken::new())
 }
 
@@ -168,8 +165,12 @@ struct HideOneFile {
 }
 
 impl crate::traversal::TraversalFilter for HideOneFile {
-    fn needs_modified(&self) -> bool {
-        self.needs_modified
+    fn required_metadata(&self) -> MetadataRequirements {
+        if self.needs_modified {
+            MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
+        } else {
+            MetadataRequirements::NONE
+        }
     }
 
     fn decide(&self, candidate: &crate::traversal::TraversalCandidate<'_>) -> TraversalDecision {
@@ -189,7 +190,11 @@ impl crate::traversal::TraversalFilter for HideOneFile {
 async fn blocks_agree_between_the_immediate_and_deferred_filter_paths() {
     let mut rendered = Vec::new();
     for needs_modified in [false, true] {
-        let request = ordered_request().filter(Arc::new(HideOneFile { needs_modified }));
+        let request = ordered_request()
+            .filter(Arc::new(HideOneFile { needs_modified }))
+            .observation_plan(
+                ObservationPlan::default().with_timestamps(ObservationMode::Required),
+            );
         let (lines, _) = tree(false, request).await;
         rendered.push(lines);
     }

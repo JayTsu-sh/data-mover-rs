@@ -68,7 +68,9 @@ async fn a_wide_directory_is_held_a_few_pages_at_a_time() {
         }),
         Arc::new(FakeMetadata),
     );
-    let mut session = source.traverse(paged_request(4));
+    let mut session = source
+        .output_capacity(NonZeroUsize::MIN)
+        .traverse(paged_request(4));
     let (mut received, mut ahead) = (0_usize, 0_usize);
     while let Some(item) = session.next_item().await {
         received += usize::from(matches!(item, TraversalItem::Entry(_)));
@@ -157,7 +159,9 @@ async fn prefetched_listings_stop_after_their_first_page() {
         }),
         Arc::new(FakeMetadata),
     );
-    let mut session = source.traverse(paged_request(WINDOW));
+    let mut session = source
+        .output_capacity(NonZeroUsize::MIN)
+        .traverse(paged_request(WINDOW));
     let mut received: HashMap<String, usize> = HashMap::new();
     let mut ahead = 0;
     while let Some(item) = session.next_item().await {

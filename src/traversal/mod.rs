@@ -8,16 +8,19 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    BackendSessionFailure, EntryKind, ObservationPlan, StoragePath, StorageTimestamp,
+    BackendSessionFailure, EntryKind, MetadataObservations, MetadataRequirements, ObservationPlan,
+    StoragePath, StorageTimestamp,
 };
 
 mod channel;
 mod checkpoint;
+mod configuration;
 mod counts;
 mod events;
 pub mod pairing;
 mod storage;
 pub use checkpoint::{Resumable, ResumeRefusal};
+pub use configuration::TraversalConfigurationError;
 pub use counts::{BlockCounts, ScanTotals};
 pub use events::{
     Checkpoint, DirectoryListed, FailureScope, ListingOutcome, ScanFailure, TraversalItem,
@@ -115,8 +118,11 @@ pub struct TraversalCandidate<'a> {
     pub kind: EntryKind,
     pub size: Option<u64>,
     /// Present only when the enumerating operation or a metadata observation already
-    /// supplied it; see [`TraversalFilter::needs_modified`].
+    /// supplied it. Even a completed timestamp observation can have no modification time.
     pub modified: Option<StorageTimestamp>,
+    /// Completed observations available to this decision. Declare every family read here in
+    /// [`TraversalFilter::required_metadata`]; undeclared families may not yet be observed.
+    pub metadata: &'a MetadataObservations,
 }
 
 /// Per-entry traversal decision. The three components are independent:
@@ -150,10 +156,12 @@ impl TraversalDecision {
 /// The trait keeps the traversal independent of any concrete expression language; the
 /// crate's DSL adapter lives outside this module.
 pub trait TraversalFilter: fmt::Debug + Send + Sync {
-    /// Whether [`TraversalCandidate::modified`] must be known before [`Self::decide`] is
-    /// meaningful. When `true`, the traversal observes every candidate before deciding and
-    /// never evaluates the filter with an absent timestamp.
-    fn needs_modified(&self) -> bool;
+    /// Metadata families read by [`Self::decide`], including `Timestamps` when it reads
+    /// [`TraversalCandidate::modified`]. Every dependency must be enabled in the caller's
+    /// observation plan. This declaration never changes that plan or authorizes extra I/O.
+    /// Decisions wait until dependencies have settled, including unsupported, failed and
+    /// not-applicable results; a settled dependency does not guarantee a value is present.
+    fn required_metadata(&self) -> MetadataRequirements;
 
     /// Decides one candidate. May be called in any order, concurrently from several tasks (each
     /// listing decides its own children as it arrives), before the entry is admitted, and for
@@ -192,7 +200,8 @@ pub struct TraversalRequest {
     pub root: StoragePath,
     pub order: TraversalOrder,
     pub max_inflight_operations: NonZeroUsize,
-    pub max_buffered_items: NonZeroUsize,
+    /// Observations requested by the caller. A filter dependency must be enabled here;
+    /// `InlineOnly` uses listed information without additional metadata I/O.
     pub observation_plan: ObservationPlan,
     pub cancel: CancellationToken,
     /// Optional admission / pruning policy. `None` admits every entry and descends into every
@@ -290,12 +299,12 @@ mod relative_tests {
 
 /// Operations in flight when the caller does not choose.
 const DEFAULT_MAX_INFLIGHT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(63);
-/// Items buffered ahead of the consumer when the caller does not choose.
-const DEFAULT_MAX_BUFFERED: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1023);
+/// Output items buffered ahead of a traversal's consumer.
+const DEFAULT_MAX_BUFFERED_ITEMS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1023);
 
 impl TraversalRequest {
     /// A traversal of `root` with every other setting at its default: [`TraversalOrder`]'s
-    /// default order, 64 operations in flight, 1024 items buffered, the default observation plan,
+    /// default order, 64 operations in flight, the default observation plan,
     /// a fresh cancellation token, no filter, no depth limit, no checkpoints, from the start.
     ///
     /// On a bucket that was versioned when it was connected, every key is one entry with its whole
@@ -309,7 +318,6 @@ impl TraversalRequest {
             root,
             order: TraversalOrder::default(),
             max_inflight_operations: DEFAULT_MAX_INFLIGHT,
-            max_buffered_items: DEFAULT_MAX_BUFFERED,
             observation_plan: ObservationPlan::default(),
             cancel: CancellationToken::new(),
             filter: None,
@@ -333,13 +341,6 @@ impl TraversalRequest {
     #[must_use]
     pub const fn max_inflight_operations(mut self, limit: NonZeroUsize) -> Self {
         self.max_inflight_operations = limit;
-        self
-    }
-
-    /// Items the session buffers ahead of its consumer.
-    #[must_use]
-    pub const fn max_buffered_items(mut self, limit: NonZeroUsize) -> Self {
-        self.max_buffered_items = limit;
         self
     }
 
@@ -442,6 +443,8 @@ pub enum TraversalTerminalFailure {
     /// The request cannot resume from its checkpoint, or cannot be resumable at all; returned
     /// before any I/O.
     Resume(ResumeRefusal),
+    /// Invalid observation requirements, refused before listing or metadata I/O.
+    Configuration(TraversalConfigurationError),
 }
 
 impl fmt::Display for TraversalTerminalFailure {
@@ -450,6 +453,7 @@ impl fmt::Display for TraversalTerminalFailure {
             Self::Session(error) => error.fmt(formatter),
             Self::Internal => formatter.write_str("traversal runtime failed"),
             Self::Resume(refusal) => write!(formatter, "cannot resume the traversal: {refusal}"),
+            Self::Configuration(error) => error.fmt(formatter),
         }
     }
 }

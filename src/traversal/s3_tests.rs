@@ -17,8 +17,8 @@ use super::{
     TraversalSource,
 };
 use crate::model::{
-    EntryKind, FailureClass, ObservedEntry, StoragePath, StorageTimestamp, TimePrecision,
-    Transience,
+    EntryKind, FailureClass, MetadataFamily, MetadataRequirements, ObservationMode,
+    ObservationPlan, ObservedEntry, StoragePath, StorageTimestamp, TimePrecision, Transience,
 };
 use crate::storage::backends::s3::tests::{MemoryS3, content_md5, identity};
 use crate::storage::backends::s3::{
@@ -35,7 +35,6 @@ pub(super) fn request() -> TraversalRequest {
     TraversalRequest::new(StoragePath::root())
         .order(TraversalOrder::Blocks)
         .max_inflight_operations(limit(8))
-        .max_buffered_items(limit(8))
         .cancel(CancellationToken::new())
 }
 
@@ -182,8 +181,8 @@ async fn tree() -> TestResult<Arc<MemoryS3>> {
 struct PruneSkip;
 
 impl TraversalFilter for PruneSkip {
-    fn needs_modified(&self) -> bool {
-        false
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
@@ -232,8 +231,8 @@ async fn pruned_and_truncated_prefixes_are_never_listed() -> TestResult {
 struct ModifiedAfter(StorageTimestamp);
 
 impl TraversalFilter for ModifiedAfter {
-    fn needs_modified(&self) -> bool {
-        true
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
@@ -266,6 +265,8 @@ async fn a_modified_filter_uses_the_listing_times() -> TestResult {
     )?);
     let mut filtered = request();
     filtered.filter = Some(Arc::new(filter));
+    filtered.observation_plan =
+        ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly);
     let (items, _) = traverse(&protocol, filtered).await?;
     let files: Vec<String> = entries(&items)
         .iter()
@@ -376,8 +377,7 @@ async fn throttling_past_the_budget_fails_one_listing_not_the_traversal() -> Tes
     protocol.listing().throttled = Some((usize::MAX, slow_down()));
     let listing_of_a = TraversalRequest::new(StoragePath::new("a")?)
         .order(TraversalOrder::Blocks)
-        .max_inflight_operations(limit(8))
-        .max_buffered_items(limit(8));
+        .max_inflight_operations(limit(8));
     let (items, outcome) = traverse(&protocol, listing_of_a).await?;
     let failures: Vec<_> = items
         .iter()

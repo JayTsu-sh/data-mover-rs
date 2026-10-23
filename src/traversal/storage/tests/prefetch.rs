@@ -93,8 +93,6 @@ fn latency_request(inflight: usize) -> TraversalRequest {
     request.observation_plan = ObservationPlan::default();
     request.max_inflight_operations =
         NonZeroUsize::new(inflight).unwrap_or_else(|| unreachable!("test limit is nonzero"));
-    request.max_buffered_items =
-        NonZeroUsize::new(4).unwrap_or_else(|| unreachable!("constant is nonzero"));
     request
 }
 
@@ -368,6 +366,8 @@ async fn deferred_decisions_are_prefetched_once_they_settle() {
     let tree = fan_tree(64, 0);
     let mut deferred = latency_request(8);
     deferred.filter = Some(Arc::new(RecordingFilter::new(true)));
+    deferred.observation_plan =
+        ObservationPlan::default().with_timestamps(ObservationMode::Required);
     let mut immediate = latency_request(8);
     immediate.filter = Some(Arc::new(RecordingFilter::new(false)));
     let (deferred_paths, peak, deferred_time) = timed(&tree, deferred).await;

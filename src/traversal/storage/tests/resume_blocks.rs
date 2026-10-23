@@ -35,7 +35,7 @@ fn position(request: &TraversalRequest, checkpoint: &Checkpoint) -> Vec<Frontier
 #[tokio::test]
 async fn a_resumed_traversal_continues_the_full_runs_directory_order() {
     let setup = setup(Tree::generate(3, 3, 2, 2), false);
-    let make = || request(TraversalOrder::Blocks, 4, 2);
+    let make = || request(TraversalOrder::Blocks, 4);
     let (items, _) = run(&setup.source, make().resumable(every_chance()), None).await;
     let full = listed(&items);
     let saved = checkpoints(&items);
@@ -64,7 +64,7 @@ async fn a_resumed_traversal_continues_the_full_runs_directory_order() {
 
 /// A checkpoint whose position is at least two levels below the root.
 async fn deep_checkpoint(setup: &super::resume::Setup) -> (Checkpoint, Vec<FrontierEntry>) {
-    let make = || request(TraversalOrder::Blocks, 2, 1);
+    let make = || request(TraversalOrder::Blocks, 2);
     let (items, _) = run(&setup.source, make().resumable(every_chance()), None).await;
     checkpoints(&items)
         .into_iter()
@@ -87,7 +87,7 @@ async fn an_ancestor_that_fails_now_is_its_own_failure() {
     setup.tree.deny(&ancestor);
     let (items, outcome) = run(
         &setup.source,
-        request(TraversalOrder::Blocks, 2, 1).resume_from(checkpoint),
+        request(TraversalOrder::Blocks, 2).resume_from(checkpoint),
         None,
     )
     .await;
@@ -120,7 +120,7 @@ async fn an_ancestor_gone_since_is_counted_vanished() {
     setup.tree.remove(chain[1].path.as_str());
     let (items, outcome) = run(
         &setup.source,
-        request(TraversalOrder::Blocks, 2, 1).resume_from(checkpoint),
+        request(TraversalOrder::Blocks, 2).resume_from(checkpoint),
         None,
     )
     .await;
@@ -144,7 +144,7 @@ async fn a_checkpoint_is_the_position_before_what_was_delivered() {
     let (tree, gate) = Tree::generate(3, 3, 2, 2).with_gated_link();
     let setup = setup(tree, false);
     let full = setup.tree.all_entries();
-    let make = || request(TraversalOrder::Blocks, 64, 64);
+    let make = || request(TraversalOrder::Blocks, 64);
     let mut session = setup.source.traverse(make().resumable(every_chance()));
     let mut held = Vec::new();
     while let Ok(Some(item)) =
@@ -180,7 +180,7 @@ async fn a_checkpoint_is_the_position_before_what_was_delivered() {
 async fn cancelling_before_the_first_period_resumes_from_the_last_position() {
     let setup = setup(Tree::generate(4, 3, 3, 2), false);
     let full = setup.tree.all_entries();
-    let make = || request(TraversalOrder::Blocks, 3, 1).resumable(Resumable::on());
+    let make = || request(TraversalOrder::Blocks, 3).resumable(Resumable::on());
     let (items, outcome) = run(&setup.source, make(), Some(40)).await;
     assert_eq!(outcome, Ok(TraversalOutcome::Cancelled));
     let Some(TraversalItem::Checkpoint(last)) = items.last() else {
@@ -203,9 +203,12 @@ async fn cancelling_before_the_first_period_resumes_from_the_last_position() {
 /// before any item); only the final one of a cancelled traversal may follow part of a block.
 #[tokio::test]
 async fn periodic_checkpoints_come_between_blocks() {
-    let setup = setup(Tree::generate(3, 3, 4, 2), false);
     for (inflight, buffered) in [(1, 1), (4, 2), (64, 64)] {
-        let request = request(TraversalOrder::Blocks, inflight, buffered).resumable(every_chance());
+        let mut setup = setup(Tree::generate(3, 3, 4, 2), false);
+        setup.source = setup
+            .source
+            .output_capacity(NonZeroUsize::new(buffered).unwrap_or(NonZeroUsize::MIN));
+        let request = request(TraversalOrder::Blocks, inflight).resumable(every_chance());
         let (items, _) = run(&setup.source, request, None).await;
         let saved = checkpoints(&items);
         assert!(saved.len() > 5, "c={inflight}");

@@ -1,5 +1,11 @@
 # 扫描（遍历）P7 设计：流式列举、两种扫描方式、事件、计数、错误与续扫
 
+> **观察接口更新（2026-10-23）**：当前实现使用 `ObservationPlan` 的五类元数据和四种模式，
+> `Metadata::observation_capabilities` 提供连接实例的细粒度能力，过滤器通过
+> `required_metadata` 声明依赖；缺少配置的依赖和已知不支持的 Required 请求在列举前拒绝。
+> InlineOnly 不增加 metadata I/O，listing 已满足的依赖立即判断。尚未发布的检查点格式统一为初始 v1，绑定过滤依赖及其观察模式；格式版本与软件版本独立。
+> 下文 `should_scan / Extra` 集合是历史设计提案，未作为当前接口采用；当前契约见 ADR-0008 和源码。
+
 > **状态：P7 实现与验收已完成**（2026-10-12）。C11b / C12、legacy 清理、C7c 首页前续读与 Q4 配对辅助均已完成；CI、可用环境实测、MinIO 十万版本与扫描续跑通过。DXN-2、StorageGRID 的环境限制保留在 §14.3；最终 CI、NFS 与修复后的 HDFS 验收见 §14.4。第 15 节保留 2026-09-25 的决定记录，ADR-0008 已完成。
 >
 > - 本文件**取代**此前的评审稿（Q1–Q30 问题清单、“待拍板”）。评审稿保留在 git 历史里，最后一个评审稿 commit 是 `fef8f2a`。
@@ -146,7 +152,6 @@ let request = TraversalRequest::new(root)
     .max_depth(NonZeroUsize::new(3))                          // None = 不限
     .should_scan([Extra::Acl, Extra::Tags])                   // 只放需要额外调用的，见下
     .max_inflight_operations(64)
-    .max_buffered_items(1024)
     .resumable(Resumable::Off)
     .cancel(token);
 let session = StorageTraversalSource::new(&storage)?.traverse(request);
@@ -752,7 +757,7 @@ struct VersionRecord {
   **只有收到 `complete=true` 那一段才把这个 key 的历史当完整**；取消 / 续扫后各段**从第 0 段重发**（已落库的段会再来一次，
   按上面的去重键吸收）。
 - **快照格式 v7**（开发期规则：只读当前格式）：所有 backend 的 v4 / v5 / v6 快照都解码为 `UnsupportedVersion`，下一次增量扫描
-  按首次扫描处理（全量重扫一次，不只 S3）。C11 的检查点 v1 同样失效（`UnsupportedVersion(1)`），从头扫。
+  按首次扫描处理（全量重扫一次，不只 S3）。开发期间保存的检查点不提供跨实现迭代的持久兼容承诺；尚未发布的遍历格式统一为初始 v1。
 - **连接**：role connect 在 `GetBucketVersioning` 瞬时失败时报 `Connectivity` / `Transient`（`session_failure()`）：重试连接，
   不要当配置错误。
 - **计数**：`bytes` 现在是当前版本字节；全部版本的字节是 `all_versions_bytes`，另有 `versions` / `delete_markers`。
@@ -796,8 +801,8 @@ struct VersionRecord {
   symlink、S3 带版本观察）才 spawn。
 - 重排缓冲快路径：序号正好是下一个时直接发，不进 `BTreeMap`（`output.rs:139-162`）。
 - 身份的分配：`BackendIdentity` 改为 `Arc` 共享，稳定字节内联（见 5.4.6）。
-- C0b：列举已带 mtime 时 filter 立即决定（`storage.rs:369-371` 今天只要 `needs_modified()` 就一律 deferred）。值与观察得到的完全相同；
-  DSL 主线的 deferred 决定从约 N 降到约 0。
+- C0b 已实现：过滤器声明元数据族依赖，列举已能完成依赖时立即判断，不等待仅为输出而请求的其他元数据。
+  只有依赖仍需额外 I/O 时才走 deferred；判断输入通过同一候选构造逻辑生成。
 
 ### 12.2 估算（推测，未测）
 
@@ -1037,7 +1042,7 @@ ONTAP v3 / v4.1、DXN-2 v3、Local，结果相同。
 | `FailureClass` | 新增 `Throttled` |
 | 扫描的观察参数 | `TraversalRequest.observation_plan: ObservationPlan` → `should_scan: 额外项集合`（`Acl / Xattrs / Tags / SymlinkTarget`，无档位）；`ObservedEntry` 的时间与 uid/gid/mode 变为普通 `Option` 字段；symlink 目标不再无条件读取 |
 | S3 身份 | `PathScoped` 身份含路径（F1），已有代的 S3 条目身份键一次性全部变化 |
-| 多版本（`mod.rs:65-86`，`ObservedEntry::version / source_version`，`storage/descriptor.rs` 的 `ListingFacts`，快照 v6） | 删除 `TraversalVersions` 与 `list_versions`、`EntryVersion`；每版本一项改为每 key 一项（`ObservedEntry::history()` → `ObjectHistory` / `VersionRecord`，超过 10 万条分段），当前已删的 key 也列出；是否列历史由连接时的 `GetBucketVersioning` 决定（从未开过版本的桶不再列 `"null"` 版本，除非拒答；瞬时失败 role connect 失败）；快照只读 v7（所有 backend 的 v4–v6 `UnsupportedVersion`）；检查点 v2（v1 `UnsupportedVersion`）；`bytes` 改为当前版本字节，新增 `versions` / `delete_markers` / `all_versions_bytes`；`BackendConnectError::session_failure()`（C11b） |
+| 多版本（`mod.rs:65-86`，`ObservedEntry::version / source_version`，`storage/descriptor.rs` 的 `ListingFacts`，快照 v6） | 删除 `TraversalVersions` 与 `list_versions`、`EntryVersion`；每版本一项改为每 key 一项（`ObservedEntry::history()` → `ObjectHistory` / `VersionRecord`，超过 10 万条分段），当前已删的 key 也列出；是否列历史由连接时的 `GetBucketVersioning` 决定（从未开过版本的桶不再列 `"null"` 版本，除非拒答；瞬时失败 role connect 失败）；快照只读 v7（所有 backend 的 v4–v6 `UnsupportedVersion`）；检查点初始 v1（开发过程不累计格式版本）；`bytes` 改为当前版本字节，新增 `versions` / `delete_markers` / `all_versions_bytes`；`BackendConnectError::session_failure()`（C11b） |
 | 行为 | 大目录中途的瞬时错误：今天（物化）从头重来会成功，P7 后首页之后不能从头重来 → 可能 `Interrupted`（NFS 需 nfs-rs 页接口才能续） |
 | 测试 / 例子 | `storage/tests/order.rs`、`tests/local_namespace_contract.rs` 的兄弟有序断言删改；`examples/storage_role_operations/` 的 `--order`；16 个测试 fake 改用 `ListingStream::from_pages` |
 | 目录对象（F5b–F5e） | `NamespaceCapabilities` 新公开字段 `directory_objects`（外部字面量要补）；`ListedChild` 可以是空名（= 目录自己的对象，路径 `<dir>/`）；S3 列举多出 `d/` 文件条目（含零字节文件夹标记，files / 行数上升），以前有内容的 `d/` 是 `Failure{Child}`；`type == "file"` 匹配到它们；写到不能存目录对象的一端在 Preflight 报 `Unsupported`；MinIO 的 `XMinioInvalidObjectName` 从会话 `Protocol` 改为条目 `Unsupported` |
@@ -1219,7 +1224,7 @@ C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 
       不猜；明确拒绝（403）→ 列历史（Q26）；501 / 不支持版本 → ListObjectsV2；快照只留一种格式、不兼容旧版本（用户 2026-09-27）
     —— 已完成，CI、实测与环境限制见 §14.3：`bda95d3`（refactor：版本列举搬到 histories.rs）、`5a20a77`（refactor：tally_child 返回 Tallied）、`f309f7a`（Q26 + Q-A：
     连接时判定，`S3VersioningAtConnect`，瞬时失败 role connect `Connectivity` / `Transient`）、`7ec3a51`（每 key 一项、`ObjectHistory`、
-    快照 v7 + golden 字节、删 `TraversalVersions` / `list_versions` / `EntryVersion`、记录级观察 R2、R3、检查点 v2）、`648b132`（分段 Q8）、
+    快照 v7 + golden 字节、删 `TraversalVersions` / `list_versions` / `EntryVersion`、记录级观察 R2、R3、检查点当时的开发编号 v2，初始发布统一为 v1）、`648b132`（分段 Q8）、
     `e2511a2`（计数）、`fdea3ed`（e2e-s3 / 续扫脚本）。要点见 §10.1 / §10.4 / §11.2c。与计划的差别：① `ObjectHistory` 多一个
     `largest`（整个 key 的最大版本，每段都带、进快照），否则分段后各段的 R3 答案可能不同（评审）；② `S3Namespace` 在连接时取一次
     `lists_histories()`（整个连接不变）；③ 构造请求失败（不是瞬时的）按拒绝处理，`Unreachable` 带 HTTP 状态进诊断；

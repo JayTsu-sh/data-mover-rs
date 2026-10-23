@@ -325,7 +325,6 @@ async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> Contr
     let mut session = traversal.traverse(
         TraversalRequest::new(StoragePath::root())
             .max_inflight_operations(nonzero(4)?)
-            .max_buffered_items(nonzero(2)?)
             .observation_plan(
                 ObservationPlan::default()
                     .with_acl(acl_mode)

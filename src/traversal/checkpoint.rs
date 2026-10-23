@@ -15,9 +15,9 @@
 //! delivered before the checkpoint item. A consumer persists the checkpoint only once everything
 //! it received before that item is committed, and resumes from the last one it persisted.
 //!
-//! **Format** (version 2; bumped on any change — to the bytes or to what the fingerprint binds —
-//! and a checkpoint of another version is refused, never misread; 2 since P7 C11b, whose
-//! fingerprint binds listing semantics through an opaque backend key; its byte encoding is unchanged):
+//! **Format** (initial version 1, including metadata dependencies and their observation modes).
+//! Once published, incompatible changes to the bytes or fingerprint semantics require a new
+//! format version. A checkpoint with an unknown version is refused rather than misread:
 //!
 //! ```text
 //! "DMTC" | version u8 | order u8 | fingerprint [32] | count u32 LE |
@@ -42,7 +42,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use super::{Checkpoint, TraversalOrder, TraversalRequest, within};
-use crate::model::{BackendIdentity, StoragePath};
+use crate::model::{BackendIdentity, ObservationMode, StoragePath};
 
 /// Whether a traversal emits checkpoints (P7 §9.1). Off by default.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -148,8 +148,8 @@ pub(crate) struct FrontierEntry {
 }
 
 const MAGIC: [u8; 4] = *b"DMTC";
-/// The current format; see the module docs. Bump on any change.
-pub(crate) const VERSION: u8 = 2;
+/// The initial format. Bump for incompatible changes after the format has been published.
+pub(crate) const VERSION: u8 = 1;
 /// Bytes of the trailing checksum.
 const CHECKSUM: usize = 16;
 /// Magic, version, order, fingerprint, count.
@@ -161,8 +161,9 @@ const MAX_BYTES: usize = 64 << 20;
 const FILTER_CHILDREN: u8 = 1;
 
 /// The fingerprint a request's checkpoints carry: what decides which directories a traversal
-/// lists and what it delivers, and nothing that only tunes it (concurrency, buffering, the
-/// observation plan, the checkpoint interval). The storage identity is hashed, never stored.
+/// lists and what it delivers. Only observation modes a filter depends on are bound; modes for
+/// unrelated families, concurrency, buffering and the checkpoint interval may change on resume.
+/// The storage identity is hashed, never stored.
 /// `listing_resume_key` binds the namespace's opaque listing semantics so incompatible
 /// backend configurations cannot reuse each other's checkpoints.
 ///
@@ -201,6 +202,20 @@ pub(crate) fn fingerprint(
         Some(key) => {
             field(&[1]);
             field(key);
+            let requirements = request
+                .filter
+                .as_ref()
+                .map(|filter| filter.required_metadata())
+                .unwrap_or_default();
+            for family in requirements.iter() {
+                let mode = match request.observation_plan.mode(family) {
+                    ObservationMode::Omit => 0,
+                    ObservationMode::InlineOnly => 1,
+                    ObservationMode::BestEffort => 2,
+                    ObservationMode::Required => 3,
+                };
+                field(&[family as u8, mode]);
+            }
         }
     }
     Ok(*hasher.finalize().as_bytes())

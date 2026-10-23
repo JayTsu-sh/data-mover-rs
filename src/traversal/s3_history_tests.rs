@@ -348,9 +348,7 @@ async fn unordered_delivers_each_key_once_with_its_whole_history() -> TestResult
     }
     put(&protocol, "v/z", b"1").await?;
     for round in 0..3 {
-        let request = request()
-            .order(TraversalOrder::Unordered)
-            .max_buffered_items(NonZeroUsize::MIN);
+        let request = request().order(TraversalOrder::Unordered);
         let (items, outcome) = traverse(&protocol, request).await?;
         let totals = totals(&outcome);
         assert_eq!(totals.files, 40 * 50 + 3, "round {round}");

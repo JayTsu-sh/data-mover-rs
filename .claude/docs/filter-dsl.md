@@ -67,12 +67,18 @@
 | `extension` | 与 `Path::extension` 一致：最后一个 `.` 之后，且该 `.` 前必须有内容，所以 `.bashrc` 没有扩展名。永不为 `None` |
 | `size` | 目录取 `Some(0)`，否则 `size` 条件会退化成放行的 `LazyMatch`。S3 版本化桶上一个 key 一项（P7 C11b）：`size` = 当前版本的大小，`modified` = 最新一条记录的时间；当前已删的 key（最新是删除标记）`size` 取 `None`、`modified` 是删除标记的时间（会命中“最近修改”类条件），**有意保留**这个 `LazyMatch`（用户决定 2026-09-25）：`size` 条件本身从不滤掉标记（表达式里的其他条件照常判断），这样历史迁移会带上大文件的删除记录 —— 标记不带数据；目的端该 key 上没有对象时，重放一个从没拷过的 key 的删除不改任何数据（有对象时重放会把它藏到新标记后面，是否重放由调用方判断） |
 
-**`modified` 缺失时不能先评估**：缺 `modified` 的 `Modified` 条件返回 `LazyMatch`，而
-`LazyMatch` 会被组合子吸收 (`Match & Lazy = Match`、`MisMatch | Lazy = MisMatch`)，
-结果既不是上界也不是下界 — 可能误剪枝，也可能误收。因此
-`FilterExpression::referenced_fields().modified` 为真时，traversal 先做元数据观察再决策
-(`TraversalFilter::needs_modified`)，绝不用缺 `modified` 的评估结果。列举已带 `modified`、观察不需要 I/O 时
-(NFS / CIFS / Local / S3 / HDFS 的列举都带 `modified`，默认计划下都是)，这次观察就在列举任务里当场完成、当场决策 (P7 C0b)，值与 deferred 路径完全相同。
+**待观察的 `modified` 不能先评估**：`FilterExpression::referenced_fields().modified`
+为真时，适配器通过 `TraversalFilter::required_metadata()` 声明 `Timestamps` 依赖。
+调用方必须在 `ObservationPlan` 中显式选择 timestamps 模式；`Omit` 在列举前报配置错误，
+过滤器不会自动扩大观察计划。`InlineOnly` 仅复用列举信息；`BestEffort` / `Required`
+在信息不足时允许额外观察。依赖已由 inline 信息确定的条目立即决策，被过滤的条目不做仅为输出准备的观察；
+依赖需要 I/O 时，完成一次选定计划的观察后再决策。候选的 `metadata` 和 `modified`
+来自同一份观察结果，两条路径一致。
+
+**最终缺失值保持 DSL 原有语义**：`Required` 要求元数据族可用，不保证其中每个字段存在。
+`InlineOnly` 缺少列举时间、或已完成的 timestamps 没有 `modified` 时，过滤器收到最终 `None`，
+`Modified` 条件仍返回 `LazyMatch`。组合规则 (`Match & Lazy = Match`、`MisMatch | Lazy = MisMatch`)
+保持不变；调度层不会把尚待补取的时间当作最终缺失值提前评估。
 
 ## 表达式形式
 

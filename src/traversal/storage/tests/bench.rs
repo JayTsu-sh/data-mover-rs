@@ -125,9 +125,6 @@ async fn run_once(
             .max_inflight_operations(
                 NonZeroUsize::new(64).unwrap_or_else(|| unreachable!("constant is nonzero")),
             )
-            .max_buffered_items(
-                NonZeroUsize::new(1024).unwrap_or_else(|| unreachable!("constant is nonzero")),
-            )
             .observation_plan(plan)
             .cancel(tokio_util::sync::CancellationToken::new()),
     );

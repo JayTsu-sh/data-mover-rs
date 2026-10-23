@@ -124,8 +124,12 @@ pub(super) struct PathFilter {
 }
 
 impl crate::traversal::TraversalFilter for PathFilter {
-    fn needs_modified(&self) -> bool {
-        self.needs_modified
+    fn required_metadata(&self) -> MetadataRequirements {
+        if self.needs_modified {
+            MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
+        } else {
+            MetadataRequirements::NONE
+        }
     }
 
     fn decide(
@@ -166,7 +170,12 @@ impl crate::traversal::TraversalFilter for PathFilter {
 
 fn filtered_request(filter: PathFilter, max_depth: Option<usize>) -> TraversalRequest {
     let mut request = request(tokio_util::sync::CancellationToken::new());
-    request.observation_plan = ObservationPlan::default();
+    request.observation_plan =
+        ObservationPlan::default().with_timestamps(if filter.needs_modified {
+            ObservationMode::Required
+        } else {
+            ObservationMode::Omit
+        });
     request.filter = Some(Arc::new(filter));
     request.max_depth = max_depth.and_then(NonZeroUsize::new);
     request
@@ -392,8 +401,12 @@ impl RecordingFilter {
 }
 
 impl crate::traversal::TraversalFilter for RecordingFilter {
-    fn needs_modified(&self) -> bool {
-        self.needs_modified
+    fn required_metadata(&self) -> MetadataRequirements {
+        if self.needs_modified {
+            MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
+        } else {
+            MetadataRequirements::NONE
+        }
     }
 
     fn decide(

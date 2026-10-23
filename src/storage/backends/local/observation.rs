@@ -13,14 +13,17 @@ use cap_std::fs::{Dir, Metadata};
 
 use crate::model::{
     AclMetadata, BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure,
-    ExtendedAttribute, FailureClass, IdentityStrength, MetadataObservation, MetadataObservations,
-    MetadataProvenance, ObservationMode, ObservationPlan, ObservedEntry, Operation, OwnershipMode,
-    SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding,
-    TimePrecision, TimestampMetadata, Transience,
+    ExtendedAttribute, FailureClass, IdentityStrength, MetadataCapabilities, MetadataObservation,
+    MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan, ObservedEntry,
+    Operation, OwnershipMode, SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget,
+    SymlinkTargetEncoding, TimePrecision, TimestampMetadata, Transience,
 };
 use crate::storage::{
     Metadata as MetadataRole, MetadataMutation, SourceDescriptor, StorageRoleFailure,
 };
+
+#[path = "observation_capabilities.rs"]
+mod capabilities;
 
 #[path = "observation_listed.rs"]
 mod listed;
@@ -381,32 +384,12 @@ impl LocalObservationAdapter {
 
 #[async_trait]
 impl MetadataRole for LocalObservationAdapter {
+    fn observation_capabilities(&self) -> MetadataCapabilities {
+        capabilities::observation_capabilities()
+    }
+
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
-        #[cfg(unix)]
-        {
-            Some(
-                ObservationPlan::default()
-                    .with_ownership_mode(ObservationMode::InlineOnly)
-                    .with_timestamps(ObservationMode::InlineOnly),
-            )
-        }
-        #[cfg(windows)]
-        {
-            // Ask explicitly so the observation records `NotApplicable` for
-            // Windows' non-numeric ownership model. Leaving this omitted
-            // would produce `NotRequested`, which AllowKnownLoss correctly
-            // refuses because it cannot distinguish unsupported ownership
-            // from an observation bug.
-            Some(
-                ObservationPlan::default()
-                    .with_ownership_mode(ObservationMode::InlineOnly)
-                    .with_timestamps(ObservationMode::InlineOnly),
-            )
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            None
-        }
+        capabilities::copied_metadata_observation_plan()
     }
 
     /// The listing's own `lstat` already answers ownership and timestamps; see

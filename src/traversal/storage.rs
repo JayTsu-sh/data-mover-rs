@@ -16,7 +16,8 @@ use super::{
 };
 use crate::model::{
     BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, MAX_HISTORY_RECORDS,
-    ObservationMode, ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
+    MetadataFamily, MetadataObservations, MetadataRequirements, ObservationMode, ObservationPlan,
+    ObservationSupport, ObservedEntry, Operation, StoragePath, Transience,
 };
 use crate::storage::{
     CapabilityUnavailable, DescentHint, Metadata, Namespace, SourceDescriptor, Storage,
@@ -62,9 +63,21 @@ struct Probe {
     /// A smaller output segment limit so tests can exercise histories with few records.
     #[cfg(test)]
     history_segment: Option<usize>,
+    /// A smaller session output channel for exercising backpressure in tests.
+    #[cfg(test)]
+    output_capacity: Option<NonZeroUsize>,
 }
 
 impl Probe {
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn output_capacity(&self) -> NonZeroUsize {
+        #[cfg(test)]
+        if let Some(capacity) = self.output_capacity {
+            return capacity;
+        }
+        super::DEFAULT_MAX_BUFFERED_ITEMS
+    }
+
     /// Production output always uses the fixed limit; only tests can override it.
     #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn history_segment(&self) -> usize {
@@ -152,6 +165,13 @@ impl StorageTraversalSource {
         self
     }
 
+    /// This source, using a smaller output channel to exercise consumer backpressure.
+    #[cfg(test)]
+    pub(crate) const fn output_capacity(mut self, capacity: NonZeroUsize) -> Self {
+        self.probe.output_capacity = Some(capacity);
+        self
+    }
+
     /// This source, reading `clock` instead of the system's when checkpoints are on.
     #[cfg(test)]
     pub(crate) fn clocked(mut self, clock: &Arc<ManualClock>) -> Self {
@@ -195,13 +215,18 @@ impl StorageTraversalSource {
 /// A session that ends at once, before any I/O, with `failure`.
 fn refuse(request: &TraversalRequest, failure: TraversalTerminalFailure) -> TraversalSession {
     let (producer, session) =
-        TraversalSession::bounded(request.max_buffered_items, request.cancel.clone());
+        TraversalSession::bounded(super::DEFAULT_MAX_BUFFERED_ITEMS, request.cancel.clone());
     producer.finish(Err(failure));
     session
 }
 
 impl TraversalSource for StorageTraversalSource {
     fn traverse(&self, request: TraversalRequest) -> TraversalSession {
+        let capabilities = self.metadata.observation_capabilities();
+        let requirements = match super::configuration::validate(&request, capabilities) {
+            Ok(requirements) => requirements,
+            Err(error) => return refuse(&request, TraversalTerminalFailure::Configuration(error)),
+        };
         let listing_resume_key = self.namespace.listing_resume_key();
         let resume = match Resume::prepare(&request, &self.identity, listing_resume_key, || {
             self.probe.clock()
@@ -210,7 +235,7 @@ impl TraversalSource for StorageTraversalSource {
             Err(refusal) => return refuse(&request, TraversalTerminalFailure::Resume(refusal)),
         };
         let drain_on_cancel = resume.as_ref().is_some_and(Resume::emits);
-        let (item_tx, item_rx) = channel::channel(request.max_buffered_items);
+        let (item_tx, item_rx) = channel::channel(self.probe.output_capacity());
         let (completion_tx, completion_rx) = oneshot::channel();
         let cancel = request.cancel.clone();
         let (namespace, metadata) = (Arc::clone(&self.namespace), Arc::clone(&self.metadata));
@@ -220,6 +245,7 @@ impl TraversalSource for StorageTraversalSource {
             namespace,
             metadata,
             request,
+            requirements,
             resume,
             probe.clone(),
         ));
@@ -285,24 +311,38 @@ struct Deferred {
 /// Per-traversal admission policy derived once from the request.
 struct Policy {
     filter: Option<Arc<dyn TraversalFilter>>,
-    /// Decisions wait for the metadata observation because the filter needs `modified`.
-    deferred: bool,
+    /// Families that must settle before a filtered child's decision.
+    requirements: MetadataRequirements,
     observation_plan: ObservationPlan,
 }
 
 impl Policy {
-    fn new(request: &TraversalRequest) -> Self {
-        let deferred = request
-            .filter
-            .as_ref()
-            .is_some_and(|filter| filter.needs_modified());
-        let mut observation_plan = request.observation_plan;
-        if deferred && observation_plan.timestamps() == ObservationMode::Omit {
-            observation_plan = observation_plan.with_timestamps(ObservationMode::InlineOnly);
-        }
+    fn new(
+        request: &TraversalRequest,
+        requirements: MetadataRequirements,
+        metadata: &dyn Metadata,
+    ) -> Self {
+        // Known unavailable families cannot justify a call. Keep their completed state in the
+        // result while preserving the caller's mode for request validation and checkpoints.
+        let capabilities = metadata.observation_capabilities();
+        let observation_plan =
+            MetadataFamily::ALL
+                .into_iter()
+                .fold(request.observation_plan, |plan, family| {
+                    if plan.mode(family).permits_io()
+                        && matches!(
+                            capabilities.support(family),
+                            ObservationSupport::Unsupported | ObservationSupport::NotApplicable
+                        )
+                    {
+                        plan.with(family, ObservationMode::InlineOnly)
+                    } else {
+                        plan
+                    }
+                });
         Self {
             filter: request.filter.clone(),
-            deferred,
+            requirements,
             observation_plan,
         }
     }
@@ -343,14 +383,16 @@ impl Shared {
         namespace: Arc<dyn Namespace>,
         metadata: Arc<dyn Metadata>,
         request: TraversalRequest,
+        requirements: MetadataRequirements,
         resume: Option<Resume>,
         probe: Probe,
     ) -> Self {
         let parked_listing_limit = namespace.parked_listing_limit().map(NonZeroUsize::get);
+        let policy = Policy::new(&request, requirements, metadata.as_ref());
         Self {
             namespace,
             metadata,
-            policy: Policy::new(&request),
+            policy,
             request,
             tickets: AtomicU64::new(0),
             root_object_reported: AtomicBool::new(false),
@@ -363,27 +405,32 @@ impl Shared {
 
 /// The admission decision for one listed child, when it can be made from the listing alone.
 ///
-/// `None` means the filter needs `modified` and still applies below `parent`, so the decision
-/// is made from the child's observation instead: at once in the listing's task when that needed
-/// no I/O, otherwise once it settles. Made once per child, when its page arrives, so that a
+/// `None` means a filter dependency still needs observation, or that observation failed. The
+/// decision then follows the child's full observation. Made once per child, when its page arrives, so that a
 /// prefetched directory's subdirectories are known before the cursor reaches it.
 fn immediate_decision(
     shared: &Shared,
     parent: &DirectoryWork,
     descriptor: &SourceDescriptor,
 ) -> Option<TraversalDecision> {
-    if shared.policy.deferred && parent.filter_children {
-        return None;
-    }
-    let candidate = TraversalCandidate {
-        path: relative_to(&shared.request.root, &descriptor.path),
-        name: entry_name(&descriptor.path),
-        kind: descriptor.kind,
-        size: descriptor.size,
-        modified: descriptor
-            .inline_timestamps
-            .and_then(|value| value.modified),
+    let requirements = if parent.filter_children {
+        shared.policy.requirements
+    } else {
+        MetadataRequirements::NONE
     };
+    let metadata = observe::dependency_without_io(
+        shared.metadata.as_ref(),
+        shared.policy.observation_plan.only(requirements),
+        descriptor,
+    )?
+    .ok()?;
+    let candidate = candidate_of(
+        &shared.request.root,
+        &descriptor.path,
+        descriptor.kind,
+        descriptor.size,
+        &metadata,
+    );
     Some(shared.policy.decide(parent.filter_children, &candidate))
 }
 
@@ -518,16 +565,36 @@ fn settle_failure(
 /// What the filter sees of an observed child: the same candidate whether the decision is made in
 /// the listing's task or once a deferred observation settles.
 fn entry_candidate<'a>(root: &StoragePath, entry: &'a ObservedEntry) -> TraversalCandidate<'a> {
+    candidate_of(
+        root,
+        entry.path(),
+        entry.kind(),
+        entry.size(),
+        entry.metadata(),
+    )
+}
+
+fn candidate_of<'a>(
+    root: &StoragePath,
+    path: &'a StoragePath,
+    kind: EntryKind,
+    size: Option<u64>,
+    metadata: &'a MetadataObservations,
+) -> TraversalCandidate<'a> {
     TraversalCandidate {
-        path: relative_to(root, entry.path()),
-        name: entry_name(entry.path()),
-        kind: entry.kind(),
-        size: entry.size(),
-        modified: entry.modified(),
+        path: relative_to(root, path),
+        name: entry_name(path),
+        kind,
+        size,
+        modified: metadata
+            .timestamps()
+            .value()
+            .and_then(|times| times.modified),
+        metadata,
     }
 }
 
-/// Applies a deferred decision now that the observation (and therefore `modified`) is known.
+/// Applies a deferred decision now that its metadata dependencies have settled.
 fn settle_entry(
     shared: &Shared,
     entry: Box<ObservedEntry>,

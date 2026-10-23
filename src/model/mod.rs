@@ -7,6 +7,7 @@ pub(crate) const MAX_MODEL_FIELD_BYTES: usize = 16 * 1024 * 1024;
 
 mod history;
 mod metadata_observation;
+mod metadata_requirements;
 pub(crate) mod observation;
 mod ownership;
 mod source_version;
@@ -15,6 +16,9 @@ pub use metadata_observation::{
     AclEncoding, AclMetadata, ExtendedAttribute, MappedOwnership, MetadataObservation,
     MetadataObservations, MetadataProvenance, ObjectTag, ObservationMode, ObservationPlan,
     OwnershipMode, TimestampMetadata,
+};
+pub use metadata_requirements::{
+    MetadataCapabilities, MetadataFamily, MetadataRequirements, ObservationSupport,
 };
 pub use observation::{
     EntryIdentityKey, EntrySnapshot, IdentityStrength, ObservedEntry, SnapshotDecodeError,

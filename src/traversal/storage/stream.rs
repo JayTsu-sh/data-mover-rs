@@ -338,9 +338,9 @@ fn holds_content(descriptor: &SourceDescriptor) -> bool {
 
 /// Decides and, when it needs no I/O, observes one child, and files it into the page.
 ///
-/// A filter that needs `modified` still decides here whenever the child needed no I/O: its entry
-/// is already assembled, so the decision reads exactly the value a deferred one would have read
-/// once the observation settled. Only a child whose observation needs I/O, or failed, waits.
+/// Filter dependencies are resolved independently of observations requested only for output.
+/// A dependency answered by the listing is decided before unrelated I/O; otherwise the full
+/// observation settles before the decision. Each filtered child is decided exactly once.
 fn prepare_child(
     shared: &Shared,
     work: &DirectoryWork,

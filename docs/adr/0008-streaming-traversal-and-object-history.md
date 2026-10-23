@@ -57,6 +57,28 @@ listed == emitted + filtered + failed_children + vanished
 emitted == files + directories + symlinks + other
 ```
 
+### Metadata observations and filter dependencies are explicit
+
+`TraversalRequest.observation_plan` selects the existing five metadata families and their
+`Omit / InlineOnly / BestEffort / Required` modes. `Metadata::observation_capabilities` exposes
+instance-specific support without I/O; unknown support is checked at runtime, and a family
+not applicable to the backend can be answered without a call. Known unsupported `Required`
+requests fail before listing. Unsupported best-effort observations retain their state without
+sending a futile request.
+
+`TraversalFilter::required_metadata` declares families read by a decision. An omitted dependency
+is a configuration refusal; filters never upgrade the caller's plan. The DSL maps `modified`
+conditions to `Timestamps`, so callers explicitly select at least `InlineOnly`. Listed information
+can settle a decision before unrelated observations. Pending dependencies wait for observation;
+missing, unsupported, failed and not-applicable results are final states, not pending work.
+The candidate exposes these states through `MetadataObservations`.
+
+Only missing families authorized for additional calls are sent to the metadata role. Listed
+values are merged with the result, so inline-only families cannot be populated accidentally by
+an unrelated call. Required failures are child failures; a directory whose deferred observation
+fails remains eligible for descent. Object histories retain their existing per-version failure
+records. Symlink targets remain mandatory entry data read through `Namespace::read_link`.
+
 ### Completion and deletion safety are explicit
 
 The session emits `TraversalItem::{Entry, Failure, DirectoryListed, Checkpoint}` and has a
@@ -80,8 +102,12 @@ that precedes it. Replay is allowed; advancing beyond uncommitted output is forb
 Blocks checkpoints follow delivered blocks. Unordered checkpoints retain queued and active
 directories. Resume re-lists the necessary directories and preserves failure exclusions. Backend,
 root, filter, depth, order and the connected history capability form the fingerprint. The
-observation plan, concurrency, buffering and checkpoint interval do not change the fingerprint. A mismatch refuses resume. Oversized frontiers suppress checkpoint emission rather
-than dropping pending work. Checkpoint format v2 rejects earlier versions.
+filter's metadata dependencies and their observation modes also form the fingerprint. Modes for
+unrelated metadata families, concurrency, buffering and checkpoint interval remain tunable.
+A mismatch refuses resume. Oversized frontiers suppress checkpoint emission rather than
+dropping pending work. The initial checkpoint format is v1, including these fingerprint rules.
+The version field identifies the persisted format independently of the crate's release version;
+future incompatible published formats require a new version and unknown versions are refused.
 
 These scan checkpoints are independent of destination-resident transfer recovery (ADR-0006).
 

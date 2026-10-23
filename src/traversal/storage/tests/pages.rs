@@ -140,8 +140,8 @@ impl Metadata for TimesMetadata {
 pub(super) struct ByTime;
 
 impl TraversalFilter for ByTime {
-    fn needs_modified(&self) -> bool {
-        true
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
@@ -166,9 +166,6 @@ pub(super) fn mixed_request(
         .max_inflight_operations(
             NonZeroUsize::new(window)
                 .unwrap_or_else(|| unreachable!("callers pass a nonzero window")),
-        )
-        .max_buffered_items(
-            NonZeroUsize::new(2).unwrap_or_else(|| unreachable!("constant is nonzero")),
         )
         .observation_plan(ObservationPlan::default().with_timestamps(ObservationMode::Required))
         .cancel(tokio_util::sync::CancellationToken::new());
@@ -416,8 +413,8 @@ async fn an_observation_failing_in_the_listing_task_still_lists_the_directory_in
 struct EveryModified;
 
 impl TraversalFilter for EveryModified {
-    fn needs_modified(&self) -> bool {
-        true
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {

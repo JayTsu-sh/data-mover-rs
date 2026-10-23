@@ -32,15 +32,10 @@ fn nonzero(value: usize) -> io::Result<NonZeroUsize> {
     NonZeroUsize::new(value).ok_or_else(|| io::Error::other("zero"))
 }
 
-fn request(
-    order: TraversalOrder,
-    inflight: usize,
-    buffered: usize,
-) -> io::Result<TraversalRequest> {
+fn request(order: TraversalOrder, inflight: usize) -> io::Result<TraversalRequest> {
     Ok(TraversalRequest::new(StoragePath::root())
         .order(order)
-        .max_inflight_operations(nonzero(inflight)?)
-        .max_buffered_items(nonzero(buffered)?))
+        .max_inflight_operations(nonzero(inflight)?))
 }
 
 async fn run(
@@ -160,15 +155,11 @@ async fn a_real_tree_is_traversed_exactly_as_blocks_does() -> io::Result<()> {
     let root = tempfile::tempdir()?;
     let entries = tree(root.path())?;
     let (source, _) = source(root.path())?;
-    let (blocks, blocks_outcome) = run(&source, request(TraversalOrder::Blocks, 8, 64)?).await?;
+    let (blocks, blocks_outcome) = run(&source, request(TraversalOrder::Blocks, 8)?).await?;
     let expected = totals(&blocks_outcome)?;
     assert_eq!(expected.emitted, entries as u64);
-    for (inflight, buffered) in [(1, 1), (4, 2), (64, 1024)] {
-        let (items, outcome) = run(
-            &source,
-            request(TraversalOrder::Unordered, inflight, buffered)?,
-        )
-        .await?;
+    for inflight in [1, 4, 64] {
+        let (items, outcome) = run(&source, request(TraversalOrder::Unordered, inflight)?).await?;
         assert_unordered(&items);
         assert_eq!(lines(&items), lines(&blocks), "c={inflight}");
         let counted = totals(&outcome)?;
@@ -193,7 +184,7 @@ async fn an_unreadable_directory_fails_alone() -> io::Result<()> {
     }
     let (source, namespace) = source(root.path())?;
     namespace.fail_list_path(StoragePath::new("a").map_err(io::Error::other)?);
-    let (items, outcome) = run(&source, request(TraversalOrder::Unordered, 4, 4)?).await?;
+    let (items, outcome) = run(&source, request(TraversalOrder::Unordered, 4)?).await?;
     assert_unordered(&items);
     let failures: Vec<_> = items
         .iter()
@@ -237,7 +228,7 @@ async fn cancellation_part_way_is_cancelled() -> io::Result<()> {
     let (source, _) = source(root.path())?;
     let cancel = CancellationToken::new();
     let mut session =
-        source.traverse(request(TraversalOrder::Unordered, 8, 1)?.cancel(cancel.clone()));
+        source.traverse(request(TraversalOrder::Unordered, 8)?.cancel(cancel.clone()));
     for _ in 0..20 {
         let _ = session.next_item().await;
     }

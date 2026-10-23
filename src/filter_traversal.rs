@@ -13,14 +13,14 @@
 //! | `continue_scan` | `descend` (only meaningful for directories) |
 //! | `check_children` | `filter_children` (transitive: once `false`, the subtree is admitted unfiltered) |
 //!
-//! `modified` is the only input the traversal cannot know from a listing alone. A missing
-//! `modified` makes the evaluator return `LazyMatch`, and `LazyMatch` is absorbed by `AND` /
-//! `OR` (`Match & Lazy = Match`), so an expression that references `modified` must never be
-//! evaluated before the timestamp is known. [`DslTraversalFilter::needs_modified`] reports
-//! that and the traversal defers the whole decision until after the metadata observation.
+//! Expressions referencing `modified` declare a timestamp dependency. The caller explicitly
+//! enables timestamps in its observation plan: `InlineOnly` uses listed times, while modes
+//! allowing additional calls can fill missing times. A decision waits for the observation to
+//! settle, not for a timestamp to exist. A final missing time retains the DSL's `LazyMatch`
+//! semantics; an observation still pending must never be mistaken for a final missing value.
 
 use crate::filter::{FilterExpression, FilterInput, parse_filter_expression, should_skip};
-use crate::model::EntryKind;
+use crate::model::{EntryKind, MetadataFamily, MetadataRequirements};
 use crate::traversal::{TraversalCandidate, TraversalDecision, TraversalFilter};
 
 /// `match` / `exclude` filter expressions applied during a role-based traversal.
@@ -28,7 +28,7 @@ use crate::traversal::{TraversalCandidate, TraversalDecision, TraversalFilter};
 pub struct DslTraversalFilter {
     match_expressions: Option<FilterExpression>,
     exclude_expressions: Option<FilterExpression>,
-    needs_modified: bool,
+    requirements: MetadataRequirements,
     /// What a resumable traversal binds its checkpoints to: see [`resume_key`].
     resume_key: [u8; 32],
 }
@@ -62,11 +62,16 @@ impl DslTraversalFilter {
             .into_iter()
             .flatten()
             .any(|expression| expression.referenced_fields().modified);
+        let requirements = if needs_modified {
+            MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
+        } else {
+            MetadataRequirements::NONE
+        };
         Self {
             resume_key: resume_key(match_expressions.as_ref(), exclude_expressions.as_ref()),
             match_expressions,
             exclude_expressions,
-            needs_modified,
+            requirements,
         }
     }
 
@@ -118,8 +123,8 @@ fn extension(name: &str) -> &str {
 }
 
 impl TraversalFilter for DslTraversalFilter {
-    fn needs_modified(&self) -> bool {
-        self.needs_modified
+    fn required_metadata(&self) -> MetadataRequirements {
+        self.requirements
     }
 
     fn resume_key(&self) -> Option<Vec<u8>> {
@@ -162,7 +167,9 @@ impl TraversalFilter for DslTraversalFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{SpecialFileKind, StoragePath, StorageTimestamp, TimePrecision};
+    use crate::model::{
+        MetadataObservations, SpecialFileKind, StoragePath, StorageTimestamp, TimePrecision,
+    };
 
     fn decide(
         filter: &DslTraversalFilter,
@@ -183,6 +190,7 @@ mod tests {
             kind,
             size,
             modified,
+            metadata: &MetadataObservations::default(),
         });
         (decision.emit, decision.descend, decision.filter_children)
     }
@@ -199,7 +207,11 @@ mod tests {
     fn no_expressions_admit_everything_without_evaluation() {
         let filter = filter(None, None);
         assert!(filter.is_empty());
-        assert!(!filter.needs_modified());
+        assert!(
+            !filter
+                .required_metadata()
+                .contains(MetadataFamily::Timestamps)
+        );
         assert_eq!(
             decide(&filter, "a", EntryKind::File, Some(1), None),
             (true, false, false)
@@ -296,9 +308,21 @@ mod tests {
 
     #[test]
     fn needs_modified_only_when_referenced() {
-        assert!(!filter(Some("name == \"*.log\""), None).needs_modified());
-        assert!(filter(Some("modified < 7d"), None).needs_modified());
-        assert!(filter(None, Some("size > 1 and modified > \"2024-01-01\"")).needs_modified());
+        assert!(
+            !filter(Some("name == \"*.log\""), None)
+                .required_metadata()
+                .contains(MetadataFamily::Timestamps)
+        );
+        assert!(
+            filter(Some("modified < 7d"), None)
+                .required_metadata()
+                .contains(MetadataFamily::Timestamps)
+        );
+        assert!(
+            filter(None, Some("size > 1 and modified > \"2024-01-01\""))
+                .required_metadata()
+                .contains(MetadataFamily::Timestamps)
+        );
     }
 
     #[test]

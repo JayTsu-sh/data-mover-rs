@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use super::*;
-use crate::model::{ObservationMode, ObservationPlan};
+use crate::model::{MetadataFamily, MetadataRequirements, ObservationMode, ObservationPlan};
 use crate::storage::backends::{hdfs, local};
 use crate::traversal::{TraversalCandidate, TraversalDecision, TraversalFilter};
 
@@ -72,7 +72,7 @@ fn opened(
     open(checkpoint, &FINGERPRINT, order, &path(root))
 }
 
-/// The current format, byte for byte: any change to it must bump [`VERSION`] (and this test).
+/// The initial published format, byte for byte. Incompatible published revisions bump VERSION.
 #[test]
 fn the_current_format_is_pinned_byte_for_byte() {
     let unordered = encoded(
@@ -83,7 +83,7 @@ fn the_current_format_is_pinned_byte_for_byte() {
         hex(unordered.as_bytes()),
         concat!(
             "444d5443",
-            "02",
+            "01",
             "00",
             "abababababababababababababababababababababababababababababababab",
             "02000000",
@@ -97,7 +97,7 @@ fn the_current_format_is_pinned_byte_for_byte() {
             "62",
             "02000000",
             "01",
-            "a2d2f95514c95534c473ac21ba9269a8"
+            "f1c4df531dfbfd5fbbcba5fb20ab8293"
         )
     );
     let blocks = encoded(
@@ -112,7 +112,7 @@ fn the_current_format_is_pinned_byte_for_byte() {
         hex(blocks.as_bytes()),
         concat!(
             "444d5443",
-            "02",
+            "01",
             "01",
             "abababababababababababababababababababababababababababababababab",
             "03000000",
@@ -131,7 +131,7 @@ fn the_current_format_is_pinned_byte_for_byte() {
             "2f79",
             "03000000",
             "00",
-            "54d1ed2a928f029e664f63fec0c09e09"
+            "6043ba8035f072c5a7ea92624ebbd9df"
         )
     );
 }
@@ -343,8 +343,8 @@ fn another_fingerprint_or_order_is_a_mismatch() {
 struct Keyless;
 
 impl TraversalFilter for Keyless {
-    fn needs_modified(&self) -> bool {
-        false
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
@@ -357,8 +357,8 @@ impl TraversalFilter for Keyless {
 struct Named(&'static str);
 
 impl TraversalFilter for Named {
-    fn needs_modified(&self) -> bool {
-        false
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
@@ -372,6 +372,52 @@ impl TraversalFilter for Named {
 
 fn named(name: &'static str) -> Arc<dyn TraversalFilter> {
     Arc::new(Named(name))
+}
+
+#[derive(Debug)]
+struct MetadataFilter(MetadataRequirements);
+
+impl TraversalFilter for MetadataFilter {
+    fn required_metadata(&self) -> MetadataRequirements {
+        self.0
+    }
+    fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
+        TraversalDecision::unfiltered(candidate.kind)
+    }
+    fn resume_key(&self) -> Option<Vec<u8>> {
+        Some(b"same-filter-key".to_vec())
+    }
+}
+
+#[test]
+fn filter_dependencies_and_their_modes_are_bound_but_unrelated_modes_are_tunable() {
+    use crate::model::{MetadataFamily as F, MetadataRequirements};
+    let identity = local::test_identity("metadata-fingerprint");
+    let request = TraversalRequest::new(StoragePath::root())
+        .filter(Arc::new(MetadataFilter(
+            MetadataRequirements::NONE.with(F::Tags),
+        )))
+        .observation_plan(ObservationPlan::default().with_tags(ObservationMode::InlineOnly));
+    let print = |request: &TraversalRequest| {
+        fingerprint(&identity, request, b"listing").unwrap_or_else(|error| panic!("{error}"))
+    };
+    let expected = print(&request);
+    for mode in [ObservationMode::BestEffort, ObservationMode::Required] {
+        let changed = request
+            .clone()
+            .observation_plan(request.observation_plan.with_tags(mode));
+        assert_ne!(expected, print(&changed));
+    }
+    let unrelated = request.clone().observation_plan(
+        request
+            .observation_plan
+            .with_timestamps(ObservationMode::Required),
+    );
+    assert_eq!(expected, print(&unrelated));
+    let changed_requirements = request.filter(Arc::new(MetadataFilter(
+        MetadataRequirements::NONE.with(F::Timestamps),
+    )));
+    assert_ne!(expected, print(&changed_requirements));
 }
 
 /// Every field that decides what a traversal lists changes the fingerprint; what only tunes it
@@ -426,7 +472,6 @@ fn the_fingerprint_binds_what_decides_the_listing_and_nothing_else() {
     let tuned = base
         .clone()
         .max_inflight_operations(NonZeroUsize::MIN)
-        .max_buffered_items(NonZeroUsize::MIN)
         .observation_plan(ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly))
         .resumable(Resumable::on());
     assert_eq!(print(&local, &tuned), expected);

@@ -133,7 +133,6 @@ pub(super) fn paged_request(window: usize) -> TraversalRequest {
         .max_inflight_operations(
             NonZeroUsize::new(window).unwrap_or_else(|| unreachable!("callers pass nonzero")),
         )
-        .max_buffered_items(NonZeroUsize::MIN)
         .cancel(tokio_util::sync::CancellationToken::new())
 }
 
@@ -142,7 +141,8 @@ pub(super) fn paged_source(tree: PagedTree) -> (StorageTraversalSource, Arc<Page
     let source = StorageTraversalSource::with_roles(
         Arc::clone(&tree) as Arc<dyn Namespace>,
         Arc::new(FakeMetadata),
-    );
+    )
+    .output_capacity(NonZeroUsize::MIN);
     (source, tree)
 }
 
@@ -283,8 +283,12 @@ pub(super) struct HideFiles {
 }
 
 impl TraversalFilter for HideFiles {
-    fn needs_modified(&self) -> bool {
-        self.needs_modified
+    fn required_metadata(&self) -> MetadataRequirements {
+        if self.needs_modified {
+            MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
+        } else {
+            MetadataRequirements::NONE
+        }
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
@@ -368,7 +372,11 @@ async fn a_listing_that_fails_after_a_page_is_interrupted_with_what_it_returned(
     // hidden, on either filter path, it is still six.
     for needs_modified in [false, true] {
         let (source, _) = paged_source(PagedTree::new(listings()));
-        let request = paged_request(4).filter(Arc::new(HideFiles { needs_modified }));
+        let request = paged_request(4)
+            .filter(Arc::new(HideFiles { needs_modified }))
+            .observation_plan(
+                ObservationPlan::default().with_timestamps(ObservationMode::Required),
+            );
         let (lines, _) = events(source.traverse(request)).await;
         assert_eq!(
             lines,
@@ -486,7 +494,11 @@ async fn the_descent_hint_reaches_the_listing_of_the_child() {
             let (source, tree) = paged_source(PagedTree::new(listings()));
             let mut request = paged_request(window);
             if let Some(needs_modified) = filter {
-                request = request.filter(Arc::new(HideFiles { needs_modified }));
+                request = request
+                    .filter(Arc::new(HideFiles { needs_modified }))
+                    .observation_plan(
+                        ObservationPlan::default().with_timestamps(ObservationMode::Required),
+                    );
             }
             let (_, outcome) = events(source.traverse(request)).await;
             assert!(matches!(outcome, TraversalOutcome::Completed(_)));
@@ -566,7 +578,11 @@ async fn the_page_size_changes_nothing_in_the_output() {
             );
             let mut request = request(tokio_util::sync::CancellationToken::new());
             if let Some(needs_modified) = filter {
-                request = request.filter(Arc::new(HideFiles { needs_modified }));
+                request = request
+                    .filter(Arc::new(HideFiles { needs_modified }))
+                    .observation_plan(
+                        ObservationPlan::default().with_timestamps(ObservationMode::Required),
+                    );
             }
             let (lines, outcome) = events(source.traverse(request)).await;
             sequences.push((lines, outcome));
@@ -629,8 +645,8 @@ async fn a_directory_listed_twice_is_descended_into_twice() {
 pub(super) struct PanicsAt(pub(super) &'static str);
 
 impl TraversalFilter for PanicsAt {
-    fn needs_modified(&self) -> bool {
-        false
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {

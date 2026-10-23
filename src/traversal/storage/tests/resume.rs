@@ -213,8 +213,8 @@ impl Namespace for Tree {
 struct PruneD1;
 
 impl TraversalFilter for PruneD1 {
-    fn needs_modified(&self) -> bool {
-        true
+    fn required_metadata(&self) -> MetadataRequirements {
+        MetadataRequirements::NONE.with(MetadataFamily::Timestamps)
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
@@ -255,11 +255,10 @@ pub(super) fn setup(tree: Tree, observed: bool) -> Setup {
     }
 }
 
-pub(super) fn request(order: TraversalOrder, inflight: usize, buffered: usize) -> TraversalRequest {
+pub(super) fn request(order: TraversalOrder, inflight: usize) -> TraversalRequest {
     TraversalRequest::new(StoragePath::root())
         .order(order)
         .max_inflight_operations(NonZeroUsize::new(inflight).unwrap_or(NonZeroUsize::MIN))
-        .max_buffered_items(NonZeroUsize::new(buffered).unwrap_or(NonZeroUsize::MIN))
 }
 
 /// `request` over the subtree at `root`.
@@ -393,10 +392,12 @@ async fn resume_from_each(
 async fn resuming_from_any_checkpoint_loses_nothing_in_either_order() {
     for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
         for (inflight, buffered) in [(1, 1), (4, 1), (8, 64)] {
-            let setup = setup(Tree::generate(3, 3, 4, 2), false);
+            let mut setup = setup(Tree::generate(3, 3, 4, 2), false);
+            setup.source = setup
+                .source
+                .output_capacity(NonZeroUsize::new(buffered).unwrap_or(NonZeroUsize::MIN));
             let case = format!("{order:?} c={inflight} b={buffered}");
-            let duplicates =
-                resume_from_each(&setup, || request(order, inflight, buffered), &case).await;
+            let duplicates = resume_from_each(&setup, || request(order, inflight), &case).await;
             // Not exact: a resumed directory is listed again whole. But never the whole tree
             // again from a late checkpoint.
             let full = setup.tree.all_entries().len();
@@ -415,7 +416,7 @@ async fn resuming_from_any_checkpoint_loses_nothing_in_either_order() {
 async fn a_filter_decides_alike_after_resuming() {
     for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
         let setup = setup(Tree::generate(3, 3, 2, 2), true);
-        let make = || request(order, 4, 2).filter(Arc::new(PruneD1));
+        let make = || request(order, 4).filter(Arc::new(PruneD1));
         let (items, _) = run(&setup.source, make(), None).await;
         let full: BTreeSet<String> = entry_paths(&items).into_iter().collect();
         assert!(full.iter().all(|path| !path.contains("d1/")), "pruned");
@@ -437,12 +438,13 @@ async fn a_filter_decides_alike_after_resuming() {
 #[tokio::test]
 async fn checkpoints_come_once_per_period_and_never_when_off() {
     for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
-        let setup = setup(Tree::generate(3, 3, 2, 2), false);
-        let (items, _) = run(&setup.source, request(order, 2, 1), None).await;
+        let mut setup = setup(Tree::generate(3, 3, 2, 2), false);
+        setup.source = setup.source.output_capacity(NonZeroUsize::MIN);
+        let (items, _) = run(&setup.source, request(order, 2), None).await;
         assert!(checkpoints(&items).is_empty());
         assert_eq!(setup.clock.reads(), 0, "{order:?}: Off read the clock");
         let every = Duration::from_mins(1);
-        let on = || request(order, 2, 1).resumable(Resumable::On { every });
+        let on = || request(order, 2).resumable(Resumable::On { every });
         let (items, _) = run(&setup.source, on(), None).await;
         assert!(
             checkpoints(&items).is_empty(),
@@ -477,10 +479,13 @@ async fn cancelling_pauses_and_a_chain_of_resumes_completes_the_tree() {
         // a resumed traversal lists its directories again whole, so a round cancelled before it
         // finishes any would start over where the last one did (resuming is not exact, §9.2).
         for (inflight, buffered, cancel_after) in [(1, 1, 15), (4, 1, 20), (8, 16, 40)] {
-            let setup = setup(Tree::generate(3, 3, 4, 3), false);
+            let mut setup = setup(Tree::generate(3, 3, 4, 3), false);
+            setup.source = setup
+                .source
+                .output_capacity(NonZeroUsize::new(buffered).unwrap_or(NonZeroUsize::MIN));
             let full = setup.tree.all_entries();
             let case = format!("{order:?} c={inflight} b={buffered}");
-            let make = || request(order, inflight, buffered).resumable(Resumable::on());
+            let make = || request(order, inflight).resumable(Resumable::on());
             let mut delivered = Vec::new();
             let mut from: Option<Checkpoint> = None;
             let mut rounds = 0;
@@ -521,7 +526,7 @@ async fn cancelled_at_once_a_resumed_traversal_returns_its_checkpoint() {
         let setup = setup(Tree::generate(3, 3, 2, 2), false);
         let (items, _) = run(
             &setup.source,
-            request(order, 2, 1).resumable(every_chance()),
+            request(order, 2).resumable(every_chance()),
             None,
         )
         .await;
@@ -532,7 +537,7 @@ async fn cancelled_at_once_a_resumed_traversal_returns_its_checkpoint() {
             .unwrap_or_else(|| panic!("checkpoints"));
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
-        let resumed = request(order, 2, 1)
+        let resumed = request(order, 2)
             .resumable(Resumable::on())
             .resume_from(middle.clone())
             .cancel(cancel);
@@ -558,7 +563,7 @@ async fn a_terminal_failure_ends_with_a_checkpoint_to_resume_from() {
         let setup = setup(Tree::generate(3, 3, 2, 2), false);
         let full = setup.tree.all_entries();
         setup.tree.break_at(Some("d1/d0"));
-        let make = || request(order, 2, 1).resumable(Resumable::on());
+        let make = || request(order, 2).resumable(Resumable::on());
         let (items, outcome) = run(&setup.source, make(), None).await;
         assert!(
             matches!(outcome, Err(TraversalTerminalFailure::Session(_))),
@@ -587,7 +592,7 @@ async fn checkpoints_of_another_request_are_refused_before_any_io() {
     let setup = setup(Tree::generate(2, 2, 1, 2), false);
     let (items, _) = run(
         &setup.source,
-        request(TraversalOrder::Unordered, 2, 1).resumable(every_chance()),
+        request(TraversalOrder::Unordered, 2).resumable(every_chance()),
         None,
     )
     .await;
@@ -609,16 +614,22 @@ async fn checkpoints_of_another_request_are_refused_before_any_io() {
     let cases = [
         (
             "root",
-            from(rooted(request(TraversalOrder::Unordered, 2, 1), "d0")),
+            from(rooted(request(TraversalOrder::Unordered, 2), "d0")),
         ),
-        ("order", from(request(TraversalOrder::Blocks, 2, 1))),
+        ("order", from(request(TraversalOrder::Blocks, 2))),
         (
             "depth",
-            from(request(TraversalOrder::Unordered, 2, 1).max_depth(NonZeroUsize::new(2))),
+            from(request(TraversalOrder::Unordered, 2).max_depth(NonZeroUsize::new(2))),
         ),
         (
             "filter",
-            from(request(TraversalOrder::Unordered, 2, 1).filter(Arc::new(PruneD1))),
+            from(
+                request(TraversalOrder::Unordered, 2)
+                    .filter(Arc::new(PruneD1))
+                    .observation_plan(
+                        ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly),
+                    ),
+            ),
         ),
     ];
     for (case, request) in cases {
@@ -630,17 +641,17 @@ async fn checkpoints_of_another_request_are_refused_before_any_io() {
         Arc::new(FakeMetadata),
     )
     .identified(crate::storage::backends::local::test_identity("another"));
-    let (_, outcome) = run(&other, from(request(TraversalOrder::Unordered, 2, 1)), None).await;
+    let (_, outcome) = run(&other, from(request(TraversalOrder::Unordered, 2)), None).await;
     refused(&outcome, ResumeRefusal::Mismatch, "storage");
     let garbage = Checkpoint::from_bytes(bytes::Bytes::from_static(b"not a checkpoint"));
     let (_, outcome) = run(
         &setup.source,
-        request(TraversalOrder::Unordered, 2, 1).resume_from(garbage),
+        request(TraversalOrder::Unordered, 2).resume_from(garbage),
         None,
     )
     .await;
     refused(&outcome, ResumeRefusal::Malformed, "garbage");
-    let keyless = request(TraversalOrder::Unordered, 2, 1)
+    let keyless = request(TraversalOrder::Unordered, 2)
         .filter(Arc::new(super::filter::PathFilter {
             needs_modified: false,
         }))
