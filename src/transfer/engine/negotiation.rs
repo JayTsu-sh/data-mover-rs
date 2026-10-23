@@ -42,6 +42,16 @@ pub(super) struct CopiedMetadataPlan {
 }
 
 impl CopiedMetadataPlan {
+    pub(super) async fn validate_recovered(
+        &self,
+        transferred: &Transferred,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        self.plan
+            .validate_recovered_stage(transferred.destination.as_ref(), &transferred.stage, cancel)
+            .await
+    }
+
     pub(super) fn checkpoint_binding(&self) -> [u8; 32] {
         self.plan.checkpoint_binding()
     }

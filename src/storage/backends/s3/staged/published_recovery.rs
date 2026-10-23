@@ -200,21 +200,32 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         Ok(evidence.clone())
     }
 
-    /// The engine may replay copied metadata after a Ready checkpoint interrupted between
-    /// Complete and tag application. Target only the final object pinned by reconciliation.
-    pub(super) async fn apply_recovered_upload_metadata(
+    /// Complete and tag application are separate S3 operations. Recovery only accepts tags
+    /// already committed on the pinned final; it never repairs metadata on a published object.
+    pub(super) async fn validate_recovered_upload_metadata(
         &self,
         stage: &PreparedStage,
         upload: &FinalUpload,
-        mutation: MetadataMutation,
+        mutations: Vec<MetadataMutation>,
         cancel: &CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
         let _guard = stage.checkpoint_guard().await;
         let path = stage.final_destination.path();
+        let mut expected = None;
+        for mutation in mutations {
+            expected = Some(single::pending_tags(
+                path,
+                self.tags_supported,
+                mutation,
+                cancel,
+            )?);
+        }
+        let Some(mut expected) = expected else {
+            return Ok(());
+        };
         if self.metadata.is_none() {
             return Err(super::metadata_unavailable(stage));
         }
-        let tags = single::pending_tags(path, self.tags_supported, mutation, cancel)?;
         let saved = upload
             .lock()
             .published
@@ -228,9 +239,35 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         if !same_object(&current, &saved) || matches!(self.fence(upload).await?, Fence::TakenOver) {
             return Err(conflict(path, "recovered S3 metadata target was replaced"));
         }
-        self.protocol
-            .put_tags(path.as_str(), &tags)
+        let mut observed = self
+            .protocol
+            .get_tags(path.as_str(), saved.version_id.as_deref())
             .await
-            .map_err(|error| role_failure(path, Operation::Metadata, error))
+            .map_err(|error| role_failure(path, Operation::Metadata, error))?;
+        expected.sort_unstable_by(|left, right| {
+            left.key()
+                .cmp(right.key())
+                .then_with(|| left.value().cmp(right.value()))
+        });
+        observed.sort_unstable_by(|left, right| {
+            left.key()
+                .cmp(right.key())
+                .then_with(|| left.value().cmp(right.value()))
+        });
+        let current = self
+            .protocol
+            .head(path.as_str())
+            .await
+            .map_err(|error| role_failure(path, Operation::Metadata, error))?;
+        if !same_object(&current, &saved) || matches!(self.fence(upload).await?, Fence::TakenOver) {
+            return Err(conflict(path, "recovered S3 metadata target was replaced"));
+        }
+        if expected != observed {
+            return Err(conflict(
+                path,
+                "recovered S3 final tags do not match the checkpoint metadata plan",
+            ));
+        }
+        Ok(())
     }
 }

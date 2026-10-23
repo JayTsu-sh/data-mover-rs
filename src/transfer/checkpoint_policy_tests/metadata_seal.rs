@@ -259,6 +259,97 @@ async fn changed_source_tags_with_unchanged_payload_cannot_adopt_the_previous_fi
     Ok(())
 }
 
+#[tokio::test]
+async fn completion_before_tags_cannot_recover_as_success() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    seed_multipart_source(&protocol).await?;
+    let expected = vec![ObjectTag::new("generation", "copied")?];
+    protocol
+        .put_tags("src/file", &expected)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    *protocol.tag_write_failure.lock().await = Some(S3ProtocolFailure::session(
+        FailureClass::Connectivity,
+        Transience::Transient,
+        "interrupt after Complete before tags",
+    ));
+    let failure = transfer(s3_request(&protocol)?)
+        .await
+        .err()
+        .ok_or("tag failure must retain the completed object")?;
+    assert_eq!(failure.phase(), TransferPhase::Publish);
+    assert!(failure.final_destination_changed());
+    assert!(failure.has_pending_cleanup());
+    drop(failure);
+    let pointer = artifact_name("file", ArtifactKind::Upload);
+    assert!(protocol.objects.lock().await.contains_key(&pointer));
+    *protocol.tag_write_failure.lock().await = None;
+
+    let failure = transfer(s3_request(&protocol)?)
+        .await
+        .err()
+        .ok_or("recovery must reject the final whose tags never committed")?;
+    assert_eq!(failure.phase(), TransferPhase::Metadata);
+    assert!(failure.final_destination_changed());
+    assert!(failure.has_pending_cleanup());
+    assert!(protocol.objects.lock().await.contains_key(&pointer));
+    assert!(
+        protocol
+            .get_tags("file", None)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovered_final_validates_tags_without_reapplying_them() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(crate::storage::backends::s3::tests::Versioning::Enabled);
+    let tags = vec![
+        ObjectTag::new("first", "one")?,
+        ObjectTag::new("second", "two")?,
+    ];
+    let pointer = leave_s3_final(&protocol, &tags).await?;
+    let published_version = protocol
+        .head("file")
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .version_id
+        .ok_or("versioned final")?;
+    let reversed: Vec<_> = tags.into_iter().rev().collect();
+    protocol
+        .put_tags("file", &reversed)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    *protocol.delete_failure.lock().await = None;
+    protocol.tag_versions.lock().await.clear();
+    *protocol.tag_write_failure.lock().await = Some(S3ProtocolFailure::session(
+        FailureClass::Unsupported,
+        Transience::Permanent,
+        "recovered final must never write tags",
+    ));
+    let outcome = transfer(s3_request(&protocol)?).await?;
+    assert!(outcome.metadata.is_none());
+    assert!(
+        protocol
+            .tag_versions
+            .lock()
+            .await
+            .contains(&Some(published_version))
+    );
+    assert!(!protocol.objects.lock().await.contains_key(&pointer));
+    assert_eq!(
+        protocol
+            .get_tags("file", None)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        reversed
+    );
+    Ok(())
+}
+
 async fn change_tags_without_changing_payload(
     protocol: &MemoryS3,
     tags: &[ObjectTag],

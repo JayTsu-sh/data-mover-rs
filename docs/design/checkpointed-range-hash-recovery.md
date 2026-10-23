@@ -244,6 +244,10 @@ S3 的 ListParts/part size/number/upload id 是恢复证据；ETag 是 opaque re
 
 `ReadyToPublish` 只能在本次 staged metadata 全部应用后提交。还要绑定请求的 ACL/xattr 选择和实际编译出的元数据写入计划（包含 tags、ACL 字节和 principal 值，不能 hash 已脱敏的 Debug 字符串）。恢复最终文件时若这些条件变化则失败并保留记录，不在 final 上补做 staged metadata。此前的应用报告没有持久化，不能伪造恢复报告。
 
+S3 tags 在 Complete 之后单独应用，Ready 记录只能证明已绑定的待发布计划。
+恢复 final 时必须只读核验实际 tags 与该计划一致，并用最终对象身份和 owner fence
+包围核验；tags 缺失、不完整或读取失败则明确失败并保留 root，禁止补写 tags 或报告成功清理。
+
 中断发生在 rename/Complete 之后时，用临时 source root 和实际发布结果协调恢复，而不是因 stage 消失就重新读源。丢失提交回复时必须处理 ambiguous commit；没有版本/条件能力时不能自动采用被其他 writer 换过的 final 对象。
 
 校验和发布均完成后，先移除可发现 root，再释放其 owned manifest/pages/intent，做到可重试清理。无永久成功记录。清理后、调用方收到成功前崩溃，无法保证该次调用 exactly-once 成功通知；不扩展本需求去解决这一窗口。

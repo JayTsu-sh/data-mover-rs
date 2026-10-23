@@ -522,6 +522,19 @@ pub trait StagedDestination: Send + Sync {
         .unwrap_or_else(|_| unreachable!("the static staged-metadata diagnostic is valid"));
         Err(StorageRoleFailure::Entry(failure))
     }
+    /// Checks metadata that a backend applies after publishing, without changing the final.
+    ///
+    /// The default needs no extra observation: rename-based backends finish staged metadata
+    /// before anchoring `ReadyToPublish`. Backends with deferred publication metadata must
+    /// override this to reject recovery when those mutations have not actually committed.
+    async fn validate_recovered_metadata(
+        &self,
+        _stage: &PreparedStage,
+        _mutations: Vec<MetadataMutation>,
+        _cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        Ok(())
+    }
     /// Applies an ordered metadata batch to the same unpublished staged object.
     ///
     /// Backends may override this to share one stage handle and one persistence barrier. The

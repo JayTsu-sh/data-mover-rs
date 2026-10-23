@@ -14,9 +14,9 @@ use crate::storage::{
     SourceQosStats, StagedDestination, StorageRoleFailure, VerificationPoint, VerifyRequest,
 };
 
-/// Recovered finals are checked before acceptance. `ReadyToPublish` is anchored only after staged
-/// metadata completes, so recovery never mutates metadata on the final file. Fresh stages retain
-/// the destination's verification point; only armed checkpoints add publication metadata I/O.
+/// Recovered finals are checked before acceptance. Staged metadata finishes before publication;
+/// deferred publication metadata is checked without mutating the recovered final. Fresh stages
+/// retain the destination's verification point; armed checkpoints add publication metadata I/O.
 pub(super) async fn complete_transfer(
     transferred: Transferred,
     read_back: ReadBackVerification,
@@ -127,8 +127,18 @@ async fn apply_metadata(
     source_qos: SourceQosStats,
 ) -> Result<(Transferred, Option<MetadataApplicationReport>), TransferFailure> {
     if transferred.stage.recovered_publication.is_some() {
-        // The earlier attempt finished staged metadata before anchoring ReadyToPublish. Its
-        // application report was not persisted; do not invent one or mutate the final again.
+        // Rename-based metadata was applied before ReadyToPublish. A backend with deferred
+        // publication metadata must still prove it committed; never replay writes on the final.
+        if let Some(copied) = &transferred.copied_metadata_plan
+            && let Err(error) = copied.validate_recovered(&transferred, cancel).await
+        {
+            return Err(retain_published_failure(
+                transferred,
+                TransferFailure::role(TransferPhase::Metadata, TransferSide::Destination, error),
+                source_qos,
+            ));
+        }
+        // The earlier application report was not persisted; do not invent one.
         return Ok((transferred, None));
     }
     match apply_copied_metadata(

@@ -465,10 +465,23 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             at_destination::of(stage).ok_or_else(|| foreign(stage, Operation::Metadata))?;
         if stage.recovered_publication.is_some() {
             return self
-                .apply_recovered_upload_metadata(stage, upload, mutation, &cancel)
+                .validate_recovered_upload_metadata(stage, upload, vec![mutation], &cancel)
                 .await;
         }
         self.apply_final_upload_metadata(stage, upload, mutation, &cancel)
+    }
+
+    async fn validate_recovered_metadata(
+        &self,
+        stage: &PreparedStage,
+        mutations: Vec<MetadataMutation>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        self.validate(stage)?;
+        let upload =
+            at_destination::of(stage).ok_or_else(|| foreign(stage, Operation::Metadata))?;
+        self.validate_recovered_upload_metadata(stage, upload, mutations, &cancel)
+            .await
     }
 
     async fn publish(

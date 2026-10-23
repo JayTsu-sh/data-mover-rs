@@ -295,6 +295,22 @@ impl MetadataPlan {
             .await
     }
 
+    pub(crate) async fn validate_recovered_stage(
+        &self,
+        target: &dyn StagedDestination,
+        stage: &PreparedStage,
+        cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        let mutations = self
+            .mutations
+            .iter()
+            .map(|(_, mutation)| mutation.clone())
+            .collect();
+        target
+            .validate_recovered_metadata(stage, mutations, cancel)
+            .await
+    }
+
     pub(crate) async fn apply_to_stage(
         &self,
         target: &dyn StagedDestination,
