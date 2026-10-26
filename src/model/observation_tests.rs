@@ -186,3 +186,68 @@ fn identity_bytes_mean_the_same_whether_held_inline_or_not() {
         assert_eq!(rebuilt, entry, "{len}");
     }
 }
+
+#[test]
+fn rename_evidence_roundtrips_without_changing_runtime_identity() {
+    let bare = nfs_entry("cluster");
+    assert!(bare.rename_evidence().is_none());
+    let backend = bare.source_identity().backend();
+    for nanos in [0, -1, i64::MIN, i64::MAX] {
+        let evidence = RenameEvidence::local_inode_birth_time(123, nanos);
+        let entry = bare.clone().with_rename_evidence(Some(evidence));
+        assert_eq!(entry.rename_evidence(), Some(&evidence));
+        assert_eq!(entry.identity_key(), bare.identity_key());
+        assert_eq!(entry.source_identity(), bare.source_identity());
+        assert_eq!(entry.source_version(), bare.source_version());
+        let rebuilt = ObservedEntry::decode_snapshot(entry.encode_snapshot().as_bytes(), backend)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(rebuilt, entry);
+        assert_eq!(rebuilt.identity_key(), bare.identity_key());
+    }
+}
+
+#[test]
+fn rename_evidence_unknown_scheme_and_truncated_tokens_are_rejected() {
+    let entry = nfs_entry("cluster");
+    let bytes = entry.encode_snapshot().as_bytes().to_vec();
+    let section = bytes.len() - 32 - 1;
+    assert_eq!(bytes[section], 0);
+    let mut unknown = bytes.clone();
+    unknown[section] = 255;
+    assert_eq!(
+        ObservedEntry::decode_snapshot(&unknown, entry.source_identity().backend()),
+        Err(SnapshotDecodeError::Malformed)
+    );
+    let mut truncated = bytes[..section].to_vec();
+    truncated.push(1);
+    truncated.extend_from_slice(&[0; 15]);
+    assert_eq!(
+        ObservedEntry::decode_snapshot(&truncated, entry.source_identity().backend()),
+        Err(SnapshotDecodeError::Truncated)
+    );
+}
+
+#[test]
+fn direct_inline_integer_pair_preserves_legacy_identity_bytes_and_key() {
+    let backend = BackendIdentity::new(BackendKind::Local, "local-root")
+        .unwrap_or_else(|error| panic!("{error}"));
+    let first = 0x0102_0304_0506_0708_u64;
+    let second = u64::MAX;
+    let direct = SourceIdentity::from_u64_pair_le(
+        backend.clone(),
+        IdentityStrength::StableWithinBackend,
+        first,
+        second,
+    );
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&first.to_le_bytes());
+    expected.extend_from_slice(&second.to_le_bytes());
+    let legacy = SourceIdentity::new(backend, IdentityStrength::StableWithinBackend, expected)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(direct, legacy);
+    assert_eq!(direct.identity_key(), legacy.identity_key());
+    assert!(matches!(
+        direct.stable_bytes,
+        StableBytes::Inline { len: 16, .. }
+    ));
+}

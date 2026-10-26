@@ -35,7 +35,7 @@ use super::observation::{
 use crate::model::OwnershipMode;
 use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
-    Operation, StoragePath, SymlinkTarget, Transience,
+    Operation, RenameContext, StoragePath, SymlinkTarget, Transience,
 };
 #[cfg(unix)]
 use crate::storage::InlineOwnership;
@@ -54,6 +54,9 @@ pub(crate) use hooks::{Hook, ReadFailure};
 pub(crate) struct LocalNamespace {
     root: Arc<Dir>,
     identity: BackendIdentity,
+    root_device: Option<u64>,
+    rename_context: Option<RenameContext>,
+    listing_resume_key: [u8; 32],
     #[cfg(test)]
     probe: Arc<ListProbe>,
 }
@@ -72,11 +75,20 @@ struct ListProbe {
 impl LocalNamespace {
     pub(crate) fn from_root(root: Arc<Dir>, identity: BackendIdentity) -> Self {
         Self {
+            root_device: super::rename::root_device(&root),
             root,
             identity,
+            rename_context: None,
+            listing_resume_key: listing_key(None),
             #[cfg(test)]
             probe: Arc::new(ListProbe::default()),
         }
+    }
+
+    pub(crate) fn with_rename_context(mut self, context: Option<RenameContext>) -> Self {
+        self.listing_resume_key = listing_key(context.as_ref());
+        self.rename_context = context;
+        self
     }
 
     /// Makes the `call_number`-th `List` (1-based) fail with `PermissionDenied`.
@@ -192,6 +204,7 @@ impl LocalNamespace {
     async fn stat_entry(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         let native = checked(path, Operation::Observe, true)?;
         let target = path.clone();
+        let root_device = self.root_device;
         self.blocking(path, Operation::Observe, move |root, identity| {
             let metadata = if native.as_os_str().is_empty() {
                 root.dir_metadata()
@@ -199,7 +212,7 @@ impl LocalNamespace {
                 in_parent(root, &native, |parent, leaf| parent.symlink_metadata(leaf))
             }
             .map_err(|error| io_failure(&target, Operation::Observe, &error))?;
-            describe(identity, target, &metadata, Operation::Observe)
+            describe(identity, target, &metadata, Operation::Observe, root_device)
         })
         .await
     }
@@ -267,6 +280,14 @@ impl LocalNamespace {
 
 #[async_trait]
 impl Namespace for LocalNamespace {
+    fn rename_context(&self) -> Option<&RenameContext> {
+        self.rename_context.as_ref()
+    }
+
+    fn listing_resume_key(&self) -> &[u8] {
+        &self.listing_resume_key
+    }
+
     async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         self.stat_entry(path).await
     }
@@ -381,6 +402,7 @@ fn describe(
     path: StoragePath,
     metadata: &Metadata,
     operation: Operation,
+    root_device: Option<u64>,
 ) -> Result<SourceDescriptor, StorageRoleFailure> {
     let Some(kind) = entry_kind(metadata) else {
         return Err(entry_failure(&path, operation, FailureClass::Unsupported));
@@ -388,6 +410,7 @@ fn describe(
     let source_identity = source_identity(identity, &path, metadata)?;
     let size = (kind == EntryKind::File).then_some(metadata.len());
     let mut descriptor = SourceDescriptor::new(path, kind, size, source_identity)
+        .with_rename_evidence(super::rename::evidence(metadata, root_device))
         .with_backend_fact(backend_facts(metadata).into())
         .with_inline_timestamps(timestamp_metadata(metadata));
     descriptor.content_version = Some(content_version(metadata));
@@ -405,6 +428,19 @@ fn describe(
             }));
     }
     Ok(descriptor)
+}
+
+/// Bind evidence semantics and the caller's trusted dataset domain to scan checkpoints.
+fn listing_key(context: Option<&RenameContext>) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"data-mover/local-listing/rename-evidence/v1\0");
+    if let Some(context) = context {
+        hasher.update(&[1]);
+        hasher.update(&context.fingerprint());
+    } else {
+        hasher.update(&[0]);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// Opens the directory at `relative` below `root`, one component at a time, refusing a

@@ -255,6 +255,7 @@ async fn nightly_lab_local_source_metadata_to_hdfs_policies() -> TestResult {
     )?;
     let source = connect_backend(data_mover::storage::BackendConfig::Local(
         LocalBackendConfig {
+            rename_context: None,
             read_chunk_bytes: None,
             write_chunk_bytes: None,
             root: local_root.clone(),

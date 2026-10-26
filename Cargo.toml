@@ -112,6 +112,10 @@ name = "local_write_benchmark"
 path = "tests/lab/tools/local_write_benchmark.rs"
 
 [[example]]
+name = "local_rename_evidence"
+path = "tests/lab/tools/local_rename_evidence.rs"
+
+[[example]]
 name = "storage_resume"
 path = "tests/lab/tools/storage_resume.rs"
 

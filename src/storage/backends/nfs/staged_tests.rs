@@ -959,6 +959,7 @@ pub(super) mod tests {
                 StoragePath::new("final.bin").unwrap_or_else(|error| panic!("{error}")),
             ),
             source: SourceDescriptor {
+                rename_evidence: None,
                 path: StoragePath::new("source.bin").unwrap_or_else(|error| panic!("{error}")),
                 kind: EntryKind::File,
                 size: Some(6),

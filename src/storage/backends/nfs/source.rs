@@ -126,6 +126,7 @@ impl NfsReadSourceAdapter {
         )
         .map_err(|_| role_failure(path, Operation::Observe, NfsProtocolFailure::protocol()))?;
         Ok(SourceDescriptor {
+            rename_evidence: None,
             path: path.clone(),
             kind: observed.kind,
             size: observed.size,

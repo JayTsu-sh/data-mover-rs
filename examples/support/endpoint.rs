@@ -173,6 +173,7 @@ pub async fn connect_with_options(
             data_mover::TransferConcurrency::new(4, 2)?,
         )?;
         BackendConfig::Local(LocalBackendConfig {
+            rename_context: None,
             read_chunk_bytes: block_size
                 .and_then(|bytes| usize::try_from(bytes).ok())
                 .and_then(NonZeroUsize::new),

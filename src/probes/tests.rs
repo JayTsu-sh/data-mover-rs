@@ -12,6 +12,7 @@ async fn local_connectivity_performs_io_and_clock_probe_creates_nothing() -> Tes
     let root = tempfile::tempdir()?;
     let slots = NonZeroUsize::new(1).ok_or("nonzero")?;
     let storage = connect_backend(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: root.path().to_path_buf(),
@@ -29,6 +30,7 @@ async fn remote_clock_composition_writes_observes_and_removes_its_probe() -> Tes
     let root = tempfile::tempdir()?;
     let slots = NonZeroUsize::new(1).ok_or("nonzero")?;
     let local = connect_backend(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: root.path().to_path_buf(),

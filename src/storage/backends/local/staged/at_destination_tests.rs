@@ -79,6 +79,7 @@ fn request(
     let prepare = PrepareRequest {
         final_destination: FinalDestination::new(StoragePath::new("dir/final.bin")?),
         source: SourceDescriptor {
+            rename_evidence: None,
             path: StoragePath::new("source.bin")?,
             kind: EntryKind::File,
             size: Some(size as u64),

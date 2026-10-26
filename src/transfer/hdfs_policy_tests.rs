@@ -28,6 +28,7 @@ async fn local_metadata_copies_mode_and_mtime_to_hdfs_without_replacing_principa
     )?;
     let source = crate::storage::connect_backend(crate::storage::BackendConfig::Local(
         crate::storage::LocalBackendConfig {
+            rename_context: None,
             read_chunk_bytes: None,
             write_chunk_bytes: None,
             root: root.path().into(),
@@ -380,6 +381,7 @@ async fn hdfs_to_local_copies_mode_mtime_and_verifies_positioned_content() -> Re
         let owner = std::fs::metadata(&baseline)?;
         let destination = crate::storage::connect_backend(crate::storage::BackendConfig::Local(
             crate::storage::LocalBackendConfig {
+                rename_context: None,
                 read_chunk_bytes: None,
                 write_chunk_bytes: None,
                 root: root.path().into(),

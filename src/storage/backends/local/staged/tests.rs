@@ -41,6 +41,7 @@ fn request(identity: &BackendIdentity, destination: &str) -> PrepareRequest {
     PrepareRequest {
         final_destination: FinalDestination::new(ok(StoragePath::new(destination))),
         source: SourceDescriptor {
+            rename_evidence: None,
             path: ok(StoragePath::new("source.bin")),
             kind: EntryKind::File,
             size: Some(9),

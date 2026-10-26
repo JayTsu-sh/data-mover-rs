@@ -2,7 +2,8 @@ use std::fmt;
 
 use super::{
     BackendIdentity, BackendKind, EntryKind, MAX_MODEL_FIELD_BYTES, MetadataObservations,
-    ModelValueError, ObjectHistory, SourceVersion, StoragePath, StorageTimestamp, VersionRecord,
+    ModelValueError, ObjectHistory, RenameEvidence, SourceVersion, StoragePath, StorageTimestamp,
+    VersionRecord,
 };
 
 #[path = "observation_codec.rs"]
@@ -143,22 +144,38 @@ impl SourceIdentity {
         })
     }
 
+    /// Builds a fixed identity directly in its inline storage, without a temporary byte buffer.
+    #[cfg(any(unix, test))]
+    pub(crate) fn from_u64_pair_le(
+        backend: BackendIdentity,
+        strength: IdentityStrength,
+        first: u64,
+        second: u64,
+    ) -> Self {
+        let mut bytes = [0; INLINE_STABLE_BYTES];
+        bytes[..8].copy_from_slice(&first.to_le_bytes());
+        bytes[8..16].copy_from_slice(&second.to_le_bytes());
+        Self {
+            backend,
+            strength,
+            stable_bytes: StableBytes::Inline { len: 16, bytes },
+        }
+    }
+
     /// Returns the advertised identity strength.
     #[must_use]
     pub const fn strength(&self) -> IdentityStrength {
         self.strength
     }
 
-    /// The identity bytes, only when they are a rename-stable key.
+    /// Borrows the bytes of an identity advertised as stable within its backend session.
     ///
-    /// `Some` for `StableWithinBackend` identities — the NFS file handle, the CIFS file id
-    /// (16 big-endian bytes, matching the legacy `NASEntry.file_handle` encoding) — which a
-    /// consumer may use as a `file_handle`-style join key across scans. `None` for
-    /// `PathScoped` and `VersionScoped` identities: their bytes change with the path or the
-    /// object version, so joining on them would turn every rename into a delete plus a create.
-    /// A `PathScoped` identity's bytes always include the path, so its identity key is never
-    /// shared by two paths; still, only `StableWithinBackend` identities are rename-stable join
-    /// keys.
+    /// NFS handles and CIFS file IDs may support cross-scan matching under their provider's
+    /// guarantees. Local Unix `dev + ino` identifies the runtime filesystem object: it is not
+    /// a persistent cross-remount rename key, because device IDs can change and inodes can be
+    /// reused. For Local cross-scan candidates use [`ObservedEntry::rename_evidence`] together
+    /// with its scan-level [`super::RenameContext`]. `PathScoped` and `VersionScoped` return
+    /// `None`; their bytes depend on the path or object version.
     #[must_use]
     pub fn stable_bytes(&self) -> Option<&[u8]> {
         matches!(self.strength, IdentityStrength::StableWithinBackend)
@@ -286,6 +303,7 @@ pub struct ObservedEntry {
     modified: Option<StorageTimestamp>,
     symlink_target: Option<SymlinkTarget>,
     source_identity: SourceIdentity,
+    rename_evidence: Option<RenameEvidence>,
     metadata: MetadataObservations,
     backend_fact: PrivateBackendEntryFacts,
     /// The key's history, or one segment of it, when the entry is a key of a versioned bucket
@@ -323,6 +341,7 @@ impl ObservedEntry {
             modified,
             symlink_target: None,
             source_identity,
+            rename_evidence: None,
             metadata: MetadataObservations::default(),
             backend_fact: PrivateBackendEntryFacts::None,
             history: None,
@@ -350,6 +369,7 @@ impl ObservedEntry {
             modified,
             symlink_target: Some(target),
             source_identity,
+            rename_evidence: None,
             metadata: MetadataObservations::default(),
             backend_fact: PrivateBackendEntryFacts::None,
             history: None,
@@ -376,6 +396,11 @@ impl ObservedEntry {
             BackendKind::Hdfs => PrivateBackendEntryFacts::Hdfs(bytes),
         };
         Ok(self)
+    }
+
+    pub(crate) fn with_rename_evidence(mut self, evidence: Option<RenameEvidence>) -> Self {
+        self.rename_evidence = evidence;
+        self
     }
 
     pub(crate) fn with_metadata(mut self, metadata: MetadataObservations) -> Self {
@@ -422,14 +447,22 @@ impl ObservedEntry {
     pub const fn identity_key(&self) -> EntryIdentityKey {
         self.identity_key
     }
-    /// The identity the source reported, with its [`IdentityStrength`].
+    /// The runtime identity reported by the source, with its [`IdentityStrength`].
     ///
-    /// Consumers that detect renames key on this: `StableWithinBackend` identities (NFS file
-    /// handle, CIFS file id) survive a rename and map to a `file_handle`-style join key, while
-    /// `PathScoped` ones must be treated as absent so the join falls back to paths.
+    /// Local Unix device/inode bytes are not a persistent rename key across remounts; see
+    /// [`SourceIdentity::stable_bytes`] and [`Self::rename_evidence`].
     #[must_use]
     pub const fn source_identity(&self) -> &SourceIdentity {
         &self.source_identity
+    }
+    /// Borrows optional cross-scan rename evidence, independent of runtime identity.
+    ///
+    /// Consumers must retain the scan's [`super::RenameContext`] and enforce its policy,
+    /// matching scope and scheme, unique pairing, equal kinds, and hard-link ambiguity
+    /// rejection. A candidate match says nothing about whether the content changed.
+    #[must_use]
+    pub const fn rename_evidence(&self) -> Option<&RenameEvidence> {
+        self.rename_evidence.as_ref()
     }
     /// Returns the owning backend kind.
     #[must_use]
@@ -498,6 +531,9 @@ impl ObservedEntry {
     }
 
     /// Encodes a lossless, versioned snapshot owned by data-mover.
+    ///
+    /// Rename evidence is included; its [`super::RenameContext`] belongs to the whole scan and
+    /// must be persisted separately. Without that context candidates cannot authorize matching.
     #[must_use]
     pub fn encode_snapshot(&self) -> EntrySnapshot {
         self.encode()

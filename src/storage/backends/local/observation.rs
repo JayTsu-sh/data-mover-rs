@@ -30,6 +30,7 @@ mod listed;
 
 pub(crate) struct LocalObservationAdapter {
     root: Arc<Dir>,
+    root_device: Option<u64>,
     identity: BackendIdentity,
     #[cfg(test)]
     probe: Arc<ObservationProbe>,
@@ -140,6 +141,7 @@ impl LocalObservationAdapter {
         let root = Dir::open_ambient_dir(&root_path, ambient_authority())
             .map_err(|error| session_io_failure(&error))?;
         Ok(Self {
+            root_device: super::rename::root_device(&root),
             root: Arc::new(root),
             identity,
             #[cfg(test)]
@@ -149,6 +151,7 @@ impl LocalObservationAdapter {
 
     pub(crate) fn from_root(root: Arc<Dir>, identity: BackendIdentity) -> Self {
         Self {
+            root_device: super::rename::root_device(&root),
             root,
             identity,
             #[cfg(test)]
@@ -240,6 +243,7 @@ impl LocalObservationAdapter {
             .ok()
             .and_then(|time| system_time_to_timestamp(time.into_std()));
         let source_identity = source_identity(&self.identity, &path, &metadata)?;
+        let rename_evidence = super::rename::evidence(&metadata, self.root_device);
         let facts = backend_facts(&metadata);
         let target = self.symlink_target(&path, kind).await?;
         let metadata_observations = self.observe_metadata(&path, kind, plan, &metadata).await?;
@@ -249,6 +253,7 @@ impl LocalObservationAdapter {
         }
         .map_err(|_| failure(&StoragePath::root(), FailureClass::Internal))?;
         let observed = observed
+            .with_rename_evidence(rename_evidence)
             .with_metadata(metadata_observations)
             .with_backend_fact_bytes(facts)
             .map_err(|_| failure(&StoragePath::root(), FailureClass::Internal))?;
@@ -729,21 +734,19 @@ pub(crate) fn entry_kind(metadata: &Metadata) -> Option<EntryKind> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // Shares the fallible signature with the path-based platform.
 pub(crate) fn source_identity(
     backend: &BackendIdentity,
     _path: &StoragePath,
     metadata: &Metadata,
 ) -> Result<SourceIdentity, StorageRoleFailure> {
     use cap_std::fs::MetadataExt as _;
-    let mut stable = Vec::with_capacity(16);
-    stable.extend_from_slice(&metadata.dev().to_le_bytes());
-    stable.extend_from_slice(&metadata.ino().to_le_bytes());
-    SourceIdentity::new(
+    Ok(SourceIdentity::from_u64_pair_le(
         backend.clone(),
         IdentityStrength::StableWithinBackend,
-        stable,
-    )
-    .map_err(|_| failure(&StoragePath::root(), FailureClass::Internal))
+        metadata.dev(),
+        metadata.ino(),
+    ))
 }
 
 #[cfg(not(unix))]

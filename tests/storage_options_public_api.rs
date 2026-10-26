@@ -9,6 +9,7 @@ use data_mover::transfer::TransferPolicy;
 fn public_role_and_transfer_modules_expose_the_supported_local_path()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = BackendConfig::Local(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: std::env::temp_dir(),

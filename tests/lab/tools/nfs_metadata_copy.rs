@@ -193,6 +193,7 @@ async fn connect(endpoint: &str) -> Result<Storage> {
     } else {
         fs::create_dir_all(endpoint)?;
         BackendConfig::Local(LocalBackendConfig {
+            rename_context: None,
             read_chunk_bytes: None,
             write_chunk_bytes: None,
             root: endpoint.into(),

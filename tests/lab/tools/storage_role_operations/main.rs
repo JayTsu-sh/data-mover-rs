@@ -201,6 +201,7 @@ async fn connect(backend: Backend, root: &str, depth: usize) -> Result<Storage, 
     let slots = NonZeroUsize::new(depth).ok_or("concurrency must be non-zero")?;
     let config = match backend {
         Backend::Local => BackendConfig::Local(LocalBackendConfig {
+            rename_context: None,
             read_chunk_bytes: None,
             write_chunk_bytes: None,
             root: root.into(),

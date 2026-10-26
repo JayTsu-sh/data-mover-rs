@@ -260,7 +260,7 @@ async fn directory_object_entries_survive_a_snapshot() -> TestResult {
             assert_eq!(own.kind(), EntryKind::File);
             for entry in &named {
                 let snapshot = entry.encode_snapshot();
-                assert_eq!(snapshot.as_bytes()[4], 7);
+                assert_eq!(snapshot.as_bytes()[4], 8);
                 let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes(), &identity())?;
                 assert_eq!(&rebuilt, *entry);
             }

@@ -155,6 +155,7 @@ async fn fixture() -> Result<SourceDescriptor> {
 async fn describe_local(root: &Path) -> Result<SourceDescriptor> {
     std::fs::write(root.join("f"), b"x")?;
     let local = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: root.to_path_buf(),

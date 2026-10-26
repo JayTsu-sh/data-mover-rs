@@ -15,6 +15,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 fn connect(root: &Path) -> TestResult<Storage> {
     let slots = NonZeroUsize::new(2).ok_or("nonzero")?;
     Ok(connect_backend(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: root.to_path_buf(),

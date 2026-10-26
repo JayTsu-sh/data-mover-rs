@@ -213,6 +213,7 @@ impl ReadSource for LocalReadSource {
             kind: observed.kind(),
             size: observed.size(),
             source_identity: observed.source_identity().clone(),
+            rename_evidence: observed.rename_evidence().copied(),
             backend_fact: None,
             content_version: Some(version),
             inline_timestamps: observed.metadata().timestamps().value().copied(),
