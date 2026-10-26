@@ -8,6 +8,7 @@
 //! handle itself as the child's descent hint (`storage::backends::nfs::listing`), and the cache held
 //! about 625 B per directory of a whole tree (P7 §12.7).
 
+use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use super::{
 use crate::model::{
     EntryKind, FailureClass, StoragePath, TimestampMetadata, without_unowned_set_id,
 };
+use crate::storage::artifacts::is_artifact_name;
 use crate::storage::backends::nfs::namespace::{
     NfsListedChild, NfsListingPages, NfsNamespaceObservation, NfsReadEnd, NfsReadFailure,
     NfsRestart, NfsUndescribedChild, inline_ownership, lossily_decoded, undescribed_child,
@@ -37,9 +39,8 @@ use crate::storage::backends::nfs::protocol::classify_error;
 use crate::storage::listing::child_path;
 
 /// One READDIRPLUS entry of a role listing, described straight from the reply: what the
-/// Namespace role lists, or why the entry cannot be described. READDIRPLUS may leave an entry's
-/// attributes out (`post_op_attr` is optional in v3): that entry cannot be described, its siblings
-/// still can.
+/// Namespace role lists, or why the entry cannot be described. `NFSv3`'s optional attributes and
+/// handle have already been completed by [`complete_v3_child`] when possible.
 ///
 /// The child's path is the listing contract's spelling ([`child_path`]) — the one the listing would
 /// otherwise respell a joined native path into — and nothing else is built per entry: no legacy
@@ -174,8 +175,8 @@ impl NFSStorage {
 /// The name ONTAP gives a volume's snapshot directory over NFS.
 const SNAPSHOT_DIRECTORY: &str = ".snapshot";
 
-/// LOOKUP and GETATTR of a child of the directory being read, for the one entry READDIRPLUS
-/// lists without attributes that the listing looks at again (see [`snapshot_directory`]).
+/// LOOKUP and GETATTR of a child of the directory being read, for READDIRPLUS entries that
+/// need their optional attributes or handle completed (see [`complete_v3_child`]).
 #[async_trait]
 pub(super) trait ChildLookup: Sync {
     /// LOOKUP of the child `name` of the directory being read.
@@ -225,35 +226,58 @@ enum Examined {
 ///   `NotFound`: it vanished), or the end of the read when the failure is the session's, a busy
 ///   server's or the directory handle's ([`lookup_failed`]).
 ///
-/// Every other entry goes on untouched: one with attributes (a real `.snapshot` a server
-/// describes, as DXN does), any other name, any entry over `NFSv4`.
-async fn snapshot_directory(
+/// Ordinary `NFSv3` entries need both attributes and a handle to be described. With a listed
+/// handle, GETATTR completes missing attributes in one request; without one, LOOKUP uses the
+/// directory being read, never a path resolved from the export root (MR !58). A LOOKUP may see
+/// a replacement, so both the handle and attributes come from that observation. Complete
+/// entries and `NFSv4` entries need no extra request. Unspellable names are never looked up.
+async fn complete_v3_child(
     directory: &StoragePath,
-    entry: nfs_rs::ReaddirplusEntry,
+    mut entry: nfs_rs::ReaddirplusEntry,
     version: NFSVersion,
     lookup: &dyn ChildLookup,
 ) -> Examined {
-    if !matches!(version, NFSVersion::NFSv3)
-        || entry.file_name != SNAPSHOT_DIRECTORY
-        || entry.attr.is_some()
-    {
+    if !matches!(version, NFSVersion::NFSv3) || (entry.attr.is_some() && !entry.handle.is_empty()) {
         return Examined::Child(entry);
     }
-    let child = Path::new(directory.as_str()).join(SNAPSHOT_DIRECTORY);
-    match looked_up(lookup).await {
-        Ok((_, attr)) if attr.type_ == FType3::NF3DIR as u32 => {
+    if lossily_decoded(&entry.file_name) {
+        return Examined::Failed(unnamed_child(directory, &entry.file_name));
+    }
+    let child = Path::new(directory.as_str()).join(&entry.file_name);
+    if matches!(entry.file_name.as_str(), "" | "." | "..")
+        || entry.file_name.contains('/')
+        || child_path(directory, &entry.file_name).is_err()
+    {
+        return Examined::Failed(undescribed_child(
+            directory,
+            &child,
+            "its name cannot be spelled",
+        ));
+    }
+    let snapshot = entry.file_name == SNAPSHOT_DIRECTORY && entry.attr.is_none();
+    let completed = if snapshot || entry.handle.is_empty() {
+        looked_up(lookup, &entry.file_name).await
+    } else {
+        lookup
+            .getattr(entry.handle.clone())
+            .await
+            .map(|attr| (entry.handle.clone(), attr))
+            .map_err(|error| (error, false))
+    };
+    match completed {
+        Ok((_, attr)) if snapshot && attr.type_ == FType3::NF3DIR as u32 => {
             info!(
                 path = %child.display(),
                 "NFSv3 listed .snapshot without attributes and it is a directory (presumably ONTAP's snapshot directory); hidden, not traversed"
             );
             Examined::Hidden
         }
-        Ok((handle, attr)) => Examined::Child(nfs_rs::ReaddirplusEntry {
-            attr: Some(attr),
+        Ok((handle, attr)) => {
+            entry.attr = Some(attr);
             // A copy: the LOOKUP reply is not kept alive by the listing.
-            handle: Bytes::copy_from_slice(&handle),
-            ..entry
-        }),
+            entry.handle = Bytes::copy_from_slice(&handle);
+            Examined::Child(entry)
+        }
         Err(failed) => lookup_failed(directory, &child, failed),
     }
 }
@@ -261,15 +285,19 @@ async fn snapshot_directory(
 /// A failed LOOKUP (`true`: sent with the directory's handle) or GETATTR (`false`) of a child.
 type LookupFailure = (NfsError, bool);
 
-/// The handle and attributes of the `.snapshot` of the directory being read: its LOOKUP, and a
+/// The handle and attributes of `name` in the directory being read: its LOOKUP, and a
 /// GETATTR of the handle it returned when that reply carries no attributes.
 async fn looked_up(
     lookup: &dyn ChildLookup,
+    name: &str,
 ) -> std::result::Result<(Bytes, nfs_rs::Attr), LookupFailure> {
-    let found = lookup
-        .lookup(SNAPSHOT_DIRECTORY)
-        .await
-        .map_err(|error| (error, true))?;
+    let found = lookup.lookup(name).await.map_err(|error| (error, true))?;
+    if found.fh.is_empty() {
+        return Err((
+            NfsError::Xdr("NFSv3 LOOKUP returned an empty file handle".into()),
+            false,
+        ));
+    }
     match found.attr {
         Some(attr) => Ok((found.fh, attr)),
         None => match lookup.getattr(found.fh.clone()).await {
@@ -300,7 +328,7 @@ fn lookup_failed(directory: &StoragePath, child: &Path, failed: LookupFailure) -
     let mut undescribed = undescribed_child(
         directory,
         child,
-        "the server omitted its attributes and looking it up failed",
+        "the server omitted attributes or a file handle and completing the entry failed",
     );
     undescribed.failure = failure.failure;
     Examined::Failed(undescribed)
@@ -309,8 +337,8 @@ fn lookup_failed(directory: &StoragePath, child: &Path, failed: LookupFailure) -
 /// Hands every READDIRPLUS entry of `entries` (the directory `directory`, read over `version`)
 /// to `pages` in the order the server sent it, until `entries` ends (`Complete`) or `pages` says
 /// to stop. It asks `pages` before taking every entry, so a stopped listing sends no further
-/// READDIRPLUS request (an entry already taken may still cost the LOOKUP of
-/// [`snapshot_directory`], which `lookup` sends in `directory`), and skips an entry `pages` has
+/// READDIRPLUS request (an entry already taken may still cost the LOOKUP / GETATTR of
+/// [`complete_v3_child`], which resolves children in `directory`), and skips an entry `pages` has
 /// already taken ([`NfsListingPages::first_sight`]) before looking at it.
 pub(super) async fn drain_readdirplus<S>(
     directory: &StoragePath,
@@ -335,7 +363,11 @@ where
         if !pages.first_sight(entry.fileid, &entry.file_name) {
             continue;
         }
-        let listed = match snapshot_directory(directory, entry, version, lookup).await {
+        if is_artifact_name(OsStr::new(&entry.file_name)) {
+            pages.hide();
+            continue;
+        }
+        let listed = match complete_v3_child(directory, entry, version, lookup).await {
             Examined::Child(entry) => listed_child(directory, &native, entry, owners_are_strings),
             Examined::Hidden => {
                 pages.hide();

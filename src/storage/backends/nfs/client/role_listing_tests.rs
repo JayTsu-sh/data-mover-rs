@@ -12,6 +12,9 @@ use super::super::{CACHE_WRITES, FType3, GLOBAL_CACHE, Time, role_metadata};
 use super::*;
 use crate::model::{FailureClass, Transience};
 
+#[path = "role_listing_completion_tests.rs"]
+mod completion;
+
 fn listed(name: &str, attr: Option<nfs_rs::Attr>, handle: &'static [u8]) -> NfsListedChild {
     listed_child(
         &StoragePath::new("dir").unwrap_or_else(|error| panic!("{error}")),
@@ -600,12 +603,11 @@ async fn a_looked_up_snapshot_that_is_not_a_directory_is_an_ordinary_child() {
     );
 }
 
-/// Nothing else is looked up or hidden: a `.snapshot` READDIRPLUS describes (a real directory,
-/// as DXN lists one) is an ordinary child, one with attributes but no handle fails as before, and
-/// any other name without attributes — ONTAP's CIFS spelling `~snapshot` included — fails alone.
-/// Over `NFSv4` even a `.snapshot` without attributes fails alone.
+/// Only a `.snapshot` originally lacking `NFSv3` attributes is hidden. Other incomplete entries
+/// are completed as ordinary children, including a `.snapshot` originally carrying attributes.
+/// `NFSv4` entries keep their existing behavior.
 #[tokio::test]
-async fn only_an_nfsv3_snapshot_without_attributes_is_looked_up() {
+async fn only_an_nfsv3_snapshot_without_attributes_is_hidden() {
     let (described, hidden) = drained(
         NFSVersion::NFSv3,
         siblings_around(entry(".snapshot", FType3::NF3DIR, b"fh-real")),
@@ -628,20 +630,25 @@ async fn only_an_nfsv3_snapshot_without_attributes_is_looked_up() {
         undescribed(".snapshot2"),
         entry(".snapshot", FType3::NF3DIR, b""),
     ];
-    let (failed, hidden) = drained(NFSVersion::NFSv3, others, &NoLookup).await;
+    let lookup = Answering::new(|| found(FType3::NF3DIR, true), || Ok(attrs(FType3::NF3DIR)));
+    let (completed, hidden) = drained(NFSVersion::NFSv3, others, &lookup).await;
     assert_eq!(
-        outcome(&failed),
+        outcome(&completed),
         (
-            vec![],
             vec![
                 "dir/other",
                 "dir/~snapshot",
                 "dir/.snapshot2",
                 "dir/.snapshot"
-            ]
+            ],
+            vec![]
         )
     );
     assert_eq!(hidden, 0);
+    assert_eq!(
+        lookup.asked(),
+        ["GETATTR fh", "GETATTR fh", "GETATTR fh", "LOOKUP .snapshot"]
+    );
     for version in [NFSVersion::NFSv4p0, NFSVersion::NFSv4p1] {
         let (v4, hidden) = drained(version, vec![ontap_snapshot()], &NoLookup).await;
         assert_eq!(outcome(&v4), (vec![], vec!["dir/.snapshot"]), "{version:?}");

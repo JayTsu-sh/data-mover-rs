@@ -209,8 +209,9 @@ pub(crate) trait NfsNamespaceProtocol: Send + Sync {
     /// `pages` says to stop. It checks
     /// [`NfsListingPages::stopping`] before every child, so a stopped listing sends no further
     /// READDIRPLUS request (a child already taken may still cost the LOOKUP / GETATTR of an
-    /// `NFSv3` `.snapshot`, P7 C7b), but it never abandons a request in flight (an NFSv4.1 session fences the slot
-    /// of a cancelled request). It holds no more than the reply it is working through, and
+    /// incomplete `NFSv3` child, including `.snapshot`, P7 C7b), but it never abandons a request
+    /// in flight (an NFSv4.1 session fences the slot of a cancelled request).
+    /// It holds no more than the reply it is working through, and
     /// caches nothing.
     async fn read_directory(
         &self,

@@ -188,11 +188,16 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
     - 真机（C7c）：ONTAP v3 / v4.0 / v4.1、DXN-2 v3 / v4.0 上 5 万文件目录与 base 逐行相同；`ss -K` 掐断连接时只有 v4.1 把
       `Retry` 交给列举（续读），v3 / v4.0 由 nfs-rs 自己重连重发；注入式故障（首页后截断回复再报 `ConnectionReset`）下五种都
       读完、0 重复。见 P7 设计 §14 C7c。
-- role `List`（`drain_readdirplus` → `listed_child`：P7 C10 起直接从 READDIRPLUS 项描述子项，不再经 legacy `NASEntry` / `PathBuf` / 扩展名，属主 / 模式 / 时间语义不变）里某项描述不出来 ——
-  READDIRPLUS 没带属性（v3 `post_op_attr` 可省；v4 的 fattr4 解不出时 nfs-rs 也给 None）、没带文件句柄（v3
-  `post_op_fh3` FALSE、v4 属性里没有 `FATTR4_FILEHANDLE`）——
-  报成该子项自己的 `Protocol` / Unknown 条目失败，兄弟照常，列举 `Partial`（之前整个目录失败；P7 评审现存问题 2）。
-  只有 LOOKUP 目录、READDIRPLUS 流本身出错才让整个列举失败。唯一的例外是下一条的 `.snapshot`。
+- role `List`（`drain_readdirplus` → `complete_v3_child` → `listed_child`）在描述 NFSv3 子项前补齐协议允许省略的核心属性与句柄：
+  - 两者齐全 → 直接描述，不增加 RPC；有句柄、缺属性 → GETATTR 该子项句柄；缺句柄 → 用**本次 READDIRPLUS 的目录句柄**
+    LOOKUP 子项名字，回复仍缺属性则 GETATTR 返回的句柄。不得从 export 根重新解析子项 basename（MR !58）。
+  - LOOKUP 可能观察到被替换的对象，必须使用这次查询对应的句柄和属性，不能沿用旧列举项属性。
+  - 补齐是形成核心条目所需的 I/O，不是可选 metadata family 的额外观察；保持逐项、背压有界，每个子项开始前检查取消，
+    已开始的补齐允许完成。重放项、隐藏 artifact、不可信名字不补查。列举不写全局句柄缓存。
+  - NOENT、ACCES、子项 stale 等保留具体状态和子项失败分类，兄弟照常；连接、节流及 LOOKUP 使用的父目录句柄失效
+    交给已有列举恢复预算处理。NFSv4 缺属性/句柄的原有失败语义不变。
+  - 2026-10-26 抓包确认 `10.128.133.31:/nfs/lisa_long_nfs` 根目录的 `mig_hsxl` / `ccma` 同时返回
+    `attributes_follow=0`、`handle_follow=0`，READDIRPLUS 状态为 `NFS3_OK`；nfs-rs 0.8.6 保留该信息，补齐由本项目承担。
 - **ONTAP 的 `.snapshot`（P7 C7b，用户 2026-09-26 定，`role_listing.rs` 的 `snapshot_directory`）**：ONTAP 9.19.1 的
   NFSv3 READDIRPLUS 在卷根列出 `.snapshot`，**带句柄、不带属性**；NFSv4 READDIR 不列它。真机实测：它与卷根 **fsid 相同**
   （只有其中每个快照的 fsid 不同，v3 `0x<n>80231f3a`），从任何目录 LOOKUP 都是同一个对象（fileid = 卷根 + 3，mode 0777，
@@ -205,8 +210,8 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   - 查失败 → 该子项失败，分类与状态取自 LOOKUP / GETATTR（`NOENT` 即 `NotFound` = 消失）；会话（`Connectivity`）、
     服务端忙（`Throttled`）、LOOKUP 用的目录句柄失效（`STALE` / `BADHANDLE`）则按 READDIRPLUS 失败结束
     这次读取（首页前从头重读 / 退避 / 重发，首页后 `Interrupted`）。
-  - 带属性的 `.snapshot`（例如 DXN 上真建的目录）、其他名字（含 CIFS 拼法 `~snapshot`，NFS 上两种版本都 `NOENT`）、
-    缺句柄但有属性的项、NFSv4 一律照旧。
+  - 带属性的 `.snapshot`（例如 DXN 上真建的目录）及其他名字按普通子项处理：缺失核心字段时补齐，但不因为补查后是目录
+    而隐藏。NFSv4 一律照旧。
   - 结果：ONTAP 同一导出 v3 与 v4.x 列出同样的条目、零失败；每次列卷根多一次 LOOKUP（和一条 `info!`）。
   - **残余风险**：某台服务器对一个**真实的**、名叫 `.snapshot` 的目录也不给属性（NFSv3 允许任何项省略；例如 Linux knfsd
     对拼不出句柄的挂载点），它会被隐藏、不迁移 —— 只留 `info!` 与 `internal_hidden` 计数。ONTAP 上不会发生（名字保留），
