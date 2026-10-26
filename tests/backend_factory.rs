@@ -75,6 +75,7 @@ async fn explicit_factory_handles_source_and_destination_without_pair_dispatch()
     let destination_root = tempfile::tempdir()?;
     tokio::fs::write(source_root.path().join("payload.bin"), b"protocol-neutral").await?;
     let source = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: source_root.path().to_path_buf(),
@@ -83,6 +84,7 @@ async fn explicit_factory_handles_source_and_destination_without_pair_dispatch()
     }))
     .await?;
     let destination = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: destination_root.path().to_path_buf(),
@@ -106,6 +108,7 @@ async fn explicit_factory_handles_source_and_destination_without_pair_dispatch()
 
 fn local_config(root: &std::path::Path) -> Result<BackendConfig, Box<dyn std::error::Error>> {
     Ok(BackendConfig::Local(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: root.to_path_buf(),

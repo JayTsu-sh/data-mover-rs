@@ -10,6 +10,7 @@ mod metadata_observation;
 mod metadata_requirements;
 pub(crate) mod observation;
 mod ownership;
+mod rename;
 mod source_version;
 pub use history::{HistoryOrder, MAX_HISTORY_RECORDS, ObjectHistory, RecordKind, VersionRecord};
 pub use metadata_observation::{
@@ -25,6 +26,9 @@ pub use observation::{
     SourceIdentity, SymlinkTarget, SymlinkTargetEncoding,
 };
 pub(crate) use ownership::without_unowned_set_id;
+pub use rename::{
+    RenameContext, RenameEvidence, RenamePolicy, RenameQuality, RenameScheme, RenameScope,
+};
 pub use source_version::SourceVersion;
 
 /// A failure to construct a neutral model value.

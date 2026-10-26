@@ -147,8 +147,9 @@ removal remain explicit results, not silent success.
 
 ### One entry-snapshot format during development
 
-`EntrySnapshot` uses `DMES` plus version byte **7**, for entries with and without history. A
-snapshot contains one complete history segment and its observations. v4, v5 and v6 are rejected
+`EntrySnapshot` uses `DMES` plus version byte **8**, for entries with and without history. A
+snapshot contains one complete history segment, its observations, and optional rename evidence.
+The scan-wide rename context is persisted separately. v4 through v7 are rejected
 with `UnsupportedVersion`; the caller treats them as no previous observation and rescans.
 
 Every format change increments the version byte, including an added field. Golden-byte tests pin

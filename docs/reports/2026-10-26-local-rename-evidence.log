@@ -1,0 +1,87 @@
+	linux-vdso.so.1 (0x00007ffc7ff57000)
+	libgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007f91d097f000)
+	libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x00007f91d0896000)
+	libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f91cbc00000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007f91d09c6000)
+cb4ccd45dc51146bb6f4b3a709b39222b667884f44a7fa5a68e563dcb38a2046  local_rename_evidence
+PROFILE cifs-serverino host=ubuntu-24c kernel=6.8.0-142-generic
+/mnt/data-mover-rename-20261026T070626Z-3883306/mount cifs //10.128.61.200/ontap_lisaauto_cifs rw,relatime,vers=3.1.1,cache=none,upcall_target=app,username=lisauser,uid=0,noforceuid,gid=0,noforcegid,addr=10.128.61.200,file_mode=0755,dir_mode=0755,soft,nounix,serverino,mapposix,rsize=1048576,wsize=1048576,bsize=1048576,echo_interval=60,nosharesock,actimeo=0,closetimeo=1
+PASS stat/list/traversal/describe/snapshot path=original.txt evidence=Some("0a0762580001bc8918e20288daa69f04")
+PASS stat/list/traversal/describe/snapshot path=nested/renamed.txt evidence=Some("0a0762580001bc8918e20288daa69f04")
+PASS unique same-kind rename candidates=1
+PASS rename + independent content change original=Some("0a0762580001bc8918e20288daa69f04") renamed=Some("0a0762580001bc8918e20288daa69f04")
+PASS changed content independently transferred and read back
+PASS hardlink ambiguity falls back: candidate_count=2 usable_unique=false
+PASS simulated same-token file/directory collision rejected
+PASS scope mismatch + policy gate + independent entry kind check
+PASS runtime source replacement read + observe_bound
+PASS Direct hardlink alias rejected before truncation
+PASS stat/list/traversal/describe/snapshot path=remount.txt evidence=Some("0a0762310001bc9218e20288e047d180")
+PASS before checkpoint_saved dev=91 all_handles_close_on_process_exit
+RESULT phase=Before PASS
+/mnt/data-mover-rename-20261026T070626Z-3883306/mount cifs //10.128.61.200/ontap_lisaauto_cifs rw,relatime,vers=3.1.1,cache=none,upcall_target=app,username=lisauser,uid=0,noforceuid,gid=0,noforcegid,addr=10.128.61.200,file_mode=0755,dir_mode=0755,soft,nounix,serverino,mapposix,rsize=1048576,wsize=1048576,bsize=1048576,echo_interval=60,nosharesock,actimeo=0,closetimeo=1
+PASS stat/list/traversal/describe/snapshot path=remounted-renamed.txt evidence=Some("0a0762310001bc9218e20288e047d180")
+PASS full-remount dev_before=91 dev_after=92 candidate_same=true policy_allows=true usable=true runtime_key_same=false
+RESULT phase=After PASS
+PROFILE cifs-serverino PASS cleaned=true full_unmount=true separate_processes=true
+PROFILE cifs-noserverino host=ubuntu-24c kernel=6.8.0-142-generic
+/mnt/data-mover-rename-20261026T070626Z-3883306/mount cifs //10.128.61.200/ontap_lisaauto_cifs rw,relatime,vers=3.1.1,cache=none,upcall_target=app,username=lisauser,uid=0,noforceuid,gid=0,noforcegid,addr=10.128.61.200,file_mode=0755,dir_mode=0755,soft,nounix,mapposix,rsize=1048576,wsize=1048576,bsize=1048576,echo_interval=60,nosharesock,actimeo=0,closetimeo=1
+PASS stat/list/traversal/describe/snapshot path=original.txt evidence=Some("000000000000ce4c18e20289fca0a6bc")
+PASS stat/list/traversal/describe/snapshot path=nested/renamed.txt evidence=Some("000000000000ce4c18e20289fca0a6bc")
+PASS unique same-kind rename candidates=0
+PASS rename + independent content change original=Some("000000000000ce4c18e20289fca0a6bc") renamed=Some("000000000000ce4c18e20289fca0a6bc")
+PASS changed content independently transferred and read back
+PASS hardlink ambiguity falls back: candidate_count=1 usable_unique=false
+PASS simulated same-token file/directory collision rejected
+PASS scope mismatch + policy gate + independent entry kind check
+PASS runtime source replacement read + observe_bound
+LIMITATION unstable-inode profile hardlink_same_inode=false; Direct hardlink safety cannot be guaranteed by dev+ino
+PASS stat/list/traversal/describe/snapshot path=remount.txt evidence=Some("000000000000ce6118e2028a02c44ee0")
+PASS before checkpoint_saved dev=91 all_handles_close_on_process_exit
+RESULT phase=Before PASS
+/mnt/data-mover-rename-20261026T070626Z-3883306/mount cifs //10.128.61.200/ontap_lisaauto_cifs rw,relatime,vers=3.1.1,cache=none,upcall_target=app,username=lisauser,uid=0,noforceuid,gid=0,noforcegid,addr=10.128.61.200,file_mode=0755,dir_mode=0755,soft,nounix,mapposix,rsize=1048576,wsize=1048576,bsize=1048576,echo_interval=60,nosharesock,actimeo=0,closetimeo=1
+PASS stat/list/traversal/describe/snapshot path=remounted-renamed.txt evidence=Some("000000000000ce7018e2028a02c44ee0")
+PASS full-remount dev_before=91 dev_after=92 candidate_same=false policy_allows=false usable=false runtime_key_same=false
+RESULT phase=After PASS
+PROFILE cifs-noserverino PASS cleaned=true full_unmount=true separate_processes=true
+PROFILE nfs3 host=ubuntu-24c kernel=6.8.0-142-generic
+/mnt/data-mover-rename-20261026T070626Z-3883306/mount nfs 10.128.61.200:/ontap_lisaauto_nfs rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,hard,nosharecache,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=10.128.61.200,mountvers=3,mountport=635,mountproto=tcp,local_lock=none,addr=10.128.61.200
+PASS stat/list/traversal/describe/snapshot path=original.txt evidence=None
+PASS stat/list/traversal/describe/snapshot path=nested/renamed.txt evidence=None
+PASS unique same-kind rename candidates=0
+PASS rename + independent content change original=None renamed=None
+PASS changed content independently transferred and read back
+PASS hardlink ambiguity falls back: candidate_count=0 usable_unique=false
+PASS scope mismatch + policy gate + independent entry kind check
+PASS runtime source replacement read + observe_bound
+PASS Direct hardlink alias rejected before truncation
+PASS stat/list/traversal/describe/snapshot path=remount.txt evidence=None
+PASS before checkpoint_saved dev=91 all_handles_close_on_process_exit
+RESULT phase=Before PASS
+/mnt/data-mover-rename-20261026T070626Z-3883306/mount nfs 10.128.61.200:/ontap_lisaauto_nfs rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,hard,nosharecache,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=10.128.61.200,mountvers=3,mountport=635,mountproto=tcp,local_lock=none,addr=10.128.61.200
+PASS stat/list/traversal/describe/snapshot path=remounted-renamed.txt evidence=None
+PASS full-remount dev_before=91 dev_after=92 candidate_same=true policy_allows=false usable=false runtime_key_same=false
+RESULT phase=After PASS
+PROFILE nfs3 PASS cleaned=true full_unmount=true separate_processes=true
+PROFILE nfs41 host=ubuntu-24c kernel=6.8.0-142-generic
+/mnt/data-mover-rename-20261026T070626Z-3883306/mount nfs4 10.128.61.200:/ontap_lisaauto_nfs rw,relatime,vers=4.1,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,hard,nosharecache,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.131.9.10,local_lock=none,addr=10.128.61.200
+PASS stat/list/traversal/describe/snapshot path=original.txt evidence=None
+PASS stat/list/traversal/describe/snapshot path=nested/renamed.txt evidence=None
+PASS unique same-kind rename candidates=0
+PASS rename + independent content change original=None renamed=None
+PASS changed content independently transferred and read back
+PASS hardlink ambiguity falls back: candidate_count=0 usable_unique=false
+PASS scope mismatch + policy gate + independent entry kind check
+PASS runtime source replacement read + observe_bound
+PASS Direct hardlink alias rejected before truncation
+PASS stat/list/traversal/describe/snapshot path=remount.txt evidence=None
+PASS before checkpoint_saved dev=92 all_handles_close_on_process_exit
+RESULT phase=Before PASS
+/mnt/data-mover-rename-20261026T070626Z-3883306/mount nfs4 10.128.61.200:/ontap_lisaauto_nfs rw,relatime,vers=4.1,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,hard,nosharecache,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.131.9.10,local_lock=none,addr=10.128.61.200
+PASS stat/list/traversal/describe/snapshot path=remounted-renamed.txt evidence=None
+PASS full-remount dev_before=92 dev_after=93 candidate_same=true policy_allows=false usable=false runtime_key_same=false
+RESULT phase=After PASS
+PROFILE nfs41 PASS cleaned=true full_unmount=true separate_processes=true
+RESULT mounted CIFS serverino/noserverino + NFSv3/v4.1 PASS
+/mnt/nfs_src nfs4 10.128.61.200:/
+PASS no owned mounts, mount directories, credentials, binaries, scripts or remote state remain

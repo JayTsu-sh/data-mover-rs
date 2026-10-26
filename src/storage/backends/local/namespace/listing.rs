@@ -124,6 +124,7 @@ impl LocalNamespace {
         read: usize,
     ) -> Result<PageRead, StorageRoleFailure> {
         let reader = PageReader {
+            root_device: self.root_device,
             directory: request.path.clone(),
             native: native.to_path_buf(),
             hooks: self.hooks(),
@@ -164,6 +165,7 @@ async fn hand_over(sink: &PageSink, request: &ListRequest, page: ListingPage) ->
 
 /// What one blocking page read needs, owned so it can move onto a blocking thread.
 struct PageReader {
+    root_device: Option<u64>,
     directory: StoragePath,
     native: PathBuf,
     hooks: Hooks,
@@ -212,7 +214,7 @@ impl PageReader {
                 continue;
             }
             self.hooks.before_describe(&self.native, &name);
-            match describe_child(identity, &self.directory, &name, &entry) {
+            match describe_child(identity, &self.directory, &name, &entry, self.root_device) {
                 Ok(Ok(descriptor)) => described.push(descriptor),
                 Ok(Err(failure)) => undescribed.push(failure),
                 Err(session) => break PageEnd::Failed(session),
@@ -238,6 +240,7 @@ fn describe_child(
     directory: &StoragePath,
     name: &OsStr,
     entry: &DirEntry,
+    root_device: Option<u64>,
 ) -> Result<Result<SourceDescriptor, ChildFailure>, StorageRoleFailure> {
     let Some(path) = name
         .to_str()
@@ -261,7 +264,7 @@ fn describe_child(
             return child_failure(directory, io_failure(&path, Operation::Traverse, &error));
         }
     };
-    match describe(identity, path, &metadata, Operation::Traverse) {
+    match describe(identity, path, &metadata, Operation::Traverse, root_device) {
         Ok(descriptor) => Ok(Ok(descriptor)),
         Err(failure) => child_failure(directory, failure),
     }

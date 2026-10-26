@@ -381,6 +381,7 @@ pub(super) fn descriptor(
         return Err(invalid_entry(&path));
     };
     Ok(SourceDescriptor {
+        rename_evidence: None,
         path,
         kind: entry.kind,
         size: entry.size,

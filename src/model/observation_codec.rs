@@ -9,7 +9,7 @@
 //! ```text
 //! "DMES" | version u8 | backend kind u8 | path | kind u8 | symlink target | size | modified |
 //! identity strength u8 | endpoint fingerprint [4] | identity bytes | 2 | metadata |
-//! backend facts | history section (history_codec) | identity key [32]
+//! backend facts | history section (history_codec) | rename evidence | identity key [32]
 //! ```
 //!
 //! The backend identity is not stored — every entry of one scan shares it, and the caller supplies
@@ -22,12 +22,12 @@ use super::{
     SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding,
 };
 use crate::model::metadata_observation;
-use crate::model::{SpecialFileKind, TimePrecision};
+use crate::model::{RenameEvidence, RenameScheme, SpecialFileKind, TimePrecision};
 
 const MAGIC: &[u8; 4] = b"DMES";
-/// The current format (P7 C11b: v6 and its per-version entries gave way to one entry per key with
-/// its history section). Bump on **any** change to the layout, and update the golden bytes.
-pub(super) const VERSION: u8 = 7;
+/// The current format: v8 adds independent optional rename evidence after the history section.
+/// Bump on **any** layout change and update the golden bytes.
+pub(super) const VERSION: u8 = 8;
 
 impl PrivateBackendEntryFacts {
     fn encode(&self, output: &mut Vec<u8>) {
@@ -72,6 +72,13 @@ impl ObservedEntry {
         metadata_observation::encode(&self.metadata, &mut output);
         self.backend_fact.encode(&mut output);
         history_codec::encode(&mut output, self.history.as_deref());
+        match self.rename_evidence {
+            Some(evidence) => {
+                output.push(evidence.scheme().tag());
+                output.extend_from_slice(evidence.as_bytes());
+            }
+            None => output.push(0),
+        }
         output.extend_from_slice(self.identity_key.as_bytes());
         EntrySnapshot(output)
     }
@@ -145,6 +152,7 @@ pub(super) fn decode_snapshot(
     let metadata = metadata_observation::decode(&mut cursor)?;
     let backend_fact = decode_facts(&mut cursor, backend_kind)?;
     let history = history_codec::decode(&mut cursor, backend)?;
+    let rename_evidence = decode_rename_evidence(&mut cursor)?;
     let identity_key = decode_identity_key(&mut cursor, bytes.len(), &source_identity)?;
     Ok(ObservedEntry {
         identity_key,
@@ -155,10 +163,24 @@ pub(super) fn decode_snapshot(
         modified,
         symlink_target,
         source_identity,
+        rename_evidence,
         metadata,
         backend_fact,
         history,
     })
+}
+
+fn decode_rename_evidence(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<RenameEvidence>, SnapshotDecodeError> {
+    let tag = cursor.byte()?;
+    if tag == 0 {
+        return Ok(None);
+    }
+    let scheme = RenameScheme::from_tag(tag).ok_or(SnapshotDecodeError::Malformed)?;
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(cursor.take(16)?);
+    Ok(Some(RenameEvidence::from_encoded(scheme, bytes)))
 }
 
 /// The stored identity key, which must end the snapshot and match the key `source_identity`

@@ -72,6 +72,7 @@ async fn endpoint(
 ) -> Result<data_mover::storage::Storage, Error> {
     let config = match transport {
         Transport::Mounted => BackendConfig::Local(LocalBackendConfig {
+            rename_context: None,
             read_chunk_bytes: NonZeroUsize::new(args.chunk_bytes),
             write_chunk_bytes: None,
             root: root.into(),

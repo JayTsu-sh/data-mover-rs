@@ -12,6 +12,7 @@ async fn an_explicit_local_backend_connects_with_its_canonical_identity()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let config = BackendConfig::Local(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: root.path().to_path_buf(),

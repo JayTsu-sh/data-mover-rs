@@ -9,6 +9,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 async fn local(path: &std::path::Path) -> Result<Storage> {
     let slots = NonZeroUsize::new(2).ok_or("nonzero")?;
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: path.into(),

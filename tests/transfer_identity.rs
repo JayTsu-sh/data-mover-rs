@@ -17,6 +17,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 async fn local(root: &Path) -> TestResult<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: root.to_path_buf(),

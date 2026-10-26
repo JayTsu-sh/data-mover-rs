@@ -31,6 +31,7 @@ fn path(value: &str) -> StoragePath {
 
 fn descriptor(value: &str, kind: EntryKind) -> SourceDescriptor {
     SourceDescriptor {
+        rename_evidence: None,
         path: path(value),
         kind,
         size: (kind == EntryKind::File).then_some(3),

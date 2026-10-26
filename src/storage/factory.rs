@@ -2,13 +2,16 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use crate::model::{BackendIdentity, BackendKind, BackendSessionFailure};
+use crate::model::{BackendIdentity, BackendKind, BackendSessionFailure, RenameContext};
 use crate::storage::{HdfsConfig, Storage, backends, endpoint};
 use crate::url_redact::redact_storage_url;
 
 #[derive(Clone, Debug)]
 pub struct LocalBackendConfig {
     pub root: PathBuf,
+    /// Scan-wide dataset scope and explicit policy for Local rename evidence.
+    /// `None` retains candidate-only behavior without claiming a persistent dataset scope.
+    pub rename_context: Option<RenameContext>,
     pub read_concurrency: NonZeroUsize,
     pub write_concurrency: NonZeroUsize,
     /// Preferred read size, capped by the Local backend ceiling. `None` uses that ceiling.

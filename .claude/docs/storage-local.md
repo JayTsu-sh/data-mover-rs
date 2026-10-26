@@ -29,8 +29,24 @@ C:\Windows\path  (Windows)
 
 完整提取：
 - `uid` / `gid` / `mode` (`MetadataExt::mode()`)。
-- `ino` (inode number，作为 join key)。
+- `dev + ino`（运行期对象校验和传输恢复绑定，不保证跨重新挂载稳定）。
 - `mtime` / `atime` / `ctime` (走 time_util)。
+
+### 跨扫描改名证据
+
+Unix Local 为已有 metadata 中包含可表示创建时间的条目提供独立的 `RenameEvidence`：
+`ino_u64_be || btime_ns_i64_be`，固定 16 字节内联保存。列举、Stat、直接观察和读取描述符
+复用同一编码，不逐文件追加 metadata 系统调用。创建时间缺失或溢出时没有候选；合法零值和负值保留。
+连接时缓存根目录设备号，子项属于其他设备（嵌套挂载）时不生成候选。Windows 不提供此方案。
+
+证据质量为启发式，默认只提供候选。调用方若明确接受启发式匹配，须通过
+`LocalBackendConfig.rename_context` 提供稳定的数据集域与 `AllowHeuristic` 策略；更换共享或介质时
+必须轮换域或 epoch。该上下文通过 Namespace 暴露，并参与续扫指纹；持久化扫描基线的消费方也须
+单独保存上下文。硬链接和其他重复候选必须整体按歧义回退，改名后内容变化仍须独立判断。
+
+本地挂载 CIFS/NFS 同样走 Local 角色。不得因挂载类型或 `serverino` 自动信任候选：CIFS 同一共享
+覆盖多个服务端文件系统时可能发生 inode 冲突，创建时间也可修改；NFS 挂载没有 btime 时回退路径匹配。
+`SourceIdentity` 及其恢复和 Direct 同文件保护继续使用原来的 `dev + ino`，不使用改名候选替代。
 
 ### 作为目的端设 owner
 

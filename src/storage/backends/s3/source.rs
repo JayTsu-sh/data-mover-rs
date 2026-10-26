@@ -192,6 +192,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
         let source_identity = object_identity(&self.identity, path, &facts)
             .map_err(|e| entry(path, Operation::Observe, e.to_string()))?;
         Ok(SourceDescriptor {
+            rename_evidence: None,
             path: path.clone(),
             kind: EntryKind::File,
             size: Some(facts.size),

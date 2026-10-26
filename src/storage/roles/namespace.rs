@@ -6,7 +6,8 @@ use async_trait::async_trait;
 
 use super::StorageRoleFailure;
 use crate::model::{
-    EntryOperationFailure, FailureClass, Operation, StoragePath, SymlinkTarget, Transience,
+    EntryOperationFailure, FailureClass, Operation, RenameContext, StoragePath, SymlinkTarget,
+    Transience,
 };
 use crate::storage::SourceDescriptor;
 use crate::storage::listing::{ListRequest, ListingStream};
@@ -60,6 +61,13 @@ pub trait Namespace: Send + Sync {
     /// The default is for backends with no configurable listing semantics. This method does no I/O.
     fn listing_resume_key(&self) -> &[u8] {
         &[0]
+    }
+
+    /// Optional scan-wide context for interpreting rename evidence returned by this namespace.
+    /// Consumers persist this once with a scan, not once per entry. Its policy never grants
+    /// permission to skip content verification or to delete a source or destination entry.
+    fn rename_context(&self) -> Option<&RenameContext> {
+        None
     }
 
     /// Reads the text a symlink itself stores, without resolving or following it.

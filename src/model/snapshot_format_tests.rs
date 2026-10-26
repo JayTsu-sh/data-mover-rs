@@ -14,9 +14,9 @@ use crate::model::{
     ObjectTag, RecordKind, TimePrecision, TimestampMetadata, VersionRecord,
 };
 
-const NFS_FILE: &str = include_str!("../../tests/data/snapshot/v7-nfs-file.hex");
-const S3_HISTORY: &str = include_str!("../../tests/data/snapshot/v7-s3-history.hex");
-const S3_SEGMENT: &str = include_str!("../../tests/data/snapshot/v7-s3-history-segment.hex");
+const NFS_FILE: &str = include_str!("../../tests/data/snapshot/v8-nfs-file.hex");
+const S3_HISTORY: &str = include_str!("../../tests/data/snapshot/v8-s3-history.hex");
+const S3_SEGMENT: &str = include_str!("../../tests/data/snapshot/v8-s3-history-segment.hex");
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut hex, byte| {
@@ -146,9 +146,9 @@ fn s3_segment() -> ObservedEntry {
 
 fn fixtures() -> [(&'static str, ObservedEntry, &'static str); 3] {
     [
-        ("v7-nfs-file", nfs_file(), NFS_FILE),
-        ("v7-s3-history", s3_history(), S3_HISTORY),
-        ("v7-s3-history-segment", s3_segment(), S3_SEGMENT),
+        ("v8-nfs-file", nfs_file(), NFS_FILE),
+        ("v8-s3-history", s3_history(), S3_HISTORY),
+        ("v8-s3-history-segment", s3_segment(), S3_SEGMENT),
     ]
 }
 
@@ -181,9 +181,9 @@ fn the_current_format_is_pinned_byte_for_byte() {
 
 #[test]
 fn another_version_byte_is_unsupported_never_misread() {
-    assert_eq!(VERSION, 7);
+    assert_eq!(VERSION, 8);
     for (name, entry, golden) in fixtures() {
-        for version in [4, 5, 6, 8, 0, u8::MAX] {
+        for version in [4, 5, 6, 7, 9, 0, u8::MAX] {
             let mut bytes = unhex(golden);
             bytes[4] = version;
             assert_eq!(
@@ -199,7 +199,7 @@ fn another_version_byte_is_unsupported_never_misread() {
 /// without a history encodes before its identity key (its one `0` byte).
 fn history_at(entry: &ObservedEntry) -> usize {
     let bare = entry.clone().with_history(None).encode_snapshot();
-    bare.as_bytes().len() - 32 - 1
+    bare.as_bytes().len() - 32 - 1 - 1
 }
 
 #[test]

@@ -247,12 +247,12 @@ async fn native_copies_by_id_arrive_in_order_and_resume_into_one_version() -> Te
         Some(v2.clone())
     );
 
-    let outcome = cut_then_resume(
+    let outcome = Box::pin(cut_then_resume(
         &protocol,
         by_id("cut", "s1")?,
         by_id("cut", "s1")?,
         v1.len(),
-    )
+    ))
     .await?;
     let resumed = version(&outcome)?.to_string();
     clean_versions(&protocol, "cut", 1, Some(&resumed)).await?;
@@ -353,12 +353,12 @@ async fn an_interrupted_and_resumed_copy_adds_one_version() -> TestResult {
     let data = payload(3 * PART, 2);
     let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["resumed"]).await;
     let policy = TransferPolicy::Checkpointed;
-    let outcome = cut_then_resume(
+    let outcome = Box::pin(cut_then_resume(
         &protocol,
         request(&protocol, "resumed", policy)?,
         request(&protocol, "resumed", policy)?,
         data.len(),
-    )
+    ))
     .await?;
     assert_eq!(outcome.blake3, Some(*blake3::hash(&data).as_bytes()));
     clean_versions(&protocol, "resumed", 1, Some(version(&outcome)?)).await?;
@@ -435,7 +435,7 @@ async fn an_interrupted_id_copy_resumes_into_one_version() -> TestResult {
         request(&protocol, "history-cut", TransferPolicy::Checkpointed)
             .map(|request| request.with_source_version(SourceVersion::Id("s1".into())))
     };
-    let outcome = cut_then_resume(&protocol, by_id()?, by_id()?, v1.len()).await?;
+    let outcome = Box::pin(cut_then_resume(&protocol, by_id()?, by_id()?, v1.len())).await?;
     assert!(outcome.reused_bytes > 0);
     let made = version(&outcome)?.to_string();
     clean_versions(&protocol, "history-cut", 1, Some(&made)).await?;

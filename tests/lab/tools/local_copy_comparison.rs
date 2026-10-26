@@ -65,6 +65,7 @@ async fn optimized_copy(args: &Args) -> Result<(u64, u128), Box<dyn std::error::
     let read_concurrency = non_zero(args.read_inflight, "read inflight")?;
     let write_concurrency = non_zero(args.write_inflight, "write inflight")?;
     let source = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: Some(non_zero(args.chunk_bytes, "read chunk")?),
         write_chunk_bytes: None,
         root: args.source.clone(),
@@ -73,6 +74,7 @@ async fn optimized_copy(args: &Args) -> Result<(u64, u128), Box<dyn std::error::
     }))
     .await?;
     let destination = connect_backend(BackendConfig::Local(LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: args.destination.clone(),

@@ -55,6 +55,20 @@ pub fn system_time_to_nanos(st: SystemTime) -> i64 {
     }
 }
 
+/// Converts a timestamp exactly, returning `None` outside signed 64-bit Unix nanoseconds.
+/// Unlike display timestamps, identity evidence must never saturate distinct times together.
+#[cfg(any(unix, test))]
+#[must_use]
+pub(crate) fn checked_system_time_to_nanos(time: SystemTime) -> Option<i64> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_nanos()).ok(),
+        Err(error) => {
+            let magnitude = i128::try_from(error.duration().as_nanos()).ok()?;
+            i64::try_from(-magnitude).ok()
+        }
+    }
+}
+
 /// An object's `Last-Modified` as a timestamp. HTTP dates carry whole seconds, so the precision
 /// is `Seconds` and any fraction a client library reports is dropped rather than invented.
 /// `None` only for a time outside the representable range — never "now" in its place.
@@ -123,6 +137,8 @@ pub fn nanos_to_smb_filetime(nanos: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -169,6 +185,28 @@ mod tests {
         assert_eq!(system_time_to_nanos(st), -1);
         assert_eq!(nanos_to_secs(-1), -1);
         assert_eq!(nanos_subsec(-1), 999_999_999);
+    }
+
+    #[test]
+    fn checked_system_time_preserves_epoch_negative_and_range_boundaries() {
+        assert_eq!(checked_system_time_to_nanos(UNIX_EPOCH), Some(0));
+        assert_eq!(
+            checked_system_time_to_nanos(UNIX_EPOCH - Duration::from_nanos(1)),
+            Some(-1)
+        );
+        for nanos in [i64::MIN, i64::MAX] {
+            let duration = Duration::from_nanos(nanos.unsigned_abs());
+            let time = if nanos < 0 {
+                UNIX_EPOCH - duration
+            } else {
+                UNIX_EPOCH + duration
+            };
+            assert_eq!(checked_system_time_to_nanos(time), Some(nanos));
+        }
+        let positive_overflow = UNIX_EPOCH + Duration::from_nanos(i64::MAX.unsigned_abs() + 1);
+        let negative_overflow = UNIX_EPOCH - Duration::from_nanos(i64::MIN.unsigned_abs() + 1);
+        assert_eq!(checked_system_time_to_nanos(positive_overflow), None);
+        assert_eq!(checked_system_time_to_nanos(negative_overflow), None);
     }
 
     #[test]

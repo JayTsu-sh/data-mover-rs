@@ -6,7 +6,8 @@ use bytes::Bytes;
 use super::DescentHint;
 use super::names::{child_path, is_segment};
 use crate::model::{
-    EntryKind, ModelValueError, SourceIdentity, SourceVersion, StoragePath, TimestampMetadata,
+    EntryKind, ModelValueError, RenameEvidence, SourceIdentity, SourceVersion, StoragePath,
+    TimestampMetadata,
 };
 use crate::storage::{InlineOwnership, ListingFacts, SourceDescriptor};
 
@@ -23,6 +24,7 @@ pub struct ListedChild {
     pub size: Option<u64>,
     /// The stable identity the listing reported for the child.
     pub source_identity: SourceIdentity,
+    pub(crate) rename_evidence: Option<RenameEvidence>,
     pub(crate) backend_fact: Option<Bytes>,
     pub(crate) content_version: Option<Bytes>,
     pub(crate) inline_timestamps: Option<TimestampMetadata>,
@@ -58,6 +60,7 @@ impl ListedChild {
             kind,
             size,
             source_identity,
+            rename_evidence: None,
             backend_fact: None,
             content_version: None,
             inline_timestamps: None,
@@ -79,6 +82,7 @@ impl ListedChild {
             kind: EntryKind::File,
             size,
             source_identity,
+            rename_evidence: None,
             backend_fact: None,
             content_version: None,
             inline_timestamps: None,
@@ -97,6 +101,7 @@ impl ListedChild {
             kind,
             size,
             source_identity,
+            rename_evidence,
             backend_fact,
             content_version,
             inline_timestamps,
@@ -110,6 +115,7 @@ impl ListedChild {
             kind,
             size,
             source_identity,
+            rename_evidence,
             backend_fact,
             content_version,
             inline_timestamps,
@@ -182,6 +188,7 @@ impl ListedChild {
     /// The descriptor of this child at `path`.
     pub(super) fn at(self, path: StoragePath) -> SourceDescriptor {
         SourceDescriptor {
+            rename_evidence: self.rename_evidence,
             path,
             kind: self.kind,
             size: self.size,

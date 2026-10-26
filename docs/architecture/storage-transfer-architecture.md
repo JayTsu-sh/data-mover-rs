@@ -306,11 +306,19 @@ the snapshot unchanged when reconstruction is required. Reconstruction never re-
 backend, but it needs the endpoint the scan ran on: `ObservedEntry::decode_snapshot(bytes,
 &identity)` takes it from `Storage::identity()` or `storage::endpoint_identity(&config)` offline.
 `SnapshotDecodeError::BackendMismatch` for a whole generation means the endpoint moved or is
-spelled differently; treat it as no previous generation. The only entry format is **DMES v7**,
+spelled differently; treat it as no previous generation. The only entry format is **DMES v8**,
 including entries without history. Other versions return `UnsupportedVersion` and require a fresh
 scan. Every format change increments the version byte and updates golden-byte fixtures. This is
 a development policy; before release, choose N-1 decoding or a documented migration/rescan path
 ([ADR-0008](../adr/0008-streaming-traversal-and-object-history.md)).
+
+Local observations carry optional inline `RenameEvidence` separately from runtime `dev + ino`.
+Its 16 bytes encode `ino_be64 || btime_ns_i64_be`; missing or overflowing birth times produce no
+candidate. Persist the namespace's `RenameContext` once per scan. Matching requires the same
+dataset scope, explicit `AllowHeuristic` on both scans, a unique same-kind pair across the full
+scans, and rejection of hard-link ambiguity. Content changes require independent comparison.
+Candidates never authorize deletion or bypass transfer/recovery identity checks. Mounts with
+unverified inode behavior (including CIFS `noserverino`) must remain candidate-only.
 
 ### Optional observations
 

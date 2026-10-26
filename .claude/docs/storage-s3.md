@@ -625,7 +625,7 @@ role namespace 隐藏相对根任意一段以 `.data-mover-` 开头的对象；�
     条目层元数据取当前版本的（观察失败时时间退回列举的）。版本很多、计划要 tags 时每个 key 要做 N 次 HEAD / GetObjectTagging。
   - **分段**（Q8）：一个 key 超过 10 万条记录时发多项（段号从 0，只有最后一段 `complete`），连续、有序；只有最后一段有
     `current()`；续扫后从第 0 段重发。计数按 key：`versions` / `delete_markers` / `all_versions_bytes` 另计，`bytes` 为当前版本字节。
-  - 快照 v7 带历史段（`src/model/history_codec.rs`）；旧格式一律 `UnsupportedVersion`。
+  - 快照当前为 v8，保留历史段（`src/model/history_codec.rs`）并增加可选 rename evidence 字段（S3 为 None）；旧格式一律 `UnsupportedVersion`。
 - **专家传输（terrasync）**：源端半程用 describe 复核观察；版本化桶上列举的观察是 `PathScoped(路径, ETag)`、describe 钉住
   `VersionScoped(id)`，`ReadSource::observation_matches` 在 describe 到的路径与版本 ETag 拼出的身份等于列举的身份时认作同一对象，
   对象被替换则仍报 "source differs"；offer / evidence 带观察的身份键（目的端半程比对它），读仍钉在 describe 到的版本。

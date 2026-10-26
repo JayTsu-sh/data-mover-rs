@@ -7,6 +7,7 @@ async fn local_backend_config_keeps_read_and_write_limits_independent()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let config = LocalBackendConfig {
+        rename_context: None,
         read_chunk_bytes: None,
         write_chunk_bytes: None,
         root: root.path().to_path_buf(),

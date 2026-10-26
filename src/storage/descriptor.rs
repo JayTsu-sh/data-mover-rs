@@ -4,8 +4,8 @@
 use bytes::Bytes;
 
 use crate::model::{
-    EntryKind, ObjectHistory, OwnershipMode, SourceIdentity, SourceVersion, StoragePath,
-    TimestampMetadata,
+    EntryKind, ObjectHistory, OwnershipMode, RenameEvidence, SourceIdentity, SourceVersion,
+    StoragePath, TimestampMetadata,
 };
 
 /// Numeric ownership the enumerating operation already returned, in the form the backend's own
@@ -40,6 +40,8 @@ pub struct SourceDescriptor {
     pub kind: EntryKind,
     pub size: Option<u64>,
     pub source_identity: SourceIdentity,
+    /// Optional evidence for comparing names across scans. Never used as a read or recovery guard.
+    pub(crate) rename_evidence: Option<RenameEvidence>,
     pub(crate) backend_fact: Option<Bytes>,
     /// Content-change observation, separate from stable inode/file-handle identity.
     pub(crate) content_version: Option<Bytes>,
@@ -83,6 +85,7 @@ impl SourceDescriptor {
             kind,
             size,
             source_identity,
+            rename_evidence: None,
             backend_fact: None,
             content_version: None,
             inline_timestamps: None,
@@ -97,6 +100,18 @@ impl SourceDescriptor {
     #[must_use]
     pub const fn version(&self) -> &SourceVersion {
         &self.version
+    }
+
+    /// Candidate for a consumer's cross-scan rename comparison, if this backend observed one.
+    #[must_use]
+    pub const fn rename_evidence(&self) -> Option<&RenameEvidence> {
+        self.rename_evidence.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) const fn with_rename_evidence(mut self, evidence: Option<RenameEvidence>) -> Self {
+        self.rename_evidence = evidence;
+        self
     }
 
     pub(crate) fn with_backend_fact(mut self, fact: Bytes) -> Self {

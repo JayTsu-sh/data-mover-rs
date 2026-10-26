@@ -201,6 +201,7 @@ fn assemble(
         kind,
         size,
         source_identity,
+        rename_evidence,
         backend_fact,
         listing,
         ..
@@ -216,6 +217,7 @@ fn assemble(
     // Unreachable after the checks above; kept typed rather than asserted.
     .map_err(|_| internal())?
     .with_metadata(metadata)
+    .with_rename_evidence(rename_evidence)
     .with_history(listing.history);
     match backend_fact {
         Some(fact) => entry
