@@ -2,8 +2,12 @@
 //! Run `before` and `after` in separate processes around a full unmount/mount.
 //! The checkpoint must live outside the mount. No server configuration is changed.
 use std::collections::{BTreeMap, HashMap};
+use std::error::Error;
 use std::fmt::Write as _;
+use std::fs;
 use std::num::NonZeroUsize;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
@@ -20,7 +24,7 @@ use data_mover::traversal::{
 };
 use tokio_util::sync::CancellationToken;
 
-type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Phase {
@@ -167,11 +171,11 @@ fn conflict<T>(result: &std::result::Result<T, StorageRoleFailure>) -> bool {
     matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
 }
 async fn runtime_replacement(storage: &Storage, root: &Path) -> Result {
-    std::fs::write(root.join("replace.txt"), b"original")?;
+    fs::write(root.join("replace.txt"), b"original")?;
     let path = StoragePath::new("replace.txt")?;
     let descriptor = storage.read_source()?.describe(&path).await?;
-    std::fs::rename(root.join("replace.txt"), root.join("retained-original.txt"))?;
-    std::fs::write(root.join("replace.txt"), b"replacement")?;
+    fs::rename(root.join("replace.txt"), root.join("retained-original.txt"))?;
+    fs::write(root.join("replace.txt"), b"replacement")?;
     let read = storage
         .read_source()?
         .read(ReadRequest {
@@ -207,9 +211,8 @@ async fn runtime_replacement(storage: &Storage, root: &Path) -> Result {
 }
 #[cfg(unix)]
 fn same_inode(first: &Path, second: &Path) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt as _;
-    let a = std::fs::metadata(first)?;
-    let b = std::fs::metadata(second)?;
+    let a = fs::metadata(first)?;
+    let b = fs::metadata(second)?;
     Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 #[cfg(not(unix))]
@@ -229,22 +232,21 @@ async fn reject_direct_alias(source: Storage, target: Storage, original: &Path) 
     .await;
     let failure = result.err().ok_or("Direct alias must be rejected")?;
     assert_eq!(failure.phase(), TransferPhase::Prepare);
-    let role = std::error::Error::source(&failure)
-        .and_then(|cause| cause.downcast_ref::<StorageRoleFailure>());
+    let role = Error::source(&failure).and_then(|cause| cause.downcast_ref::<StorageRoleFailure>());
     assert!(
         matches!(role, Some(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
     );
-    assert_eq!(std::fs::read(original)?, b"keep source intact");
+    assert_eq!(fs::read(original)?, b"keep source intact");
     println!("PASS Direct hardlink alias rejected before truncation");
     Ok(())
 }
 async fn aliases(args: &Args, ctx: &RenameContext) -> Result {
     let src = args.root.join("alias-source");
     let dst = args.root.join("alias-target");
-    std::fs::create_dir(&src)?;
-    std::fs::create_dir(&dst)?;
-    std::fs::write(src.join("file.bin"), b"keep source intact")?;
-    std::fs::hard_link(src.join("file.bin"), dst.join("file.bin"))?;
+    fs::create_dir(&src)?;
+    fs::create_dir(&dst)?;
+    fs::write(src.join("file.bin"), b"keep source intact")?;
+    fs::hard_link(src.join("file.bin"), dst.join("file.bin"))?;
     let same = same_inode(&src.join("file.bin"), &dst.join("file.bin"))?;
     if args.allow_heuristic || !args.expect_evidence {
         assert!(same, "stable-inode profile must recognize hardlinks");
@@ -267,15 +269,15 @@ struct RenameCase {
     renamed: ObservedEntry,
 }
 async fn rename_case(args: &Args, ctx: &RenameContext, storage: &Storage) -> Result<RenameCase> {
-    std::fs::write(args.root.join("original.txt"), b"before")?;
+    fs::write(args.root.join("original.txt"), b"before")?;
     let original = consistent(storage, "original.txt", args.expect_evidence).await?;
     let original_scan = scan(storage).await?;
-    std::fs::create_dir(args.root.join("nested"))?;
-    std::fs::rename(
+    fs::create_dir(args.root.join("nested"))?;
+    fs::rename(
         args.root.join("original.txt"),
         args.root.join("nested/renamed.txt"),
     )?;
-    std::fs::write(
+    fs::write(
         args.root.join("nested/renamed.txt"),
         b"after rename with changed content",
     )?;
@@ -295,7 +297,7 @@ async fn rename_case(args: &Args, ctx: &RenameContext, storage: &Storage) -> Res
     println!("PASS unique same-kind rename candidates={}", matched.len());
     assert_ne!(original.size(), renamed.size());
     assert_eq!(
-        std::fs::read(args.root.join("nested/renamed.txt"))?,
+        fs::read(args.root.join("nested/renamed.txt"))?,
         b"after rename with changed content"
     );
     println!(
@@ -311,7 +313,7 @@ async fn rename_case(args: &Args, ctx: &RenameContext, storage: &Storage) -> Res
 }
 async fn copy_changed(args: &Args, ctx: &RenameContext) -> Result {
     let copy_root = args.root.join("content-copy");
-    std::fs::create_dir(&copy_root)?;
+    fs::create_dir(&copy_root)?;
     transfer(
         TransferRequest::new(
             local(&args.root.join("nested"), *ctx).await?,
@@ -323,7 +325,7 @@ async fn copy_changed(args: &Args, ctx: &RenameContext) -> Result {
     )
     .await?;
     assert_eq!(
-        std::fs::read(copy_root.join("renamed.txt"))?,
+        fs::read(copy_root.join("renamed.txt"))?,
         b"after rename with changed content"
     );
     println!("PASS changed content independently transferred and read back");
@@ -335,7 +337,7 @@ async fn reject_ambiguous(
     storage: &Storage,
     case: &RenameCase,
 ) -> Result {
-    std::fs::hard_link(
+    fs::hard_link(
         args.root.join("nested/renamed.txt"),
         args.root.join("hardlink.txt"),
     )?;
@@ -372,20 +374,19 @@ async fn reject_ambiguous(
 }
 #[cfg(unix)]
 fn device(path: &Path) -> Result<u64> {
-    use std::os::unix::fs::MetadataExt as _;
-    Ok(std::fs::metadata(path)?.dev())
+    Ok(fs::metadata(path)?.dev())
 }
 #[cfg(not(unix))]
 fn device(_path: &Path) -> Result<u64> {
     Ok(0)
 }
 async fn checkpoint(args: &Args, ctx: &RenameContext, storage: &Storage) -> Result {
-    std::fs::write(args.root.join("remount.txt"), b"remount evidence")?;
+    fs::write(args.root.join("remount.txt"), b"remount evidence")?;
     let remount = consistent(storage, "remount.txt", args.expect_evidence).await?;
     let dev = device(&args.root.join("remount.txt"))?;
     let checkpoint = serde_json::json!({"scope":args.scope,"evidence":evidence(&remount),
         "runtime":hex(remount.identity_key().as_bytes()),"dev":dev,"fingerprint":hex(&ctx.fingerprint())});
-    std::fs::write(&args.checkpoint, serde_json::to_vec_pretty(&checkpoint)?)?;
+    fs::write(&args.checkpoint, serde_json::to_vec_pretty(&checkpoint)?)?;
     println!("PASS before checkpoint_saved dev={dev} all_handles_close_on_process_exit");
     Ok(())
 }
@@ -398,13 +399,13 @@ async fn before(args: &Args, ctx: &RenameContext, storage: &Storage) -> Result {
     checkpoint(args, ctx, storage).await
 }
 async fn after(args: &Args, ctx: &RenameContext, storage: &Storage) -> Result {
-    let old: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.checkpoint)?)?;
+    let old: serde_json::Value = serde_json::from_slice(&fs::read(&args.checkpoint)?)?;
     assert_eq!(old["scope"].as_str(), Some(args.scope.as_str()));
     assert_eq!(
         old["fingerprint"],
         serde_json::json!(hex(&ctx.fingerprint()))
     );
-    std::fs::rename(
+    fs::rename(
         args.root.join("remount.txt"),
         args.root.join("remounted-renamed.txt"),
     )?;

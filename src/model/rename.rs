@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use blake3::Hasher;
+
 use super::{MAX_MODEL_FIELD_BYTES, ModelValueError};
 
 /// The interpretation and encoding version of rename candidate bytes.
@@ -200,7 +202,7 @@ impl RenameContext {
     /// Hashes scope, scheme, and policy for a scan/resume fingerprint.
     #[must_use]
     pub fn fingerprint(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Hasher::new();
         hasher.update(b"data-mover/rename-context/v1\0");
         hasher.update(self.scope.as_bytes());
         hasher.update(&[self.scheme().tag()]);

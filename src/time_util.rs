@@ -137,6 +137,8 @@ pub fn nanos_to_smb_filetime(nanos: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -187,7 +189,6 @@ mod tests {
 
     #[test]
     fn checked_system_time_preserves_epoch_negative_and_range_boundaries() {
-        use std::time::Duration;
         assert_eq!(checked_system_time_to_nanos(UNIX_EPOCH), Some(0));
         assert_eq!(
             checked_system_time_to_nanos(UNIX_EPOCH - Duration::from_nanos(1)),

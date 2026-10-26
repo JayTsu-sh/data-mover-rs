@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Metadata};
 
+use super::rename;
 use crate::model::{
     AclMetadata, BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure,
     ExtendedAttribute, FailureClass, IdentityStrength, MetadataCapabilities, MetadataObservation,
@@ -141,7 +142,7 @@ impl LocalObservationAdapter {
         let root = Dir::open_ambient_dir(&root_path, ambient_authority())
             .map_err(|error| session_io_failure(&error))?;
         Ok(Self {
-            root_device: super::rename::root_device(&root),
+            root_device: rename::root_device(&root),
             root: Arc::new(root),
             identity,
             #[cfg(test)]
@@ -151,7 +152,7 @@ impl LocalObservationAdapter {
 
     pub(crate) fn from_root(root: Arc<Dir>, identity: BackendIdentity) -> Self {
         Self {
-            root_device: super::rename::root_device(&root),
+            root_device: rename::root_device(&root),
             root,
             identity,
             #[cfg(test)]
@@ -243,7 +244,7 @@ impl LocalObservationAdapter {
             .ok()
             .and_then(|time| system_time_to_timestamp(time.into_std()));
         let source_identity = source_identity(&self.identity, &path, &metadata)?;
-        let rename_evidence = super::rename::evidence(&metadata, self.root_device);
+        let rename_evidence = rename::evidence(&metadata, self.root_device);
         let facts = backend_facts(&metadata);
         let target = self.symlink_target(&path, kind).await?;
         let metadata_observations = self.observe_metadata(&path, kind, plan, &metadata).await?;

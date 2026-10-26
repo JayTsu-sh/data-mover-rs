@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use blake3::Hasher;
 use cap_std::fs::{Dir, Metadata};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK;
@@ -31,6 +32,7 @@ use super::observation::{
     backend_facts, classify_io, content_version, entry_kind, path_bytes, source_identity,
     timestamp_metadata,
 };
+use super::rename;
 #[cfg(unix)]
 use crate::model::OwnershipMode;
 use crate::model::{
@@ -75,7 +77,7 @@ struct ListProbe {
 impl LocalNamespace {
     pub(crate) fn from_root(root: Arc<Dir>, identity: BackendIdentity) -> Self {
         Self {
-            root_device: super::rename::root_device(&root),
+            root_device: rename::root_device(&root),
             root,
             identity,
             rename_context: None,
@@ -410,7 +412,7 @@ fn describe(
     let source_identity = source_identity(identity, &path, metadata)?;
     let size = (kind == EntryKind::File).then_some(metadata.len());
     let mut descriptor = SourceDescriptor::new(path, kind, size, source_identity)
-        .with_rename_evidence(super::rename::evidence(metadata, root_device))
+        .with_rename_evidence(rename::evidence(metadata, root_device))
         .with_backend_fact(backend_facts(metadata).into())
         .with_inline_timestamps(timestamp_metadata(metadata));
     descriptor.content_version = Some(content_version(metadata));
@@ -432,7 +434,7 @@ fn describe(
 
 /// Bind evidence semantics and the caller's trusted dataset domain to scan checkpoints.
 fn listing_key(context: Option<&RenameContext>) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = Hasher::new();
     hasher.update(b"data-mover/local-listing/rename-evidence/v1\0");
     if let Some(context) = context {
         hasher.update(&[1]);

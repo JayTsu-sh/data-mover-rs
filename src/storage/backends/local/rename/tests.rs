@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fs;
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
@@ -13,6 +14,8 @@ use crate::storage::backends::local::{
 };
 use crate::storage::listing::testing::listed;
 use crate::storage::{Namespace, ReadSource};
+#[cfg(unix)]
+use crate::time_util::checked_system_time_to_nanos;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
@@ -28,7 +31,7 @@ fn open(root: &std::path::Path) -> Result<Arc<Dir>> {
 #[test]
 fn rename_evidence_excludes_other_devices_and_unknown_root() -> Result {
     let temp = tempfile::tempdir()?;
-    std::fs::write(temp.path().join("file"), b"abc")?;
+    fs::write(temp.path().join("file"), b"abc")?;
     let root = open(temp.path())?;
     let metadata = root.symlink_metadata("file")?;
     let device = root_device(&root).ok_or("expected Unix root device")?;
@@ -37,7 +40,7 @@ fn rename_evidence_excludes_other_devices_and_unknown_root() -> Result {
     let expected = metadata
         .created()
         .ok()
-        .and_then(|created| crate::time_util::checked_system_time_to_nanos(created.into_std()));
+        .and_then(|created| checked_system_time_to_nanos(created.into_std()));
     assert_eq!(
         evidence(&metadata, Some(device)).is_some(),
         expected.is_some()
@@ -48,7 +51,7 @@ fn rename_evidence_excludes_other_devices_and_unknown_root() -> Result {
 #[tokio::test]
 async fn rename_evidence_agrees_across_list_stat_observe_and_read_describe() -> Result {
     let temp = tempfile::tempdir()?;
-    std::fs::write(temp.path().join("file"), b"abc")?;
+    fs::write(temp.path().join("file"), b"abc")?;
     let root = open(temp.path())?;
     let identity = test_identity("rename-role-consistency");
     let namespace = LocalNamespace::from_root(Arc::clone(&root), identity.clone());
@@ -85,17 +88,17 @@ async fn rename_evidence_agrees_across_list_stat_observe_and_read_describe() -> 
 #[tokio::test]
 async fn rename_evidence_survives_rename_content_change_and_hard_links() -> Result {
     let temp = tempfile::tempdir()?;
-    std::fs::write(temp.path().join("before"), b"abc")?;
-    std::fs::create_dir(temp.path().join("nested"))?;
+    fs::write(temp.path().join("before"), b"abc")?;
+    fs::create_dir(temp.path().join("nested"))?;
     let adapter = LocalObservationAdapter::new(temp.path(), test_identity("rename-invariance"))
         .map_err(|error| format!("{error:?}"))?;
     let (before, version) = adapter
         .observe_versioned(path("before"), ObservationPlan::default())
         .await
         .map_err(|error| format!("{error:?}"))?;
-    std::fs::rename(temp.path().join("before"), temp.path().join("nested/after"))?;
-    std::fs::write(temp.path().join("nested/after"), b"changed content")?;
-    std::fs::hard_link(temp.path().join("nested/after"), temp.path().join("alias"))?;
+    fs::rename(temp.path().join("before"), temp.path().join("nested/after"))?;
+    fs::write(temp.path().join("nested/after"), b"changed content")?;
+    fs::hard_link(temp.path().join("nested/after"), temp.path().join("alias"))?;
     let (after, after_version) = adapter
         .observe_versioned(path("nested/after"), ObservationPlan::default())
         .await
