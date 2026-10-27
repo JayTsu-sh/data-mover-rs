@@ -9,6 +9,8 @@ use tracing::trace;
 // 内部模块
 use crate::{Result, error::StorageError};
 
+mod equivalence;
+
 /// glob 匹配选项：`require_literal_separator = true` 确保 `*` 不匹配路径分隔符 `/`，
 /// 只有 `**` 才能跨越目录边界。
 const GLOB_MATCH_OPTIONS: MatchOptions = MatchOptions {
@@ -18,7 +20,7 @@ const GLOB_MATCH_OPTIONS: MatchOptions = MatchOptions {
 };
 
 /// 比较操作符枚举，替代原来的字符串 operator
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CompareOp {
     Eq, // "=="
     Ne, // "!="
