@@ -118,7 +118,7 @@ async fn acknowledge_private_stage(control: &Path) -> TestResult {
         control.join("private.ready"),
         b"inspect nonempty stage mode=0600\n",
     )?;
-    timeout(Duration::from_secs(60), async {
+    timeout(Duration::from_mins(1), async {
         loop {
             if control.join("private.continue").try_exists()? {
                 return Ok(());

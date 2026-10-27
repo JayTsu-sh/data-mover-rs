@@ -249,7 +249,7 @@ async fn interrupt_transfer(
 #[tokio::test]
 #[ignore = "requires isolated real S3 and filesystem endpoints plus external CLI inspection"]
 async fn creation_permissions_on_real_backend() -> TestResult {
-    if let Err(error) = timeout(Duration::from_secs(300), Box::pin(run())).await? {
+    if let Err(error) = timeout(Duration::from_mins(5), Box::pin(run())).await? {
         eprintln!("{error}");
         return Err(error);
     }
