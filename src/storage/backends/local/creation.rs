@@ -4,7 +4,12 @@
 use std::ffi::OsStr;
 use std::io;
 #[cfg(target_os = "linux")]
-use std::{fs, os::fd::AsRawFd, os::unix::fs::PermissionsExt as _, path::Path};
+use std::{
+    fs::{self, Permissions as StdPermissions},
+    os::fd::AsRawFd,
+    os::unix::fs::PermissionsExt as _,
+    path::Path,
+};
 
 #[cfg(target_os = "linux")]
 use cap_primitives::fs::open_dir_nofollow;
@@ -35,7 +40,7 @@ pub(super) fn create_file(
     {
         // open(2) still applies umask. Correct only the newly created inode before writing,
         // without changing the process-wide umask or permissions of existing files.
-        let permissions = fs::Permissions::from_mode(mode);
+        let permissions = StdPermissions::from_mode(mode);
         if let Err(error) = file.set_permissions(Permissions::from_std(permissions)) {
             let _ = directory.remove_file(name);
             return Err(error);
@@ -68,6 +73,6 @@ fn set_directory_permissions(directory: &fs::File) -> io::Result<()> {
     let descriptor = format!("/proc/self/fd/{}", directory.as_raw_fd());
     fs::set_permissions(
         descriptor,
-        fs::Permissions::from_mode(DEFAULT_DIRECTORY_MODE),
+        StdPermissions::from_mode(DEFAULT_DIRECTORY_MODE),
     )
 }

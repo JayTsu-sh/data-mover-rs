@@ -1,5 +1,8 @@
 //! In-place Local targets: shared payload/metadata I/O, no stage artifacts or rename.
 #[cfg(unix)]
+use std::io::ErrorKind;
+
+#[cfg(unix)]
 use super::super::creation::create_file;
 
 use super::{
@@ -75,7 +78,7 @@ impl LocalStagedDestination {
                 .write(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
             let file = match create_file(&directory, &name, &options, private_creation) {
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     directory.open_with(&name, &options)
                 }
                 other => other,

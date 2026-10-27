@@ -2,6 +2,7 @@
 pub(super) mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::PoisonError;
 
     use crate::storage::ListingFacts;
     use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion};
@@ -282,7 +283,7 @@ pub(super) mod tests {
             }
             self.creations
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(PoisonError::into_inner)
                 .push((path.as_str().to_owned(), mode));
             Ok(())
         }
