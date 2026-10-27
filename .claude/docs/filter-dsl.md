@@ -80,6 +80,27 @@
 `Modified` 条件仍返回 `LazyMatch`。组合规则 (`Match & Lazy = Match`、`MisMatch | Lazy = MisMatch`)
 保持不变；调度层不会把尚待补取的时间当作最终缺失值提前评估。
 
+## 逻辑等价比较
+
+`FilterExpression` 保留 AST 用于实际过滤，通过临时 ROBDD 比较布尔组合是否等价：
+
+- `logically_equivalent(&self, other: &Self) -> crate::Result<bool>`：复用已解析的表达式。
+- `logically_equivalent_str(&self, other: &str) -> crate::Result<bool>`：先调用现有解析器，再比较。
+
+比较满足交换律、结合律、分配律、幂等律和两种吸收律，例如
+`A or (A and B)` 与 `A` 相等，`A and (A or B)` 与 `A` 相等。
+每个完整条件以解析后的字段、操作符和值作为独立布尔变量；路径预计算缓存不参与身份判断。
+不推导不同条件间的大小关系、glob 等价性或 `==` / `!=` 的互补关系。
+相对修改时间保持相对天数，采用精确值比较，正负零视为相同。
+
+每次比较共用一个条件表和 ROBDD 上下文，最多包含 256 个不同条件、65,536 个决策节点，
+以及 1,000,000 次构建/运算步骤。超过任一上限返回 `StorageError::OperationError`，
+不把超限当作不相等。字符串接口保留现有解析器的错误。
+
+此处的布尔等价不保证实际遍历决策一致：AST 求值的短路顺序、`LazyMatch`、
+`PartialMatch` 和路径附加信息仍可能影响目录裁剪。因此比较结果不得用来替换执行 AST，
+也不得用于认定断点恢复兼容；现有 `resume_key` 生成逻辑不变。
+
 ## 表达式形式
 
 ```
