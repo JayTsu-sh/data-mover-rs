@@ -17,6 +17,7 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
 use tokio::task::JoinSet;
 
+use super::creation::create_directory;
 #[cfg(any(unix, windows))]
 use crate::model::AclEncoding;
 use crate::model::{
@@ -803,7 +804,7 @@ impl LocalStagedDestination {
             let next = match directory.open_dir(name) {
                 Ok(next) => next,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    match directory.create_dir(name) {
+                    match create_directory(&directory, name) {
                         Ok(()) => sync_directory(&directory)?,
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                         Err(error) => return Err(error),

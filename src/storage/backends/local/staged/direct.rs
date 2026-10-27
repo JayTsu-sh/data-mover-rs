@@ -1,4 +1,7 @@
 //! In-place Local targets: shared payload/metadata I/O, no stage artifacts or rename.
+#[cfg(unix)]
+use super::super::creation::create_file;
+
 use super::{
     FailureClass, LocalStagedDestination, Operation, PrepareRequest, PreparedStage,
     PublicationEvidence, PublicationFailure, PublishRequest, StorageRoleFailure, failure, io,
@@ -54,6 +57,7 @@ impl LocalStagedDestination {
             .unwrap_or_else(|| Path::new("."))
             .to_owned();
         let root = Arc::clone(&self.root_dir);
+        let private_creation = request.final_destination.private_creation();
         let source = request.source.source_identity;
         let open_path = path.clone();
         let (directory, file) = tokio::task::spawn_blocking(move || {
@@ -69,11 +73,14 @@ impl LocalStagedDestination {
             options
                 .read(true)
                 .write(true)
-                .create(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            let file = directory
-                .open_with(&name, &options)
-                .map_err(|e| io_failure(&open_path, Operation::Prepare, &e))?;
+            let file = match create_file(&directory, &name, &options, private_creation) {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    directory.open_with(&name, &options)
+                }
+                other => other,
+            }
+            .map_err(|e| io_failure(&open_path, Operation::Prepare, &e))?;
             let metadata = file
                 .metadata()
                 .map_err(|e| io_failure(&open_path, Operation::Prepare, &e))?;

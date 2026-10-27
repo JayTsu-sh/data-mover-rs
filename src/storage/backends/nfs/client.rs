@@ -938,9 +938,10 @@ impl NfsStagedProtocol for NFSStorage {
     async fn create_empty(
         &self,
         path: &crate::model::StoragePath,
+        mode: u32,
     ) -> std::result::Result<(), NfsProtocolFailure> {
         let native = Path::new(path.as_str());
-        let handle = self.create_empty_open(path).await?;
+        let handle = self.create_empty_open(path, mode).await?;
         if let Err(primary) = handle.close().await {
             let cleanup_failure = self
                 .delete_file(native)
@@ -955,11 +956,11 @@ impl NfsStagedProtocol for NFSStorage {
     async fn create_empty_open(
         &self,
         path: &crate::model::StoragePath,
+        mode: u32,
     ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
         let native = Path::new(path.as_str());
-        // Pointer temporaries can carry raw source fragments in checkpoint v2. Keep
-        // this restriction in CREATE itself, before any bytes, and after payload chmod.
-        let Some(handle) = self.role_create_file_exclusive(native, Some(0o600)).await? else {
+        // Data and checkpoint creation select their own mode before writing any bytes.
+        let Some(handle) = self.role_create_file_exclusive(native, Some(mode)).await? else {
             return Err(NfsProtocolFailure::new(
                 crate::model::FailureClass::Conflict,
                 crate::model::Transience::Permanent,

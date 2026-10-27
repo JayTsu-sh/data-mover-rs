@@ -274,6 +274,13 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   `create_directory_all` 其下路径即重建（旧代码 `NotFound` / Transient），往其中写文件也成功（旧代码同样成功：discovery
   的 LOOKUP 先清掉了过期缓存）。ONTAP v3 / v4.0 / v4.1、DXN-2 v3 / v4.0 全过。
 
+## 创建权限
+
+新建目录使用 `0755`。源端没有可用 mode 时，新建数据文件从 CREATE 起使用 `0644`。
+若可信的已编译元数据计划稍后会应用源 mode，数据 stage 先以 `0600` 创建，避免传输期间暴露私有源数据，
+随后由既有元数据应用阶段设置源权限。此判定不使用仅供展示的 `inline_mode`。
+检查点及其临时文件维持 `0600`，包括可能携带原始源片段的 v2 检查点。
+
 ## 目的端恢复（ADR-0006 C10，`src/storage/backends/nfs/at_destination.rs`）
 
 续传状态全在最终文件旁，运行 data-mover 的机器上什么都不存（C21 起所有后端都如此，本地恢复存储已删除）。

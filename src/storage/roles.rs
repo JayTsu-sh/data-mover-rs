@@ -207,16 +207,33 @@ pub struct PrepareRequest {
 
 /// A typed destination that remains unchanged until publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FinalDestination(StoragePath);
+pub struct FinalDestination {
+    path: StoragePath,
+    // A trusted source metadata plan will set permissions before publication. Keep
+    // fresh data private until then; display-grade descriptor modes never select this.
+    private_creation: bool,
+}
 
 impl FinalDestination {
     #[must_use]
     pub const fn new(path: StoragePath) -> Self {
-        Self(path)
+        Self {
+            path,
+            private_creation: false,
+        }
     }
     #[must_use]
     pub const fn path(&self) -> &StoragePath {
-        &self.0
+        &self.path
+    }
+
+    pub(crate) const fn with_private_creation(mut self, private: bool) -> Self {
+        self.private_creation = private;
+        self
+    }
+
+    pub(crate) const fn private_creation(&self) -> bool {
+        self.private_creation
     }
 }
 

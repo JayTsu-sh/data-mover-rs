@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use uuid::Uuid;
 
+use super::super::DEFAULT_FILE_MODE;
 use super::source::{NfsProtocolFailure, entry_failure, role_failure};
 use super::staged::{NfsStageFile, NfsStageState, NfsStagedDestinationAdapter, sibling_path};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
@@ -272,7 +273,12 @@ pub(super) async fn prepare(
     }));
     stage.mark_at_destination(found.fact);
     let Some(point) = found.resume else {
-        let handle = create(adapter, &artifacts.stage, &final_path).await?;
+        let mode = if request.prepare.final_destination.private_creation() {
+            0o600
+        } else {
+            DEFAULT_FILE_MODE
+        };
+        let handle = create(adapter, &artifacts.stage, &final_path, mode).await?;
         adapter.claim_authority(token.clone());
         adapter.cache_prepared_handle(token, handle);
         if !request.recoverable {
@@ -331,10 +337,11 @@ async fn create(
     adapter: &NfsStagedDestinationAdapter,
     path: &StoragePath,
     final_path: &StoragePath,
+    mode: u32,
 ) -> Result<Arc<dyn NfsStageFile>, StorageRoleFailure> {
     adapter
         .protocol
-        .create_empty_open(path)
+        .create_empty_open(path, mode)
         .await
         .map(Arc::from)
         .map_err(|error| role_failure(final_path, Operation::Prepare, transient_collision(error)))
@@ -462,7 +469,8 @@ async fn write_temporary(
     delete_if_present(adapter, temporary).await?;
     let handle = adapter
         .protocol
-        .create_empty_open(temporary)
+        // Checkpoint temporaries may carry raw source fragments; keep them private from CREATE.
+        .create_empty_open(temporary, 0o600)
         .await
         .map_err(transient_collision)?;
     let written = async {

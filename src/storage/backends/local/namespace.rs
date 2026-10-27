@@ -28,6 +28,7 @@ use cap_std::fs::{Dir, Metadata};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK;
 
+use super::creation::create_directory;
 use super::observation::{
     backend_facts, classify_io, content_version, entry_kind, path_bytes, source_identity,
     timestamp_metadata,
@@ -246,7 +247,7 @@ impl LocalNamespace {
         let target = path.clone();
         self.blocking(path, Operation::Namespace, move |root, _| {
             in_parent(root, &native, |parent, leaf| {
-                parent.create_dir(leaf)?;
+                create_directory(parent, leaf)?;
                 sync_directory(parent)
             })
             .map_err(|error| io_failure(&target, Operation::Namespace, &error))

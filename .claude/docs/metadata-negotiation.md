@@ -36,6 +36,17 @@ S3→S3 时，源端用本次传输选定的版本读取 `GetObjectTagging`，�
 空标签集也需要应用，用来清除目标旧标签；读写失败仍使文件失败。single PUT / native single copy
 先缓冲标签，在对象发布后写入，因此此时的标签写失败发生于 Publish，并报告目标可能已改变。
 
+## 无源 mode 时的创建默认值
+
+Linux Local、NFS、HDFS 在源没有可用 mode 时，新建数据文件以 `0644`、目录以 `0755` 为默认值；
+Linux Local 显式修正本次新建条目的 umask 过滤结果，不改已有条目。HDFS Direct 也显式传入 `0644`。
+这是创建行为，源元数据仍由既有协商计划在后续阶段应用，可用的源 mode 决定最终权限。
+若可信的已编译计划会应用源 mode，Linux Local 新建数据文件及 NFS/HDFS 数据 stage 先以私有 `0600` 创建，
+避免写入期间扩大源数据可见性；没有可用源 mode 时才从 CREATE 起使用 `0644`。
+
+内部检查点不使用数据文件默认值，权限策略保持现状：NFS 检查点 `0600`；Local 旧版指针跟随 umask、
+HDFS 旧版检查点为 `0644`；可能存有原始源片段的 v2 检查点均从创建时即为 `0600`。
+
 ## 要了一个可选功能之后
 
 ACL/xattr 的判定点是 `src/transfer/engine/negotiation.rs` 的 `optional_policy()`（要 → 规划期

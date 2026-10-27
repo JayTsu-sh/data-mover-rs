@@ -433,11 +433,12 @@ async fn start(
     path: &StoragePath,
     recoverable: bool,
 ) -> Result<PreparedStage, StorageRoleFailure> {
-    adapter
-        .protocol
-        .create_empty_stage_exclusive(path)
-        .await
-        .map_err(|error| transient_collision(stage.final_destination.path(), error))?;
+    let created = if stage.final_destination.private_creation() {
+        adapter.protocol.create_private_file_exclusive(path).await
+    } else {
+        adapter.protocol.create_empty_stage_exclusive(path).await
+    };
+    created.map_err(|error| transient_collision(stage.final_destination.path(), error))?;
     if !recoverable {
         return Ok(stage.disable_recovery());
     }
@@ -571,7 +572,7 @@ async fn write_temporary(
     private: bool,
 ) -> Result<(), StorageRoleFailure> {
     let created = if private {
-        protocol.create_private_checkpoint_exclusive(path).await
+        protocol.create_private_file_exclusive(path).await
     } else {
         protocol.create_empty_stage_exclusive(path).await
     };

@@ -50,7 +50,7 @@ use crate::storage::backends::nfs::protocol::classify_error;
 use crate::storage::backends::nfs::source::NfsProtocolFailure;
 
 /// Mode of a directory the role creates, as the legacy helper created them.
-const DIRECTORY_MODE: u32 = 0o755;
+const DIRECTORY_MODE: u32 = crate::storage::backends::DEFAULT_DIRECTORY_MODE;
 
 impl NFSStorage {
     /// Creates the one directory `path` names; its parent must exist. See the module docs.

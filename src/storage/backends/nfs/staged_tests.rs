@@ -22,6 +22,7 @@ pub(super) mod tests {
     #[derive(Default)]
     pub(in crate::storage::backends::nfs) struct FakeProtocol {
         pub(in crate::storage::backends::nfs) files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        pub(in crate::storage::backends::nfs) creations: Mutex<Vec<(String, u32)>>,
         opens: std::sync::atomic::AtomicU64,
         closes: Arc<std::sync::atomic::AtomicU64>,
         pub(in crate::storage::backends::nfs) rename_mode: std::sync::atomic::AtomicU8,
@@ -268,7 +269,7 @@ pub(super) mod tests {
                 .max(1)
         }
 
-        async fn create_empty(&self, path: &StoragePath) -> Result<(), NfsProtocolFailure> {
+        async fn create_empty(&self, path: &StoragePath, mode: u32) -> Result<(), NfsProtocolFailure> {
             let mut files = self
                 .files
                 .lock()
@@ -279,6 +280,10 @@ pub(super) mod tests {
                     Transience::Permanent,
                 ));
             }
+            self.creations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((path.as_str().to_owned(), mode));
             Ok(())
         }
 

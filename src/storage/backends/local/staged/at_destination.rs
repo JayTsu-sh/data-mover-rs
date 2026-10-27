@@ -21,6 +21,7 @@ use bytes::Bytes;
 use cap_std::fs::MetadataExt as _;
 use cap_std::fs::{Dir, OpenOptions};
 
+use super::super::creation::create_file;
 pub(super) use super::hash_checkpoint::cleanup;
 use super::{LocalStagedDestination, failure, failure_with_transience, io_failure, publication};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
@@ -639,11 +640,12 @@ async fn start(
     let final_path = stage.final_destination.path().clone();
     let name = artifacts.stage.clone();
     let recoverable = request.recoverable;
+    let private_creation = stage.final_destination.private_creation();
     let created = artifacts
         .blocking(&final_path, move |directory| {
             let mut options = OpenOptions::new();
             options.create_new(true).read(true).write(true);
-            let file = directory.open_with(&name, &options)?.into_std();
+            let file = create_file(directory, &name, &options, private_creation)?.into_std();
             let synced = if recoverable {
                 file.sync_all().and_then(|()| sync_directory(directory))
             } else {

@@ -141,8 +141,8 @@ pub(crate) trait HdfsProtocol: Send + Sync {
         &self,
         path: &StoragePath,
     ) -> Result<(), StorageRoleFailure>;
-    /// The empty artifact must be private before any hash fragments can be written.
-    async fn create_private_checkpoint_exclusive(
+    /// Creates a private empty file before payload or checkpoint fragments can be written.
+    async fn create_private_file_exclusive(
         &self,
         path: &StoragePath,
     ) -> Result<(), StorageRoleFailure> {

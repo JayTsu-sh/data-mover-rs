@@ -272,6 +272,18 @@ impl MetadataPlan {
         !self.mutations.is_empty()
     }
 
+    /// Whether trusted source permissions will replace the data-file creation default.
+    pub(crate) fn carries_mode(&self) -> bool {
+        self.mutations.iter().any(|(_, mutation)| {
+            matches!(
+                mutation,
+                MetadataMutation::NumericOwnership(_)
+                    | MetadataMutation::MappedOwnership(_)
+                    | MetadataMutation::Mode(_)
+            )
+        })
+    }
+
     /// Applies the immutable plan in family order. A family the target refuses does not stop the
     /// others; the item fails afterwards with every refusal listed.
     ///
