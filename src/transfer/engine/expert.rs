@@ -534,7 +534,12 @@ async fn prepare_destination_stage(
         cancel: request.cancel.clone(),
     };
     let prepare = PrepareRequest {
-        final_destination: FinalDestination::new(request.final_path.clone()),
+        final_destination: FinalDestination::new(request.final_path.clone()).with_private_creation(
+            request
+                .metadata_plan
+                .as_ref()
+                .is_some_and(MetadataPlan::carries_mode),
+        ),
         source: source.clone(),
         recovery_binding: binding,
     };

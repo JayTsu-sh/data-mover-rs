@@ -9,6 +9,7 @@ use crate::model::{
     Transience as RoleTransience,
 };
 use crate::storage::StorageRoleFailure as RoleFailure;
+use super::super::DEFAULT_FILE_MODE;
 use crate::storage::backends::hdfs::protocol::{
     HdfsEntryFacts as RoleHdfsEntryFacts, HdfsListedChild as RoleHdfsListedChild,
     HdfsProtocol as RoleHdfsProtocol, HdfsWriteSession as RoleHdfsWriteSession,
@@ -178,10 +179,10 @@ impl RoleHdfsProtocol for HDFSStorage {
         &self,
         path: &RoleStoragePath,
     ) -> Result<(), RoleFailure> {
-        create_exclusive_stage(self, path, 0o644).await
+        create_exclusive_stage(self, path, DEFAULT_FILE_MODE).await
     }
 
-    async fn create_private_checkpoint_exclusive(
+    async fn create_private_file_exclusive(
         &self,
         path: &RoleStoragePath,
     ) -> Result<(), RoleFailure> {
@@ -215,6 +216,7 @@ impl RoleHdfsProtocol for HDFSStorage {
                     &resolved,
                     hdfs_native::WriteOptions::default()
                         .block_size(self.block_size)
+                        .permission(DEFAULT_FILE_MODE)
                         .overwrite(true),
                 )
                 .await

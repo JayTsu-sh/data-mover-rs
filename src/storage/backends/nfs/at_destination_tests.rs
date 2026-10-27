@@ -1,3 +1,4 @@
+use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
 
 use futures::stream;
@@ -18,6 +19,51 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const IDENTITY: [u8; 32] = [4; 32];
 const BINDING: [u8; 32] = [7; 32];
+
+#[tokio::test]
+async fn new_data_file_is_readable_but_checkpoint_is_private_from_creation() -> TestResult {
+    let (destination, protocol, backend) = adapter();
+    let stage = destination
+        .prepare_at_destination(request(&backend, 12, BINDING, ResumeMode::Restart)?)
+        .await?;
+    let created = protocol
+        .creations
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        created,
+        vec![
+            (name(ArtifactKind::Stage, false), 0o644),
+            (name(ArtifactKind::Pointer, true), 0o600),
+        ]
+    );
+    destination.discard(stage).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn source_permissions_keep_data_private_from_creation() -> TestResult {
+    let (destination, protocol, backend) = adapter();
+    let mut prepare = request(&backend, 12, BINDING, ResumeMode::Restart)?;
+    prepare.prepare.final_destination = prepare
+        .prepare
+        .final_destination
+        .with_private_creation(true);
+    let stage = destination.prepare_at_destination(prepare).await?;
+    assert_eq!(
+        *protocol
+            .creations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        vec![
+            (name(ArtifactKind::Stage, false), 0o600),
+            (name(ArtifactKind::Pointer, true), 0o600),
+        ]
+    );
+    destination.discard(stage).await?;
+    Ok(())
+}
 
 fn request(
     backend: &BackendIdentity,

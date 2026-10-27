@@ -771,6 +771,10 @@ fn copied_mode_never_synthesizes_numeric_ownership() {
             false,
         )
         .unwrap();
+        assert_eq!(
+            plan.carries_mode(),
+            ownership != OwnershipTarget::NotApplicable
+        );
         if ownership == OwnershipTarget::NotApplicable {
             assert!(plan.mutations.is_empty());
             assert_eq!(

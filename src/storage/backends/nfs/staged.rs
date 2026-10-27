@@ -71,12 +71,13 @@ pub(crate) trait NfsStagedProtocol: Send + Sync {
     fn maximum_write_chunk_bytes(&self) -> usize {
         1024 * 1024
     }
-    async fn create_empty(&self, path: &StoragePath) -> Result<(), NfsProtocolFailure>;
+    async fn create_empty(&self, path: &StoragePath, mode: u32) -> Result<(), NfsProtocolFailure>;
     async fn create_empty_open(
         &self,
         path: &StoragePath,
+        mode: u32,
     ) -> Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
-        self.create_empty(path).await?;
+        self.create_empty(path, mode).await?;
         match self.open_write(path).await {
             Ok(handle) => Ok(handle),
             Err(error) => {

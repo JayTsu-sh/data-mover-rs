@@ -71,6 +71,7 @@ pub(super) async fn prepare(
     recovery_binding: [u8; 32],
     plan: TransferPlan,
     lease: DestinationLease,
+    private_creation: bool,
 ) -> Result<PreparedStage, TransferFailure> {
     let spec = Spec {
         policy: request.transfer_policy,
@@ -88,7 +89,8 @@ pub(super) async fn prepare(
         cancel: request.cancel.clone(),
     };
     let prepare = PrepareRequest {
-        final_destination: FinalDestination::new(request.final_path().clone()),
+        final_destination: FinalDestination::new(request.final_path().clone())
+            .with_private_creation(private_creation),
         source: descriptor.clone(),
         recovery_binding,
     };
@@ -164,6 +166,9 @@ pub(super) async fn run_until_transferred(
         recovery_binding,
         plan,
         lease,
+        copied_metadata_plan
+            .as_ref()
+            .is_some_and(CopiedMetadataPlan::carries_mode),
     )
     .await?;
     if super::checkpointed::eligible(request, destination.as_ref(), &stage, plan) {

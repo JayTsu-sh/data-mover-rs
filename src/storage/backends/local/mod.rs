@@ -14,6 +14,7 @@ use crate::storage::{
 
 pub(crate) mod namespace;
 
+mod creation;
 mod rename;
 
 #[allow(dead_code)]

@@ -42,6 +42,10 @@ pub(super) struct CopiedMetadataPlan {
 }
 
 impl CopiedMetadataPlan {
+    pub(super) fn carries_mode(&self) -> bool {
+        self.plan.carries_mode()
+    }
+
     pub(super) async fn validate_recovered(
         &self,
         transferred: &Transferred,
