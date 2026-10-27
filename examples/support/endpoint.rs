@@ -1,6 +1,7 @@
 //! Endpoints for examples that take any backend on the command line.
 //!
 //! - `nfs://…` — an NFS URL, used as given;
+//! - `smb://user:password@server/share[/root]` — an SMB URL, used as given;
 //! - `smb:<sub-path>` — that sub-path of the share named by `CIFS_REAL_SERVER` / `CIFS_REAL_SHARE` /
 //!   `CIFS_REAL_USER` / `CIFS_REAL_PASS` (the e2e-cifs `.env`);
 //!   `CIFS_GUEST_POLICY=allow_unsigned` explicitly permits unsigned guest for lab fixtures only;
@@ -41,6 +42,29 @@ fn cifs_guest_policy(value: Option<&str>) -> Result<CifsGuestPolicy> {
         Some("allow_unsigned") => Ok(CifsGuestPolicy::AllowUnsigned),
         _ => Err("CIFS_GUEST_POLICY must be deny or allow_unsigned".into()),
     }
+}
+
+/// The `smb:` spelling is a lab shortcut resolved from `CIFS_REAL_*` variables.
+fn cifs_config(endpoint: &str, ensure_dir: bool) -> Result<CifsBackendConfig> {
+    let mut config = if endpoint.starts_with("smb://") {
+        CifsBackendConfig::from_url(endpoint)?
+    } else if let Some(root) = endpoint.strip_prefix("smb:") {
+        CifsBackendConfig {
+            server: env_var("CIFS_REAL_SERVER")?,
+            share: env_var("CIFS_REAL_SHARE")?,
+            root: (!root.is_empty()).then(|| root.to_owned()),
+            ensure_dir,
+            username: env_var("CIFS_REAL_USER")?,
+            password: env_var("CIFS_REAL_PASS")?,
+            signing_policy: CifsSigningPolicy::default(),
+            guest_policy: CifsGuestPolicy::default(),
+        }
+    } else {
+        return Err("give an smb:// URL".into());
+    };
+    config.ensure_dir = ensure_dir;
+    config.guest_policy = cifs_guest_policy(env::var("CIFS_GUEST_POLICY").ok().as_deref())?;
+    Ok(config)
 }
 
 /// `s3[+https]://AK:SK@bucket.host/prefix[?options]` — the crate takes the key and secret as
@@ -125,17 +149,8 @@ pub async fn connect_with_options(
             block_size,
             ensure_dir,
         })
-    } else if let Some(root) = endpoint.strip_prefix("smb:") {
-        BackendConfig::Cifs(CifsBackendConfig {
-            server: env_var("CIFS_REAL_SERVER")?,
-            share: env_var("CIFS_REAL_SHARE")?,
-            root: (!root.is_empty()).then(|| root.to_owned()),
-            ensure_dir,
-            username: env_var("CIFS_REAL_USER")?,
-            password: env_var("CIFS_REAL_PASS")?,
-            signing_policy: CifsSigningPolicy::default(),
-            guest_policy: cifs_guest_policy(env::var("CIFS_GUEST_POLICY").ok().as_deref())?,
-        })
+    } else if endpoint.starts_with("smb:") {
+        BackendConfig::Cifs(cifs_config(endpoint, ensure_dir)?)
     } else if endpoint.split_once("://").is_some_and(|(scheme, _)| {
         scheme.eq_ignore_ascii_case("s3") || scheme.to_ascii_lowercase().starts_with("s3+")
     }) {
@@ -259,8 +274,8 @@ async fn names(endpoint: &str, dir: &str) -> Result<Vec<String>> {
             .await?;
         return Ok(names);
     }
-    if let Some(root) = endpoint.strip_prefix("smb:") {
-        return smb_names(root, dir).await;
+    if endpoint.starts_with("smb:") {
+        return smb_names(&cifs_config(endpoint, false)?, dir).await;
     }
     if endpoint.starts_with("hdfs://") {
         let (client, location) = data_mover::storage::build_hdfs_client(endpoint, &hdfs_client())?;
@@ -284,20 +299,31 @@ async fn names(endpoint: &str, dir: &str) -> Result<Vec<String>> {
 }
 
 /// The names in `dir` below the share sub-path `root`, read with a plain SMB directory query.
-async fn smb_names(root: &str, dir: &str) -> Result<Vec<String>> {
+async fn smb_names(config: &CifsBackendConfig, dir: &str) -> Result<Vec<String>> {
     let client = smb_domain::Client::with_policies(
-        smb_domain::SigningPolicy::WhenRequired,
-        smb_domain::GuestPolicy::Deny,
+        match config.signing_policy {
+            CifsSigningPolicy::Required => smb_domain::SigningPolicy::Required,
+            CifsSigningPolicy::WhenRequired => smb_domain::SigningPolicy::WhenRequired,
+        },
+        match config.guest_policy {
+            CifsGuestPolicy::Deny => smb_domain::GuestPolicy::Deny,
+            CifsGuestPolicy::AllowUnsigned => smb_domain::GuestPolicy::AllowUnsigned,
+        },
     );
-    let target =
-        smb_domain::ShareTarget::new(&env_var("CIFS_REAL_SERVER")?, &env_var("CIFS_REAL_SHARE")?)?;
+    let target = smb_domain::ShareTarget::new(&config.server, &config.share)?;
+    let username =
+        if config.username.is_empty() && config.guest_policy == CifsGuestPolicy::AllowUnsigned {
+            "anonymous"
+        } else {
+            &config.username
+        };
     let share = client
         .connect_share(
             &target,
-            smb_domain::Credentials::ntlm(env_var("CIFS_REAL_USER")?, env_var("CIFS_REAL_PASS")?),
+            smb_domain::Credentials::ntlm(username, &config.password),
         )
         .await?;
-    let path = join(root, dir).replace('/', "\\");
+    let path = join(config.root.as_deref().unwrap_or_default(), dir).replace('/', "\\");
     let path = smb_domain::SharePath::new(if path.is_empty() {
         ".".to_owned()
     } else {

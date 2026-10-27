@@ -1292,10 +1292,12 @@ impl NFSStorage {
         reject_readdir_buffer(query_part)?;
 
         // root_dir 去掉前后 '/'，使其成为相对路径前缀（空串表示挂载根）
-        let (nfs_path, root_dir) = path_part.split_once(':').map_or_else(
+        let (nfs_path, encoded_root_dir) = path_part.split_once(':').map_or_else(
             || (path_part.to_string(), String::new()),
             |(p, r)| (p.to_string(), r.trim_matches('/').to_string()),
         );
+        let root_dir = crate::storage::endpoint::decode_nfs_prefix(&encoded_root_dir)
+            .map_err(|error| StorageError::UrlParseError(error.to_string()))?;
 
         // 检查query_part是否包含uid和gid参数
         let query_has_user = query_part.contains("uid=");
@@ -2322,6 +2324,22 @@ mod tests {
             .assert_value("test value should be present");
         assert_eq!(nfs_url, "nfs://server/path?uid=0&gid=0");
         assert_eq!(root_dir, "prefix/dir");
+
+        for (input, expected) in [
+            ("测试", "测试"),
+            ("%E6%B5%8B%E8%AF%95", "测试"),
+            ("a%20b", "a b"),
+            ("100%", "100%"),
+            ("100%25", "100%"),
+        ] {
+            let url = format!("nfs://server/path:{input}");
+            let (_, root_dir) =
+                NFSStorage::parse_nfs_url(&url).assert_value("NFS URL prefix should parse");
+            assert_eq!(root_dir, expected, "{url}");
+        }
+        for input in ["%FF", "a%2Fb", "a%00b", "%2E%2E"] {
+            assert!(NFSStorage::parse_nfs_url(&format!("nfs://server/path:{input}")).is_err());
+        }
 
         // 测试无效格式（非 nfs:// 开头）
         let result = NFSStorage::parse_nfs_url("http://server/path");

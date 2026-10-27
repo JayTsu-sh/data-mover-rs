@@ -7,8 +7,9 @@ description: 验证 role-based CIFS / SMB backend — 编译 tests/lab/tools/cif
 
 **触发关键词**：验证 CIFS / 测 SMB / e2e cifs / CIFS policy contract。
 
-CIFS 只有 role-based 实现 (`src/storage/backends/cifs/`)，不在 `StorageEnum` 里，
-没有 `smb://` URL；legacy `cifs_walkdir` / `cifs_copy` examples 已随 #150 删除。
+CIFS 只有 role-based 实现 (`src/storage/backends/cifs/`)，不在 `StorageEnum` 里。
+连接入口支持 `CifsBackendConfig::from_url("smb://user:password@server/share[/root]")`；
+legacy `cifs_walkdir` / `cifs_copy` examples 已随 #150 删除。
 
 ## 输入 (.env)
 

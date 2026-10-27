@@ -14,12 +14,14 @@ mod protocol;
 mod read_pipeline;
 mod source;
 mod staged;
+mod url;
 mod writer;
 
 use std::sync::Arc;
 
 pub(crate) use connection::connect_backend;
 use protocol::{ensure_root, probe_identity_mode};
+pub(crate) use url::parse_smb_url;
 
 use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};

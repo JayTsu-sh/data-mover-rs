@@ -74,6 +74,31 @@ pub struct CifsBackendConfig {
     pub guest_policy: CifsGuestPolicy,
 }
 
+impl CifsBackendConfig {
+    /// Parse `smb://[username[:password]@]server[:port]/share[/root]`.
+    ///
+    /// URL path segments are percent-decoded once before the SMB client sees them. The returned
+    /// config uses the default signing and guest policies and does not create a missing root;
+    /// callers may change those fields before connecting.
+    ///
+    /// # Errors
+    /// Returns a CIFS-attributed error for an invalid URL, path or UTF-8 sequence.
+    pub fn from_url(url: &str) -> Result<Self, BackendConnectError> {
+        let parsed = backends::cifs::parse_smb_url(url)
+            .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))?;
+        Ok(Self {
+            server: parsed.server,
+            share: parsed.share,
+            root: parsed.root,
+            ensure_dir: false,
+            username: parsed.username,
+            password: parsed.password,
+            signing_policy: CifsSigningPolicy::default(),
+            guest_policy: CifsGuestPolicy::default(),
+        })
+    }
+}
+
 impl fmt::Debug for CifsBackendConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

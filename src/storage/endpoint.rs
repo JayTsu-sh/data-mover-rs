@@ -24,7 +24,7 @@ use std::fmt;
 use std::net::Ipv6Addr;
 use std::path::{Component, Path, Prefix};
 
-use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, percent_encode};
 use url::{Url, form_urlencoded};
 
 use crate::model::{BackendIdentity, BackendKind};
@@ -53,12 +53,9 @@ type Derived = Result<BackendIdentity, EndpointError>;
 /// `nfs://host[:port]/export[/prefix]` from a data-mover NFS URL
 /// (`nfs://host[:port]/export[:prefix][?query]`).
 ///
-/// The two halves are read the way the backend uses them. The export is URL text that nfs-rs
-/// parses with the `url` crate and sends to the server as `Url::path()` (so `a b` reaches the
-/// server as `a%20b`, `.`/`..` are resolved, `#…` is a fragment); the prefix is a literal path
-/// looked up inside the mounted export, whose `..` may not climb out of it. Each name the server
-/// sees becomes one encoded segment, so `export:prefix` and `export/prefix` are the same endpoint
-/// for ordinary names. The port comes from the authority, or from the first `nfsport=` query value
+/// The export and prefix are URL paths. Each segment is decoded once before it reaches the
+/// server, then encoded in the identity. The prefix's `..` may not climb out of the export.
+/// The port comes from the authority, or from the first `nfsport=` query value
 /// (as in nfs-rs); 2049 and 0 (portmapper) are dropped. `version`, `uid`, `gid`, `mountport` and
 /// every other option are excluded.
 pub(crate) fn nfs(url: &str) -> Derived {
@@ -81,24 +78,48 @@ pub(crate) fn nfs(url: &str) -> Derived {
     }
     let port = port.filter(|port| *port != 0 && *port != NFS_DEFAULT_PORT);
     let mut segments = nfs_export_segments(export)?;
+    let prefix = decode_nfs_prefix(prefix)?;
     segments.extend(
-        normalize(prefix)?
+        normalize(&prefix)?
             .iter()
             .map(|name| encode(name.as_bytes())),
     );
     derive(BackendKind::Nfs, "nfs", &host, port, &segments)
 }
 
-/// The server-side names of an NFS export, as nfs-rs derives them from the URL.
+/// The server-side names of an NFS export after URL path decoding.
 fn nfs_export_segments(export: &str) -> Result<Vec<String>, EndpointError> {
     let parsed = Url::parse(&format!("nfs://export/{export}"))
         .map_err(|_| EndpointError("the NFS export is not a URL path"))?;
-    Ok(parsed
+    parsed
         .path()
         .split('/')
         .filter(|name| !name.is_empty())
-        .map(|name| encode(name.as_bytes()))
-        .collect())
+        .map(|name| decode_nfs_segment(name).map(|decoded| encode(decoded.as_bytes())))
+        .collect()
+}
+
+/// Decode a path inside an NFS export without turning an encoded slash into a new component.
+pub(crate) fn decode_nfs_prefix(prefix: &str) -> Result<String, EndpointError> {
+    let decoded = prefix
+        .split('/')
+        .map(decode_nfs_segment)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("/");
+    normalize(&decoded)?;
+    Ok(decoded)
+}
+
+fn decode_nfs_segment(segment: &str) -> Result<String, EndpointError> {
+    let decoded = percent_decode_str(segment)
+        .decode_utf8()
+        .map_err(|_| EndpointError("an NFS path segment is not valid UTF-8"))?;
+    if decoded.contains('/') || decoded.contains('\0') {
+        return Err(EndpointError(
+            "an NFS path segment contains an encoded separator or NUL",
+        ));
+    }
+    Ok(decoded.into_owned())
 }
 
 /// `smb://server[:port]/share[/root]` from the CIFS config fields.
@@ -125,7 +146,7 @@ pub(crate) fn smb(server: &str, share: &str, root: Option<&str>) -> Derived {
 ///
 /// http and https are the same endpoint (the key space belongs to the service, not the
 /// transport), so ports 80 and 443 are dropped whatever the scheme; the compatibility profile is
-/// excluded. The bucket is lowercased. The prefix — URL text as the backend stores it — is taken
+/// excluded. The bucket is lowercased. The decoded prefix as stored by the backend is taken
 /// **literally**: S3 keys are not paths, so `a//`, `a/` and `/a/` are three key spaces, and only
 /// the single trailing `/` the backend appends is removed.
 pub(crate) fn s3(http_endpoint: &str, bucket: &str, prefix: Option<&str>) -> Derived {

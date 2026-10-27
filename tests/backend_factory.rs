@@ -28,6 +28,24 @@ fn cifs_config_debug_never_exposes_credentials() {
 }
 
 #[test]
+fn cifs_url_names_are_decoded_before_connection_and_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let raw = CifsBackendConfig::from_url(
+        "smb://sensitive-user:sensitive-password@nas/share/测试/a b/100%",
+    )?;
+    let encoded = CifsBackendConfig::from_url(
+        "smb://sensitive-user:sensitive-password@nas/share/%E6%B5%8B%E8%AF%95/a%20b/100%25",
+    )?;
+    assert_eq!(raw.root.as_deref(), Some("测试/a b/100%"));
+    assert_eq!(encoded.root, raw.root);
+    assert_eq!(
+        endpoint_identity(&BackendConfig::Cifs(raw))?,
+        endpoint_identity(&BackendConfig::Cifs(encoded))?
+    );
+    Ok(())
+}
+
+#[test]
 fn s3_config_debug_never_exposes_the_key_pair() {
     // A secret with `/`, `+` and `=` is exactly what a URL parser cannot find.
     let config = BackendConfig::S3(S3BackendConfig {

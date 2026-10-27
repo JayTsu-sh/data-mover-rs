@@ -30,14 +30,13 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
 - **缺省即默认**：标准 S3、校验证书、对象桶。写出默认值（`compat=standard`、`bucket_type=object`、`tls_verify=true`）、
   未知 / 重复 / 空值参数、`tls_verify` 用在 `s3://` 上、`bucket_type=nas` 不带 `compat=ontap`、无桶端点 URL
   （`list_buckets`）带 `bucket_type` —— 全部 `UrlParseError`（D4：URL 文本能判定的都算）。报错不回显 URL 与凭据。
-- **旧协议名已删除**，报错给出新写法：`s3+http://` → `s3://`；`s3+sg://` → `s3://…?compat=sg`；`s3+dxn://` →
-  `s3://…?compat=dxn`；`s3+hcp://` → `s3://…`（HCP 支持已删除）；`s3+sg+https://` / `s3+dxn+https://` →
-  `s3+https://…?compat=sg|dxn&tls_verify=false`（旧形式本来就不校验证书）。`detect_storage_type` 把任何
-  `s3+…://` 判为 S3，所以旧写法走到这条报错而不是被当成本地路径。
+- **旧协议名已删除**：除 `s3://` 和 `s3+https://` 外，`s3+http://`、`s3+sg://`、
+  `s3+dxn://`、`s3+hcp://` 等都报通用的 unsupported scheme，不提供迁移提示。
+  `detect_storage_type` 把任何 `s3+…://` 判为 S3，使错误进入 S3 URL 解析器。
 - **参数不进端点身份**：`s3://host[:port]/bucket[/prefix]` 与改参数前相同，TransferIdentity / 恢复绑定不变。
 - `compat=sg` — StorageGRID：签名前精确删除 `x-id`；不走原生拷贝。
 - `compat=dxn` — DXN（Ceph RGW Octopus）：标签不支持；原生拷贝亲和标签 `dxn`。
-- **HCP 支持已删除**（用户 2026-09-27）：没有 `compat=hcp`（报错提示按标准 S3 写），不再读 HCP REST 的 `BPM` 注解、
+- **HCP 支持已删除**（用户 2026-09-27）：没有 `compat=hcp`（按普通无效选项报错），不再读 HCP REST 的 `BPM` 注解、
   不再把 HCP 桶一律当作开版本；`src/third_party/hcp` 与直接依赖 reqwest 0.13 一并删除。HCP 命名空间按标准 S3 使用（标签走
   S3 对象标签，版本按 GetBucketVersioning）。
 - `compat=ontap` — ONTAP：**不改任何线上请求**（对象桶的怪癖都已通用处理：F4、F6、空末页、CommonPrefix 计入
@@ -751,7 +750,7 @@ Content-MD5，是 `Matched`）；存储若在扣字节期间因 body 空闲断�
 | Multipart 失败留垃圾 | 必须 abort |
 | MinIO 列出的 upload id 与签发的写法不同 | 比较 upload id 用 `upload_pointer::same_upload`，别逐字节比 |
 | 自签 / 私有 CA 端点连接失败（证书不受信） | 把 CA 放进 `SSL_CERT_FILE`，或 URL 加 `?tls_verify=false` |
-| 旧协议名 `s3+sg://` / `s3+dxn+https://` 等 | 已删除，改写成 `?compat=` 参数（报错里给出新写法） |
+| 旧协议名 `s3+sg://` / `s3+dxn+https://` 等 | 不支持，返回通用 scheme 错误；按当前 URL 规则填写 `compat=` 参数 |
 | DXN 对无 body 的 `UploadPartCopy`、ONTAP 对无 body 的 `CopyObject` 回 411 | 所有拷贝请求显式 `Content-Length: 0`（`copy_request.rs`，legacy 与 role） |
 | 把 501 `NotImplemented` 当断连重试 | 条目 `Unsupported` / Permanent（`a65ae18`）；ONTAP NAS 桶大量回 501 |
 | RustFS 暂停版本桶里 PUT 不回 `x-amz-version-id: null` | 连接时 Suspended → 按 `"null"` 记（`S3Storage::write_facts`），指针按 id 删 |

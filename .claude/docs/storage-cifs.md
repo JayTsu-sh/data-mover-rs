@@ -5,9 +5,9 @@
 - CIFS **只有** role-based 实现：`src/storage/backends/cifs/`，经
   `storage::connect_backend(BackendConfig::Cifs(CifsBackendConfig { .. }))` 构造。
   `src/storage/backends/cifs/connection.rs` 负责 SDK 连接、凭据与签名策略、根身份探测和角色装配；
-  `storage/factory.rs` 只向 backend facade 分派。
-- 历史 `CifsStorage` / `StorageEnum::CIFS` / `create_cifs_storage` 及其 `smb://` URL 解析已随
-  #150 删除；旧统一 `create_storage` 和 `StorageType` 入口也已删除。CIFS 使用类型化配置。
+  `storage/factory.rs` 提供 URL 配置入口并向 backend facade 分派。
+- 历史 `CifsStorage` / `StorageEnum::CIFS` / `create_cifs_storage` 已随 #150 删除；旧统一
+  `create_storage` 和 `StorageType` 入口也已删除。CIFS 使用类型化配置，并可从 `smb://` URL 构造。
 - backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
 - data-mover 不得重新依赖 smb-rs 的 connection、runtime、wire create/query/set 类型或协议 handle。
 - `smb_domain::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
@@ -17,7 +17,9 @@
 
 ## 连接配置
 
-没有 URL。`CifsBackendConfig` 字段：`server` / `share` / `username` / `password` /
+`CifsBackendConfig::from_url("smb://user:password@server[:port]/share[/root]")` 解码凭据、share
+和 root 后返回类型化配置；`ensure_dir` 默认为 `false`，签名和 guest 策略取默认值，调用方可修改。
+也可直接构造 `CifsBackendConfig` 字段：`server` / `share` / `username` / `password` /
 `root: Option<String>` (share 内子路径) / `signing_policy`。存储标识由 data-mover 推导为
 `smb://server/share[/root]`（server、share 小写，root 保留大小写；ADR-0006 C4，`src/storage/endpoint.rs`），
 调用方不再提供。

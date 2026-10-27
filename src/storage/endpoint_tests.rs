@@ -83,10 +83,41 @@ fn nfs_prefix_may_not_climb_out_of_the_export_but_the_export_resolves_like_nfs_r
 
 #[test]
 fn nfs_names_are_what_the_server_sees() -> TestResult {
-    // nfs-rs sends the export as URL text, so `a b` reaches the server as `a%20b`, while the
-    // prefix is looked up literally: two different directories, two different endpoints.
-    assert_eq!(text(nfs("nfs://h/vol/a b"))?, "nfs://h/vol/a%2520b");
-    assert_eq!(text(nfs("nfs://h/vol:a b"))?, "nfs://h/vol/a%20b");
+    // The export and prefix decode URL segments once and name the same directory.
+    for name in ["a b", "a%20b"] {
+        assert_eq!(
+            text(nfs(&format!("nfs://h/vol/{name}")))?,
+            "nfs://h/vol/a%20b"
+        );
+        assert_eq!(
+            text(nfs(&format!("nfs://h/vol:{name}")))?,
+            "nfs://h/vol/a%20b"
+        );
+    }
+    for name in ["测试", "%E6%B5%8B%E8%AF%95"] {
+        assert_eq!(
+            text(nfs(&format!("nfs://h/vol/{name}")))?,
+            "nfs://h/vol/%E6%B5%8B%E8%AF%95"
+        );
+        assert_eq!(
+            text(nfs(&format!("nfs://h/vol:{name}")))?,
+            "nfs://h/vol/%E6%B5%8B%E8%AF%95"
+        );
+    }
+    for name in ["100%", "100%25"] {
+        assert_eq!(
+            text(nfs(&format!("nfs://h/vol/{name}")))?,
+            "nfs://h/vol/100%25"
+        );
+        assert_eq!(
+            text(nfs(&format!("nfs://h/vol:{name}")))?,
+            "nfs://h/vol/100%25"
+        );
+    }
+    for name in ["%FF", "a%2Fb", "a%00b"] {
+        assert!(nfs(&format!("nfs://h/vol/{name}")).is_err(), "{name}");
+        assert!(nfs(&format!("nfs://h/vol:{name}")).is_err(), "{name}");
+    }
     // `#` starts a fragment in the export and is dropped by nfs-rs; in the prefix it is a name.
     assert_eq!(text(nfs("nfs://h/vol#x"))?, "nfs://h/vol");
     assert_eq!(text(nfs("nfs://h/vol:a#b"))?, "nfs://h/vol/a%23b");
