@@ -23,6 +23,9 @@ use crate::filter::{FilterExpression, FilterInput, parse_filter_expression, shou
 use crate::model::{EntryKind, MetadataFamily, MetadataRequirements};
 use crate::traversal::{TraversalCandidate, TraversalDecision, TraversalFilter};
 
+#[cfg(test)]
+mod local_tests;
+
 /// `match` / `exclude` filter expressions applied during a role-based traversal.
 #[derive(Debug)]
 pub struct DslTraversalFilter {
@@ -33,18 +36,21 @@ pub struct DslTraversalFilter {
     resume_key: [u8; 32],
 }
 
-/// A key of both parsed expressions: equal keys decide alike. Taken from their derived `Debug`
-/// form, which spells out the whole parsed tree (every condition, operator, value and glob) and
-/// keeps a relative time such as `modified < 7d` relative. A new version of the DSL may spell a tree
-/// differently; a checkpoint then refuses to resume, which is the safe direction.
+/// A key of the DSL semantics version and both parsed expressions: equal keys decide alike.
+/// Their derived `Debug` form spells out every condition, operator, value and glob, and keeps
+/// a relative time such as `modified < 7d` relative. A new DSL version may spell a tree differently;
+/// a checkpoint then refuses to resume, which is the safe direction.
 ///
 /// A relative time is evaluated against the moment of each decision, so a traversal resumed a day
 /// later keeps the same key under a window a day later.
+///
+/// Version 2 gates unfiltered subtree admission. Old checkpoints may contain unsafe
+/// `filter_children = false` frontiers and must be refused even when their expressions are identical.
 fn resume_key(
     match_expressions: Option<&FilterExpression>,
     exclude_expressions: Option<&FilterExpression>,
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key("data-mover DSL traversal filter");
+    let mut hasher = blake3::Hasher::new_derive_key("data-mover DSL traversal filter v2");
     hasher.update(format!("{match_expressions:?}").as_bytes());
     hasher.update(&[0]);
     hasher.update(format!("{exclude_expressions:?}").as_bytes());

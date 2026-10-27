@@ -44,6 +44,19 @@
 `filter_children = false` 是**传递性**的：整棵子树都不再调 `should_skip`，连 exclude 也绕过
 (legacy `dir_tree.rs` 的 `need_filter` 同语义)。
 
+只有**没有 exclude，且白名单仅由正向 `path == ...` 条件经 AND / OR 组合**时，
+命中的目录才允许子树免检。正向路径命中可通过祖先匹配传递给后代；`path != ...`
+不具备这个保证，例如 `path != "k/**/blocked"` 保留 `k/a`，但必须排除 `k/a/blocked`。
+祖先匹配允许每个 `**` 匹配零段，例如 `path == "k/**/a"` 命中 `k/a` 后，
+`k/a/allowed` 仍继承路径命中；存在 exclude 时也不会因逐项评估而误排除它。
+存在 exclude 或白名单含 name / modified / dir_date 等条件时，被保留目录的子项仍逐项评估。
+`dir_date` 因此会按嵌套日期目录自身的日期判断；文件和无日期目录仍透传。
+这个门控只改变被保留目录的 `check_children`，文件判定和停止下钻的判定保持原有语义。
+
+DSL 续扫指纹绑定解析后的表达式和过滤语义版本（当前为 v2）。升级前的 DSL 检查点
+可能已保存错误的 `filter_children = false`，升级后以 `ResumeRefusal::Mismatch` 拒绝续扫，
+调用方须从头扫描。检查点格式和没有 DSL filter 的扫描不受此语义版本变更影响。
+
 被 filter 拦下的目录在遍历输出里是**可观测**的，`(emit, descend)` 两个分量各自对应不同的证据：
 
 | `(emit, descend)` | 遍历输出 |
@@ -99,7 +112,7 @@
 
 此处的布尔等价不保证实际遍历决策一致：AST 求值的短路顺序、`LazyMatch`、
 `PartialMatch` 和路径附加信息仍可能影响目录裁剪。因此比较结果不得用来替换执行 AST，
-也不得用于认定断点恢复兼容；现有 `resume_key` 生成逻辑不变。
+也不得用于认定断点恢复兼容；续扫仍以带语义版本的原始 AST 指纹为准。
 
 ## 表达式形式
 

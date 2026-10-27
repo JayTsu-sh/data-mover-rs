@@ -10,6 +10,7 @@ use tracing::trace;
 use crate::{Result, error::StorageError};
 
 mod equivalence;
+mod pruning;
 
 /// glob 匹配选项：`require_literal_separator = true` 确保 `*` 不匹配路径分隔符 `/`，
 /// 只有 `**` 才能跨越目录边界。
@@ -145,8 +146,16 @@ pub fn should_skip(
             expr, match_result, is_dir
         );
 
-        if let Some(decision) = included_entry_decision(&match_result, is_dir) {
-            return decision;
+        if let Some((skip_entry, continue_scan, check_children)) =
+            included_entry_decision(&match_result, is_dir)
+        {
+            // LISA-3849: admitting a directory must not bypass excludes or per-child conditions.
+            let check_children = check_children
+                || (is_dir
+                    && !skip_entry
+                    && (exclude_expressions.is_some()
+                        || !pruning::allows_unfiltered_descendants(&expr.root)));
+            return (skip_entry, continue_scan, check_children);
         }
     }
 
@@ -1562,26 +1571,26 @@ struct PathPatternMatch<'a> {
 }
 
 fn matches_ancestor(file_parts: &[&str], path_pattern: &PathPatternMatch<'_>) -> bool {
-    if file_parts.len() <= path_pattern.pattern_depth {
-        return false;
-    }
     if path_pattern.has_double_wildcard {
-        let prefix_count = path_pattern
+        // Each `**` may match zero segments, so a matched ancestor can be shallower
+        // than the pattern's textual depth, including when it has multiple globstars.
+        let min_depth = path_pattern
             .pattern_parts
             .iter()
-            .position(|part| part == "**")
-            .unwrap_or(0);
-        let min_depth = prefix_count + path_pattern.pattern_after_wildcard.len();
+            .filter(|part| part.as_str() != "**")
+            .count();
         (min_depth..file_parts.len()).any(|depth| {
             path_pattern
                 .pattern
                 .matches_with(&file_parts[..depth].join("/"), GLOB_MATCH_OPTIONS)
         })
-    } else {
+    } else if file_parts.len() > path_pattern.pattern_depth {
         path_pattern.pattern.matches_with(
             &file_parts[..path_pattern.pattern_depth].join("/"),
             GLOB_MATCH_OPTIONS,
         )
+    } else {
+        false
     }
 }
 
@@ -5062,7 +5071,7 @@ mod tests {
 
     #[test]
     fn test_skip_dir_date_match() {
-        // 日期目录匹配 → 保留，扫描子目录，子项免检
+        // 日期目录匹配 → 保留，扫描子目录，按子目录自身的日期继续过滤
         let (skip, cont, check) = skip!(
             Some("dir_date <= 240301"),
             None,
@@ -5073,7 +5082,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!((skip, cont, check), (false, true, false));
+        assert_eq!((skip, cont, check), (false, true, true));
     }
 
     #[test]
@@ -5153,7 +5162,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!((s, c, ch), (false, true, false));
+        assert_eq!((s, c, ch), (false, true, true));
     }
 
     #[test]
@@ -5185,7 +5194,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!((s, c, ch), (false, true, false));
+        assert_eq!((s, c, ch), (false, true, true));
     }
 
     #[test]

@@ -451,12 +451,12 @@ mod tests {
     #[test]
     fn boolean_equivalence_preserves_existing_order_sensitive_traversal() {
         let path_first =
-            parse_filter_expression("path == src or name == src").assert_value("parse");
+            parse_filter_expression("path == src/child and name == keep").assert_value("parse");
         let name_first =
-            parse_filter_expression("name == src or path == src").assert_value("parse");
+            parse_filter_expression("name == keep and path == src/child").assert_value("parse");
         let input = FilterInput {
-            file_name: Some("src"),
-            file_path: Some("src"),
+            file_name: Some("deep"),
+            file_path: Some("other/deep"),
             file_type: Some("dir"),
             ..FilterInput::default()
         };
@@ -467,11 +467,11 @@ mod tests {
         );
         assert_eq!(
             should_skip(Some(&path_first), None, input),
-            (false, true, false)
+            (true, false, false)
         );
         assert_eq!(
             should_skip(Some(&name_first), None, input),
-            (false, true, true)
+            (true, true, true)
         );
     }
 
