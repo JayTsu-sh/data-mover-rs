@@ -162,7 +162,14 @@ enum ModifiedValue {
 - `RelativeDays(-7.0)` = "7 天内修改的"。
 - `AbsoluteEpoch(1704067200)` = "2024-01-01 UTC 之后修改的"。
 
-混用：表达式 parse 时统一为 `AbsoluteEpoch` (相对值用当前时间换算)。
+解析后，相对条件保留为 `RelativeDays`，在每次求值时使用当前时间；绝对日期
+解析为固定的 `AbsoluteEpoch`。因此，同一表达式与同一份条目元数据在不同时间
+求值，相对条件的结果仍可能变化。
+
+`FilterExpression::has_relative_time_condition()` 遍历已解析的 AST：任一分支含
+`ModifiedValue::RelativeDays` 即返回 `true`，包括当前条目求值时可能短路的分支。
+绝对 `modified` 条件和 `dir_date` 返回 `false`。这是保守的结构判定，
+不保证具体条目的匹配结果一定变化；解析错误由 `parse_filter_expression` 返回。
 
 ## 目录名匹配
 
