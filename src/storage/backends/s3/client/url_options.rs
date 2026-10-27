@@ -114,22 +114,6 @@ pub(crate) struct S3UrlParts<'a> {
     pub(crate) options: S3UrlOptions,
 }
 
-/// The schemes that were replaced by options, with their new spelling. The old `+https` schemes
-/// accepted any certificate, hence `tls_verify=false` in their replacement. HCP support was removed
-/// altogether: an HCP namespace is used as standard S3.
-const REMOVED_SCHEMES: [(&str, &str); 6] = [
-    ("s3+http", "s3://…"),
-    ("s3+sg", "s3://…?compat=sg"),
-    ("s3+sg+https", "s3+https://…?compat=sg&tls_verify=false"),
-    ("s3+dxn", "s3://…?compat=dxn"),
-    ("s3+dxn+https", "s3+https://…?compat=dxn&tls_verify=false"),
-    ("s3+hcp", HCP_REMOVED),
-];
-
-/// What the removed HCP spellings (`s3+hcp://`, `compat=hcp`) are told.
-const HCP_REMOVED: &str = "s3://… (HCP support was removed: the namespace is used as standard S3, \
-                           its tags as S3 object tagging, not the HCP BPM annotation)";
-
 /// Splits `scheme://AK:SK@location[?options]` into its parts.
 ///
 /// The credentials end at the **last** `@` (a secret key never contains `@`, but often `/`, `+`,
@@ -138,7 +122,7 @@ const HCP_REMOVED: &str = "s3://… (HCP support was removed: the namespace is u
 ///
 /// # Errors
 /// `UrlParseError` for anything the URL text alone decides: a missing `://`, `@` or `:` in the
-/// credentials, a scheme other than `s3` / `s3+https` (a removed scheme names its replacement), and
+/// credentials, a scheme other than `s3` / `s3+https`, and
 /// every option error listed in the module documentation.
 pub(crate) fn split_s3_url(url: &str, target: S3UrlTarget) -> Result<S3UrlParts<'_>> {
     let scheme_end = url
@@ -172,17 +156,7 @@ fn scheme_https(scheme: &str) -> Result<bool> {
     match scheme.as_str() {
         "s3" => Ok(false),
         "s3+https" => Ok(true),
-        _ => Err(invalid(
-            REMOVED_SCHEMES
-                .iter()
-                .find(|(removed, _)| *removed == scheme)
-                .map_or_else(
-                    || "an S3 URL starts with s3:// (HTTP) or s3+https:// (HTTPS)".to_string(),
-                    |(removed, replacement)| {
-                        format!("the scheme {removed}:// was removed; write {replacement}")
-                    },
-                ),
-        )),
+        _ => Err(invalid("unsupported S3 URL scheme".to_string())),
     }
 }
 
@@ -236,11 +210,6 @@ fn read_query(query: &str) -> Result<Given> {
         }
         if value.is_empty() {
             return Err(invalid(format!("the S3 URL option {name} has no value")));
-        }
-        if name == "compat" && value == "hcp" {
-            return Err(invalid(format!(
-                "compat=hcp was removed; write {HCP_REMOVED}"
-            )));
         }
         match name {
             "compat" => set(

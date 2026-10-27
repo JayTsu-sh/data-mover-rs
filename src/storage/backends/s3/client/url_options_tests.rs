@@ -91,35 +91,23 @@ fn accepted_spellings() {
 }
 
 #[test]
-fn removed_schemes_name_their_replacement() {
-    for (scheme, replacement) in [
-        ("s3+http", "write s3://…"),
-        ("s3+sg", "write s3://…?compat=sg"),
-        ("S3+SG", "write s3://…?compat=sg"),
-        (
-            "s3+sg+https",
-            "write s3+https://…?compat=sg&tls_verify=false",
-        ),
-        ("s3+dxn", "write s3://…?compat=dxn"),
-        (
-            "s3+dxn+https",
-            "write s3+https://…?compat=dxn&tls_verify=false",
-        ),
-        ("s3+hcp", "write s3://… (HCP support was removed"),
+fn unsupported_schemes_have_no_migration_hint() {
+    for scheme in [
+        "s3+http",
+        "s3+sg",
+        "S3+SG",
+        "s3+sg+https",
+        "s3+dxn",
+        "s3+dxn+https",
+        "s3+hcp",
+        "http",
+        "https",
+        "s3+foo",
+        "s3+https+dxn",
     ] {
         let message = refusal(&url(scheme, ""), S3UrlTarget::Bucket);
         assert!(
-            message.contains(&format!(
-                "the scheme {}:// was removed",
-                scheme.to_ascii_lowercase()
-            )) && message.contains(replacement),
-            "{scheme}: {message}"
-        );
-    }
-    for scheme in ["http", "https", "s3+foo", "s3+https+dxn"] {
-        let message = refusal(&url(scheme, ""), S3UrlTarget::Bucket);
-        assert!(
-            message.contains("starts with s3:// (HTTP) or s3+https:// (HTTPS)"),
+            message.contains("unsupported S3 URL scheme") && !message.contains("write "),
             "{scheme}: {message}"
         );
     }
@@ -173,7 +161,7 @@ const REFUSED: &[(&str, &str, &str)] = &[
     (
         "s3",
         "?compat=hcp",
-        "compat=hcp was removed; write s3://… (HCP support was removed",
+        "compat does not accept `hcp`; allowed: sg, dxn, ontap",
     ),
     (
         "s3",

@@ -9,6 +9,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::types::CompletedPart;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_types::region::Region;
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tls::{build_skip_verify_http_client, untrusted_certificate, warn_unverified};
@@ -113,6 +114,11 @@ fn parse_s3_url(url: &str) -> Result<ParsedS3Url> {
     let safe_url = format!("s3://dummy:dummy@{}", parts.location);
     let parsed_url =
         Url::parse(&safe_url).map_err(|e| StorageError::UrlParseError(e.to_string()))?;
+    if parsed_url.fragment().is_some() {
+        return Err(StorageError::UrlParseError(
+            "S3 URL must not contain a fragment; encode a literal # as %23".to_string(),
+        ));
+    }
 
     // 获取主机名
     let host = parsed_url
@@ -140,12 +146,13 @@ fn parse_s3_url(url: &str) -> Result<ParsedS3Url> {
     // 构建HTTP端点，根据URL的scheme决定使用http还是https
     let endpoint = format!("{http_scheme}://{host_and_port}");
 
-    // 获取URL路径部分作为prefix，并确保以/结尾
-    let mut prefix = parsed_url
-        .path()
-        .strip_prefix('/')
-        .unwrap_or(parsed_url.path())
-        .to_string();
+    // Read the original path so URL dot-segment normalization cannot change an S3 key.
+    // Both raw UTF-8 and percent-encoded URL spellings name the same prefix.
+    let encoded_prefix = parts.location.split_once('/').map_or("", |(_, path)| path);
+    let mut prefix = percent_decode_str(encoded_prefix)
+        .decode_utf8()
+        .map_err(|_| StorageError::UrlParseError("S3 prefix is not valid UTF-8".to_string()))?
+        .into_owned();
     if !prefix.is_empty() && !prefix.ends_with('/') {
         prefix.push('/');
     }
@@ -739,6 +746,38 @@ mod tests {
         let ParsedS3Url { prefix, .. } =
             parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(prefix, "prefix/");
+    }
+
+    #[test]
+    fn test_parse_s3_url_percent_encoded_prefix() {
+        let base = "s3://ak:sk@bucket.host.com:9000/";
+        for (raw, encoded, expected) in [
+            ("测试", "%E6%B5%8B%E8%AF%95", "测试/"),
+            ("a b", "a%20b", "a b/"),
+            ("100%", "100%25", "100%/"),
+            ("a//b", "a//b", "a//b/"),
+            ("a/./b", "a/./b", "a/./b/"),
+        ] {
+            let raw_url = format!("{base}{raw}");
+            let encoded_url = format!("{base}{encoded}");
+            assert_eq!(parse_s3_url(&raw_url).assert_value("raw").prefix, expected);
+            assert_eq!(
+                parse_s3_url(&encoded_url).assert_value("encoded").prefix,
+                expected
+            );
+            assert_eq!(
+                endpoint_identity(&raw_url).assert_value("raw identity"),
+                endpoint_identity(&encoded_url).assert_value("encoded identity")
+            );
+        }
+        assert_eq!(
+            parse_s3_url(&format!("{base}100%2525"))
+                .assert_value("literal percent encoding")
+                .prefix,
+            "100%25/"
+        );
+        assert!(parse_s3_url(&format!("{base}%FF")).is_err());
+        assert!(parse_s3_url(&format!("{base}name#fragment")).is_err());
     }
 
     // --- TLS 校验解析测试（s3+https 默认校验，tls_verify=false 才跳过）---
