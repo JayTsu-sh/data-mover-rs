@@ -258,7 +258,7 @@ fn observed_time_request(
         options: IntegrityOptions {
             mode: IntegrityMode::Content,
             mtime_precision: MtimePrecision::Exact,
-            mtime_tolerance: std::time::Duration::from_secs(60),
+            mtime_tolerance: std::time::Duration::from_mins(1),
         },
         cancel: tokio_util::sync::CancellationToken::new(),
     })

@@ -91,7 +91,8 @@ async fn observed(storage: &Storage, key: &StoragePath) -> Result<ObservedEntry,
     while let Some(item) = session.next_item().await {
         match item {
             TraversalItem::Entry(entry) if entry.path() == key => {
-                if found.replace(*entry).is_some() {
+                let previous = found.replace(*entry);
+                if previous.is_some() {
                     return Err("duplicate observed entry".into());
                 }
             }
@@ -153,7 +154,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let ready = pause_file.with_extension("ready");
         let resume = pause_file.with_extension("resume");
         std::fs::write(&ready, b"ready")?;
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(Duration::from_mins(1), async {
             while !resume.exists() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
