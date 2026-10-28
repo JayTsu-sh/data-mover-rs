@@ -7,14 +7,16 @@ use bytes::Bytes;
 use futures::Stream;
 use tokio_util::sync::CancellationToken;
 
-use super::copied_metadata::{CopiedMetadataObservation, CopiedMetadataTarget};
-use super::{PermissionFacts, SourceDescriptor};
+use super::SourceDescriptor;
+use super::copied_metadata::CopiedMetadataTarget;
 use crate::runtime::qos::SourceQosBudget;
 
+mod metadata;
 mod namespace;
 mod stage;
 mod verification;
 mod version;
+pub use metadata::{Metadata, MetadataMutation};
 pub use namespace::{
     CaseSensitivity, CreateSymlinkRequest, NameNormalization, NameSemantics, Namespace,
     NamespaceCapabilities,
@@ -25,10 +27,8 @@ pub use verification::{ReadBackMethod, UnpinnedReadReason, UploadDigest, UploadD
 use version::version_unsupported;
 
 use crate::model::{
-    AclMetadata, BackendSessionFailure, EntryOperationFailure, ExtendedAttribute, FailureClass,
-    MappedOwnership, MetadataCapabilities, MetadataFamily, MetadataObservations, ObjectTag,
-    ObservationPlan, ObservationSupport, Operation, OwnershipMode, SourceIdentity, SourceVersion,
-    StoragePath, TimestampMetadata, Transience,
+    BackendSessionFailure, EntryOperationFailure, FailureClass, Operation, SourceIdentity,
+    SourceVersion, StoragePath, Transience,
 };
 
 /// A bounded payload stream. Implementations own request sizing and backpressure.
@@ -665,160 +665,6 @@ pub enum DeleteMarkerOutcome {
         /// The marker written, if the store also wrote one.
         marker: Option<String>,
     },
-}
-
-/// Metadata observation and application role. It never implicitly refetches omitted facts.
-#[async_trait]
-pub trait Metadata: Send + Sync {
-    /// Instance-specific observation support, queried without backend I/O. Unknown by default
-    /// so external roles can continue to determine support while observing individual entries.
-    fn observation_capabilities(&self) -> MetadataCapabilities {
-        MetadataCapabilities::default()
-    }
-
-    /// Removes one named extended attribute. This is distinct from applying `Xattrs`, which
-    /// only sets the supplied values. Unsupported backends refuse before I/O; NFS requires a
-    /// nonempty UTF-8 name and reports the server's missing-attribute or permission refusal.
-    async fn remove_xattr(
-        &self,
-        path: &StoragePath,
-        _name: &[u8],
-    ) -> Result<(), StorageRoleFailure> {
-        Err(StorageRoleFailure::Entry(
-            EntryOperationFailure::new(
-                path.clone(),
-                Operation::Metadata,
-                FailureClass::Unsupported,
-                Transience::Permanent,
-                "removing extended attributes is unsupported",
-            )
-            .unwrap_or_else(|_| unreachable!("static metadata diagnostic")),
-        ))
-    }
-
-    /// Permission facts bound to a description. Reuses inline facts when available; named
-    /// principal backends override this instead of fabricating numeric owner identifiers.
-    /// Known unsupported or inapplicable ownership returns no facts without backend I/O;
-    /// backends with independent permission facts override this method.
-    async fn permissions(
-        &self,
-        descriptor: &SourceDescriptor,
-    ) -> Result<super::PermissionFacts, StorageRoleFailure> {
-        if matches!(
-            self.observation_capabilities()
-                .support(MetadataFamily::OwnershipMode),
-            ObservationSupport::NotApplicable | ObservationSupport::Unsupported
-        ) {
-            return Ok(PermissionFacts::default());
-        }
-        let plan = ObservationPlan::default()
-            .with_ownership_mode(crate::model::ObservationMode::BestEffort);
-        let observations = match self.observe_listed(descriptor, plan) {
-            Some(observed) => observed?,
-            None => {
-                self.observe_bound(&descriptor.path, &descriptor.source_identity, plan)
-                    .await?
-            }
-        };
-        Ok(match observations.ownership_mode() {
-            crate::model::MetadataObservation::Failed { class, transience } => {
-                return Err(StorageRoleFailure::Entry(
-                    EntryOperationFailure::new(
-                        descriptor.path.clone(),
-                        Operation::Observe,
-                        *class,
-                        *transience,
-                        "permission observation failed",
-                    )
-                    .unwrap_or_else(|_| unreachable!("static diagnostic")),
-                ));
-            }
-            crate::model::MetadataObservation::Value { value, .. } => super::PermissionFacts {
-                owner: Some(super::PrincipalIdentity::Numeric(value.uid)),
-                group: Some(super::PrincipalIdentity::Numeric(value.gid)),
-                mode: Some(value.mode & 0o7777),
-            },
-            _ => super::PermissionFacts::default(),
-        })
-    }
-    /// Source observations requested by the ordinary transfer entry for baseline metadata copy.
-    fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
-        None
-    }
-
-    async fn observe(
-        &self,
-        path: &StoragePath,
-        plan: ObservationPlan,
-    ) -> Result<MetadataObservations, StorageRoleFailure>;
-    /// The observations of a listed child that its listing already answers under `plan`, with
-    /// no I/O: exactly what [`Self::observe`] would report from the same attributes, failures
-    /// included. `None` when answering takes a call, which is the default; a traversal then
-    /// calls [`Self::observe`] instead.
-    fn observe_listed(
-        &self,
-        descriptor: &SourceDescriptor,
-        plan: ObservationPlan,
-    ) -> Option<Result<MetadataObservations, StorageRoleFailure>> {
-        let _ = (descriptor, plan);
-        None
-    }
-    /// Observes metadata only when the same operation confirms the expected source identity.
-    /// Roles that advertise copied metadata should override this method.
-    async fn observe_bound(
-        &self,
-        path: &StoragePath,
-        expected: &SourceIdentity,
-        plan: ObservationPlan,
-    ) -> Result<MetadataObservations, StorageRoleFailure> {
-        let _ = expected;
-        self.observe(path, plan).await
-    }
-    /// Observes baseline copy facts together, bound to the described source version.
-    async fn observe_copy_bound(
-        &self,
-        path: &StoragePath,
-        expected: &SourceIdentity,
-        plan: ObservationPlan,
-    ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
-        Ok(CopiedMetadataObservation {
-            observations: self.observe_bound(path, expected, plan).await?,
-            mode_without_ownership: None,
-            owner_names_unmapped: false,
-        })
-    }
-    /// [`Metadata::observe_copy_bound`] for one pinned source version. The default serves stores
-    /// without versions: `Current` observes as usual, and `Id` is `Unsupported`.
-    async fn observe_copy_bound_version(
-        &self,
-        path: &StoragePath,
-        expected: &SourceIdentity,
-        version: &SourceVersion,
-        plan: ObservationPlan,
-    ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
-        match version {
-            SourceVersion::Current => self.observe_copy_bound(path, expected, plan).await,
-            SourceVersion::Id(_) => Err(version_unsupported(path, Operation::Metadata)),
-        }
-    }
-    async fn apply(
-        &self,
-        path: &StoragePath,
-        mutation: MetadataMutation,
-        cancel: CancellationToken,
-    ) -> Result<(), StorageRoleFailure>;
-}
-
-/// One backend-neutral metadata mutation compiled before target side effects.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MetadataMutation {
-    Acl(AclMetadata),
-    Xattrs(Vec<ExtendedAttribute>),
-    Tags(Vec<ObjectTag>),
-    NumericOwnership(OwnershipMode),
-    MappedOwnership(MappedOwnership),
-    Mode(u32),
-    Timestamps(TimestampMetadata),
 }
 
 #[cfg(test)]

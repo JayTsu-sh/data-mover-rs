@@ -10,7 +10,7 @@ use super::listing::{child_failure, directory_descriptor};
 use crate::model::{BackendIdentity, EntryKind, FailureClass, StoragePath};
 use crate::storage::listing::cancelled;
 use crate::storage::{
-    ChildFailure, ListRequest, ListingPage, Namespace, PageSink, SourceDescriptor,
+    ChildFailure, ListRequest, ListedChild, ListingPage, Namespace, PageSink, SourceDescriptor,
     StorageRoleFailure,
 };
 
@@ -24,6 +24,7 @@ pub(super) async fn produce(
     sink: &PageSink,
 ) {
     let mut raw = namespace.list(request.clone());
+    let mut root_object_reported = false;
     loop {
         let next = tokio::select! {
             biased;
@@ -40,7 +41,7 @@ pub(super) async fn produce(
             biased;
             () = request.cancel.cancelled() => return sink.fail(cancelled(&request.path)).await,
             () = sink.closed() => return,
-            result = project(namespace, identity, request, is_root, page) => result,
+            result = project(namespace, identity, request, is_root, &mut root_object_reported, page) => result,
         };
         match projected {
             Ok(page) => {
@@ -58,11 +59,15 @@ async fn project(
     identity: &BackendIdentity,
     request: &ListRequest,
     is_root: bool,
+    root_object_reported: &mut bool,
     page: ListingPage,
 ) -> Result<ListingPage, StorageRoleFailure> {
     let mut result = ListingPage::new(Vec::new(), page.failures, page.internal_hidden);
     for child in page.children {
-        if child.is_directory_object() && !is_root {
+        if child.is_directory_object() {
+            if is_root {
+                root_object(&request.path, child, root_object_reported, &mut result)?;
+            }
             continue;
         }
         if child.kind != EntryKind::Directory {
@@ -88,6 +93,37 @@ async fn project(
         }
     }
     Ok(result)
+}
+
+/// The scan root itself is omitted: only a current unversioned zero-byte marker is harmless.
+/// Every history is diagnostic here, even when its object versions are all zero bytes.
+fn root_object(
+    directory: &StoragePath,
+    child: ListedChild,
+    reported: &mut bool,
+    page: &mut ListingPage,
+) -> Result<(), StorageRoleFailure> {
+    if *reported || (child.size == Some(0) && child.listing.history.is_none()) {
+        return Ok(());
+    }
+    let descriptor = child.into_descriptor(directory).map_err(|_| {
+        StorageRoleFailure::Entry(child_failure(
+            directory,
+            FailureClass::Unsupported,
+            "an S3 own key exceeds the path limit",
+        ))
+    })?;
+    *reported = true;
+    page.push_failure(ChildFailure::from_failure(
+        directory,
+        child_failure(
+            &descriptor.path,
+            FailureClass::Unsupported,
+            "the traversal root's own directory object holds content or history but is not part of the \
+             traversal; traverse its parent to include it",
+        ),
+    ));
+    Ok(())
 }
 
 #[derive(Default)]

@@ -72,7 +72,7 @@ pub use failure::{ChildFailure, is_vanished};
 pub use hint::DescentHint;
 pub use names::child_path;
 pub(crate) use names::respelled;
-use names::{child_name, child_path_owned};
+use names::{child_name, child_path_owned, valid_object_suffix};
 
 use crate::model::{
     BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
@@ -712,10 +712,7 @@ fn too_long(directory: &StoragePath, name: &str) -> EntryOperationFailure {
 /// Why an empty-named child cannot be handed over: at the storage root its path would be the root
 /// itself, and a directory object is always a file (P7 F5). `None` for any other child.
 fn misplaced_object(directory: &StoragePath, child: &ListedChild) -> Option<EntryOperationFailure> {
-    if child.name.ends_with('/')
-        && (child.kind != EntryKind::File
-            || !names::is_segment(child.name.strip_suffix('/').unwrap_or_default()))
-    {
+    if !valid_object_suffix(&child.name, child.kind) {
         return Some(listing_failure(
             directory,
             FailureClass::Protocol,

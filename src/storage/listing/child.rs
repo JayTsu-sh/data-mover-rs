@@ -4,7 +4,7 @@
 use bytes::Bytes;
 
 use super::DescentHint;
-use super::names::{child_path, is_segment};
+use super::names::{child_path, is_segment, valid_object_suffix};
 use crate::model::{
     EntryKind, ModelValueError, RenameEvidence, SourceIdentity, SourceVersion, StoragePath,
     TimestampMetadata,
@@ -175,10 +175,7 @@ impl ListedChild {
         self,
         directory: &StoragePath,
     ) -> Result<SourceDescriptor, ModelValueError> {
-        if self.name.ends_with('/')
-            && (self.kind != EntryKind::File
-                || !is_segment(self.name.strip_suffix('/').unwrap_or_default()))
-        {
+        if !valid_object_suffix(&self.name, self.kind) {
             return Err(ModelValueError::new(
                 "listed_child_name",
                 "a trailing slash is only valid on one file key segment",

@@ -5,9 +5,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::permissions::compare_permissions;
 use super::{
-    AclComparisonScope, Endpoint, IntegrityFailure, IntegrityInput, IntegrityMode,
-    IntegrityOptions, IntegrityPlan, IntegrityReport, IntegrityRequest, IntegritySide,
-    compare_content, compare_facts, compare_modified, endpoint, missing, permissions, reconcile,
+    AclComparisonScope, Endpoint, IntegrityDifference, IntegrityFailure, IntegrityIgnored,
+    IntegrityInput, IntegrityMode, IntegrityOptions, IntegrityPlan, IntegrityReport,
+    IntegrityRequest, IntegritySide, MtimePrecision, ObservedMtime, endpoint, missing, permissions,
+    reconcile, same_instant,
 };
 use crate::model::EntryKind;
 use crate::storage::SourceDescriptor;
@@ -131,5 +132,88 @@ async fn compare_metadata(
         &mut report.ignored,
     )
     .await?;
+    Ok(())
+}
+
+fn compare_facts(
+    source: &SourceDescriptor,
+    destination: &SourceDescriptor,
+    differences: &mut Vec<IntegrityDifference>,
+) {
+    if source.kind != destination.kind {
+        differences.push(IntegrityDifference::Kind {
+            source: source.kind,
+            destination: destination.kind,
+        });
+    }
+    if source.size != destination.size {
+        differences.push(IntegrityDifference::Size {
+            source: source.size,
+            destination: destination.size,
+        });
+    }
+}
+
+async fn compare_modified(
+    source: &Endpoint,
+    destination: &Endpoint,
+    entries: (&SourceDescriptor, &SourceDescriptor),
+    options: IntegrityOptions,
+    differences: &mut Vec<IntegrityDifference>,
+    ignored: &mut Vec<IntegrityIgnored>,
+) -> Result<(), IntegrityFailure> {
+    let (source_time, destination_time) = reconcile(join!(
+        source.modified(entries.0),
+        destination.modified(entries.1)
+    ))?;
+    let (ObservedMtime::Observed(source_time), ObservedMtime::Observed(destination_time)) =
+        (source_time, destination_time)
+    else {
+        ignored.push(IntegrityIgnored::Modified);
+        return Ok(());
+    };
+    let equal = match options.mtime_precision {
+        MtimePrecision::Coarsest => {
+            same_instant(source_time, destination_time, options.mtime_tolerance)
+        }
+        MtimePrecision::Exact => match (source_time, destination_time) {
+            (Some(source), Some(destination)) => {
+                source.unix_nanos().abs_diff(destination.unix_nanos())
+                    <= options.mtime_tolerance.as_nanos()
+            }
+            (None, None) => true,
+            _ => false,
+        },
+    };
+    if !equal {
+        differences.push(IntegrityDifference::Modified {
+            source: source_time,
+            destination: destination_time,
+        });
+    }
+    Ok(())
+}
+
+async fn compare_content(
+    source: &Endpoint,
+    destination: &Endpoint,
+    entries: (&SourceDescriptor, &SourceDescriptor),
+    cancel: &CancellationToken,
+    report: &mut IntegrityReport,
+) -> Result<(), IntegrityFailure> {
+    let (source_entry, destination_entry) = entries;
+    let ((source_digest, source_bytes), (destination_digest, destination_bytes)) =
+        reconcile(join!(
+            source.digest(source_entry, cancel),
+            destination.digest(destination_entry, cancel)
+        ))?;
+    report.compared_bytes = source_bytes;
+    report.digests = Some((source_digest, destination_digest));
+    if source_digest != destination_digest {
+        report.differences.push(IntegrityDifference::Content {
+            source_bytes,
+            destination_bytes,
+        });
+    }
     Ok(())
 }

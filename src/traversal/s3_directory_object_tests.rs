@@ -4,7 +4,7 @@
 //! dropped (zero bytes), never emitted at the root's own relative path; and `p/d/`, the file
 //! `p/d` and the directory `p/d` never share an identity key or a snapshot (their transfer
 //! identities differ too: `transfer::identity_tests`). Every case runs in both traversal orders:
-//! the root's own object is taken out of the root's listing by the page preparation both share.
+//! the S3 namespace projects the root's own object before either traversal consumes the listing.
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -555,10 +555,11 @@ async fn the_traversal_roots_own_object_is_reported_not_emitted() -> TestResult 
             "{listed:?}"
         );
         let scan = totals(&outcome);
-        assert_eq!((scan.emitted, scan.failed_children), (3, 1));
+        assert_eq!((scan.listed, scan.emitted, scan.failed_children), (4, 3, 1));
         let (items, outcome) = traverse(&protocol, request("p/d", order)?).await?;
         assert_eq!(rows(&items), ["p/d/x File Some(1)"]);
-        assert_eq!(totals(&outcome).listed, 1);
+        let scan = totals(&outcome);
+        assert_eq!((scan.listed, scan.emitted, scan.failed_children), (1, 1, 0));
 
         let versioned = Arc::new(MemoryS3::default());
         versioned.set_versioning(Versioning::Enabled);
@@ -593,6 +594,30 @@ async fn the_traversal_roots_own_object_is_reported_not_emitted() -> TestResult 
             rows(&items),
             ["failure Child z/ Unsupported", "z/x File Some(1)"]
         );
+    }
+    Ok(())
+}
+
+/// Repeated server pages still produce one diagnostic for the scan root's own key.
+#[tokio::test]
+async fn the_traversal_roots_own_object_is_reported_once_across_pages() -> TestResult {
+    for order in ORDERS {
+        let protocol = Arc::new(MemoryS3::default());
+        lists_histories(&protocol, false);
+        put(&protocol, "r/", b"fives").await?;
+        put(&protocol, "r/a", b"123").await?;
+        {
+            let mut knobs = protocol.listing();
+            knobs.page_size = 1;
+            knobs.repeat_first_object = true;
+        }
+        let (items, outcome) = traverse(&protocol, request("r", order)?).await?;
+        assert_eq!(
+            rows(&items),
+            ["failure Child r/ Unsupported", "r/a File Some(3)"]
+        );
+        let scan = totals(&outcome);
+        assert_eq!((scan.listed, scan.emitted, scan.failed_children), (2, 1, 1));
     }
     Ok(())
 }

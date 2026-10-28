@@ -53,10 +53,11 @@ pub trait Namespace: Send + Sync {
     /// [`crate::storage::listing`] for the stream's contract.
     fn list(&self, request: ListRequest) -> ListingStream;
 
-    /// Lists logical traversal children. By default these are the raw namespace children.
-    /// Object stores may classify folder markers and content objects here without changing
-    /// raw listings or deletion. `is_root` retains diagnostics for an unrepresentable own
-    /// object; below the root, that object was already represented in the parent's listing.
+    /// Lists logical traversal children. Filesystems use the raw namespace listing by default.
+    /// Backends advertising `directory_objects` own the complete projection of markers and
+    /// content objects, including diagnostics for an unrepresentable own object when `is_root`.
+    /// Below the root, the parent's projection already represents that object. Traversal does
+    /// not classify or suppress own objects again. Raw listings and deletion stay unchanged.
     /// This is not a user-selectable scan mode: every traversal uses these semantics.
     fn list_for_traversal(&self, request: ListRequest, _is_root: bool) -> ListingStream {
         self.list(request)
