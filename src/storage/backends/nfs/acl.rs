@@ -1,72 +1,52 @@
-use crate::model::{AclEncoding, AclMetadata};
+use nfs_rs::{AceFlags, AceMask, AceType, NfsAce as ProtocolAce};
 
-const VERSION: u8 = 1;
+use crate::model::AclMetadata;
+use crate::model::acl::{self, NfsAce, PosixAcl, PosixEntry};
 
 pub(super) fn encode(value: &nfs_rs::Acl) -> Result<AclMetadata, NfsAclCodecError> {
-    let count = u32::try_from(value.aces.len()).map_err(|_| NfsAclCodecError)?;
-    let mut output = Vec::new();
-    output.push(VERSION);
-    output.extend_from_slice(&count.to_le_bytes());
-    for ace in &value.aces {
-        output.push(match ace.ace_type {
-            nfs_rs::AceType::AccessAllowed => 0,
-            nfs_rs::AceType::AccessDenied => 1,
-            nfs_rs::AceType::SystemAudit => 2,
-            nfs_rs::AceType::SystemAlarm => 3,
-        });
-        output.extend_from_slice(&ace.flags.0.to_le_bytes());
-        output.extend_from_slice(&ace.access_mask.0.to_le_bytes());
-        let who = ace.who.as_bytes();
-        let length = u32::try_from(who.len()).map_err(|_| NfsAclCodecError)?;
-        output.extend_from_slice(&length.to_le_bytes());
-        output.extend_from_slice(who);
-    }
-    AclMetadata::new(AclEncoding::NfsV4, output).map_err(|_| NfsAclCodecError)
+    let entries: Vec<_> = value
+        .aces
+        .iter()
+        .map(|ace| NfsAce {
+            ace_type: match ace.ace_type {
+                AceType::AccessAllowed => 0,
+                AceType::AccessDenied => 1,
+                AceType::SystemAudit => 2,
+                AceType::SystemAlarm => 3,
+            },
+            flags: ace.flags.0,
+            permissions: ace.access_mask.0,
+            who: ace.who.clone(),
+        })
+        .collect();
+    acl::encode_nfs4(&entries).map_err(|_| NfsAclCodecError)
 }
 
 pub(super) fn decode(value: &AclMetadata) -> Result<nfs_rs::Acl, NfsAclCodecError> {
-    if value.encoding() != AclEncoding::NfsV4 || value.default_acl().is_some() {
-        return Err(NfsAclCodecError);
-    }
-    let mut input = value.access().ok_or(NfsAclCodecError)?;
-    if take_u8(&mut input)? != VERSION {
-        return Err(NfsAclCodecError);
-    }
-    let count = take_u32(&mut input)? as usize;
-    if count > 4096 {
-        return Err(NfsAclCodecError);
-    }
-    let mut aces = Vec::with_capacity(count);
-    for _ in 0..count {
-        let ace_type = match take_u8(&mut input)? {
-            0 => nfs_rs::AceType::AccessAllowed,
-            1 => nfs_rs::AceType::AccessDenied,
-            2 => nfs_rs::AceType::SystemAudit,
-            3 => nfs_rs::AceType::SystemAlarm,
-            _ => return Err(NfsAclCodecError),
-        };
-        let flags = nfs_rs::AceFlags(take_u32(&mut input)?);
-        let access_mask = nfs_rs::AceMask(take_u32(&mut input)?);
-        let length = take_u32(&mut input)? as usize;
-        let who = std::str::from_utf8(take(&mut input, length)?)
-            .map_err(|_| NfsAclCodecError)?
-            .to_owned();
-        aces.push(nfs_rs::NfsAce {
-            ace_type,
-            flags,
-            access_mask,
-            who,
-        });
-    }
-    if !input.is_empty() {
-        return Err(NfsAclCodecError);
-    }
+    let entries = acl::decode_nfs4(value).map_err(|_| NfsAclCodecError)?;
+    let aces = entries
+        .into_iter()
+        .map(|ace| {
+            Ok(ProtocolAce {
+                ace_type: match ace.ace_type {
+                    0 => AceType::AccessAllowed,
+                    1 => AceType::AccessDenied,
+                    2 => AceType::SystemAudit,
+                    3 => AceType::SystemAlarm,
+                    _ => return Err(NfsAclCodecError),
+                },
+                flags: AceFlags(ace.flags),
+                access_mask: AceMask(ace.permissions),
+                who: ace.who,
+            })
+        })
+        .collect::<Result<_, _>>()?;
     Ok(nfs_rs::Acl { aces })
 }
 
 /// The protocol and model keep the complete access/default configuration, including masked bits.
 pub(super) fn encode_posix(value: &nfs_rs::PosixAcl) -> Result<AclMetadata, NfsAclCodecError> {
-    let entry = |value: &nfs_rs::PosixAclEntry| crate::model::acl::PosixEntry {
+    let entry = |value: &nfs_rs::PosixAclEntry| PosixEntry {
         tag: value.tag,
         id: if matches!(value.tag, 2 | 8) {
             value.id
@@ -75,7 +55,7 @@ pub(super) fn encode_posix(value: &nfs_rs::PosixAcl) -> Result<AclMetadata, NfsA
         },
         permissions: value.permissions,
     };
-    crate::model::acl::encode_posix(&crate::model::acl::PosixAcl {
+    acl::encode_posix(&PosixAcl {
         access: value.access.iter().map(entry).collect(),
         default: value.default.iter().map(entry).collect(),
     })
@@ -94,7 +74,7 @@ pub(super) fn posix_from_mode(mode: u32) -> Vec<nfs_rs::PosixAclEntry> {
 }
 
 pub(super) fn decode_posix(value: &AclMetadata) -> Result<nfs_rs::PosixAcl, NfsAclCodecError> {
-    let mut value = crate::model::acl::decode_posix(value).map_err(|_| NfsAclCodecError)?;
+    let mut value = acl::decode_posix(value).map_err(|_| NfsAclCodecError)?;
     // Linux SETACL requires canonical tag/qualifier ordering; POSIX configuration order is immaterial.
     value
         .access
@@ -102,7 +82,7 @@ pub(super) fn decode_posix(value: &AclMetadata) -> Result<nfs_rs::PosixAcl, NfsA
     value
         .default
         .sort_unstable_by_key(|entry| (entry.tag, entry.id));
-    let entry = |value: crate::model::acl::PosixEntry| nfs_rs::PosixAclEntry {
+    let entry = |value: PosixEntry| nfs_rs::PosixAclEntry {
         tag: value.tag,
         id: value.id,
         permissions: value.permissions,
@@ -113,24 +93,6 @@ pub(super) fn decode_posix(value: &AclMetadata) -> Result<nfs_rs::PosixAcl, NfsA
     })
 }
 
-fn take<'a>(input: &mut &'a [u8], count: usize) -> Result<&'a [u8], NfsAclCodecError> {
-    if input.len() < count {
-        return Err(NfsAclCodecError);
-    }
-    let (value, remaining) = input.split_at(count);
-    *input = remaining;
-    Ok(value)
-}
-
-fn take_u8(input: &mut &[u8]) -> Result<u8, NfsAclCodecError> {
-    Ok(take(input, 1)?[0])
-}
-
-fn take_u32(input: &mut &[u8]) -> Result<u32, NfsAclCodecError> {
-    let bytes: [u8; 4] = take(input, 4)?.try_into().map_err(|_| NfsAclCodecError)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct NfsAclCodecError;
 
@@ -138,6 +100,7 @@ pub(super) struct NfsAclCodecError;
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::model::AclEncoding;
 
     #[test]
     fn nfs_v4_acl_round_trips_in_order_without_principal_loss() {
@@ -159,6 +122,15 @@ mod tests {
         };
         let encoded = encode(&acl).unwrap_or_else(|_| panic!("ACL encodes"));
         assert_eq!(encoded.encoding(), AclEncoding::NfsV4);
+        // Established version-1 bytes remain readable after centralizing the codec.
+        let expected = [
+            &[1, 2, 0, 0, 0, 0, 3, 0, 0, 0, 0x45, 0x23, 1, 0, 13, 0, 0, 0][..],
+            b"alice@example",
+            &[1, 7, 0, 0, 0, 0x21, 0x43, 5, 0, 13, 0, 0, 0],
+            b"GROUP@example",
+        ]
+        .concat();
+        assert_eq!(encoded.access(), Some(expected.as_slice()));
         assert_eq!(decode(&encoded), Ok(acl));
     }
 
@@ -263,10 +235,10 @@ mod tests {
         let posix =
             AclMetadata::new(AclEncoding::Posix, vec![1]).unwrap_or_else(|error| panic!("{error}"));
         assert!(decode(&posix).is_err());
-        let truncated = AclMetadata::new(AclEncoding::NfsV4, vec![VERSION, 1, 0, 0, 0])
+        let truncated = AclMetadata::new(AclEncoding::NfsV4, vec![1, 1, 0, 0, 0])
             .unwrap_or_else(|error| panic!("{error}"));
         assert!(decode(&truncated).is_err());
-        let trailing = AclMetadata::new(AclEncoding::NfsV4, vec![VERSION, 0, 0, 0, 0, 9])
+        let trailing = AclMetadata::new(AclEncoding::NfsV4, vec![1, 0, 0, 0, 0, 9])
             .unwrap_or_else(|error| panic!("{error}"));
         assert!(decode(&trailing).is_err());
     }

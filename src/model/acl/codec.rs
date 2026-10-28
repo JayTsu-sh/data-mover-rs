@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::str::from_utf8;
+
 use super::{AclEncoding, AclError, AclMetadata};
 
 pub(crate) const USER_OBJ: u32 = 1;
@@ -107,7 +110,7 @@ pub(crate) fn validate_entries(entries: &[PosixEntry]) -> Result<(), AclError> {
     if entries.len() > MAX_ENTRIES {
         return Err(AclError("too many POSIX ACL entries"));
     }
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for entry in entries {
         if entry.permissions > 7
             || !matches!(
@@ -164,7 +167,7 @@ pub fn decode_nfs4(value: &AclMetadata) -> Result<Vec<NfsAce>, AclError> {
         let flags = take_u32(&mut input)?;
         let permissions = take_u32(&mut input)?;
         let length = take_u32(&mut input)? as usize;
-        let who = std::str::from_utf8(take(&mut input, length)?)
+        let who = from_utf8(take(&mut input, length)?)
             .map_err(|_| AclError("invalid NFSv4 principal UTF-8"))?
             .to_owned();
         entries.push(NfsAce {

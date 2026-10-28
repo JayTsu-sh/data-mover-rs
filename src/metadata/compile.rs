@@ -1,6 +1,7 @@
 //! Compiling a metadata plan: which families a copy carries, exactly or with which loss, and the
 //! mutations that carry them — decided before any write is issued.
 
+use super::acl_mapping;
 use super::{
     AclTarget, FamilyMapping, LossReport, MappingDecision, MetadataFamily, MetadataPlan,
     MetadataPlanError, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, OwnershipTarget,
@@ -182,7 +183,7 @@ fn compile_acl(
     let family = MetadataFamily::Acl;
     let policy = request.policies.get(family);
     if policy == MetadataPolicy::RequireEquivalent {
-        return super::acl_mapping::compile(request, plan);
+        return acl_mapping::compile(request, plan);
     }
     if policy == MetadataPolicy::RequireExact
         && matches!(

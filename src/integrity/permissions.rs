@@ -1,11 +1,16 @@
 //! Automatic permission comparison and explicitly requested ACL/xattr comparison.
 
+use super::acl::compare as compare_acl;
 use super::{
-    Endpoint, IntegrityDifference, IntegrityFailure, IntegrityIgnored, IntegrityPlan, reconcile,
+    AclComparisonScope, Endpoint, IntegrityDifference, IntegrityFailure, IntegrityIgnored,
+    IntegrityPlan, reconcile,
 };
 use crate::model::{
-    EntryKind, FailureClass, MetadataObservation, ObservationMode, ObservationPlan, SourceVersion,
+    EntryKind, EntryOperationFailure, ExtendedAttribute, FailureClass, MetadataFamily,
+    MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan,
+    ObservationSupport, Operation, SourceVersion,
 };
+use crate::storage::PrincipalIdentity::{Named, Numeric};
 use crate::storage::{PermissionFacts, PrincipalIdentity, SourceDescriptor, StorageRoleFailure};
 
 pub(super) async fn compare_permissions(
@@ -40,10 +45,7 @@ fn compare_permission_facts(
     differences: &mut Vec<IntegrityDifference>,
     ignored: &mut Vec<IntegrityIgnored>,
 ) {
-    use crate::storage::PrincipalIdentity::{Named, Numeric};
-    let principal = |a: &Option<crate::storage::PrincipalIdentity>,
-                     b: &Option<crate::storage::PrincipalIdentity>| match (a, b)
-    {
+    let principal = |a: &Option<PrincipalIdentity>, b: &Option<PrincipalIdentity>| match (a, b) {
         (Some(Numeric(a)), Some(Numeric(b))) => Some(a != b),
         (Some(Named(a)), Some(Named(b))) => Some(a != b),
         _ => None,
@@ -93,9 +95,8 @@ async fn permission_facts(
         endpoint
             .metadata
             .observation_capabilities()
-            .support(crate::model::MetadataFamily::OwnershipMode),
-        crate::model::ObservationSupport::NotApplicable
-            | crate::model::ObservationSupport::Unsupported
+            .support(MetadataFamily::OwnershipMode),
+        ObservationSupport::NotApplicable | ObservationSupport::Unsupported
     ) {
         return Ok(PermissionFacts::default());
     }
@@ -147,7 +148,7 @@ pub(super) async fn compare_optional_metadata(
     requested: IntegrityPlan,
     differences: &mut Vec<IntegrityDifference>,
     ignored: &mut Vec<IntegrityIgnored>,
-) -> Result<Option<super::AclComparisonScope>, IntegrityFailure> {
+) -> Result<Option<AclComparisonScope>, IntegrityFailure> {
     let mode = |enabled| {
         if enabled {
             ObservationMode::BestEffort
@@ -167,7 +168,7 @@ pub(super) async fn compare_optional_metadata(
     ))?;
     let cross_acl_verified = if requested.acl || requested.acl_required || requested.acl_equivalent
     {
-        super::acl::compare(
+        compare_acl(
             source,
             destination,
             (source_entry, destination_entry),
@@ -196,7 +197,7 @@ async fn observe_optional(
     endpoint: &Endpoint,
     entry: &SourceDescriptor,
     plan: ObservationPlan,
-) -> Result<crate::model::MetadataObservations, IntegrityFailure> {
+) -> Result<MetadataObservations, IntegrityFailure> {
     endpoint
         .metadata
         .observe_copy_bound_version(
@@ -213,8 +214,8 @@ async fn observe_optional(
 fn compare_xattr_values(
     source: &Endpoint,
     destination: &Endpoint,
-    source_observed: &MetadataObservation<Vec<crate::model::ExtendedAttribute>>,
-    destination_observed: &MetadataObservation<Vec<crate::model::ExtendedAttribute>>,
+    source_observed: &MetadataObservation<Vec<ExtendedAttribute>>,
+    destination_observed: &MetadataObservation<Vec<ExtendedAttribute>>,
     differences: &mut Vec<IntegrityDifference>,
     ignored: &mut Vec<IntegrityIgnored>,
 ) -> Result<(), IntegrityFailure> {
@@ -235,9 +236,7 @@ fn compare_xattr_values(
     Ok(())
 }
 
-fn sorted_xattrs(
-    values: &[crate::model::ExtendedAttribute],
-) -> Vec<&crate::model::ExtendedAttribute> {
+fn sorted_xattrs(values: &[ExtendedAttribute]) -> Vec<&ExtendedAttribute> {
     let mut sorted: Vec<_> = values.iter().collect();
     sorted.sort_unstable_by(|left, right| {
         left.name()
@@ -256,9 +255,9 @@ pub(super) fn optional_value<'a, T>(
         MetadataObservation::Value { value, .. } => Ok(Some(value)),
         MetadataObservation::Failed { class, transience } => {
             Err(endpoint.attribute(StorageRoleFailure::Entry(
-                crate::model::EntryOperationFailure::new(
+                EntryOperationFailure::new(
                     endpoint.path.clone(),
-                    crate::model::Operation::Observe,
+                    Operation::Observe,
                     *class,
                     *transience,
                     reason,

@@ -7,8 +7,8 @@ use bytes::Bytes;
 use futures::Stream;
 use tokio_util::sync::CancellationToken;
 
-use super::SourceDescriptor;
 use super::copied_metadata::{CopiedMetadataObservation, CopiedMetadataTarget};
+use super::{PermissionFacts, SourceDescriptor};
 use crate::runtime::qos::SourceQosBudget;
 
 mod namespace;
@@ -26,9 +26,9 @@ use version::version_unsupported;
 
 use crate::model::{
     AclMetadata, BackendSessionFailure, EntryOperationFailure, ExtendedAttribute, FailureClass,
-    MappedOwnership, MetadataCapabilities, MetadataObservations, ObjectTag, ObservationPlan,
-    Operation, OwnershipMode, SourceIdentity, SourceVersion, StoragePath, TimestampMetadata,
-    Transience,
+    MappedOwnership, MetadataCapabilities, MetadataFamily, MetadataObservations, ObjectTag,
+    ObservationPlan, ObservationSupport, Operation, OwnershipMode, SourceIdentity, SourceVersion,
+    StoragePath, TimestampMetadata, Transience,
 };
 
 /// A bounded payload stream. Implementations own request sizing and backpressure.
@@ -706,11 +706,10 @@ pub trait Metadata: Send + Sync {
     ) -> Result<super::PermissionFacts, StorageRoleFailure> {
         if matches!(
             self.observation_capabilities()
-                .support(crate::model::MetadataFamily::OwnershipMode),
-            crate::model::ObservationSupport::NotApplicable
-                | crate::model::ObservationSupport::Unsupported
+                .support(MetadataFamily::OwnershipMode),
+            ObservationSupport::NotApplicable | ObservationSupport::Unsupported
         ) {
-            return Ok(super::PermissionFacts::default());
+            return Ok(PermissionFacts::default());
         }
         let plan = ObservationPlan::default()
             .with_ownership_mode(crate::model::ObservationMode::BestEffort);

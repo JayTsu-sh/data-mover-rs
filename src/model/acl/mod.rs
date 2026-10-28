@@ -21,6 +21,7 @@ use super::{AclEncoding, AclMetadata, OwnershipMode};
 pub struct AclError(pub(crate) &'static str);
 
 impl AclError {
+    /// The reason the ACL observation or requested mapping was rejected.
     #[must_use]
     pub const fn reason(self) -> &'static str {
         self.0

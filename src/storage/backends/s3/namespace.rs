@@ -13,6 +13,7 @@ use super::histories::produce_histories;
 use super::listing::{directory_descriptor, directory_prefix, file_descriptor};
 use super::paging::{ListingLimits, Paging};
 use super::source::role_failure;
+use super::traversal_listing::produce as produce_traversal;
 use super::{S3Protocol, S3ProtocolFailure};
 use crate::model::{
     BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath, SymlinkTarget,
@@ -164,8 +165,7 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
         };
         let identity = self.identity.clone();
         ListingStream::from_producer(request.path.clone(), move |sink| async move {
-            super::traversal_listing::produce(&namespace, &identity, &request, is_root, &sink)
-                .await;
+            produce_traversal(&namespace, &identity, &request, is_root, &sink).await;
         })
     }
 

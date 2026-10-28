@@ -7,12 +7,14 @@ use std::sync::Arc;
 
 use super::{TransferFailure, TransferPhase, TransferSide, Transferred};
 use crate::metadata::{
-    AclTarget, MetadataApplicationFailure, MetadataPlan, MetadataPlanError, MetadataPlanRequest,
-    MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget, RefusalSide,
-    TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
-    compile_nothing_stored_plan, role_failure_text,
+    AclTarget, MetadataApplicationFailure, MetadataFamily, MetadataPlan, MetadataPlanError,
+    MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget,
+    RefusalCause, RefusalSide, TimestampTarget, TimestampTargetCapability, ValueTarget,
+    compile_copied_metadata_plan, compile_nothing_stored_plan, role_failure_text,
 };
-use crate::model::{MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan};
+use crate::model::{
+    EntryKind, MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan,
+};
 use crate::storage::{
     CopiedAclTarget, CopiedMetadataTarget, CopiedOwnershipTarget, CopiedTimestampTarget,
     CopiedValueTarget, Metadata, SourceDescriptor, StagedDestination, StorageRoleFailure,
@@ -316,28 +318,28 @@ fn missing_acl_roles(request: &TransferRequest) -> TransferFailure {
     required_acl_refusal(
         request.copied_metadata,
         if source_missing {
-            crate::metadata::RefusalCause::SourceCannotObserve
+            RefusalCause::SourceCannotObserve
         } else {
-            crate::metadata::RefusalCause::DestinationCannotStore
+            RefusalCause::DestinationCannotStore
         },
     )
 }
 
 fn validate_acl_target(
     requested: CopiedMetadataRequest,
-    kind: crate::model::EntryKind,
+    kind: EntryKind,
     target: CopiedAclTarget,
 ) -> Result<(), TransferFailure> {
     if requested.acl_required() && target == CopiedAclTarget::Unsupported {
         return Err(required_acl_refusal(
             requested,
-            crate::metadata::RefusalCause::DestinationCannotStore,
+            RefusalCause::DestinationCannotStore,
         ));
     }
-    if requested.acl_mapping() && kind != crate::model::EntryKind::File {
+    if requested.acl_mapping() && kind != EntryKind::File {
         return Err(required_acl_refusal(
             requested,
-            crate::metadata::RefusalCause::AclMappingRejected {
+            RefusalCause::AclMappingRejected {
                 reason: "ACL equivalence mapping requires a regular file",
             },
         ));
@@ -345,12 +347,9 @@ fn validate_acl_target(
     Ok(())
 }
 
-fn required_acl_refusal(
-    requested: CopiedMetadataRequest,
-    cause: crate::metadata::RefusalCause,
-) -> TransferFailure {
+fn required_acl_refusal(requested: CopiedMetadataRequest, cause: RefusalCause) -> TransferFailure {
     TransferFailure::refused_metadata(MetadataPlanError::new(
-        crate::metadata::MetadataFamily::Acl,
+        MetadataFamily::Acl,
         acl_policy(requested),
         cause,
     ))

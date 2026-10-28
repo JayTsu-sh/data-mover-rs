@@ -19,7 +19,6 @@ use crate::model::{
     AclEncoding, EntryKind, FailureClass, MetadataObservation, ObservationMode, ObservationPlan,
     ObservedEntry, SourceVersion, StoragePath, StorageTimestamp,
 };
-use permissions::compare_permissions;
 
 use crate::storage::{
     CapabilityUnavailable, CopiedTimestampTarget, Metadata, ReadRequest, ReadSource,
@@ -498,106 +497,6 @@ fn is_not_found(failure: &StorageRoleFailure) -> bool {
     }
 }
 
-/// Compares one entry on two connected backends, selected by path or observation on each side.
-///
-/// Absence on either side is a reported difference, not a failure; only a role failure that
-/// prevents the comparison is an error. An observed entry is revalidated against the connected
-/// backend; a stale or foreign observation is a failure on that side. Observed versioned entries
-/// select their recorded current version. Cancellation surfaces as the backend's own `Cancelled`
-/// role failure on the side that observed it.
-///
-/// # Errors
-/// Returns the first role failure, attributed to the side that produced it, or a capability
-/// failure when either side lends no read-source or metadata role.
-pub async fn compare<S, D>(
-    request: IntegrityRequest<S, D>,
-) -> Result<IntegrityReport, IntegrityFailure>
-where
-    S: Into<IntegrityInput>,
-    D: Into<IntegrityInput>,
-{
-    let source = endpoint(
-        IntegritySide::Source,
-        &request.source,
-        request.source_path.into(),
-    )?;
-    let destination = endpoint(
-        IntegritySide::Destination,
-        &request.destination,
-        request.destination_path.into(),
-    )?;
-    let (source_entry, destination_entry) =
-        reconcile(futures::join!(source.describe(), destination.describe()))?;
-    let mut report = IntegrityReport {
-        acl_scope: None,
-        differences: Vec::new(),
-        ignored: Vec::new(),
-        compared_bytes: 0,
-        digests: None,
-    };
-    let (Some(source_entry), Some(destination_entry)) = (&source_entry, &destination_entry) else {
-        report
-            .differences
-            .extend(missing(source_entry.is_none(), destination_entry.is_none()));
-        return Ok(report);
-    };
-    compare_facts(source_entry, destination_entry, &mut report.differences);
-    report.acl_scope = if request.plan.acl
-        || request.plan.acl_required
-        || request.plan.acl_equivalent
-        || request.plan.xattrs
-    {
-        permissions::compare_optional_metadata(
-            &source,
-            &destination,
-            source_entry,
-            destination_entry,
-            request.plan,
-            &mut report.differences,
-            &mut report.ignored,
-        )
-        .await?
-    } else {
-        None
-    };
-    compare_permissions(
-        &source,
-        &destination,
-        source_entry,
-        destination_entry,
-        matches!(
-            report.acl_scope,
-            Some(AclComparisonScope::CurrentRegularFileAccess)
-        ),
-        &mut report.differences,
-        &mut report.ignored,
-    )
-    .await?;
-    compare_modified(
-        &source,
-        &destination,
-        (source_entry, destination_entry),
-        request.options,
-        &mut report.differences,
-        &mut report.ignored,
-    )
-    .await?;
-    if request.options.mode == IntegrityMode::Content
-        && source_entry.kind == EntryKind::File
-        && destination_entry.kind == EntryKind::File
-    {
-        compare_content(
-            &source,
-            &destination,
-            (source_entry, destination_entry),
-            &request.cancel,
-            &mut report,
-        )
-        .await?;
-    }
-    Ok(report)
-}
-
 fn endpoint(
     side: IntegritySide,
     storage: &Storage,
@@ -785,7 +684,10 @@ async fn compare_content(
 }
 
 mod acl;
+mod comparison;
 mod permissions;
+
+pub use comparison::compare;
 
 #[cfg(test)]
 mod tests;

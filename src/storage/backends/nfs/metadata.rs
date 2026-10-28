@@ -2,17 +2,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use super::acl;
 use super::namespace::inline_ownership;
 use super::source::NfsProtocolFailure;
+use crate::model::acl::equivalent_native;
 use crate::model::{
-    EntryKind, ExtendedAttribute, MetadataCapabilities, MetadataFamily as F, MetadataObservation,
-    MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan,
-    ObservationSupport as S, OwnershipMode, StoragePath, StorageTimestamp, TimePrecision,
-    TimestampMetadata,
+    AclEncoding, AclMetadata, EntryKind, ExtendedAttribute, FailureClass, MetadataCapabilities,
+    MetadataFamily as F, MetadataObservation, MetadataObservations, MetadataProvenance,
+    ObservationMode, ObservationPlan, ObservationSupport as S, OwnershipMode, StoragePath,
+    StorageTimestamp, TimePrecision, TimestampMetadata, Transience,
 };
 use crate::storage::{
-    CopiedMetadataObservation, InlineOwnership, Metadata, MetadataMutation, SourceDescriptor,
-    StorageRoleFailure,
+    CopiedMetadataObservation, InlineOwnership, Metadata, MetadataMutation, PermissionFacts,
+    PrincipalIdentity, SourceDescriptor, StorageRoleFailure,
 };
 
 pub(crate) struct NfsMetadataAdapter {
@@ -35,27 +37,20 @@ pub(crate) struct NfsMetadataInline {
 pub(crate) trait NfsMetadataProtocol: Send + Sync {
     async fn stat(&self, path: &StoragePath) -> Result<NfsMetadataInline, NfsProtocolFailure>;
     fn supports_acl(&self) -> bool;
-    fn acl_encoding(&self) -> Option<crate::model::AclEncoding> {
-        self.supports_acl()
-            .then_some(crate::model::AclEncoding::NfsV4)
+    fn acl_encoding(&self) -> Option<AclEncoding> {
+        self.supports_acl().then_some(AclEncoding::NfsV4)
     }
-    async fn get_native_acl(
-        &self,
-        path: &StoragePath,
-    ) -> Result<crate::model::AclMetadata, NfsProtocolFailure> {
+    async fn get_native_acl(&self, path: &StoragePath) -> Result<AclMetadata, NfsProtocolFailure> {
         let value = self.get_acl(path).await?;
-        super::acl::encode(&value).map_err(|_| NfsProtocolFailure::protocol())
+        acl::encode(&value).map_err(|_| NfsProtocolFailure::protocol())
     }
     async fn set_native_acl(
         &self,
         path: &StoragePath,
-        value: &crate::model::AclMetadata,
+        value: &AclMetadata,
     ) -> Result<(), NfsProtocolFailure> {
-        let value = super::acl::decode(value).map_err(|_| {
-            NfsProtocolFailure::new(
-                crate::model::FailureClass::InvalidInput,
-                crate::model::Transience::Permanent,
-            )
+        let value = acl::decode(value).map_err(|_| {
+            NfsProtocolFailure::new(FailureClass::InvalidInput, Transience::Permanent)
         })?;
         self.set_acl(path, &value).await
     }
@@ -117,32 +112,27 @@ impl NfsMetadataAdapter {
     async fn apply_acl(
         &self,
         path: &StoragePath,
-        value: &crate::model::AclMetadata,
+        value: &AclMetadata,
     ) -> Result<(), NfsProtocolFailure> {
         let Some(encoding) = self.protocol.acl_encoding() else {
             return Err(NfsProtocolFailure::new(
-                crate::model::FailureClass::Unsupported,
-                crate::model::Transience::Permanent,
+                FailureClass::Unsupported,
+                Transience::Permanent,
             ));
         };
         if value.encoding() != encoding {
             return Err(NfsProtocolFailure::new(
-                crate::model::FailureClass::InvalidInput,
-                crate::model::Transience::Permanent,
+                FailureClass::InvalidInput,
+                Transience::Permanent,
             ));
         }
-        crate::model::acl::equivalent_native(value, value).map_err(|_| {
-            NfsProtocolFailure::new(
-                crate::model::FailureClass::InvalidInput,
-                crate::model::Transience::Permanent,
-            )
+        equivalent_native(value, value).map_err(|_| {
+            NfsProtocolFailure::new(FailureClass::InvalidInput, Transience::Permanent)
         })?;
         let value = self.materialize_acl(path, value).await?;
         self.protocol.set_native_acl(path, &value).await?;
         let actual = self.protocol.get_native_acl(path).await?;
-        if !crate::model::acl::equivalent_native(&value, &actual)
-            .map_err(|_| NfsProtocolFailure::protocol())?
-        {
+        if !equivalent_native(&value, &actual).map_err(|_| NfsProtocolFailure::protocol())? {
             return Err(NfsProtocolFailure::protocol().with_status("ACL_READBACK_MISMATCH"));
         }
         Ok(())
@@ -152,18 +142,17 @@ impl NfsMetadataAdapter {
     async fn materialize_acl(
         &self,
         path: &StoragePath,
-        value: &crate::model::AclMetadata,
-    ) -> Result<crate::model::AclMetadata, NfsProtocolFailure> {
-        if value.encoding() != crate::model::AclEncoding::Posix {
+        value: &AclMetadata,
+    ) -> Result<AclMetadata, NfsProtocolFailure> {
+        if value.encoding() != AclEncoding::Posix {
             return Ok(value.clone());
         }
-        let mut acl =
-            super::acl::decode_posix(value).map_err(|_| NfsProtocolFailure::protocol())?;
+        let mut acl = acl::decode_posix(value).map_err(|_| NfsProtocolFailure::protocol())?;
         if !acl.access.is_empty() {
             return Ok(value.clone());
         }
-        acl.access = super::acl::posix_from_mode(self.protocol.stat(path).await?.mode);
-        super::acl::encode_posix(&acl).map_err(|_| NfsProtocolFailure::protocol())
+        acl.access = acl::posix_from_mode(self.protocol.stat(path).await?.mode);
+        acl::encode_posix(&acl).map_err(|_| NfsProtocolFailure::protocol())
     }
 
     async fn observe_entry(
@@ -328,8 +317,7 @@ impl Metadata for NfsMetadataAdapter {
     async fn permissions(
         &self,
         descriptor: &SourceDescriptor,
-    ) -> Result<crate::storage::PermissionFacts, StorageRoleFailure> {
-        use crate::storage::{PermissionFacts, PrincipalIdentity};
+    ) -> Result<PermissionFacts, StorageRoleFailure> {
         if let Some(InlineOwnership::Known(value)) = descriptor.inline_ownership {
             return Ok(PermissionFacts {
                 owner: Some(PrincipalIdentity::Numeric(value.uid)),

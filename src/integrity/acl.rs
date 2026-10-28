@@ -1,8 +1,10 @@
 //! Complete ACL observations and explicit cross-model access equivalence.
+use super::permissions::optional_value;
 use super::{
     AclComparisonScope, Endpoint, IntegrityDifference, IntegrityFailure, IntegrityIgnored,
     IntegrityPlan,
 };
+use crate::model::acl::compare_acl;
 use crate::model::{
     AclMetadata, EntryKind, MetadataObservation, MetadataObservations, OwnershipMode,
 };
@@ -17,13 +19,8 @@ pub(super) fn compare(
     differences: &mut Vec<IntegrityDifference>,
     ignored: &mut Vec<IntegrityIgnored>,
 ) -> Result<Option<AclComparisonScope>, IntegrityFailure> {
-    let source_acl =
-        super::permissions::optional_value(source, observed.0.acl(), "ACL observation failed")?;
-    let destination_acl = super::permissions::optional_value(
-        destination,
-        observed.1.acl(),
-        "ACL observation failed",
-    )?;
+    let source_acl = optional_value(source, observed.0.acl(), "ACL observation failed")?;
+    let destination_acl = optional_value(destination, observed.1.acl(), "ACL observation failed")?;
     if !plan.acl_required && !plan.acl_equivalent {
         compare_optional(source_acl, destination_acl, differences, ignored);
         return Ok(None);
@@ -60,7 +57,7 @@ fn compare_required(
     let (Some(owner_a), Some(owner_b)) = (ownership(observed.0), ownership(observed.1)) else {
         return Err(unverified("required numeric ACL ownership is unavailable"));
     };
-    let equal = crate::model::acl::compare_acl(a, b, owner_a, owner_b, equivalent)
+    let equal = compare_acl(a, b, owner_a, owner_b, equivalent)
         .map_err(|error| unverified(error.reason()))?;
     if !equal {
         return Err(IntegrityDifference::Acl {

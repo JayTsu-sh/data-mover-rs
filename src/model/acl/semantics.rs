@@ -1,8 +1,9 @@
 //! Independent, direct authorization evaluators. Neither evaluator calls the mapper.
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::codec::{GROUP, GROUP_OBJ, MASK, OTHER, USER, USER_OBJ};
 use super::mapping::{DATA, GROUP_FLAG, permission};
 use super::{AclError, NfsAce, OwnershipMode, PosixAcl};
-use std::collections::BTreeMap;
 
 /// Prove the qualified template by exhaustive principal/permission equivalence classes.
 /// Group masks form a chain, so there are at most four classes and sixteen subsets.
@@ -81,7 +82,7 @@ fn user_representatives(
     mask: u32,
 ) -> Result<Vec<u32>, AclError> {
     let mut representatives = BTreeMap::new();
-    let mut identities = std::collections::BTreeSet::from([owner.uid]);
+    let mut identities = BTreeSet::from([owner.uid]);
     for entry in posix.access.iter().filter(|e| e.tag == USER) {
         representatives
             .entry(entry.permissions & mask)

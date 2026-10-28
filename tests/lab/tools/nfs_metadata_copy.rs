@@ -2,7 +2,7 @@
 //! negotiation did with them, against a real share. See `.claude/docs/metadata-negotiation.md`.
 //!
 //! ```text
-//! # NFSv3 cannot read an ACL, so asking for one skips it with the reason and still copies the file
+//! # On an NFSv3 export without NFSACL, optional ACL copying reports unsupported and copies bytes
 //! cargo run --example nfs_metadata_copy -- \
 //!     --source 'nfs://10.131.5.221/m1-source:/d000?uid=0&gid=0&noresvport=true' --source-path f000 \
 //!     --destination /tmp/dm-meta --destination-path f000 \

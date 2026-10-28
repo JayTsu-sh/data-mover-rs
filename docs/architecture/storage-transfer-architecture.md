@@ -224,8 +224,10 @@ For NFS, the common adapter consumes the dialect and negotiated `rsize`/`wsize` 
 owned by `nfs-rs`; data-mover adds no second mount semaphore or blanket request retry. The adapter
 only bounds transfer chunks, applies source QoS/cancellation, and invalidates cached handles for
 the explicitly classified stale-handle, bad-handle, and concurrent-lookup cases. NFSv3, v4.0, and
-v4.1 retain independent capability evidence and real-environment gates. NFSv4 ACLs use a private,
-versioned, lossless codec under the NFS metadata adapter.
+v4.1 retain independent capability evidence and real-environment gates. `model::acl` owns the
+versioned, lossless NFSv4 metadata codec and typed POSIX codec shared by negotiation, integrity,
+and adapters. The NFS metadata adapter converts protocol types through those codecs; it does not
+maintain a second byte format implementation.
 
 ### Namespace
 
@@ -259,7 +261,7 @@ A history is a property of each key returned by `list`; there is no separate tra
 
 ### Metadata
 
-Owns backend metadata observation and application plus backend-private encoding. ACL,
+Owns backend metadata observation and application plus protocol-to-model conversion. ACL,
 xattr, tags, ownership/mode, and timestamps are separate capabilities. It never performs an
 implicit source refetch to fill observations omitted during scanning.
 
@@ -819,7 +821,7 @@ identity. A backend performs only safe protocol retries; terrasync owns job retr
 | `ResumeContext` | Replaced by the destination pointer beside the final file (ADR-0006) |
 | `StreamHandle`, `DataChunk`, commit callbacks | Make crate-private runtime details or delete |
 | `storage_resume_compat`, `hdfs_legacy_resume`, `.terrasync-part` | Delete |
-| scattered metadata/copy ACL/xattr helpers | Replace with Metadata role; backend codecs private |
+| scattered metadata/copy ACL/xattr helpers | Replace with Metadata role; shared ACL codecs in model, protocol conversions private |
 | whole-file byte convenience and scattered hash helpers | Delete; retain integrity module contracts |
 | NFS export and S3 bucket discovery | Export narrow discovery helpers from `storage`; implementation stays in its backend |
 | verified StorageGRID/DXN/NFS/HDFS/CIFS quirks | Keep inside owning backend adapter |

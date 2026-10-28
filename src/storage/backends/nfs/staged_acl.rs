@@ -1,6 +1,11 @@
+use tokio_util::sync::CancellationToken;
+
+use super::super::source::cancelled;
 use super::{NfsStagedDestinationAdapter, failure};
+use crate::model::acl::{compare_acl, equivalent_native};
 use crate::model::{
-    FailureClass, MetadataObservation, ObservationMode, ObservationPlan, OwnershipMode, Transience,
+    AclMetadata, FailureClass, MetadataObservation, MetadataObservations, ObservationMode,
+    ObservationPlan, OwnershipMode, Transience,
 };
 use crate::storage::{MetadataMutation, PreparedStage, StorageRoleFailure};
 
@@ -9,7 +14,7 @@ pub(super) async fn validate_recovered_metadata(
     adapter: &NfsStagedDestinationAdapter,
     stage: &PreparedStage,
     mutations: Vec<MetadataMutation>,
-    cancel: tokio_util::sync::CancellationToken,
+    cancel: CancellationToken,
 ) -> Result<(), StorageRoleFailure> {
     adapter.validate(stage)?;
     let path = stage.final_destination.path();
@@ -22,7 +27,7 @@ pub(super) async fn validate_recovered_metadata(
             continue;
         };
         if cancel.is_cancelled() {
-            return Err(super::super::source::cancelled(path));
+            return Err(cancelled(path));
         }
         let metadata = adapter
             .metadata
@@ -45,8 +50,8 @@ pub(super) async fn validate_recovered_metadata(
 }
 
 fn recovered_acl_matches(
-    expected: &crate::model::AclMetadata,
-    observed: &crate::model::MetadataObservations,
+    expected: &AclMetadata,
+    observed: &MetadataObservations,
     expected_owner: Option<OwnershipMode>,
 ) -> bool {
     let MetadataObservation::Value { value, .. } = observed.acl() else {
@@ -60,7 +65,7 @@ fn recovered_acl_matches(
         }) {
             return false;
         }
-        crate::model::acl::compare_acl(
+        compare_acl(
             expected,
             value,
             expected_owner.unwrap_or(*owner),
@@ -69,7 +74,6 @@ fn recovered_acl_matches(
         )
         .unwrap_or(false)
     } else {
-        expected_owner.is_none()
-            && crate::model::acl::equivalent_native(expected, value).unwrap_or(false)
+        expected_owner.is_none() && equivalent_native(expected, value).unwrap_or(false)
     }
 }

@@ -10,7 +10,8 @@ use super::listing::{child_failure, directory_descriptor};
 use crate::model::{BackendIdentity, EntryKind, FailureClass, StoragePath};
 use crate::storage::listing::cancelled;
 use crate::storage::{
-    ListRequest, ListingPage, Namespace, PageSink, SourceDescriptor, StorageRoleFailure,
+    ChildFailure, ListRequest, ListingPage, Namespace, PageSink, SourceDescriptor,
+    StorageRoleFailure,
 };
 
 /// Root own objects retain their diagnostics. Below the root they were already represented by
@@ -80,9 +81,9 @@ async fn project(
             .map_err(StorageRoleFailure::Entry)?;
         match inspect(namespace, request, &directory.path).await {
             Ok(evidence) => emit(identity, &request.path, directory, evidence, &mut result)?,
-            Err(StorageRoleFailure::Entry(failure)) => result.push_failure(
-                crate::storage::ChildFailure::from_failure(&request.path, failure),
-            ),
+            Err(StorageRoleFailure::Entry(failure)) => {
+                result.push_failure(ChildFailure::from_failure(&request.path, failure));
+            }
             Err(session) => return Err(session),
         }
     }

@@ -1,4 +1,4 @@
-use super::codec::{GROUP, GROUP_OBJ, MASK, OTHER, UNDEFINED, USER, USER_OBJ};
+use super::codec::{GROUP, GROUP_OBJ, MASK, OTHER, UNDEFINED, USER, USER_OBJ, validate_entries};
 use super::{AclEncoding, AclError, AclMetadata, NfsAce, OwnershipMode, PosixAcl, PosixEntry};
 use super::{decode_nfs4, decode_posix, encode_nfs4, encode_posix, semantics};
 
@@ -7,8 +7,10 @@ pub(super) const READ: u32 = 1;
 pub(super) const WRITE: u32 = 2 | 4;
 pub(super) const EXECUTE: u32 = 0x20;
 pub(super) const DATA: u32 = READ | WRITE | EXECUTE;
-const BASE: u32 = 0x80 | 0x2_0000 | 0x10_0000;
-const OWNER_EXTRA: u32 = 0x100 | 0x4_0000;
+// READ_ATTRIBUTES | READ_ACL | SYNCHRONIZE apply to every principal in the template.
+const COMMON_METADATA_READ_PERMISSIONS: u32 = 0x80 | 0x2_0000 | 0x10_0000;
+// WRITE_ATTRIBUTES | WRITE_ACL preserve the owner's metadata administration rights.
+const OWNER_METADATA_WRITE_PERMISSIONS: u32 = 0x100 | 0x4_0000;
 
 pub(super) fn map(
     source: &AclMetadata,
@@ -245,7 +247,12 @@ fn canonical(value: &PosixAcl) -> Vec<NfsAce> {
         );
     }
     push_groups(&mut aces, &access, mask, other);
-    aces.push(ace(0, "EVERYONE@".into(), 0, data_mask(other) | BASE));
+    aces.push(ace(
+        0,
+        "EVERYONE@".into(),
+        0,
+        data_mask(other) | COMMON_METADATA_READ_PERMISSIONS,
+    ));
     aces
 }
 
@@ -264,7 +271,7 @@ fn push_groups(aces: &mut Vec<NfsAce>, access: &[PosixEntry], mask: u32, other: 
             0,
             who,
             GROUP_FLAG,
-            data_mask(e.permissions & mask) | BASE,
+            data_mask(e.permissions & mask) | COMMON_METADATA_READ_PERMISSIONS,
         ));
     }
     for e in &groups {
@@ -296,7 +303,13 @@ fn push_pair(
         0,
         who,
         flags,
-        data_mask(permissions) | BASE | if owner { OWNER_EXTRA } else { 0 },
+        data_mask(permissions)
+            | COMMON_METADATA_READ_PERMISSIONS
+            | if owner {
+                OWNER_METADATA_WRITE_PERMISSIONS
+            } else {
+                0
+            },
     ));
 }
 
@@ -340,7 +353,7 @@ fn reverse(aces: &[NfsAce], owner: OwnershipMode) -> Result<PosixAcl, AclError> 
         access,
         default: Vec::new(),
     };
-    super::codec::validate_entries(&candidate.access)?;
+    validate_entries(&candidate.access)?;
     qualify_posix(&candidate, owner)?;
     if normalize_nfs(canonical(&candidate)) != normalize_nfs(aces.to_vec()) {
         return Err(AclError(
@@ -360,7 +373,10 @@ fn qualify_nfs(aces: &[NfsAce]) -> Result<(), AclError> {
                 "NFSv4 inheritance or unknown ACE flags cannot map to POSIX",
             ));
         }
-        if ace.permissions & !(DATA | BASE | OWNER_EXTRA) != 0 {
+        if ace.permissions
+            & !(DATA | COMMON_METADATA_READ_PERMISSIONS | OWNER_METADATA_WRITE_PERMISSIONS)
+            != 0
+        {
             return Err(AclError(
                 "NFSv4 rights are outside the fixed regular-file access profile",
             ));

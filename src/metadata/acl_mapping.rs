@@ -3,6 +3,7 @@ use super::{
     AclTarget, FamilyMapping, MappingDecision, MetadataFamily, MetadataPlan, MetadataPlanError,
     MetadataPlanRequest, MetadataPolicy, RefusalCause,
 };
+use crate::model::acl::map_acl;
 use crate::model::{AclMetadata, MetadataObservation};
 use crate::storage::MetadataMutation;
 
@@ -22,7 +23,7 @@ pub(super) fn compile(
             }));
         }
     };
-    let mapped = crate::model::acl::map_acl(value, target, owner).map_err(|error| {
+    let mapped = map_acl(value, target, owner).map_err(|error| {
         reject(RefusalCause::AclMappingRejected {
             reason: error.reason(),
         })
