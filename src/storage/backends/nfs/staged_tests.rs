@@ -4,8 +4,10 @@ pub(super) mod tests {
     use std::collections::HashMap;
     use std::sync::PoisonError;
 
+    use crate::model::{
+        AclEncoding, BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion,
+    };
     use crate::storage::ListingFacts;
-    use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion};
     use crate::storage::artifacts::{ArtifactKind, artifact_name};
     use crate::storage::{
         DestinationPrepareRequest, FinalDestination, PrepareFact, PrepareRequest, ResumeMode,
@@ -22,6 +24,7 @@ pub(super) mod tests {
 
     #[derive(Default)]
     pub(in crate::storage::backends::nfs) struct FakeProtocol {
+        pub(in crate::storage::backends::nfs) acl_encoding: Option<AclEncoding>,
         pub(in crate::storage::backends::nfs) files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         pub(in crate::storage::backends::nfs) creations: Mutex<Vec<(String, u32)>>,
         opens: std::sync::atomic::AtomicU64,
@@ -250,6 +253,14 @@ pub(super) mod tests {
 
     #[async_trait]
     impl NfsStagedProtocol for FakeProtocol {
+        fn supports_acl(&self) -> bool {
+            self.acl_encoding.is_some()
+        }
+
+        fn acl_encoding(&self) -> Option<AclEncoding> {
+            self.acl_encoding
+        }
+
         fn read_inflight(&self) -> usize {
             4
         }
@@ -270,7 +281,11 @@ pub(super) mod tests {
                 .max(1)
         }
 
-        async fn create_empty(&self, path: &StoragePath, mode: u32) -> Result<(), NfsProtocolFailure> {
+        async fn create_empty(
+            &self,
+            path: &StoragePath,
+            mode: u32,
+        ) -> Result<(), NfsProtocolFailure> {
             let mut files = self
                 .files
                 .lock()
