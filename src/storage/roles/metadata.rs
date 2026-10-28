@@ -7,9 +7,9 @@ use super::StorageRoleFailure;
 use super::version::version_unsupported;
 use crate::model::{
     AclMetadata, EntryOperationFailure, ExtendedAttribute, FailureClass, MappedOwnership,
-    MetadataCapabilities, MetadataFamily, MetadataObservations, ObjectTag, ObservationPlan,
-    ObservationSupport, Operation, OwnershipMode, SourceIdentity, SourceVersion, StoragePath,
-    TimestampMetadata, Transience,
+    MetadataCapabilities, MetadataFamily, MetadataObservation, MetadataObservations, ObjectTag,
+    ObservationMode, ObservationPlan, ObservationSupport, Operation, OwnershipMode, SourceIdentity,
+    SourceVersion, StoragePath, TimestampMetadata, Transience,
 };
 use crate::storage::{
     CopiedMetadataObservation, PermissionFacts, PrincipalIdentity, SourceDescriptor,
@@ -48,6 +48,8 @@ pub trait Metadata: Send + Sync {
     /// principal backends override this instead of fabricating numeric owner identifiers.
     /// Known unsupported or inapplicable ownership returns no facts without backend I/O;
     /// backends with independent permission facts override this method.
+    /// Every implementation must honor `descriptor.version()`: a historical descriptor must
+    /// never read the current object. Refuse an unavailable version with `Unsupported`.
     async fn permissions(
         &self,
         descriptor: &SourceDescriptor,
@@ -59,36 +61,33 @@ pub trait Metadata: Send + Sync {
         ) {
             return Ok(PermissionFacts::default());
         }
-        let plan = ObservationPlan::default()
-            .with_ownership_mode(crate::model::ObservationMode::BestEffort);
-        let observations = match self.observe_listed(descriptor, plan) {
-            Some(observed) => observed?,
-            None => {
-                self.observe_bound(&descriptor.path, &descriptor.source_identity, plan)
-                    .await?
+        let plan = ObservationPlan::default().with_ownership_mode(ObservationMode::BestEffort);
+        let (observations, mode_without_ownership) = match descriptor.version() {
+            SourceVersion::Current => (
+                match self.observe_listed(descriptor, plan) {
+                    Some(observed) => observed?,
+                    None => {
+                        self.observe_bound(&descriptor.path, &descriptor.source_identity, plan)
+                            .await?
+                    }
+                },
+                None,
+            ),
+            version @ SourceVersion::Id(_) => {
+                let bound = self
+                    .observe_copy_bound_version(
+                        &descriptor.path,
+                        &descriptor.source_identity,
+                        version,
+                        plan,
+                    )
+                    .await?;
+                (bound.observations, bound.mode_without_ownership)
             }
         };
-        Ok(match observations.ownership_mode() {
-            crate::model::MetadataObservation::Failed { class, transience } => {
-                return Err(StorageRoleFailure::Entry(
-                    EntryOperationFailure::new(
-                        descriptor.path.clone(),
-                        Operation::Observe,
-                        *class,
-                        *transience,
-                        "permission observation failed",
-                    )
-                    .unwrap_or_else(|_| unreachable!("static diagnostic")),
-                ));
-            }
-            crate::model::MetadataObservation::Value { value, .. } => PermissionFacts {
-                owner: Some(PrincipalIdentity::Numeric(value.uid)),
-                group: Some(PrincipalIdentity::Numeric(value.gid)),
-                mode: Some(value.mode & 0o7777),
-            },
-            _ => PermissionFacts::default(),
-        })
+        permission_facts(&descriptor.path, &observations, mode_without_ownership)
     }
+
     /// Source observations requested by the ordinary transfer entry for baseline metadata copy.
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
         None
@@ -157,6 +156,34 @@ pub trait Metadata: Send + Sync {
     ) -> Result<(), StorageRoleFailure>;
 }
 
+fn permission_facts(
+    path: &StoragePath,
+    observations: &MetadataObservations,
+    mode_without_ownership: Option<u32>,
+) -> Result<PermissionFacts, StorageRoleFailure> {
+    match observations.ownership_mode() {
+        MetadataObservation::Failed { class, transience } => Err(StorageRoleFailure::Entry(
+            EntryOperationFailure::new(
+                path.clone(),
+                Operation::Observe,
+                *class,
+                *transience,
+                "permission observation failed",
+            )
+            .unwrap_or_else(|_| unreachable!("static diagnostic")),
+        )),
+        MetadataObservation::Value { value, .. } => Ok(PermissionFacts {
+            owner: Some(PrincipalIdentity::Numeric(value.uid)),
+            group: Some(PrincipalIdentity::Numeric(value.gid)),
+            mode: Some(value.mode & 0o7777),
+        }),
+        _ => Ok(PermissionFacts {
+            mode: mode_without_ownership,
+            ..PermissionFacts::default()
+        }),
+    }
+}
+
 /// One backend-neutral metadata mutation compiled before target side effects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetadataMutation {
@@ -168,3 +195,6 @@ pub enum MetadataMutation {
     Mode(u32),
     Timestamps(TimestampMetadata),
 }
+#[cfg(test)]
+#[path = "metadata_tests.rs"]
+mod tests;

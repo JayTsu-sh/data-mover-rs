@@ -51,3 +51,37 @@ async fn permissions_keep_mode_when_nfs_owner_names_cannot_be_mapped()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn permissions_reject_named_versions_before_using_current_inline_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let protocol = Arc::new(CancellingProtocol {
+        cancel: tokio_util::sync::CancellationToken::new(),
+        sets: AtomicUsize::new(0),
+        xattrs_supported: false,
+        owner_unmapped: false,
+    });
+    let identity = BackendIdentity::new(BackendKind::Nfs, "permission-version")?;
+    let adapter = NfsMetadataAdapter::new(protocol.clone(), identity.clone());
+    let mut descriptor = SourceDescriptor::new(
+        StoragePath::new("file")?,
+        EntryKind::File,
+        Some(4),
+        SourceIdentity::new(
+            identity,
+            IdentityStrength::StableWithinBackend,
+            b"source-handle",
+        )?,
+    )
+    .with_inline_ownership(InlineOwnership::Known(OwnershipMode {
+        uid: 12345,
+        gid: 12346,
+        mode: 0o640,
+    }));
+    descriptor.version = crate::model::SourceVersion::Id("old-version".into());
+    let result = adapter.permissions(&descriptor).await;
+    assert!(matches!(result, Err(StorageRoleFailure::Entry(ref entry))
+        if entry.class() == FailureClass::Unsupported && entry.operation() == crate::model::Operation::Metadata));
+    assert_eq!(protocol.sets.load(Ordering::SeqCst), 0);
+    Ok(())
+}

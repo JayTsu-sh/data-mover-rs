@@ -9,8 +9,8 @@ use crate::model::acl::equivalent_native;
 use crate::model::{
     AclEncoding, AclMetadata, EntryKind, ExtendedAttribute, FailureClass, MetadataCapabilities,
     MetadataFamily as F, MetadataObservation, MetadataObservations, MetadataProvenance,
-    ObservationMode, ObservationPlan, ObservationSupport as S, OwnershipMode, StoragePath,
-    StorageTimestamp, TimePrecision, TimestampMetadata, Transience,
+    ObservationMode, ObservationPlan, ObservationSupport as S, OwnershipMode, SourceVersion,
+    StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata, Transience,
 };
 use crate::storage::{
     CopiedMetadataObservation, InlineOwnership, Metadata, MetadataMutation, PermissionFacts,
@@ -318,6 +318,9 @@ impl Metadata for NfsMetadataAdapter {
         &self,
         descriptor: &SourceDescriptor,
     ) -> Result<PermissionFacts, StorageRoleFailure> {
+        if !matches!(descriptor.version(), SourceVersion::Current) {
+            return Err(unsupported(&descriptor.path));
+        }
         if let Some(InlineOwnership::Known(value)) = descriptor.inline_ownership {
             return Ok(PermissionFacts {
                 owner: Some(PrincipalIdentity::Numeric(value.uid)),
