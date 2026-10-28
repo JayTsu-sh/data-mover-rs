@@ -16,16 +16,16 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::super::Shared;
-use super::super::observe::observe;
+use super::super::observe::{ObservationError, observe};
 use crate::model::ObservedEntry;
-use crate::storage::{SourceDescriptor, StorageRoleFailure};
+use crate::storage::SourceDescriptor;
 use crate::traversal::TraversalTerminalFailure;
 
 /// One child to observe, by its place in the page.
 pub(super) type Job = (usize, Box<SourceDescriptor>);
 
 /// One child's observation, by its place in the page.
-pub(super) type Done = (usize, Result<Box<ObservedEntry>, StorageRoleFailure>);
+pub(super) type Done = (usize, Result<Box<ObservedEntry>, ObservationError>);
 
 /// Observes `jobs`, returning every result, or `None` once the traversal halts first.
 ///

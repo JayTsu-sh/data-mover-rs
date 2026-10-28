@@ -310,6 +310,9 @@ pub struct ObservedEntry {
     /// (P7 §10); `None` for every other entry. Boxed: only a versioned bucket's entries have one,
     /// and an entry without one pays a pointer for it.
     history: Option<Box<ObjectHistory>>,
+    /// The real current zero-byte object represented by this logical directory, when it has
+    /// no history. Structural directories have none. The payload is always a leaf File.
+    marker: Option<Box<ObservedEntry>>,
 }
 
 impl ObservedEntry {
@@ -345,6 +348,7 @@ impl ObservedEntry {
             metadata: MetadataObservations::default(),
             backend_fact: PrivateBackendEntryFacts::None,
             history: None,
+            marker: None,
         })
     }
 
@@ -373,6 +377,7 @@ impl ObservedEntry {
             metadata: MetadataObservations::default(),
             backend_fact: PrivateBackendEntryFacts::None,
             history: None,
+            marker: None,
         })
     }
 
@@ -411,6 +416,43 @@ impl ObservedEntry {
     pub(crate) fn with_history(mut self, history: Option<Box<ObjectHistory>>) -> Self {
         self.history = history;
         self
+    }
+
+    /// Attaches the current marker object without replacing the directory's structural identity.
+    ///
+    /// # Errors
+    /// The outer entry must be a directory without history. Its marker must be a zero-byte File
+    /// at exactly the directory's path plus `/`, on the same backend, without history or another
+    /// marker. `None` removes a marker without changing any other observation.
+    pub(crate) fn with_directory_marker_object(
+        mut self,
+        marker: Option<Box<Self>>,
+    ) -> Result<Self, ModelValueError> {
+        if let Some(object) = marker.as_deref()
+            && (self.kind != EntryKind::Directory
+                || self.history.is_some()
+                || object.kind != EntryKind::File
+                || object.size != Some(0)
+                || object.path.as_str().strip_suffix('/') != Some(self.path.as_str())
+                || object.source_identity.backend() != self.source_identity.backend()
+                || object.history.is_some()
+                || object.marker.is_some())
+        {
+            return Err(ModelValueError::new(
+                "directory_marker_object",
+                "must be a zero-byte own File on the same backend, with no history or nesting",
+            ));
+        }
+        self.marker = marker;
+        Ok(self)
+    }
+
+    /// The real current zero-byte File represented by this logical directory. Its exact object
+    /// path, identity and metadata can be passed to a file transfer independently of the logical
+    /// directory. Structural directories and directories carrying history return `None`.
+    #[must_use]
+    pub fn directory_marker_object(&self) -> Option<&Self> {
+        self.marker.as_deref()
     }
 
     /// This entry once per segment of its history, each of at most `cap` records (P7 Q8): the
@@ -516,14 +558,31 @@ impl ObservedEntry {
     pub fn history(&self) -> Option<&ObjectHistory> {
         self.history.as_deref()
     }
+
+    /// The raw object key whose versions this entry carries. A Directory's marker history
+    /// belongs to `path + "/"`; its logical directory path must not be used to read/replay those
+    /// versions. The mapping also holds after snapshot decoding and history segmentation.
+    ///
+    /// # Errors
+    /// Returns an error if appending the marker suffix exceeds the model path limit.
+    pub fn history_source_path(&self) -> Result<Option<StoragePath>, super::ModelValueError> {
+        self.history
+            .as_ref()
+            .map(|_| ObjectHistory::source_path(&self.path, self.kind))
+            .transpose()
+    }
     /// The selector that copies this entry's current state with
     /// `TransferRequest::with_source_version`: `Current` for an entry without a history (only a
     /// file entry can be copied), and the current object's own selector for a key with one
     /// ([`VersionRecord::source`]). `None` for a key deleted now, or a segment that is not the
     /// key's last: there is no current object to copy. Each record of a history selects itself
-    /// with [`VersionRecord::source`].
+    /// with [`VersionRecord::source`]. A Directory carrying history returns `None`; its marker
+    /// records are selected individually using [`Self::history_source_path`].
     #[must_use]
     pub fn source_version(&self) -> Option<SourceVersion> {
+        if self.kind != EntryKind::File && self.history.is_some() {
+            return None;
+        }
         match self.history.as_deref() {
             None => Some(SourceVersion::Current),
             Some(history) => history.current().and_then(VersionRecord::source),
@@ -624,3 +683,7 @@ mod tests;
 #[cfg(test)]
 #[path = "snapshot_format_tests.rs"]
 mod snapshot_format_tests;
+
+#[cfg(test)]
+#[path = "directory_marker_tests.rs"]
+mod directory_marker_tests;

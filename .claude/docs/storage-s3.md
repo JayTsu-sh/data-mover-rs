@@ -578,9 +578,24 @@ role namespace 隐藏相对根任意一段以 `.data-mover-` 开头的对象；�
 - **目录对象**（P7 F5，键以 `/` 结尾，有没有内容都算）：目录 `p` 自己的键 `p/` 由 `p` 的列举作为**空名的文件子项**交出，
   路径恰为 `p/`（name 对 filter 是 `p`、深度同 `p` 的子项、页内排在最前）；Current 只要存在就交出（零字节文件夹标记也是
   零字节文件条目），每个列举只交一次；版本化桶上它是一项、带整段历史（有内容版本、零字节版本、删除标记，旧→新；最新是
-  标记也列出）。身份
+  标记也列出）。**逻辑遍历**（两种顺序一致）通过 S3 的 `list_for_traversal` 做一级探测后分类：
+  无历史的零字节 marker、所有对象版本均为零字节的历史 → `Directory p`；后者仍携带全部版本和删除标记。
+  任一版本非零 → 整个 key 为 `File p/`，包括最新为零或已删除的情况；仅有删除标记但无对象版本也保留 File 历史。
+  有内容的 `p/` 本身不产生 `Directory p`，只有真实子项才额外产生该 Directory；子项独立遍历。
+  普通零字节文件不受影响。原始 `Namespace.list` / 删除列举仍保留真实目录对象，不新增扫描视图。
+  探测可能重复列举一个目录；过滤/深度限制前也需要探测以确定候选类型，但不递归探测整个子树。失败明确报出，不把失败当作空。
+  Directory 携带的版本记录使用 `history_source_path()` 还原原始 `p/`，观察元数据、快照恢复与重放均使用该 key；
+  历史计数独立于条目类型。无历史 marker 单独保留原始 File 观察，可由 `directory_marker_object()` 访问，虚拟目录没有此载荷。
+  S3→S3 保留原 key/内容/可复制元数据：marker 仍复制为零字节对象，虚拟目录不凭空造对象。
+  `TransferRequest::from_observation` 向对象存储复制时会展开无历史 marker；版本历史仍逐记录重放。
+  多版本→非多版本只复制当前对象，例如 `[7,0]` 写成零字节 `p/`，目标重新扫描时自然成为 Directory；源端仍分类为 File。
+  非对象存储目的端按整组历史决策：任一非零版本则整个 key Skip（所有分段一致），全零 marker 按普通建目录流程处理；
+  当前已删除的 marker 不单独建目录，子项仍可创建父目录。
+  身份
   `PathScoped(len‖"p/"‖ETag)` / `VersionScoped`，与文件 `p`、目录 `p` 都不冲突。存储根自己的键（URL 前缀本身）：
-  零字节 / 全零历史忽略，有内容 → 根上的 `Unsupported` 子项失败；扫描根 `p` 自己的 `p/` 同理（遍历处理）。`stat("p/")`
+  无历史的零字节标记忽略，有内容或任意历史 → 根上的 `Unsupported` 子项失败（全零版本和删除标记也不能静默丢弃）；
+  扫描根 `p` 自己的 `p/` 同理（遍历处理）。遍历仍只输出指定根的子项；从父级扫描空目录得到一个 Directory，
+  直接扫描空目录的子项为空。S3 续扫语义键修订号为 2，旧 checkpoint 拒绝复用，避免混用旧计数语义。`stat("p/")`
   只 HEAD，不存在 → `NotFound`。MinIO 2023：版本桶里最新是删除标记的 `p/` 仍被 ListObjectsV2 列成无 ETag、0 字节的
   Contents（HEAD 404）→ 不是子项。
   目的端写 `p/d/`（P7 D13，F5g）：**只用单次请求**，不看单 PUT 阈值与 native 单次拷贝上限 —— 流式 / `Direct` 一次
@@ -624,7 +639,7 @@ role namespace 隐藏相对根任意一段以 `.data-mover-` 开头的对象；�
     条目层元数据取当前版本的（观察失败时时间退回列举的）。版本很多、计划要 tags 时每个 key 要做 N 次 HEAD / GetObjectTagging。
   - **分段**（Q8）：一个 key 超过 10 万条记录时发多项（段号从 0，只有最后一段 `complete`），连续、有序；只有最后一段有
     `current()`；续扫后从第 0 段重发。计数按 key：`versions` / `delete_markers` / `all_versions_bytes` 另计，`bytes` 为当前版本字节。
-  - 快照当前为 v8，保留历史段（`src/model/history_codec.rs`）并增加可选 rename evidence 字段（S3 为 None）；旧格式一律 `UnsupportedVersion`。
+  - 快照当前为 v10，保留历史段、rename evidence、可选的真实目录标识 File 观察与元数据失败摘要；旧格式一律 `UnsupportedVersion`。
 - **专家传输（terrasync）**：源端半程用 describe 复核观察；版本化桶上列举的观察是 `PathScoped(路径, ETag)`、describe 钉住
   `VersionScoped(id)`，`ReadSource::observation_matches` 在 describe 到的路径与版本 ETag 拼出的身份等于列举的身份时认作同一对象，
   对象被替换则仍报 "source differs"；offer / evidence 带观察的身份键（目的端半程比对它），读仍钉在 describe 到的版本。
@@ -637,6 +652,36 @@ role namespace 隐藏相对根任意一段以 `.data-mover-` 开头的对象；�
   `Record <key> <段>.<序号> version= latest= marker= size=`；`--current` 只打印当前对象）；
   `.claude/skills/e2e-s3/scripts/traversal_versions.sh`（见 SKILL 第 8 步）。C11b / C12 已完成，真机矩阵、十万版本测量、
   实际扫描 cancel / SIGKILL 续跑与环境限制见设计文档 §14.3。
+
+#### 2026-10-26 DXN / Ceph prefix 与目录标记回归（第一阶段）
+
+独立临时账户、两个临时桶实测通过；测试完删除全部对象 / 版本 / 删除标记、桶和账户，桶 HEAD=404、账户查询不存在。
+两种遍历顺序 × `--path scan` / URL 自带 `scan/`：只扫描指定 prefix 的子项，不输出 prefix 自身，不包含 `scan-other/`
+或桶根的对象；无历史的 marker-only prefix 返回零条目。从父级扫描它则只有 Directory，不再多出零字节 File。
+`missing/` 同样无条目：URL 根为空列表，`--path missing` 仍保留 `NotFound` 列举失败，防止错误源路径被当成空源。
+
+版本桶按原始 `ListObjectVersions` 核对每条记录的 versionId、latest、删除标记类型和大小（旧→新）：
+`empty/=[0]`、`mixed/=[3,0]`、`deleted/=[4,0,删除标记]`、`zero-deleted/=[0,删除标记]` 均完整保留。
+Suspended 后额外验证 `null/=[具名版本2字节,null版本0字节]`，删除后变为 `[具名版本2字节,null删除标记]`；
+不能把最新零字节或最新删除标记折成目录并丢掉旧版本。根自身有历史而无法表示时明确报 `Unsupported`，包括全零历史。
+主用例计数：非多版本 `files=3 dirs=4 bytes=8`；Enabled `files=7 dirs=6 versions=9 delete_markers=2 all_versions_bytes=15`，
+全部 totals 平衡。以上计数属于第一阶段的旧分类；后续整组历史分类规则见上文，不能作为当前计数基线。
+原始 Namespace 的目录对象列举和删除语义不变；`--current` 仍仅过滤示例输出，不是扫描模式。
+
+#### 2026-10-26 DXN / Ceph 整组历史分类与 S3 重放复测
+
+使用新的独立临时账户与两个临时桶复测通过。两种顺序 × `--path scan` / URL `scan/` 的结果一致：
+非多版本 `files=3 dirs=3 bytes=8`；Enabled `files=5 dirs=3 versions=9 delete_markers=2 all_versions_bytes=15`。
+`data/=[7]` 仅 File、不产生虚假 Directory；`empty/=[0]` 和 `zero-deleted/=[0,删除标记]` 为带完整历史的 Directory；
+`mixed/=[3,0]`、`deleted/=[4,0,删除标记]` 为 File，逐条对照原始 `ListObjectVersions`，历史无丢失。
+Suspended 的 `null/=[2,0(null)]` 仍为 File；删除后 `[2,删除标记(null)]` 也保留，计数分别为
+`versions=11 markers=2`、`versions=10 markers=3`，均 `files=6 dirs=3 all_versions_bytes=17`。
+
+另将六个 key 重放到版本桶的新前缀，逐条比较对象字节、版本顺序、大小和删除标记；目录标识仍保留原始 `/` key。
+重放到非多版本桶时仅写当前对象：`mixed/` 变成零字节对象，目标重新扫描为 Directory，已删除的 key 不恢复旧版本。
+只有 `tree/file` 的虚拟父目录没有被添加 `tree/` 对象。未比较目标新生成的 VersionId / LastModified 与源端相等。
+清理删除版本桶的 26 条对象/版本/标记、非版本桶的 12 个对象；两个桶 HEAD=404，临时账户也已撤销。
+
 ### 版本历史顺序与 ONTAP 分页
 
 `src/storage/backends/s3/client/version_order.rs` 的 `send_in_document_order` 保留 SDK 原始 XML 中 Version / DeleteMarker

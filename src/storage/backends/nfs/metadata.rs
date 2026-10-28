@@ -5,15 +5,16 @@ use async_trait::async_trait;
 use super::acl;
 use super::namespace::inline_ownership;
 use super::source::NfsProtocolFailure;
+use crate::model::acl::equivalent_native;
 use crate::model::{
-    EntryKind, ExtendedAttribute, MetadataCapabilities, MetadataFamily as F, MetadataObservation,
-    MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan,
-    ObservationSupport as S, OwnershipMode, StoragePath, StorageTimestamp, TimePrecision,
-    TimestampMetadata,
+    AclEncoding, AclMetadata, EntryKind, ExtendedAttribute, FailureClass, MetadataCapabilities,
+    MetadataFamily as F, MetadataObservation, MetadataObservations, MetadataProvenance,
+    ObservationMode, ObservationPlan, ObservationSupport as S, OwnershipMode, SourceVersion,
+    StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata, Transience,
 };
 use crate::storage::{
-    CopiedMetadataObservation, InlineOwnership, Metadata, MetadataMutation, SourceDescriptor,
-    StorageRoleFailure,
+    CopiedMetadataObservation, InlineOwnership, Metadata, MetadataMutation, PermissionFacts,
+    PrincipalIdentity, SourceDescriptor, StorageRoleFailure,
 };
 
 pub(crate) struct NfsMetadataAdapter {
@@ -36,6 +37,23 @@ pub(crate) struct NfsMetadataInline {
 pub(crate) trait NfsMetadataProtocol: Send + Sync {
     async fn stat(&self, path: &StoragePath) -> Result<NfsMetadataInline, NfsProtocolFailure>;
     fn supports_acl(&self) -> bool;
+    fn acl_encoding(&self) -> Option<AclEncoding> {
+        self.supports_acl().then_some(AclEncoding::NfsV4)
+    }
+    async fn get_native_acl(&self, path: &StoragePath) -> Result<AclMetadata, NfsProtocolFailure> {
+        let value = self.get_acl(path).await?;
+        acl::encode(&value).map_err(|_| NfsProtocolFailure::protocol())
+    }
+    async fn set_native_acl(
+        &self,
+        path: &StoragePath,
+        value: &AclMetadata,
+    ) -> Result<(), NfsProtocolFailure> {
+        let value = acl::decode(value).map_err(|_| {
+            NfsProtocolFailure::new(FailureClass::InvalidInput, Transience::Permanent)
+        })?;
+        self.set_acl(path, &value).await
+    }
     fn supports_xattrs(&self) -> bool;
     async fn get_acl(&self, path: &StoragePath) -> Result<nfs_rs::Acl, NfsProtocolFailure>;
     async fn get_xattrs(
@@ -90,6 +108,53 @@ impl NfsMetadataAdapter {
         Self { protocol, identity }
     }
 
+    /// A successful SET is insufficient: servers may rewrite or drop ACL entries.
+    async fn apply_acl(
+        &self,
+        path: &StoragePath,
+        value: &AclMetadata,
+    ) -> Result<(), NfsProtocolFailure> {
+        let Some(encoding) = self.protocol.acl_encoding() else {
+            return Err(NfsProtocolFailure::new(
+                FailureClass::Unsupported,
+                Transience::Permanent,
+            ));
+        };
+        if value.encoding() != encoding {
+            return Err(NfsProtocolFailure::new(
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+            ));
+        }
+        equivalent_native(value, value).map_err(|_| {
+            NfsProtocolFailure::new(FailureClass::InvalidInput, Transience::Permanent)
+        })?;
+        let value = self.materialize_acl(path, value).await?;
+        self.protocol.set_native_acl(path, &value).await?;
+        let actual = self.protocol.get_native_acl(path).await?;
+        if !equivalent_native(&value, &actual).map_err(|_| NfsProtocolFailure::protocol())? {
+            return Err(NfsProtocolFailure::protocol().with_status("ACL_READBACK_MISMATCH"));
+        }
+        Ok(())
+    }
+
+    /// POSIX xattrs can report absence for a basic ACL; NFSACL SET needs explicit mode entries.
+    async fn materialize_acl(
+        &self,
+        path: &StoragePath,
+        value: &AclMetadata,
+    ) -> Result<AclMetadata, NfsProtocolFailure> {
+        if value.encoding() != AclEncoding::Posix {
+            return Ok(value.clone());
+        }
+        let mut acl = acl::decode_posix(value).map_err(|_| NfsProtocolFailure::protocol())?;
+        if !acl.access.is_empty() {
+            return Ok(value.clone());
+        }
+        acl.access = acl::posix_from_mode(self.protocol.stat(path).await?.mode);
+        acl::encode_posix(&acl).map_err(|_| NfsProtocolFailure::protocol())
+    }
+
     async fn observe_entry(
         &self,
         path: &StoragePath,
@@ -130,8 +195,7 @@ impl NfsMetadataAdapter {
             ));
         }
         let acl = observe_optional(path, plan.acl(), self.protocol.supports_acl(), || async {
-            let value = self.protocol.get_acl(path).await?;
-            acl::encode(&value).map_err(|_| super::source::NfsProtocolFailure::protocol())
+            self.protocol.get_native_acl(path).await
         })
         .await?;
         let xattrs = observe_optional(
@@ -250,6 +314,30 @@ fn listed_optional<T>(
 
 #[async_trait]
 impl Metadata for NfsMetadataAdapter {
+    async fn permissions(
+        &self,
+        descriptor: &SourceDescriptor,
+    ) -> Result<PermissionFacts, StorageRoleFailure> {
+        if !matches!(descriptor.version(), SourceVersion::Current) {
+            return Err(unsupported(&descriptor.path));
+        }
+        if let Some(InlineOwnership::Known(value)) = descriptor.inline_ownership {
+            return Ok(PermissionFacts {
+                owner: Some(PrincipalIdentity::Numeric(value.uid)),
+                group: Some(PrincipalIdentity::Numeric(value.gid)),
+                mode: Some(value.mode & 0o7777),
+            });
+        }
+        let entry = self
+            .bound_entry(&descriptor.path, &descriptor.source_identity)
+            .await?;
+        Ok(PermissionFacts {
+            owner: entry.uid.map(PrincipalIdentity::Numeric),
+            group: entry.gid.map(PrincipalIdentity::Numeric),
+            mode: Some(entry.mode & 0o7777),
+        })
+    }
+
     fn observation_capabilities(&self) -> MetadataCapabilities {
         MetadataCapabilities::default()
             .with(
@@ -385,24 +473,7 @@ impl Metadata for NfsMetadataAdapter {
             return Err(super::source::cancelled(path));
         }
         let result = match mutation {
-            MetadataMutation::Acl(value) => {
-                // The xattr branch below has always checked this. Without the same check here a
-                // mount that never negotiated ACL support still sends a SETACL, and the caller
-                // gets whatever protocol error comes back instead of the typed refusal that says
-                // the destination cannot do this at all.
-                if !self.protocol.supports_acl() {
-                    return Err(unsupported(path));
-                }
-                let value = acl::decode(&value).map_err(|_| {
-                    super::source::entry_failure(
-                        path,
-                        crate::model::Operation::Metadata,
-                        crate::model::FailureClass::InvalidInput,
-                        crate::model::Transience::Permanent,
-                    )
-                })?;
-                self.protocol.set_acl(path, &value).await
-            }
+            MetadataMutation::Acl(value) => self.apply_acl(path, &value).await,
             MetadataMutation::Xattrs(values) => {
                 if !self.protocol.supports_xattrs() {
                     return Err(unsupported(path));

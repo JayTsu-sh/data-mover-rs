@@ -274,15 +274,16 @@ impl<'a> Block<'a> {
     }
 
     /// The storage root's own object (the URL prefix's key itself): no path of this tree spells
-    /// it, so one holding content is reported at the root rather than dropped; a zero-byte folder
-    /// marker stands for nothing the root does not already.
-    pub(super) fn root_object(&mut self, content: bool) {
-        if content {
+    /// it, so content or history is reported at the root rather than dropped; a current-only
+    /// zero-byte folder marker stands for nothing the root does not already.
+    pub(super) fn root_object(&mut self, content_or_history: bool) {
+        if content_or_history {
             self.failures.push(child_failure(
                 self.directory,
                 FailureClass::Unsupported,
-                "the S3 object at the storage root's own key (ending in '/') holds content; no path \
-                 of this tree names it, so it is not listed",
+                "the S3 object at the storage root's own key (ending in '/') holds content or \
+                 history; no path of this tree names it, so it is not listed; use its parent \
+                 as the storage root to include it",
             ));
         }
     }

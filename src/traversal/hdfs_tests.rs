@@ -74,7 +74,7 @@ async fn an_undescribable_child_is_a_child_failure_in_a_complete_listing()
             TraversalItem::DirectoryListed(listed) => {
                 listing = Some((listed.outcome, listed.counts));
             }
-            TraversalItem::Checkpoint(_) => {}
+            TraversalItem::Checkpoint(_) | TraversalItem::ObservationFailure(_) => {}
         }
     }
     session.finish().await?;
@@ -124,7 +124,7 @@ async fn a_listing_failing_after_the_first_page_is_interrupted()
             TraversalItem::Entry(_) => entries += 1,
             TraversalItem::Failure(failure) => failures.push((failure.scope, failure.delivered)),
             TraversalItem::DirectoryListed(listed) => outcome = Some(listed.outcome),
-            TraversalItem::Checkpoint(_) => {}
+            TraversalItem::Checkpoint(_) | TraversalItem::ObservationFailure(_) => {}
         }
     }
     let completion = match session.finish().await? {

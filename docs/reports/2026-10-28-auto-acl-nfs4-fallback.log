@@ -1,0 +1,18 @@
+OwnershipMode: Applied
+Acl: AppliedConservativeAcl
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Acl: AclPartiallyCopied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+ACL conservative fallback: true
+ACL omission Acl None: IdentityResolutionUnverified (server identity namespaces and group resolution have not been verified)
+ACL omission Acl None: UnprovenAccess { reason: "cross-model group permissions do not form an inclusion chain" } (cross-model group permissions do not form an inclusion chain)
+ACL omission Acl None: NoSafeCandidate (no ACL candidate preserves current data authorization)
+mapping OwnershipMode: Exact
+mapping Acl: Lossy([AclPartiallyCopied])
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes

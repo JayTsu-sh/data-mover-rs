@@ -29,8 +29,8 @@ pub struct CreateSymlinkRequest {
 /// Every failure is a [`StorageRoleFailure`]: `Entry` concerns only the path at hand and the
 /// caller may go on; `Session` means the connection is unusable and the caller should stop.
 ///
-/// The verbs other than [`Namespace::list`] default to an `Unsupported` entry failure, never to a
-/// silent no-op; every backend implements each one it supports.
+/// Mutation verbs default to an `Unsupported` entry failure, never to a silent no-op; every
+/// backend implements each one it supports.
 #[async_trait]
 pub trait Namespace: Send + Sync {
     /// Performs a fresh connectivity operation. Object stores override this with a bucket
@@ -49,9 +49,19 @@ pub trait Namespace: Send + Sync {
         ))
     }
 
-    /// Lists the direct children of one directory, page by page: the only listing entry. See
+    /// Lists the raw direct children of one directory, page by page. See
     /// [`crate::storage::listing`] for the stream's contract.
     fn list(&self, request: ListRequest) -> ListingStream;
+
+    /// Lists logical traversal children. Filesystems use the raw namespace listing by default.
+    /// Backends advertising `directory_objects` own the complete projection of markers and
+    /// content objects, including diagnostics for an unrepresentable own object when `is_root`.
+    /// Below the root, the parent's projection already represents that object. Traversal does
+    /// not classify or suppress own objects again. Raw listings and deletion stay unchanged.
+    /// This is not a user-selectable scan mode: every traversal uses these semantics.
+    fn list_for_traversal(&self, request: ListRequest, _is_root: bool) -> ListingStream {
+        self.list(request)
+    }
 
     /// Opaque identifier for the listing semantics used to validate traversal checkpoints.
     /// Consumers must compare/hash the bytes without interpreting them. Implementations must

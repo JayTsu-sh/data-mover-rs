@@ -1,10 +1,13 @@
-//! What a traversal delivers: entries, failures scoped to a child or to a listing, directory
-//! events, and checkpoints (P7 §4).
+//! What a traversal delivers: entries, child/listing failures, supplementary metadata errors,
+//! directory events, and checkpoints (P7 §4).
 
 use bytes::Bytes;
 
 use super::counts::BlockCounts;
-use crate::model::{EntryOperationFailure, ObservedEntry, StoragePath};
+use crate::model::{
+    EntryOperationFailure, FailureClass, MetadataFamily, ObservedEntry, SourceVersion, StoragePath,
+    Transience,
+};
 
 /// One traversal item. Failures do not terminate the session.
 ///
@@ -25,6 +28,14 @@ use crate::model::{EntryOperationFailure, ObservedEntry, StoragePath};
 /// What a consumer may conclude from a traversal is governed by the deletion-safety rules on
 /// [`ScanFailure`]; only [`super::TraversalOutcome::Completed`] makes any of it final.
 ///
+/// An observed child can additionally produce [`Self::ObservationFailure`] for each failed
+/// family/version, even if its filter decision hides the entry. These supplementary events
+/// precede that child's entry and do not count as additional children.
+/// If a later operation terminates the session, already observed errors are still delivered
+/// before the terminal result, even when an earlier unfinished child prevents normal ordered
+/// delivery. This terminal-only exception emits no incomplete entry or directory completion,
+/// and does not advance a checkpoint beyond the unfinished child.
+///
 /// Every variant is boxed, so an item is two words however much its payload grows: items are
 /// moved through the session's channel in batches, and a batch of a page is a page of pointers.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +45,9 @@ pub enum TraversalItem {
     /// A child that could not be observed, or a directory that could not be listed; see
     /// [`ScanFailure::scope`].
     Failure(Box<ScanFailure>),
+    /// A metadata family failed, but the child itself remains known. This supplementary event
+    /// does not count as a failed child or make its directory listing incomplete.
+    ObservationFailure(Box<ObservationFailure>),
     /// Every direct child of one listed directory has been delivered.
     DirectoryListed(Box<DirectoryListed>),
     /// A position a later traversal can resume from ([`super::TraversalRequest::resume_from`]).
@@ -41,6 +55,23 @@ pub enum TraversalItem {
     /// interval, and as its last item when it ends early (unless its position was too large to
     /// record). Persist it once everything received before it is committed.
     Checkpoint(Box<Checkpoint>),
+}
+
+/// A metadata observation failure retained on an entry or one historical version.
+///
+/// Delivered even when a filter hides the child after observing it. These are the facts the
+/// metadata role retained: the original backend diagnostic is not available in this event.
+/// This is not evidence of a missing entry and does not change [`ScanFailure`]'s deletion rules.
+/// Like entries, these events may be repeated when resuming. Metadata that was not observed
+/// produces no error event; callers must still inspect the session's terminal result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ObservationFailure {
+    pub path: StoragePath,
+    pub family: MetadataFamily,
+    pub version: SourceVersion,
+    pub class: FailureClass,
+    pub transience: Transience,
 }
 
 /// What one failure item is about.

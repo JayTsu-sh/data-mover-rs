@@ -80,7 +80,7 @@ impl<'a, 'd> Reader<'a, 'd> {
                     self.close(listed)?;
                     boundary = Some(listed.as_ref());
                 }
-                TraversalItem::Checkpoint(_) => {}
+                TraversalItem::Checkpoint(_) | TraversalItem::ObservationFailure(_) => {}
             }
         }
         let listed = boundary.ok_or("missing directory boundary")?;

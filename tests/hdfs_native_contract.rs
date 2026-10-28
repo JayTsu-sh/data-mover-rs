@@ -663,6 +663,7 @@ async fn verified_copy(
         source_path: StoragePath::new(from)?,
         destination: destination.clone(),
         destination_path: StoragePath::new(to)?,
+        plan: data_mover::integrity::IntegrityPlan::default(),
         options: IntegrityOptions {
             mode: IntegrityMode::Content,
             ..Default::default()
@@ -719,6 +720,7 @@ async fn nightly_lab_cross_protocol_copy_and_integrity() -> TestResult {
         source_path: StoragePath::new("source")?,
         destination: second_hdfs,
         destination_path: StoragePath::new("source")?,
+        plan: data_mover::integrity::IntegrityPlan::default(),
         options: data_mover::integrity::IntegrityOptions {
             mode: data_mover::integrity::IntegrityMode::Content,
             ..Default::default()

@@ -2,7 +2,9 @@
 
 use std::error::Error;
 
-use data_mover::integrity::{IntegrityMode, IntegrityOptions, IntegrityRequest, compare};
+use data_mover::integrity::{
+    IntegrityMode, IntegrityOptions, IntegrityPlan, IntegrityRequest, compare,
+};
 use data_mover::model::{
     BackendKind, MetadataObservation, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
 };
@@ -29,9 +31,9 @@ pub async fn verify(source: &Storage, destination: &Storage, path: &StoragePath)
         source_path: path.clone(),
         destination: destination.clone(),
         destination_path: path.clone(),
+        plan: IntegrityPlan::default(),
         options: IntegrityOptions {
             mode: IntegrityMode::Content,
-            permissions: true,
             ..IntegrityOptions::default()
         },
         cancel: CancellationToken::new(),

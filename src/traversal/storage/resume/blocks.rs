@@ -4,9 +4,9 @@
 //! - **Start.** At the root; or, resuming, at the checkpoint's position: every ancestor on the
 //!   chain is listed again, emitting nothing ([`relist`](super::relist)), to learn the
 //!   subdirectories it still descends into; the last directory on the chain is listed whole. An
-//!   ancestor whose listing fails now is reported as that directory's `Listing` failure, on its
-//!   own and first, never inside a block (the block it would land in is the next directory's,
-//!   whose outcome must stay its own). Cancelled while it relists, the traversal ends at once,
+//!   ancestor's newly encountered child or listing failures are reported on their own and first,
+//!   never inside a block (the block it would land in is the next directory's, whose outcome must
+//!   stay its own). Cancelled while it relists, the traversal ends at once,
 //!   and its final checkpoint is the one it resumed from.
 //! - **Periodic.** After each flush, the positions recorded before what has been delivered are
 //!   dropped but the latest, and, when a checkpoint is due and the last item delivered closed a
@@ -26,7 +26,7 @@ use crate::traversal::storage::cursor::Cursor;
 use crate::traversal::storage::output::Output;
 use crate::traversal::storage::root_work;
 use crate::traversal::storage::stream::ArrivalSender;
-use crate::traversal::{ScanFailure, TraversalItem, TraversalTerminalFailure};
+use crate::traversal::{ObservationFailure, ScanFailure, TraversalItem, TraversalTerminalFailure};
 
 /// The cursor a Blocks traversal drives: at the root, or at the position it resumes from.
 ///
@@ -58,21 +58,22 @@ pub(crate) async fn start(
         return Ok(Cursor::resumed(sender, Vec::new(), None, positions));
     };
     let mut frames = Vec::with_capacity(ancestors.len());
-    let mut failures = Vec::new();
-    let mut vanished = 0_u64;
     for (index, (entry, next)) in ancestors.iter().zip(chain.iter().skip(1)).enumerate() {
         let work = work_of(entry);
-        let relisted = relist::remaining(runtime.shared, &work, descent_name(&next.path)).await?;
+        let relisted = relist::remaining(runtime.shared, &work, descent_name(&next.path)).await;
         if runtime.request.cancel.is_cancelled() {
             // Nothing is driven any more; the recorded position is the one resumed from.
             return Ok(Cursor::resumed(sender, Vec::new(), None, positions));
         }
-        failures.extend(relisted.failure);
-        vanished = vanished.saturating_add(u64::from(relisted.vanished));
+        state
+            .output
+            .count_resumed(&relisted.failures, u64::from(relisted.vanished));
+        deliver_failures(runtime, relisted.failures, relisted.observation_failures).await?;
+        if let Some(failure) = relisted.terminal {
+            return Err(failure);
+        }
         frames.push((work, relisted.works, level(index)));
     }
-    state.output.count_resumed(&failures, vanished);
-    deliver_failures(runtime, failures).await?;
     let top = (work_of(top), level(ancestors.len()));
     Ok(Cursor::resumed(sender, frames, Some(top), positions))
 }
@@ -87,17 +88,23 @@ fn levels_of(chain: &[FrontierEntry]) -> Vec<Arc<Level>> {
     levels
 }
 
-/// Sends the resumed ancestors' listing failures, ahead of anything else.
+/// Sends the resumed ancestors' child and listing failures, ahead of anything else.
 async fn deliver_failures(
     runtime: &Runtime<'_>,
     failures: Vec<ScanFailure>,
+    observations: Vec<ObservationFailure>,
 ) -> Result<(), TraversalTerminalFailure> {
-    if failures.is_empty() {
+    if failures.is_empty() && observations.is_empty() {
         return Ok(());
     }
     let batch = failures
         .into_iter()
         .map(|failure| TraversalItem::Failure(Box::new(failure)))
+        .chain(
+            observations
+                .into_iter()
+                .map(|failure| TraversalItem::ObservationFailure(Box::new(failure))),
+        )
         .collect();
     tokio::select! {
         biased;

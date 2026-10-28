@@ -1,0 +1,9 @@
+target ACL:
+user::---
+group::---
+other::---
+
+
+{"subject": "named-user", "target": {"read": 13, "write": 13, "read_write": 13, "execute": false}}
+{"subject": "other", "target": {"read": 13, "write": 13, "read_write": 13, "execute": false}}
+PASS: conservative fallback is deny-all for tested unprivileged identities

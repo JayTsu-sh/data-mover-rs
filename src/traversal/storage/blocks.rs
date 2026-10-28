@@ -107,6 +107,14 @@ async fn traverse(
         }
         Err(failure) => Err(failure.clone()),
     };
+    let result = flush_terminal_errors(
+        &runtime,
+        cursor.as_mut().ok(),
+        &mut observations,
+        &mut state.output,
+        result,
+    )
+    .await;
     #[cfg(test)]
     probe.record_observers(&observations);
     // Never abort a backend operation: it may hold an open handle between two awaits (a CIFS
@@ -126,6 +134,32 @@ async fn traverse(
         resume::blocks::final_checkpoint(&runtime, positions.as_ref(), delivered).await;
     }
     terminal
+}
+
+/// Retains results already handed to the driver and prepared pages not yet admitted. No new
+/// observations or filter decisions are started while the session is ending.
+async fn flush_terminal_errors(
+    runtime: &Runtime<'_>,
+    cursor: Option<&mut Cursor>,
+    observations: &mut Observations,
+    output: &mut Output,
+    result: Result<(), TraversalTerminalFailure>,
+) -> Result<(), TraversalTerminalFailure> {
+    if result.is_ok() {
+        return result;
+    }
+    if let Some(cursor) = cursor {
+        cursor.remember_terminal_errors(runtime.shared, output);
+    }
+    while let Some((_, result, _)) = observations.ready() {
+        match resolve(runtime.shared, result, None) {
+            Ok(resolved) => output.remember_terminal_item(resolved.item),
+            Err(error) => output.remember_terminal_observations(error.observations),
+        }
+    }
+    let prefix = output.flush(runtime).await;
+    let details = output.flush_terminal(runtime).await;
+    prefix.and(details).and(result)
 }
 
 /// How the traversal ended: cancelled, failed, or completed with what it counted.
@@ -230,8 +264,20 @@ pub(super) fn admit(
     observations: &mut Observations,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
-    let stream::Child { listed, deferred } = child;
     let sequence = state.allocate()?;
+    let (listed, deferred) = match child {
+        stream::Child::Observe { listed, deferred } => (listed, deferred),
+        stream::Child::Filtered(failures) => {
+            state.output.settle(
+                sequence,
+                Settled::Child {
+                    item: ChildItem::ObservationFailures(failures),
+                    descent: None,
+                },
+            );
+            return Ok(());
+        }
+    };
     match listed {
         Listed::Observed(result) => settle(runtime, decisions, state, (sequence, result, deferred)),
         Listed::Unobserved(descriptor) => observations.start(
@@ -255,11 +301,20 @@ fn settle(
     observed: Observed,
 ) -> Result<(), TraversalTerminalFailure> {
     let (sequence, result, deferred) = observed;
+    let resolved = match resolve(runtime.shared, result, deferred) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            state
+                .output
+                .remember_terminal_observations(error.observations);
+            return Err(error.terminal);
+        }
+    };
     let Resolved {
         item,
         descent,
         below,
-    } = resolve(runtime.shared, result, deferred)?;
+    } = resolved;
     if let Some(ticket) = deferred.and_then(|deferred| deferred.ticket) {
         decisions.insert(ticket, below);
     }

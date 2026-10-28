@@ -1,0 +1,130 @@
+Evidence from authorized live tests in this session, 2026-10-28 Asia/Shanghai.
+No additional remote operations were run while compiling this archive.
+
+ONTAP NFSv3 POSIX ACL setup
+10.128.61.200:/ontap_lisaauto_nfs nfs    rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,soft,nolock,nosharecache,proto=tcp,timeo=20,retrans=1,sec=sys,mountaddr=10.128.61.200,mountvers=3,mountport=635,mountproto=tcp,local_lock=all,addr=10.128.61.200
+setfacl: /tmp/dm-nfs3-posix-mount.dCfZga/data-mover-test/integrity-plan/ontap3-to-ontap41-20261028/source/access.bin: Operation not supported
+
+DXN1 NFSv3 POSIX ACL setup
+10.131.7.201:/jay_nfs nfs    rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,soft,nolock,nosharecache,proto=tcp,timeo=20,retrans=1,sec=sys,mountaddr=10.131.7.201,mountvers=3,mountport=2050,mountproto=tcp,local_lock=all,addr=10.131.7.201
+setfacl: /tmp/dm-nfs3-posix-mount.Um0iy0/data-mover-ci/integrity-plan/posix-v3-20261028/access.bin: Operation not supported
+
+DXN2 NFSv3 POSIX ACL setup
+10.128.136.211:/nfs nfs    rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,soft,nolock,nosharecache,proto=tcp,timeo=20,retrans=1,sec=sys,mountaddr=10.128.136.211,mountvers=3,mountport=2050,mountproto=tcp,local_lock=all,addr=10.128.136.211
+setfacl: /tmp/dm-nfs3-posix-mount.RbAdUJ/data-mover-test/integrity-plan/posix-v3-20261028/access.bin: Operation not supported
+
+ONTAP v3 to v4.1 copy and native ACL readback
+BASELINE COPY NFSv3 TO NFSv4.1 WITH ACL REQUESTED
+OwnershipMode: Applied
+Acl: Unsupported
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+ACL skipped: the source cannot read it
+copied 33 bytes
+matches=true bytes=33 differences=[] ignored=[Acl { source: None, destination: Some(NfsV4) }]
+SOURCE POSIX VIEW OVER v3
+user::rw-
+group::r--
+other::---
+
+DESTINATION POSIX VIEW OVER v4.1
+user::rw-
+group::r--
+other::---
+
+SOURCE NATIVE ACL VIA v4.1
+A::OWNER@:rwatTnNcCoy
+A:g:GROUP@:rtncy
+A::EVERYONE@:tcy
+DESTINATION NATIVE ACL VIA v4.1
+A::OWNER@:rwatTnNcCoy
+A:g:GROUP@:rtncy
+A::EVERYONE@:tcy
+MODE=640 UID=0 GID=0
+MODE=640 UID=0 GID=0
+7f18b87d83d952ea84446133f4273193fc03a1d21b0cffbc493b544ba5d185fe  /tmp/dm-ontap-acl-v3.BEcxyI/data-mover-test/integrity-plan/ontap3-to-ontap41-20261028/source/access.bin
+7f18b87d83d952ea84446133f4273193fc03a1d21b0cffbc493b544ba5d185fe  /tmp/dm-ontap-acl-v41.GFtq0M/data-mover-test/integrity-plan/ontap3-to-ontap41-20261028/destination/access.bin
+ADD NON-MODE NFSv4 ACL MARK TO SOURCE
+A::42421:r
+A::OWNER@:rwatTnNcCoy
+A:g:GROUP@:rtncy
+A::EVERYONE@:tcy
+SOURCE v3 VIEW OF MARKED FILE
+getxattr("/tmp/dm-ontap-acl-v3.BEcxyI/data-mover-test/integrity-plan/ontap3-to-ontap41-20261028/source/access.bin", "system.posix_acl_access", 0x7ffecf514490, 132) = -1 EOPNOTSUPP (Operation not supported)
+user::rw-
+group::r--
+other::---
+
+COPY MARKED SOURCE THROUGH v3
+OwnershipMode: Applied
+Acl: Unsupported
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+ACL skipped: the source cannot read it
+copied 33 bytes
+matches=true bytes=33 differences=[] ignored=[Acl { source: None, destination: Some(NfsV4) }]
+DESTINATION NATIVE ACL AFTER v3 COPY
+A::OWNER@:rwatTnNcCoy
+A:g:GROUP@:rtncy
+A::EVERYONE@:tcy
+MARK LOST: native source has named ACE; destination does not
+NATIVE ACL DIFF
+--- /tmp/dm-ontap-marked-source-acl.txt	2026-10-28 11:40:26.149235169 +0800
++++ /tmp/dm-ontap-marked-destination-acl.txt	2026-10-28 11:40:26.310232384 +0800
+@@ -1,4 +1,3 @@
+-A::42421:r
+ A::OWNER@:rwatTnNcCoy
+ A:g:GROUP@:rtncy
+ A::EVERYONE@:tcy
+MODE=640 UID=0 GID=0
+MODE=640 UID=0 GID=0
+7f18b87d83d952ea84446133f4273193fc03a1d21b0cffbc493b544ba5d185fe  /tmp/dm-ontap-acl-v3.BEcxyI/data-mover-test/integrity-plan/ontap3-to-ontap41-20261028/source/access.bin
+7f18b87d83d952ea84446133f4273193fc03a1d21b0cffbc493b544ba5d185fe  /tmp/dm-ontap-acl-v41.GFtq0M/data-mover-test/integrity-plan/ontap3-to-ontap41-20261028/destination/access.bin
+RETAINED 10.128.61.200:/ontap_lisaauto_nfs/data-mover-test/integrity-plan/ontap3-to-ontap41-20261028
+
+
+Additional source supplied by user: 10.131.5.221:/m1-source, forced NFSv3.
+showmount -e: /m1-source exported to *.
+rpcinfo -T tcp 10.131.5.221 100227 3: RPC: Program not registered.
+Named ACL setup
+10.131.5.221:/m1-source nfs    rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,soft,nolock,nosharecache,proto=tcp,timeo=20,retrans=1,sec=sys,mountaddr=10.131.5.221,mountvers=3,mountport=20048,mountproto=tcp,local_lock=all,addr=10.131.5.221
+setfacl: /tmp/dm-nfs3-posix-mount.gm3GqZ/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/access.bin: Operation not supported
+
+Access/default ACL syscalls and remount readback
+GET ACCESS ACL
+getxattr("/tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/access.bin", "system.posix_acl_access", 0x7ffcc6acb780, 132) = -1 EOPNOTSUPP (Operation not supported)
+user::rw-
+group::r--
+other::---
+
+SET ACCESS ACL
+getxattr("/tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/access.bin", "system.posix_acl_access", 0x7ffe69910900, 132) = -1 EOPNOTSUPP (Operation not supported)
+setxattr("/tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/access.bin", "system.posix_acl_access", "\2\0\0\0\1\0\6\0\377\377\377\377\2\0\4\0\265\245\0\0\4\0\4\0\377\377\377\377\10\0\4", 52, 0) = -1 EOPNOTSUPP (Operation not supported)
+setfacl: /tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/access.bin: Operation not supported
+SET DEFAULT ACL
+getxattr("/tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/inheritance", "system.posix_acl_default", 0x7ffc91d93d00, 132) = -1 EOPNOTSUPP (Operation not supported)
+getxattr("/tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/inheritance", "system.posix_acl_access", 0x7ffc91d93d00, 132) = -1 EOPNOTSUPP (Operation not supported)
+setxattr("/tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/inheritance", "system.posix_acl_default", "\2\0\0\0\1\0\7\0\377\377\377\377\2\0\5\0\265\245\0\0\4\0\5\0\377\377\377\377\20\0\5", 44, 0) = -1 EOPNOTSUPP (Operation not supported)
+setfacl: /tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/inheritance: Operation not supported
+ACCESS_SET_EXIT=1 DEFAULT_SET_EXIT=1
+FRESH MOUNT ACL READ
+getxattr("/tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/access.bin", "system.posix_acl_access", 0x7ffc30710790, 132) = -1 EOPNOTSUPP (Operation not supported)
+getxattr("/tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/inheritance", "system.posix_acl_access", 0x7ffc30710790, 132) = -1 EOPNOTSUPP (Operation not supported)
+getxattr("/tmp/dm-nfs3-posix-read.skTvNm/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/inheritance", "system.posix_acl_default", 0x7ffc30710790, 132) = -1 EOPNOTSUPP (Operation not supported)
+user::rw-
+group::r--
+other::---
+
+user::rwx
+group::r-x
+other::r-x
+
+
+Retained fixture: 10.131.5.221:/m1-source/data-mover-test/integrity-plan/posix-v3-221-20261028-1158/
+Temporary client mounts were unmounted. No server/export configuration changes.

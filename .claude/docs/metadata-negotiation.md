@@ -4,7 +4,7 @@
 > 代码：`src/transfer/model.rs`（请求）· `src/transfer/engine/negotiation.rs`（协商）·
 > `src/metadata/compile.rs`（规划）· `src/metadata/mod.rs`（应用）· `src/storage/roles.rs`（目的端能力）。
 
-## 用户规则（2026-09-23，决定本页一切）
+## 默认复制规则（2026-09-23；严格 ACL 为 2026-10-28 显式新增选项）
 
 - **should**（要拷什么）由调用方给 —— terrasync-rs 的命令行 —— 对 data-mover 是用户输入，
   但**用户输入错误由上层处理**：data-mover 从不因「要了做不到」而失败。
@@ -57,9 +57,9 @@ ACL/xattr 的判定点是 `src/transfer/engine/negotiation.rs` 的 `optional_pol
 |---|---|---|
 | 两端都能，精确 | 不读不写 | 拷 |
 | 两端都能，有损（精度降低、只保留 mode 等） | 不读不写 | 拷，损失记进报告 |
-| 源端读不了（NFSv3 的 ACL、未协商 named attributes 的 xattr） | 不读不写 | 跳过：outcome `Unsupported`，`skipped()` 记 `SourceCannotObserve` |
+| 源端读不了 | 不读不写 | 普通文件 ACL 目标可安全写入时使用保守 ACL 并报告 `SourceUnavailable`；其他族按能力跳过 |
 | 目的端存不了 | 不读不写 | 跳过：outcome `Unsupported`，`skipped()` 记 `DestinationCannotStore` |
-| 两端都存但编码不同（Posix ↔ NfsV4 ↔ WindowsSecurityDescriptor） | 不读不写 | 跳过：outcome `Unsupported`，`skipped()` 记 `EncodingsDiffer { source, destination }`；**不做任何转换** |
+| 两端都存但 ACL 编码不同 | 不读不写 | 普通文件自动映射受支持的 POSIX/NFSv4 权限并报告未复制项；不支持的映射使用目标模型的保守 ACL 并报告原因 |
 | 源端**读失败**（GETACL 报错） | — | **文件失败**（`SourceObservationFailed`，带 class） |
 | 目的端**写失败**（能力位为真但 SETACL 被拒） | — | 其余族照常应用，**文件最终失败**并列出所有失败的族 |
 | 应用期**取消** / **会话级失败** / **整批失败** | — | **立即停止**并失败 |
@@ -73,8 +73,24 @@ Display 如 `ACL skipped: the source cannot read it`。不变式：outcome 为 `
 —— 目的端什么都不存时例外：不读源端，记目的端。要了却没发观测（`NotRequested`，拷贝路径上不会
 发生：要的功能一定以 `BestEffort` 观测）记 `NotObserved`，不进 `skipped()`。
 
-`MetadataPolicy` 的四档（`RequireExact` / `AllowKnownLoss` / `BestEffort` / `Omit`）仍在
+`MetadataPolicy`（`RequireExact` / `AllowKnownLoss` / `BestEffort` / `Omit`）在
 `metadata` 模块里，给基线族与直接调用 `compile_metadata_plan` 的代码用；**不再出现在拷贝请求里**。
+
+## ACL 自动复制与错误报告
+
+`CopiedMetadataRequest::with_acl()` 选择 ACL 复制，后端自动处理本地 ACL 或普通文件的
+POSIX/NFSv4 映射。`TransferOutcome.metadata` 中的 `acl_copy_report()` 返回未复制项，
+包括源 ACE 序号、主体、权限或标志掩码与原因；应用失败时同一报告可从
+`MetadataApplicationFailure::report()` 取得。实际读取、写入或读回验证失败仍返回错误。
+
+跨模型只映射受支持的当前普通文件 rwx，保持 DENY 顺序并使用独立求值器验证；
+不能证明时使用显式拒绝数据访问的 ACL，并通过 `AppliedConservativeAcl` 与报告提示。
+数字身份和组解析是否一致无法由本库验证，跨模型报告会明确提示。身份不保留时不会声称
+等效；目录只使用原生复制。NFS ACL 写入后读回最终候选并验证，owner/mode 先于 ACL。
+
+完整性比对独立提供 `IntegrityPlan::with_required_acl()` 与 `with_acl_equivalence()`；
+其 `acl_scope()` 说明比较范围。NFSv3 POSIX ACL 需要 NFSACL 扩展。具体可表达范围与
+真机证据见 [四组合实现验收报告](../../docs/reports/2026-10-28-nfs-acl-four-way-validation.md)。
 
 ## 否决链（按发生顺序）
 
@@ -111,7 +127,7 @@ owner/group/mode 记成**损失** `OwnershipModeDropped`（走 `OwnershipTarget:
 
 | backend | owner/group（源端读；目的端另注） | ACL | xattrs | 依据 |
 |---|---|---|---|---|
-| NFS | v3 数字；v4 字符串，nfs-rs 映射不了的名字走「只有 mode」（`OwnerAndGroupUnmapped`，见 `storage-nfs.md`） | 协商到才有，报 `NfsV4` | nfs-rs 0.8.4 永远报未协商 | `mount.capabilities().acl` / `.named_attributes` |
+| NFS | v3 数字；v4 字符串，nfs-rs 映射不了的名字走「只有 mode」（`OwnerAndGroupUnmapped`，见 `storage-nfs.md`） | NFSv3 实际探测 NFSACL 扩展后报 `Posix`；v4 协商到后报 `NfsV4` | nfs-rs 0.8.4 永远报未协商 | `mount.capabilities().posix_acl` / `.acl` / `.named_attributes` |
 | Local | unix 下数字（作目的端时逐文件问能不能设这个 owner，见下节） | unix 下 `Posix` | unix 下支持 | 非 unix 整体不参与拷贝 |
 | CIFS | 读不到（`NotApplicable`） | `WindowsSecurityDescriptor`（只保留 account 类 ACE） | 不支持 | `cifs/metadata.rs` 的 decode 只认这一种 |
 | HDFS | 字符串，走「只有 mode」（`OwnerAndGroupDropped`） | 不支持 | 不支持 | 观测侧也一律 `unavailable` |
@@ -208,14 +224,16 @@ flush 失败经 `classify` 成 Entry 级，被当成那一条的拒绝 —— �
 诊断带服务端状态名，例如 chown 被拒是 `NFS role failed: NFS4ERR_PERM (permission denied)`；SETATTR 之前的
 LOOKUP 失败与 xattr 路径还没有（见 storage-nfs.md「Retry Taxonomy」的缺口）。
 
-## 真机证据（2026-09-23，`examples/nfs_metadata_copy.rs`）
+## 历史真机证据（2026-09-23，`examples/nfs_metadata_copy.rs`）
+
+下表记录当时的版本与结果；当前自动映射和回退行为以 2026-10-28 的[自动映射验收](../../docs/reports/2026-10-28-auto-acl-validation.md)为准。
 
 入口：`.claude/skills/e2e-nfs/scripts/metadata_matrix.sh`，9 档全过。环境：m1-source（NFSv3，只读源）、
 FAS2750 `ontap_lisaauto_nfs`（ONTAP 9.19.1，NFSv4.1）与同机 CIFS share。
 
 | 路径 | 要什么 | 结果 |
 |---|---|---|
-| NFSv3 → NFSv4.1 | ACL + xattr | 拷贝成功，两族记 `Unsupported`（源端读不了） |
+| 无 NFSACL 扩展的 NFSv3 → NFSv4.1 | 默认 ACL + xattr | 拷贝成功，两族记 `Unsupported`（源端读不了）；Linux nfsd 原生扩展与显式映射见四组合报告 |
 | NFSv4.1 → NFSv4.1 | ACL | `Applied`，raw GETACL 回读与源**逐条相等且带标记** |
 | NFSv4.1 → NFSv4.1 | 不要 ACL（阴性对照） | 目的端没有标记，校验按预期失败 |
 | NFSv4.1 → NFSv4.1 | xattr | 拷贝成功，记 `Unsupported`（该导出没协商到 named attributes） |

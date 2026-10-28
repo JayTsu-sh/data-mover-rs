@@ -229,7 +229,7 @@ async fn a_nas_bucket_keeps_no_versions_and_no_directory_objects() -> TestResult
     );
     assert_eq!(described.version, SourceVersion::Current);
     let capabilities = storage.namespace()?.capabilities();
-    assert_eq!(storage.namespace()?.listing_resume_key(), &[0]);
+    assert_eq!(storage.namespace()?.listing_resume_key(), &[0, 2]);
     assert!(!capabilities.directory_objects);
     assert!(!storage.holds_directory_objects());
     let destination = storage.staged_destination()?;
@@ -257,7 +257,7 @@ async fn a_nas_bucket_keeps_no_versions_and_no_directory_objects() -> TestResult
     versioned.set_versioning(Versioning::Enabled);
     let object = connect(versioned, identity(), None)?;
     assert!(object.read_source()?.supports_source_versions());
-    assert_eq!(object.namespace()?.listing_resume_key(), &[1]);
+    assert_eq!(object.namespace()?.listing_resume_key(), &[1, 2]);
     assert!(object.holds_directory_objects());
     Ok(())
 }

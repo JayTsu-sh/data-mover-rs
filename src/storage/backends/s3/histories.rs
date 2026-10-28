@@ -196,14 +196,10 @@ fn listing_wide(
 impl Block<'_> {
     /// The directory's own key `<path>/` (P7 F5, D5): one child with its whole history — every
     /// version, zero-byte ones included, and every delete marker. At the storage root it has no
-    /// path: ignored when no version holds content, a failure when one does.
+    /// path: report a failure even for an all-zero history, which a directory cannot preserve.
     pub(super) fn own_history(&mut self, history: KeyHistory<S3ListedVersion>) {
         if self.directory.as_str().is_empty() {
-            let content = history
-                .entries
-                .iter()
-                .any(|entry| !entry.facts.delete_marker && entry.facts.size > 0);
-            self.root_object(content);
+            self.root_object(true);
             return;
         }
         let described = self

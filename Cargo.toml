@@ -32,7 +32,7 @@ percent-encoding = "2"
 tracing = "0.1.44"
 moka = { version = "0.12.15", features = ["sync"] }
 md-5 = "0.10"
-nfs-rs = "0.8.8"
+nfs-rs = "0.9.1"
 num-traits = "0.2.19"
 path-clean = "1.0.1"
 quick-xml = { version = "0.39.2", features = ["serialize"] }
@@ -154,6 +154,10 @@ path = "tests/lab/tools/nfs_mount_comparison.rs"
 [[example]]
 name = "s3_history_replay"
 path = "tests/lab/tools/s3_history_replay.rs"
+
+[[example]]
+name = "integrity_input_probe"
+path = "tests/lab/tools/integrity_input_probe.rs"
 
 [[example]]
 name = "transfer_resume"

@@ -11,6 +11,8 @@ use super::*;
 use crate::traversal::checkpoint::{FrontierEntry, fingerprint, open};
 use crate::traversal::{Checkpoint, FailureScope, ListingOutcome, Resumable, TraversalOrder};
 
+mod failures;
+
 fn listed(items: &[TraversalItem]) -> Vec<String> {
     items
         .iter()

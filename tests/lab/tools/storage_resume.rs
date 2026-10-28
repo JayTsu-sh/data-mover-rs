@@ -132,8 +132,18 @@ async fn main() -> Result {
         reused_bytes: None,
     };
     match args.phase {
-        Phase::Interrupt => interrupt(&args, &path, &mut state).await?,
-        Phase::Resume => resume(&args, &source, &destination, &path, request, &mut state).await?,
+        Phase::Interrupt => Box::pin(interrupt(&args, &path, &mut state)).await?,
+        Phase::Resume => {
+            Box::pin(resume(
+                &args,
+                &source,
+                &destination,
+                &path,
+                request,
+                &mut state,
+            ))
+            .await?;
+        }
     }
     Ok(())
 }

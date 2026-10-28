@@ -210,7 +210,7 @@ fn rename_evidence_roundtrips_without_changing_runtime_identity() {
 fn rename_evidence_unknown_scheme_and_truncated_tokens_are_rejected() {
     let entry = nfs_entry("cluster");
     let bytes = entry.encode_snapshot().as_bytes().to_vec();
-    let section = bytes.len() - 32 - 1;
+    let section = bytes.len() - 32 - 1 - 1;
     assert_eq!(bytes[section], 0);
     let mut unknown = bytes.clone();
     unknown[section] = 255;

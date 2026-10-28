@@ -1,7 +1,8 @@
-//! The current entry snapshot format, byte for byte (P7 §10.4): three golden fixtures under
+//! The current entry snapshot format, byte for byte (P7 §10.4): four v10 golden fixtures under
 //! `tests/data/snapshot/` — a plain NFS file, an S3 key's whole history (versions, delete markers,
 //! the `"null"` version, an inferred order) and a later, incomplete segment whose records carry
-//! metadata. Any change to the layout must bump the version byte and these files together; bytes
+//! metadata, and a directory carrying a current marker object with metadata. Any change to the
+//! layout must bump the version byte and these fixtures together; bytes
 //! of any other version are refused, never misread.
 
 use std::fmt::Write as _;
@@ -14,9 +15,10 @@ use crate::model::{
     ObjectTag, RecordKind, TimePrecision, TimestampMetadata, VersionRecord,
 };
 
-const NFS_FILE: &str = include_str!("../../tests/data/snapshot/v8-nfs-file.hex");
-const S3_HISTORY: &str = include_str!("../../tests/data/snapshot/v8-s3-history.hex");
-const S3_SEGMENT: &str = include_str!("../../tests/data/snapshot/v8-s3-history-segment.hex");
+const NFS_FILE: &str = include_str!("../../tests/data/snapshot/v10-nfs-file.hex");
+const S3_HISTORY: &str = include_str!("../../tests/data/snapshot/v10-s3-history.hex");
+const S3_SEGMENT: &str = include_str!("../../tests/data/snapshot/v10-s3-history-segment.hex");
+const S3_MARKER: &str = include_str!("../../tests/data/snapshot/v10-s3-directory-marker.hex");
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut hex, byte| {
@@ -144,11 +146,16 @@ fn s3_segment() -> ObservedEntry {
     s3_history().with_history(Some(Box::new(history)))
 }
 
-fn fixtures() -> [(&'static str, ObservedEntry, &'static str); 3] {
+fn fixtures() -> [(&'static str, ObservedEntry, &'static str); 4] {
     [
-        ("v8-nfs-file", nfs_file(), NFS_FILE),
-        ("v8-s3-history", s3_history(), S3_HISTORY),
-        ("v8-s3-history-segment", s3_segment(), S3_SEGMENT),
+        ("v10-nfs-file", nfs_file(), NFS_FILE),
+        ("v10-s3-history", s3_history(), S3_HISTORY),
+        ("v10-s3-history-segment", s3_segment(), S3_SEGMENT),
+        (
+            "v10-s3-directory-marker",
+            super::directory_marker_tests::directory_marker_fixture(),
+            S3_MARKER,
+        ),
     ]
 }
 
@@ -167,7 +174,7 @@ fn the_current_format_is_pinned_byte_for_byte() {
         .collect();
     assert!(
         changed.is_empty(),
-        "the format changed — bump VERSION and rewrite tests/data/snapshot/:\n{}",
+        "the format changed — bump VERSION and rewrite the golden fixtures:\n{}",
         changed.join("\n")
     );
     for (name, entry, golden) in fixtures() {
@@ -181,9 +188,9 @@ fn the_current_format_is_pinned_byte_for_byte() {
 
 #[test]
 fn another_version_byte_is_unsupported_never_misread() {
-    assert_eq!(VERSION, 8);
+    assert_eq!(VERSION, 10);
     for (name, entry, golden) in fixtures() {
-        for version in [4, 5, 6, 7, 9, 0, u8::MAX] {
+        for version in [4, 5, 6, 7, 8, 9, 11, 0, u8::MAX] {
             let mut bytes = unhex(golden);
             bytes[4] = version;
             assert_eq!(
@@ -196,10 +203,10 @@ fn another_version_byte_is_unsupported_never_misread() {
 }
 
 /// Where the history section of `entry`'s snapshot starts: right after what the same entry
-/// without a history encodes before its identity key (its one `0` byte).
+/// without a history encodes before its rename evidence, marker tag and identity key.
 fn history_at(entry: &ObservedEntry) -> usize {
     let bare = entry.clone().with_history(None).encode_snapshot();
-    bare.as_bytes().len() - 32 - 1 - 1
+    bare.as_bytes().len() - 32 - 1 - 1 - 1
 }
 
 #[test]

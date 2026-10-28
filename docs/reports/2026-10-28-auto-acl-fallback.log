@@ -1,0 +1,24 @@
+seeded fallback-automatic.bin bytes=61
+marked source ACL (Principal): 4 ACE(s)
+OwnershipMode: Applied
+Acl: AppliedConservativeAcl
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Acl: AclPartiallyCopied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+ACL conservative fallback: true
+ACL omission Acl None: IdentityResolutionUnverified (server identity namespaces and group resolution have not been verified)
+ACL omission NfsAce { index: 0 } Some("OWNER@"): UnsupportedRights { rights: 524312 } (NFSv4 rights are not preserved)
+ACL omission NfsAce { index: 1 } Some("GROUP@"): UnsupportedRights { rights: 8 } (NFSv4 rights are not preserved)
+ACL omission NfsAce { index: 2 } Some("EVERYONE@"): UnsupportedRights { rights: 8 } (NFSv4 rights are not preserved)
+ACL omission NfsAce { index: 3 } Some("12345"): MetadataRightsNormalized { original: 0, normalized: 1179776 } (non-data metadata authorization uses the target template)
+ACL omission Acl None: UnprovenAccess { reason: "NFSv4 ACL is outside the canonical POSIX access template" } (NFSv4 ACL is outside the canonical POSIX access template)
+ACL omission Acl None: NoSafeCandidate (no ACL candidate preserves current data authorization)
+mapping OwnershipMode: Exact
+mapping Acl: Lossy([AclPartiallyCopied])
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 61 bytes

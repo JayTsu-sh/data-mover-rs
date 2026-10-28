@@ -20,6 +20,7 @@ use tracing::{debug, error, info, trace, warn};
 use url::form_urlencoded;
 
 use crate::error::StorageError;
+use crate::model::AclEncoding;
 use crate::storage::backends::nfs::common::{
     NfsFactsError, NfsFactsProvider, NfsFailureCode, NfsInstanceFacts, NfsRetryAction,
     NfsRetryPolicy,
@@ -913,6 +914,10 @@ impl NfsStageFile for NfsRoleStageFile {
 impl NfsStagedProtocol for NFSStorage {
     fn supports_acl(&self) -> bool {
         Self::supports_acl(self)
+    }
+
+    fn acl_encoding(&self) -> Option<AclEncoding> {
+        Self::acl_encoding(self)
     }
 
     fn supports_xattrs(&self) -> bool {
@@ -1952,12 +1957,6 @@ impl NFSStorage {
     /// [`owner_id`].
     pub(crate) fn owners_are_strings(&self) -> bool {
         owners_are_strings(self.mount.version())
-    }
-
-    /// 返回当前已协商实例报告的 ACL 能力。
-    #[must_use]
-    pub fn supports_acl(&self) -> bool {
-        self.mount.capabilities().acl
     }
 
     /// 返回当前已协商实例报告的 named-attribute 能力。

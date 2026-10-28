@@ -34,6 +34,7 @@ fn apply_support(
     capabilities: MetadataCapabilities,
 ) -> MetadataObservations {
     MetadataObservations {
+        retained_failures: metadata.retained_failures,
         acl: known(plan.acl(), capabilities.support(F::Acl), metadata.acl),
         xattrs: known(
             plan.xattrs(),
@@ -73,6 +74,7 @@ pub(super) fn record_inline(
         _ => O::Unsupported,
     };
     MetadataObservations {
+        retained_failures: None,
         acl: unavailable(plan.acl(), capabilities.support(F::Acl)),
         xattrs: unavailable(plan.xattrs(), capabilities.support(F::Xattrs)),
         tags: unavailable(plan.tags(), capabilities.support(F::Tags)),
@@ -128,6 +130,7 @@ fn descriptor_fallback(
         }
     };
     MetadataObservations {
+        retained_failures: None,
         acl: unavailable(plan.acl(), support(F::Acl)),
         xattrs: unavailable(plan.xattrs(), support(F::Xattrs)),
         tags: unavailable(plan.tags(), support(F::Tags)),
@@ -201,6 +204,11 @@ pub(super) fn merge(
     observed: MetadataObservations,
     requested: ObservationPlan,
 ) -> MetadataObservations {
+    for failure in observed.retained_failures.as_deref().unwrap_or_default() {
+        if requested.mode(failure.family) != M::Omit {
+            inline.retain_failure_summary(*failure);
+        }
+    }
     if requested.acl() != M::Omit {
         inline.acl = observed.acl;
     }
@@ -229,13 +237,44 @@ fn missing<T>(observation: &O<T>) -> Option<(FailureClass, Transience)> {
     }
 }
 
+fn required_record<T>(mode: M, value: &mut O<T>) {
+    if mode == M::Required && matches!(value, O::NotRequested | O::Unsupported) {
+        *value = O::Failed {
+            class: FailureClass::Unsupported,
+            transience: Transience::Permanent,
+        };
+    }
+}
+
+/// History records keep individual failures without discarding successfully observed families.
+pub(super) fn validate_history(
+    descriptor: &SourceDescriptor,
+    plan: ObservationPlan,
+    mut metadata: MetadataObservations,
+) -> Result<MetadataObservations, StorageRoleFailure> {
+    required_record(plan.acl(), &mut metadata.acl);
+    required_record(plan.xattrs(), &mut metadata.xattrs);
+    required_record(plan.tags(), &mut metadata.tags);
+    required_record(plan.ownership_mode(), &mut metadata.ownership_mode);
+    required_record(plan.timestamps(), &mut metadata.timestamps);
+    let relaxed = F::ALL.into_iter().fold(plan, |plan, family| {
+        if plan.mode(family) == M::Required {
+            plan.with(family, M::BestEffort)
+        } else {
+            plan
+        }
+    });
+    validate(descriptor, relaxed, metadata)
+}
+
 pub(super) fn validate(
     descriptor: &SourceDescriptor,
     plan: ObservationPlan,
     metadata: MetadataObservations,
 ) -> Result<MetadataObservations, StorageRoleFailure> {
     // Separate valid partial observations may exceed the aggregate payload bound when merged.
-    let metadata = MetadataObservations::new(
+    let retained_failures = metadata.retained_failures;
+    let mut metadata = MetadataObservations::new(
         metadata.acl,
         metadata.xattrs,
         metadata.tags,
@@ -244,6 +283,7 @@ pub(super) fn validate(
     )
     .map_err(|_| entry_failure(&descriptor.path, FailureClass::Protocol))
     .map_err(StorageRoleFailure::Entry)?;
+    metadata.retained_failures = retained_failures;
     for family in F::ALL {
         if plan.mode(family) != M::Required {
             continue;

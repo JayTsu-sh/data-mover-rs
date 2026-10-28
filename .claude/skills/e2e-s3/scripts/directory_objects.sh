@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # P7 F5: S3 "directory objects" — keys ending in '/' (with or without content) — against a real
-# server: the role-based traversal lists each as a file entry of its own directory, and
+# server: traversal classifies all-zero markers as directories and content histories as files;
 # S3→S3 copies recreate them by ONE request whatever their size
 # (P7 D13: one PUT, or one CopyObject natively; never multipart, never resumed), and S3→Local
 # refuses them at Preflight.
@@ -20,10 +20,10 @@
 # delete marker, 3 B, delete marker (mixed history).
 #
 # Checks:
-# - Current traversal (--sizes): every seeded key once, own objects as `File <d>/ size=<n>`, the
-#   zero-byte ones included; balanced totals, no failure; --order blocks identical at c=1/4/32.
+# - Current traversal (--sizes): content objects as `File <d>/ size=<n>`, all-zero histories as
+#   Directory <d>; no phantom directory for a content-only leaf; balanced totals and blocks at c=1/4/32.
 # - Traversal roots: --path dirobj reports `failure scope=Child dirobj/ Unsupported` and does not
-#   emit dirobj/; --path emptydir reports and emits nothing of emptydir/.
+#   emit dirobj/; --path emptydir reports its unrepresentable history only on versioned buckets.
 # - Histories (versioned): each own object one entry; dirobj/ one 5 B version; z/ 0 B, marker, 0 B;
 #   m/ 5 B, 0 B, marker, 3 B, marker (latest last), listed although deleted now.
 # - Copies (transfer_resume, same bucket): dirobj/ and emptydir/ streamed (single PUT), dirobj/
@@ -367,25 +367,19 @@ if [ "$VERSIONED" = 1 ]; then
   echo "   raw ListObjectsV2 of ${P}m/: $(s3c "$H/$VB?list-type=2&delimiter=%2F&prefix=$(enc "${P}m/")" | grep -oE '<(Key|Size|Prefix)>[^<]*' | tr '\n' ' ')"
   echo "   raw root CommonPrefixes: $(s3c "$H/$VB?list-type=2&delimiter=%2F&prefix=$(enc "$P")" | grep -oE '<Prefix>[^<]*' | tr '\n' ' ')"
 fi
-expected_current="Directory big size=-
-Directory dirobj size=-
+expected_current="Directory dirobj size=-
 Directory e size=-
 Directory emptydir size=-
-Directory lonely size=-
 File big/ size=$BIG
 File dirobj/ size=5
 File dirobj/child size=1
-File e/ size=0
-File emptydir/ size=0
 File emptydir/child size=1
 File lonely/ size=6
 File plain.txt size=1"
-[ "$VERSIONED" = 1 ] && expected_current=$(printf '%s\nDirectory z size=-\nFile z/ size=0' "$expected_current" | sort)
-# The directory m of the deleted directory object m/: a versioned bucket is listed with histories
-# (P7 C11b), where m/ still has records, so its prefix m is listed (--current then prints no m/);
-# on a store that keeps no versions of m/ it is gone. Either way never an entry m/ here.
-echo "   directory m listed beside the deleted directory object m/: $(grep -c '^Directory m size=-$' "$WORK/cur")"
-check "current entries" "$(grep -E '^(File|Directory) ' "$WORK/cur" | grep -v '^Directory m size=-$' | sort)" "$(sort <<<"$expected_current")"
+[ "$VERSIONED" = 1 ] && expected_current=$(printf '%s\nDirectory z size=-' "$expected_current" | sort)
+# m/ has content history but no descendants: one File in the full scan, suppressed by --current.
+check "no phantom directory m" "$(grep -c '^Directory m size=-$' "$WORK/cur")" 0
+check "current entries" "$(grep -E '^(File|Directory) ' "$WORK/cur" | sort)" "$(sort <<<"$expected_current")"
 check "current totals balanced, no failure" "$(grep -c '^totals balanced=true' "$WORK/cur") $(grep -c '^failure' "$WORK/cur.err")" "1 0"
 check "current outcome" "$(grep -o 'outcome=Completed[^ ]*' "$WORK/cur" | head -1)" "outcome=Completed(TraversalCompletion"
 for c in 1 4 32; do
@@ -398,7 +392,8 @@ traverse "$WORK/root-dirobj" --current --path dirobj --sizes
 check "root dirobj: own object reported" "$(grep -c '^failure scope=Child dirobj/ Unsupported' "$WORK/root-dirobj.err")" 1
 check "root dirobj: entries" "$(grep -E '^(File|Directory) ' "$WORK/root-dirobj" | tr '\n' ';')" "File dirobj/child size=1;"
 traverse "$WORK/root-empty" --current --path emptydir --sizes
-check "root emptydir: nothing of emptydir/" "$(grep -c 'emptydir/ ' "$WORK/root-empty" "$WORK/root-empty.err" | awk -F: '{s+=$2} END {print s}') $(grep -E '^(File|Directory) ' "$WORK/root-empty" | tr '\n' ';')" "0 File emptydir/child size=1;"
+check "root emptydir: entries" "$(grep -E '^(File|Directory) ' "$WORK/root-empty" | tr '\n' ';')" "File emptydir/child size=1;"
+check "root emptydir: history reported" "$(grep -c '^failure scope=Child emptydir/ Unsupported' "$WORK/root-empty.err")" "$VERSIONED"
 
 if [ "$VERSIONED" = 1 ]; then
   echo "== role traversal, each key with its history"
@@ -406,7 +401,8 @@ if [ "$VERSIONED" = 1 ]; then
   grep -E ' (dirobj|z|m|e)/ ' "$WORK/all" | sed 's/^/   /'
   hist() { grep -E "^Record $1 " "$WORK/all" | sed -E 's/.* latest=([01]) marker=([01]) size=(\S+).*/\1\2\3/' | tr '\n' ' '; }
   # Each key ending in '/' is one entry of its directory, whatever its history (m/ deleted now too).
-  for k in dirobj/ e/ z/; do check "one entry $k" "$(grep -cE "^File $k " "$WORK/all")" 1; done
+  check "one content entry dirobj/" "$(grep -cE '^File dirobj/ ' "$WORK/all")" 1
+  for k in e z; do check "one directory marker $k" "$(grep -cE "^Directory $k " "$WORK/all")" 1; done
   [ "$DIR_VERSIONED" = 1 ] && check "one entry m/ (deleted now)" "$(grep -cE '^File m/ ' "$WORK/all")" 1
   check "all dirobj/ (5 B)" "$(hist dirobj/)" "105 "
   check "all e/ (0 B)" "$(hist e/)" "100 "

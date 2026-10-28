@@ -32,8 +32,25 @@ use crate::model::{
     VersionRecord,
 };
 use crate::storage::{Metadata, Namespace, SourceDescriptor, StorageRoleFailure};
-use crate::traversal::TraversalTerminalFailure;
+use crate::traversal::{ObservationFailure, TraversalTerminalFailure};
 
+/// Facts obtained before a later operation failed, carried only on the internal result path.
+#[derive(Debug)]
+pub(super) struct ObservationError {
+    pub(super) failure: StorageRoleFailure,
+    pub(super) observations: Vec<ObservationFailure>,
+}
+
+impl From<StorageRoleFailure> for ObservationError {
+    fn from(failure: StorageRoleFailure) -> Self {
+        Self {
+            failure,
+            observations: Vec::new(),
+        }
+    }
+}
+
+mod marker;
 mod metadata;
 pub(super) use metadata::{dependency_without_io, without_io as metadata_without_io};
 
@@ -90,9 +107,17 @@ async fn observe_history(
     mut history: Box<ObjectHistory>,
     plan: ObservationPlan,
     cancel: &CancellationToken,
-) -> Result<ObservedEntry, StorageRoleFailure> {
-    let path = &descriptor.path;
+) -> Result<ObservedEntry, ObservationError> {
+    let history_path =
+        ObjectHistory::source_path(&descriptor.path, descriptor.kind).map_err(|_| {
+            StorageRoleFailure::Entry(super::entry_failure(
+                &descriptor.path,
+                FailureClass::Unsupported,
+            ))
+        })?;
+    let path = &history_path;
     let capabilities = metadata_role.observation_capabilities();
+    let mut observations = Vec::new();
     for record in history.records_mut() {
         if record.is_delete_marker() {
             continue;
@@ -104,7 +129,10 @@ async fn observe_history(
             continue;
         }
         if cancel.is_cancelled() {
-            return Err(StorageRoleFailure::Entry(cancelled(path)));
+            return Err(ObservationError {
+                failure: StorageRoleFailure::Entry(cancelled(path)),
+                observations,
+            });
         }
         let Some(version) = record.source() else {
             continue;
@@ -114,37 +142,41 @@ async fn observe_history(
             .await
             .map_err(|failure| throttling_scoped_to(path, Operation::Observe, failure))
             .and_then(|observed| {
-                metadata::validate(
+                metadata::validate_history(
                     &descriptor,
                     plan,
-                    metadata::merge(inline, observed.observations, requested),
+                    metadata::merge(inline.clone(), observed.observations, requested),
                 )
             });
         let mut metadata = match observed {
             Ok(observed) => observed,
-            Err(StorageRoleFailure::Entry(failure)) => {
-                failed_observations(plan, path, failure.class(), failure.transience())?
+            Err(StorageRoleFailure::Entry(failure)) => metadata::merge(
+                inline,
+                failed_observations(requested, path, failure.class(), failure.transience())?,
+                requested,
+            ),
+            Err(session @ StorageRoleFailure::Session(_)) => {
+                return Err(ObservationError {
+                    failure: session,
+                    observations,
+                });
             }
-            Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
         };
-        if plan.timestamps() != ObservationMode::Omit
-            && metadata.timestamps.value().is_none()
-            && let Some(modified) = record.modified()
-        {
-            metadata.timestamps = MetadataObservation::Value {
-                value: TimestampMetadata {
-                    accessed: None,
-                    modified: Some(modified),
-                    created: None,
-                },
-                provenance: MetadataProvenance::Inline,
-            };
-        }
+        preserve_record_timestamp(&mut metadata, record, plan);
+        observations.extend(super::output::metadata_failures(path, &version, &metadata));
         record.set_metadata(metadata);
     }
     let mut metadata = match history.current().and_then(VersionRecord::metadata) {
         Some(current) => current.clone(),
-        None => metadata::inline(metadata_role, &descriptor, plan)?,
+        None => match metadata::inline(metadata_role, &descriptor, plan) {
+            Ok(metadata) => metadata,
+            Err(failure) => {
+                return Err(ObservationError {
+                    failure,
+                    observations,
+                });
+            }
+        },
     };
     // The current version's time could not be observed: the key keeps the one its listing gave,
     // as a key without a history would (its entry never goes without a time the listing had).
@@ -152,13 +184,43 @@ async fn observe_history(
         && plan.timestamps() != ObservationMode::Omit
         && let Some(value) = descriptor.inline_timestamps
     {
+        metadata.retain_failure(crate::model::MetadataFamily::Timestamps);
         metadata.timestamps = MetadataObservation::Value {
             value,
             provenance: MetadataProvenance::Inline,
         };
     }
     descriptor.listing.history = Some(history);
-    assemble(descriptor, metadata, None)
+    assemble(descriptor, metadata, None).map_err(|mut error| {
+        for failure in error.observations {
+            if !observations.contains(&failure) {
+                observations.push(failure);
+            }
+        }
+        error.observations = observations;
+        error
+    })
+}
+
+fn preserve_record_timestamp(
+    metadata: &mut MetadataObservations,
+    record: &VersionRecord,
+    plan: ObservationPlan,
+) {
+    if plan.timestamps() != ObservationMode::Omit
+        && metadata.timestamps.value().is_none()
+        && let Some(modified) = record.modified()
+    {
+        metadata.retain_failure(crate::model::MetadataFamily::Timestamps);
+        metadata.timestamps = MetadataObservation::Value {
+            value: TimestampMetadata {
+                accessed: None,
+                modified: Some(modified),
+                created: None,
+            },
+            provenance: MetadataProvenance::Inline,
+        };
+    }
 }
 
 /// The failure a key abandoned by cancellation settles with; never delivered.
@@ -181,6 +243,19 @@ fn internal() -> StorageRoleFailure {
 
 /// Builds the entry from its descriptor, moving every field rather than copying it.
 fn assemble(
+    descriptor: SourceDescriptor,
+    metadata: MetadataObservations,
+    target: Option<SymlinkTarget>,
+) -> Result<ObservedEntry, ObservationError> {
+    let observations =
+        super::output::metadata_failures(&descriptor.path, descriptor.version(), &metadata);
+    assemble_entry(descriptor, metadata, target).map_err(|failure| ObservationError {
+        failure,
+        observations,
+    })
+}
+
+fn assemble_entry(
     descriptor: SourceDescriptor,
     metadata: MetadataObservations,
     target: Option<SymlinkTarget>,
@@ -230,7 +305,7 @@ fn assemble(
 /// What the listing's task made of one child.
 pub(super) enum Listed {
     /// Observed already: nothing about it needed backend I/O.
-    Observed(Result<Box<ObservedEntry>, StorageRoleFailure>),
+    Observed(Result<Box<ObservedEntry>, ObservationError>),
     /// Needs backend I/O (a symlink's target, metadata the listing did not carry), which starts
     /// once the child is admitted.
     Unobserved(Box<SourceDescriptor>),
@@ -242,10 +317,10 @@ impl Listed {
     pub(super) fn path_len(&self) -> usize {
         match self {
             Self::Observed(Ok(entry)) => entry.path().as_str().len(),
-            Self::Observed(Err(StorageRoleFailure::Entry(failure))) => {
-                failure.path().as_str().len()
-            }
-            Self::Observed(Err(StorageRoleFailure::Session(_))) => 0,
+            Self::Observed(Err(error)) => match &error.failure {
+                StorageRoleFailure::Entry(failure) => failure.path().as_str().len(),
+                StorageRoleFailure::Session(_) => 0,
+            },
             Self::Unobserved(descriptor) => descriptor.path.as_str().len(),
         }
     }
@@ -258,6 +333,9 @@ pub(super) fn observe_listed(
     mut descriptor: SourceDescriptor,
     plan: ObservationPlan,
 ) -> Listed {
+    if let Some(marker) = descriptor.listing.directory_marker.take() {
+        return marker::listed(metadata_role, descriptor, *marker, plan);
+    }
     if descriptor.kind == EntryKind::Symlink {
         return Listed::Unobserved(Box::new(descriptor));
     }
@@ -279,7 +357,7 @@ pub(super) fn observe_listed(
             }
             Listed::Observed(assemble(descriptor, metadata, None).map(Box::new))
         }
-        Some(Err(failure)) => Listed::Observed(Err(failure)),
+        Some(Err(failure)) => Listed::Observed(Err(failure.into())),
         None => Listed::Unobserved(Box::new(descriptor)),
     }
 }
@@ -292,13 +370,19 @@ pub(super) async fn observe(
     mut descriptor: SourceDescriptor,
     plan: ObservationPlan,
     cancel: &CancellationToken,
-) -> Result<ObservedEntry, StorageRoleFailure> {
+) -> Result<ObservedEntry, ObservationError> {
+    if let Some(marker) = descriptor.listing.directory_marker.take() {
+        return marker::observe(namespace, metadata_role, descriptor, *marker, plan).await;
+    }
     if let Some(history) = descriptor.listing.history.take() {
         return observe_history(metadata_role, descriptor, history, plan, cancel).await;
     }
     match observe_io(namespace, metadata_role, &descriptor, plan).await {
         Ok((metadata, target)) => assemble(descriptor, metadata, target),
-        Err(failure) => Err(confirm_vanished(namespace, &descriptor.path, failure).await),
+        Err(mut error) => {
+            error.failure = confirm_vanished(namespace, &descriptor.path, error.failure).await;
+            Err(error)
+        }
     }
 }
 
@@ -308,7 +392,7 @@ async fn observe_io(
     metadata_role: &dyn Metadata,
     descriptor: &SourceDescriptor,
     plan: ObservationPlan,
-) -> Result<(MetadataObservations, Option<SymlinkTarget>), StorageRoleFailure> {
+) -> Result<(MetadataObservations, Option<SymlinkTarget>), ObservationError> {
     // A throttled request is this child's failure, never the traversal's end (P7 §8).
     let scoped = |failure| throttling_scoped_to(&descriptor.path, Operation::Observe, failure);
     let metadata = if let Some(metadata) = metadata_without_io(metadata_role, plan, descriptor) {
@@ -328,10 +412,19 @@ async fn observe_io(
     };
     let target = if descriptor.kind == EntryKind::Symlink {
         Some(
-            namespace
-                .read_link(&descriptor.path)
-                .await
-                .map_err(scoped)?,
+            match namespace.read_link(&descriptor.path).await.map_err(scoped) {
+                Ok(target) => target,
+                Err(failure) => {
+                    return Err(ObservationError {
+                        failure,
+                        observations: super::output::metadata_failures(
+                            &descriptor.path,
+                            descriptor.version(),
+                            &metadata,
+                        ),
+                    });
+                }
+            },
         )
     } else {
         None
@@ -402,7 +495,7 @@ pub(super) struct Job {
 /// A settled observation, keyed by the sequence its child was admitted under.
 pub(super) type Observed = (
     u64,
-    Result<Box<ObservedEntry>, StorageRoleFailure>,
+    Result<Box<ObservedEntry>, ObservationError>,
     Option<Deferred>,
 );
 

@@ -169,15 +169,21 @@ async fn a_zero_byte_marker_is_a_zero_size_file_entry() -> TestResult {
     Ok(())
 }
 
-/// The storage root's own object (the URL prefix's key) has no path: a zero-byte one is ignored,
-/// one with content is an `Unsupported` failure at the root — in both listings.
+/// The storage root's own object (the URL prefix's key) has no path: only a current-only
+/// zero-byte marker is ignored. Content or history is an `Unsupported` failure at the root.
 #[tokio::test]
 async fn a_zero_byte_root_marker_is_ignored_and_a_content_one_reported() -> TestResult {
     let marker = bucket(&[("", b""), ("a", b"1")]).await?;
     for histories in [false, true] {
         let listed = listed_as(&marker, "", histories).await?;
         let paths: Vec<&str> = listed.0.iter().map(|d| d.path.as_str()).collect();
-        assert_eq!((paths, rows(&listed).1), (vec!["a"], vec![]));
+        assert_eq!(paths, ["a"]);
+        let expected = if histories {
+            vec![" Unsupported"]
+        } else {
+            vec![]
+        };
+        assert_eq!(rows(&listed).1, expected);
     }
     let content = bucket(&[("", b"x"), ("a", b"1")]).await?;
     for histories in [false, true] {

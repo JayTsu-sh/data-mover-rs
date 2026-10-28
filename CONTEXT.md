@@ -4,6 +4,18 @@ This context describes the storage systems and transfer roles that data-mover pr
 
 ## Language
 
+**Directory marker**:
+An object whose key ends in `/`, with a zero-byte unversioned value or at least one retained object version, all zero bytes. Its history may also contain delete markers; a deleted marker does not establish a currently existing directory.
+_Avoid_: Content directory object, ordinary zero-byte file
+
+**Content directory object**:
+An object whose key ends in `/` and has content in its current unversioned value or in at least one retained object version. Zero-byte versions belong to the same object's history rather than to a separate directory marker.
+_Avoid_: Directory marker, directory subtree
+
+**Directory subtree**:
+The descendants below a directory prefix, distinct from an object stored at the prefix key itself. A content directory object and a directory subtree can coexist under the same prefix.
+_Avoid_: Directory object, folder marker
+
 **Storage backend**:
 A supported storage system presented through data-mover's common set of storage operations.
 _Avoid_: Protocol, driver, client

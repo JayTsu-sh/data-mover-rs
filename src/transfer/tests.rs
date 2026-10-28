@@ -1377,3 +1377,6 @@ impl Drop for TestRoot {
 
 #[path = "local_optimization_tests.rs"]
 mod local_optimization;
+
+#[path = "acl_policy_tests.rs"]
+mod acl_policy_tests;

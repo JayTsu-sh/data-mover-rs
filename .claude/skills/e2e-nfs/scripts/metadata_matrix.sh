@@ -35,9 +35,9 @@ case_() { # name, expected exit (0|1), grep marker, args...
 }
 echo "run=$RUN"
 if [ -n "${NFS_META_V3_URL:-}" ]; then
-case_ "v3->v4.1 acl+xattrs asked: copied, both skipped, the ACL reason names the source" 0 "ACL skipped: the source cannot read it" \
+case_ "v3->v4.1 acl+xattrs asked: copied with conservative ACL, source unavailability reported" 0 "SourceUnavailable" \
   --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$(v41_at v3-asked)" --destination-path "$NFS_META_V3_FILE" \
-  --acl --xattrs --expect copied --expect-acl unsupported --expect-xattrs unsupported
+  --acl --xattrs --expect copied --expect-acl applied-conservative-acl --expect-xattrs unsupported
 case_ "v3->v4.1 xattrs asked: skipped, the reason names the source" 0 "extended attributes skipped: the source cannot read it" \
   --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$(v41_at v3-xattrs)" --destination-path "$NFS_META_V3_FILE" \
   --xattrs --expect copied --expect-xattrs unsupported
@@ -55,9 +55,9 @@ case_ "v4.1->v4.1 xattrs asked: copied, skipped (export did not negotiate named 
   --source "$V41" --source-path src-principal --destination "$(v41_at xattrs-asked)" --destination-path src-principal \
   --xattrs --expect copied --expect-xattrs unsupported
 if [ -n "${CIFS_REAL_SERVER:-}" ]; then
-case_ "v4.1->cifs acl asked: copied, skipped (NfsV4 vs Windows SD, no conversion)" 0 "ACL skipped: the source holds a NfsV4 ACL and the destination stores WindowsSecurityDescriptor" \
+case_ "v4.1->cifs acl asked: copied with conservative ACL and uncopied entries reported" 0 "UncopiedEntry" \
   --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path src-principal \
-  --acl --expect copied --expect-acl unsupported
+  --acl --expect copied --expect-acl applied-conservative-acl
 case_ "cifs->v4.1 xattrs asked: copied, skipped (smb-rs exposes no EA query)" 0 "extended attributes skipped: the source cannot read it" \
   --source "$CIFS" --source-path src-cifs --seed-bytes 4096 --destination "$V41" --destination-path src-cifs \
   --xattrs --expect copied --expect-xattrs unsupported

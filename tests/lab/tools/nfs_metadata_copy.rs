@@ -2,7 +2,7 @@
 //! negotiation did with them, against a real share. See `.claude/docs/metadata-negotiation.md`.
 //!
 //! ```text
-//! # NFSv3 cannot read an ACL, so asking for one skips it with the reason and still copies the file
+//! # On an NFSv3 export without NFSACL, optional ACL copying reports unsupported and copies bytes
 //! cargo run --example nfs_metadata_copy -- \
 //!     --source 'nfs://10.131.5.221/m1-source:/d000?uid=0&gid=0&noresvport=true' --source-path f000 \
 //!     --destination /tmp/dm-meta --destination-path f000 \
@@ -38,6 +38,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
 #[derive(Debug, Parser)]
 #[command(about = "Copy one file with optional ACL / xattr policies and check the outcome")]
+#[allow(clippy::struct_excessive_bools)] // Independent CLI switches.
 struct Args {
     #[arg(long)]
     source: String,
@@ -100,6 +101,9 @@ enum Expect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Outcome {
     Applied,
+    AppliedPartialAcl,
+    AppliedConservativeAcl,
+    RecoveredFromCheckpoint,
     OmittedByPolicy,
     NotObserved,
     Unsupported,
@@ -112,6 +116,9 @@ impl From<ApplicationOutcome> for Outcome {
             ApplicationOutcome::Applied | ApplicationOutcome::PreservedByNativeTransfer => {
                 Self::Applied
             }
+            ApplicationOutcome::AppliedPartialAcl => Self::AppliedPartialAcl,
+            ApplicationOutcome::AppliedConservativeAcl => Self::AppliedConservativeAcl,
+            ApplicationOutcome::RecoveredFromCheckpoint => Self::RecoveredFromCheckpoint,
             ApplicationOutcome::OmittedByPolicy => Self::OmittedByPolicy,
             ApplicationOutcome::NotObserved => Self::NotObserved,
             ApplicationOutcome::Unsupported => Self::Unsupported,
@@ -240,9 +247,13 @@ async fn seed(source: &Storage, path: &str, bytes: usize) -> Result {
         Ok(_) => return Err(format!("{path} already exists; seed a new path").into()),
     }
     let local = tempfile::tempdir()?;
-    fs::write(local.path().join("seed"), vec![b'x'; bytes])?;
+    let local_path = local.path().join(path);
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(local_path, vec![b'x'; bytes])?;
     let local = connect(&local.path().to_string_lossy()).await?;
-    transfer(request(&local, "seed", source, path)?).await?;
+    transfer(request(&local, path, source, path)?).await?;
     println!("seeded {path} bytes={bytes}");
     Ok(())
 }
@@ -375,6 +386,18 @@ fn print_report(report: &MetadataApplicationReport) {
     for (family, loss) in report.loss_report().losses() {
         println!("loss {family:?}: {loss:?}");
     }
+    if let Some(acl) = report.acl_copy_report() {
+        println!("ACL conservative fallback: {}", acl.conservative_fallback);
+        for issue in &acl.issues {
+            println!(
+                "ACL omission {:?} {:?}: {:?} ({})",
+                issue.location,
+                issue.principal,
+                issue.kind,
+                issue.kind.reason()
+            );
+        }
+    }
     for skip in report.skipped() {
         println!("{skip}");
     }
@@ -385,6 +408,9 @@ async fn copied(args: &Args, outcome: TransferOutcome) -> Result {
         .metadata
         .ok_or("the copy produced no metadata report")?;
     print_report(&report);
+    for mapping in report.mappings() {
+        println!("mapping {:?}: {:?}", mapping.family, mapping.decision);
+    }
     let outcome_of = |family| {
         report
             .outcomes()
@@ -457,6 +483,14 @@ async fn main() -> Result {
             Ok(())
         }
         (Ok(_), Expect::Refused) => Err("the copy succeeded but a refusal was expected".into()),
-        (Err(failure), Expect::Copied) => Err(format!("the copy failed: {failure:?}").into()),
+        (Err(failure), Expect::Copied) => {
+            if let Some(metadata) = failure.metadata_failure() {
+                print_report(metadata.report());
+                for family in metadata.failures() {
+                    eprintln!("{family}");
+                }
+            }
+            Err(format!("the copy failed: {failure}").into())
+        }
     }
 }

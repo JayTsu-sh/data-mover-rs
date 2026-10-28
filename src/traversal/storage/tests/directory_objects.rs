@@ -1,7 +1,6 @@
-//! Directory objects (P7 F5): a directory's own object `p/d/`, handed over by the listing of `p/d`
-//! as the child with the empty name, is a file entry of that block — counted, filtered and cut by
-//! `max_depth` like its siblings, named after its directory — except for the traversal root's own
-//! object, which is not part of the traversal.
+//! Generic traversal consumes the namespace's logical projection before filtering and counting.
+//! These fixed pages omit folded markers; S3 root-object classification is covered through the
+//! real S3 adapter in `s3_directory_object_tests`.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -28,6 +27,13 @@ fn own_object(key: &str, size: u64) -> SourceDescriptor {
 
 #[async_trait]
 impl Namespace for ObjectsNamespace {
+    fn capabilities(&self) -> crate::storage::NamespaceCapabilities {
+        crate::storage::NamespaceCapabilities {
+            directory_objects: true,
+            ..crate::storage::NamespaceCapabilities::default()
+        }
+    }
+
     fn list(&self, request: ListRequest) -> ListingStream {
         let directory = request.path;
         let children = match directory.as_str() {
@@ -44,6 +50,19 @@ impl Namespace for ObjectsNamespace {
             other => panic!("{other:?} must not be listed"),
         };
         entries(&directory, children)
+    }
+
+    fn list_for_traversal(&self, request: ListRequest, is_root: bool) -> ListingStream {
+        // Fixed logical pages supplied by this fixture, without a second classification algorithm.
+        let children = match (request.path.as_str(), is_root) {
+            ("p", true) => vec![
+                descriptor("p/f", EntryKind::File),
+                descriptor("p/d", EntryKind::Directory),
+            ],
+            ("p/d", _) => vec![descriptor("p/d/x", EntryKind::File)],
+            _ => return self.list(request),
+        };
+        entries(&request.path, children)
     }
 }
 
@@ -97,7 +116,6 @@ async fn directory_objects_are_entries_counted_as_files() {
             "p/d Directory None",
             "p/ File Some(5)",
             "p/d/x File Some(3)",
-            "p/d/ File Some(0)",
         ]
     );
     let entries: Vec<bool> = items
@@ -107,46 +125,19 @@ async fn directory_objects_are_entries_counted_as_files() {
             _ => None,
         })
         .collect();
-    assert_eq!(entries, [false, false, false, false, true, false, true]);
+    assert_eq!(entries, [false, false, false, false, true, false]);
     assert_eq!(
         totals(&outcome),
         ScanTotals {
-            listed: 7,
-            emitted: 7,
-            files: 5,
+            listed: 6,
+            emitted: 6,
+            files: 4,
             directories: 2,
             bytes: 14,
             all_versions_bytes: 14,
             ..ScanTotals::default()
         }
     );
-}
-
-/// The root `p`'s own object would have the root's own relative path (`""`): it holds content, so
-/// it is that key's `Unsupported` child failure, reported, never emitted. The root `p/d`'s own
-/// object is a zero-byte folder marker: dropped, uncounted.
-#[tokio::test]
-async fn the_traversal_roots_own_object_is_reported_not_emitted() {
-    let (items, outcome) = drain(traverse("p", None)).await;
-    assert_well_formed(&items, &outcome);
-    assert_eq!(
-        rows(&items),
-        [
-            "failure p/ Unsupported",
-            "p/f File Some(3)",
-            "p/d Directory None",
-            "p/d/x File Some(3)",
-            "p/d/ File Some(0)",
-        ]
-    );
-    let scan = totals(&outcome);
-    assert_eq!((scan.listed, scan.emitted, scan.failed_children), (5, 4, 1));
-
-    let (items, outcome) = drain(traverse("p/d", None)).await;
-    assert_well_formed(&items, &outcome);
-    assert_eq!(rows(&items), ["p/d/x File Some(3)"]);
-    let scan = totals(&outcome);
-    assert_eq!((scan.listed, scan.emitted, scan.failed_children), (1, 1, 0));
 }
 
 /// Records every candidate the traversal asks about, and hides nothing (still consulted below
@@ -175,8 +166,8 @@ impl TraversalFilter for Recording {
     }
 }
 
-/// D7: the filter sees `p/d/` as a file named after its directory (`d`, never empty), at the path
-/// with its trailing `/`, relative to the traversal root.
+/// The filter sees the directory but never its folded marker; paths stay relative to the
+/// specified traversal root, not the bucket root.
 #[tokio::test]
 async fn filters_see_a_directory_object_by_its_directory_name() {
     let recording = Arc::new(Recording::default());
@@ -196,12 +187,7 @@ async fn filters_see_a_directory_object_by_its_directory_name() {
     seen.sort();
     assert_eq!(
         seen,
-        [
-            "d name=d Directory",
-            "d/ name=d File",
-            "d/x name=x File",
-            "f name=f File",
-        ]
+        ["d name=d Directory", "d/x name=x File", "f name=f File",]
     );
 }
 
@@ -224,42 +210,4 @@ async fn max_depth_cuts_a_directory_object_with_its_directory() {
             "p/ File Some(5)",
         ]
     );
-}
-
-/// The root `r` lists its own key on two pages (a history split across them: content, a zero-byte
-/// version, a marker without size): one failure, once; nothing of it is emitted or counted twice.
-struct TwoPages;
-
-#[async_trait]
-impl Namespace for TwoPages {
-    fn list(&self, request: ListRequest) -> ListingStream {
-        let directory = request.path;
-        let mut first = ListingPage::from_descriptors(
-            &directory,
-            vec![descriptor("r/a", EntryKind::File)],
-            vec![],
-            0,
-        );
-        first.push_directory_object(&directory, own_object("r/", 5));
-        let mut marker = own_object("r/", 0);
-        marker.size = None;
-        let mut second = ListingPage::default();
-        for record in [own_object("r/", 0), marker, own_object("r/", 3)] {
-            second.push_directory_object(&directory, record);
-        }
-        ListingStream::from_pages(directory, [Ok(first), Ok(second)])
-    }
-}
-
-#[tokio::test]
-async fn the_traversal_roots_own_object_is_reported_once_across_pages() {
-    let request = TraversalRequest::new(path("r"))
-        .order(TraversalOrder::Blocks)
-        .cancel(CancellationToken::new());
-    let source = StorageTraversalSource::with_roles(Arc::new(TwoPages), Arc::new(FakeMetadata));
-    let (items, outcome) = drain(source.traverse(request)).await;
-    assert_well_formed(&items, &outcome);
-    assert_eq!(rows(&items), ["failure r/ Unsupported", "r/a File Some(3)"]);
-    let scan = totals(&outcome);
-    assert_eq!((scan.listed, scan.emitted, scan.failed_children), (2, 1, 1));
 }

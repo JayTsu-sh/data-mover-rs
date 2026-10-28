@@ -2,7 +2,7 @@
 //!
 //! Cross-cutting checks compose deep roles instead of matching on a backend enum: the source
 //! and the destination are two connected [`Storage`] handles, and the comparison only uses
-//! [`ReadSource`] (describe plus streamed bytes) and [`Metadata`] (timestamps). Any pair of
+//! [`ReadSource`] (describe plus streamed bytes) and [`Metadata`] (permission and metadata facts). Any pair of
 //! backends that lends those roles can therefore be compared, including pairs that never
 //! existed in the legacy dispatch table.
 //!
@@ -10,16 +10,16 @@
 //! uses for read-back verification, so a report produced here is comparable with the evidence
 //! a transfer emits.
 
-use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    EntryKind, FailureClass, MetadataObservation, ObservationMode, ObservationPlan, SourceVersion,
-    StoragePath, StorageTimestamp,
+    AclEncoding, EntryKind, FailureClass, MetadataObservation, ObservationMode, ObservationPlan,
+    ObservedEntry, SourceVersion, StoragePath, StorageTimestamp,
 };
+
 use crate::storage::{
     CapabilityUnavailable, CopiedTimestampTarget, Metadata, ReadRequest, ReadSource,
     SourceDescriptor, Storage, StorageRoleFailure,
@@ -35,11 +35,12 @@ pub enum IntegritySide {
 /// How much evidence the comparison gathers.
 ///
 /// Symlink targets are never compared: reading a link target needs the `Namespace` role, which
-/// this module deliberately does not take (S3's lists only). Two links with equal size and
-/// timestamp therefore compare as matching whatever they point at.
+/// this module deliberately does not take (S3's lists only). Two links whose compared metadata
+/// agree therefore compare as matching whatever they point at.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum IntegrityMode {
-    /// Kind, size, and modification time only. No object bytes are read.
+    /// Kind, size, modification time, comparable permissions, and metadata selected by the plan.
+    /// No object bytes are read.
     #[default]
     Metadata,
     /// Everything `Metadata` checks plus a full BLAKE3 digest of both objects.
@@ -61,14 +62,9 @@ pub enum MtimePrecision {
 pub struct IntegrityOptions {
     pub mode: IntegrityMode,
     pub mtime_precision: MtimePrecision,
-    /// Also compare permission bits and comparable owner/group identities.
-    pub permissions: bool,
     /// Absolute timestamp difference still treated as equal, on top of the automatic
-    /// comparison at the coarser of the two observed precisions.
+    /// comparison at the coarser of the two observed precisions. Defaults to zero.
     pub mtime_tolerance: Duration,
-    /// Caller-side upper bound per read; each backend may negotiate something smaller.
-    pub maximum_chunk_bytes: NonZeroUsize,
-    pub read_inflight: NonZeroUsize,
 }
 
 impl Default for IntegrityOptions {
@@ -76,23 +72,96 @@ impl Default for IntegrityOptions {
         Self {
             mode: IntegrityMode::default(),
             mtime_precision: MtimePrecision::default(),
-            permissions: false,
             mtime_tolerance: Duration::ZERO,
-            maximum_chunk_bytes: NonZeroUsize::new(1 << 20)
-                .unwrap_or_else(|| unreachable!("constant is nonzero")),
-            read_inflight: NonZeroUsize::new(4)
-                .unwrap_or_else(|| unreachable!("constant is nonzero")),
         }
     }
 }
 
-/// One comparison of a single object present on two connected backends.
+/// Optional metadata families. Owner, group, and mode comparisons are determined automatically
+/// from the facts each backend supplies; `NFSv4` does not guarantee ACL or xattr support.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // Independent optional families and explicit strict ACL selectors.
+pub struct IntegrityPlan {
+    pub acl: bool,
+    pub xattrs: bool,
+    pub acl_required: bool,
+    pub acl_equivalent: bool,
+}
+
+impl IntegrityPlan {
+    /// Requires complete native ACL observations; unavailable ACLs cannot match.
+    #[must_use]
+    pub const fn with_required_acl(mut self) -> Self {
+        self.acl = true;
+        self.acl_required = true;
+        self
+    }
+
+    /// Compares current regular-file access under a shared numeric identity/group namespace.
+    #[must_use]
+    pub const fn with_acl_equivalence(mut self) -> Self {
+        self.acl = true;
+        self.acl_required = true;
+        self.acl_equivalent = true;
+        self
+    }
+}
+
+/// One side of a comparison. An observation constrains the entry found at its path.
 #[derive(Clone)]
-pub struct IntegrityRequest {
+pub enum IntegrityInput {
+    /// Describe and compare the current entry at this path.
+    Path(StoragePath),
+    /// Validate this observation against its backend before comparing the selected entry.
+    Observed(Box<ObservedEntry>),
+}
+
+impl IntegrityInput {
+    fn path(&self) -> &StoragePath {
+        match self {
+            Self::Path(path) => path,
+            Self::Observed(entry) => entry.path(),
+        }
+    }
+
+    fn observation(&self) -> Option<&ObservedEntry> {
+        match self {
+            Self::Path(_) => None,
+            Self::Observed(entry) => Some(entry),
+        }
+    }
+}
+
+impl From<StoragePath> for IntegrityInput {
+    fn from(path: StoragePath) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl From<ObservedEntry> for IntegrityInput {
+    fn from(entry: ObservedEntry) -> Self {
+        Self::Observed(Box::new(entry))
+    }
+}
+
+impl From<Box<ObservedEntry>> for IntegrityInput {
+    fn from(entry: Box<ObservedEntry>) -> Self {
+        Self::Observed(entry)
+    }
+}
+
+/// One comparison of a single entry on two connected backends.
+///
+/// Each side can select a path or an [`ObservedEntry`]. The default type arguments preserve
+/// path-based requests, so existing callers need no conversion.
+#[derive(Clone)]
+pub struct IntegrityRequest<S = StoragePath, D = StoragePath> {
     pub source: Storage,
-    pub source_path: StoragePath,
+    pub source_path: S,
     pub destination: Storage,
-    pub destination_path: StoragePath,
+    pub destination_path: D,
+    /// Selects ACL and xattr comparisons independently. Both default to omitted.
+    pub plan: IntegrityPlan,
     pub options: IntegrityOptions,
     pub cancel: CancellationToken,
 }
@@ -100,6 +169,12 @@ pub struct IntegrityRequest {
 /// One way in which the two objects disagree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IntegrityDifference {
+    /// Two native ACLs with the same encoding differ.
+    Acl { encoding: AclEncoding },
+    /// A required ACL could not be completely observed or proven comparable.
+    AclUnverified { reason: &'static str },
+    /// The two supported xattr sets differ. Values are not included in the report.
+    Xattrs,
     Permissions {
         source: crate::storage::PermissionFacts,
         destination: crate::storage::PermissionFacts,
@@ -125,15 +200,48 @@ pub enum IntegrityDifference {
     },
 }
 
+/// A requested fact that the two backends cannot compare without inventing a mapping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IntegrityIgnored {
+    Owner,
+    Group,
+    Mode,
+    /// `None` means the side did not provide a comparable ACL value.
+    Acl {
+        source: Option<AclEncoding>,
+        destination: Option<AclEncoding>,
+    },
+    Xattrs,
+    Modified,
+}
+
+/// Scope of a successful strict ACL comparison; identity and other facts are checked separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AclComparisonScope {
+    NativeConfiguration {
+        encoding: AclEncoding,
+    },
+    /// Current regular-file rwx access with shared numeric identities and group membership.
+    CurrentRegularFileAccess,
+}
+
 /// The result of one comparison. An empty difference list is a positive match.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntegrityReport {
+    acl_scope: Option<AclComparisonScope>,
     differences: Vec<IntegrityDifference>,
+    ignored: Vec<IntegrityIgnored>,
     compared_bytes: u64,
     digests: Option<([u8; 32], [u8; 32])>,
 }
 
 impl IntegrityReport {
+    /// The ACL contract proven from complete observations, when strict ACL checking was selected.
+    #[must_use]
+    pub const fn acl_scope(&self) -> Option<AclComparisonScope> {
+        self.acl_scope
+    }
+
     /// Whether the two objects agree on every checked property.
     #[must_use]
     pub fn matches(&self) -> bool {
@@ -143,6 +251,12 @@ impl IntegrityReport {
     #[must_use]
     pub fn differences(&self) -> &[IntegrityDifference] {
         &self.differences
+    }
+
+    /// Requested facts skipped because the two sides cannot compare them faithfully.
+    #[must_use]
+    pub fn ignored(&self) -> &[IntegrityIgnored] {
+        &self.ignored
     }
 
     /// Bytes read from the source side; zero in [`IntegrityMode::Metadata`].
@@ -179,6 +293,7 @@ struct Endpoint {
     read_source: std::sync::Arc<dyn ReadSource>,
     metadata: std::sync::Arc<dyn Metadata>,
     path: StoragePath,
+    input: IntegrityInput,
     /// Whether this side's modification time is the copied one. A destination that declares it
     /// does not store the time (an object store stamps its own) never received the source's, so
     /// its time is no evidence of a difference.
@@ -189,7 +304,7 @@ impl Endpoint {
     fn new(
         side: IntegritySide,
         storage: &Storage,
-        path: StoragePath,
+        input: IntegrityInput,
     ) -> Result<Self, CapabilityUnavailable> {
         let mtime_copied = side == IntegritySide::Source
             || storage
@@ -203,7 +318,8 @@ impl Endpoint {
             side,
             read_source: storage.read_source()?,
             metadata: storage.metadata()?,
-            path,
+            path: input.path().clone(),
+            input,
             mtime_copied,
         })
     }
@@ -215,11 +331,65 @@ impl Endpoint {
         }
     }
 
-    /// `Ok(None)` when the object does not exist on this side.
+    fn observation_failure(&self, class: FailureClass, reason: &'static str) -> IntegrityFailure {
+        observation_failure(self.side, &self.path, class, reason)
+    }
+
+    /// `Ok(None)` when a path-selected entry does not exist on this side.
     async fn describe(&self) -> Result<Option<SourceDescriptor>, IntegrityFailure> {
-        match self.read_source.describe(&self.path).await {
-            Ok(descriptor) => Ok(Some(descriptor)),
-            Err(failure) if is_not_found(&failure) => Ok(None),
+        let version = match self.input.observation() {
+            Some(observed) => observed.source_version().ok_or_else(|| {
+                self.observation_failure(
+                    FailureClass::InvalidInput,
+                    "observation does not identify a current entry",
+                )
+            })?,
+            None => SourceVersion::Current,
+        };
+        let described = match &version {
+            SourceVersion::Current => self.read_source.describe(&self.path).await,
+            SourceVersion::Id(_) => {
+                self.read_source
+                    .describe_version(&self.path, &version)
+                    .await
+            }
+        };
+        match described {
+            Ok(descriptor) => {
+                if let Some(observed) = self.input.observation() {
+                    let modified_changed = observed
+                        .modified()
+                        .zip(
+                            descriptor
+                                .inline_timestamps()
+                                .and_then(|times| times.modified),
+                        )
+                        .is_some_and(|(before, now)| {
+                            !same_instant(Some(before), Some(now), Duration::ZERO)
+                        });
+                    if observed.path() != &descriptor.path
+                        || observed.kind() != descriptor.kind
+                        || observed.size() != descriptor.size
+                        || modified_changed
+                        || !self
+                            .read_source
+                            .observation_matches(observed.source_identity(), &descriptor)
+                    {
+                        return Err(self.observation_failure(
+                            FailureClass::Conflict,
+                            "entry differs from advertised observation",
+                        ));
+                    }
+                }
+                Ok(Some(descriptor))
+            }
+            Err(failure) if is_not_found(&failure) && self.input.observation().is_none() => {
+                Ok(None)
+            }
+            Err(failure) if is_not_found(&failure) => {
+                Err(self
+                    .observation_failure(FailureClass::Conflict, "observed entry no longer exists"))
+            }
             Err(failure) => Err(self.attribute(failure)),
         }
     }
@@ -235,12 +405,24 @@ impl Endpoint {
             return Ok(ObservedMtime::Observed(timestamps.modified));
         }
         let plan = ObservationPlan::default().with_timestamps(ObservationMode::BestEffort);
-        let observed = self
-            .metadata
-            .observe(&self.path, plan)
-            .await
-            .map_err(|failure| self.attribute(failure))?;
-        Ok(match observed.timestamps() {
+        let metadata = if self.input.observation().is_some() {
+            self.metadata
+                .observe_copy_bound_version(
+                    &self.path,
+                    &described.source_identity,
+                    described.version(),
+                    plan,
+                )
+                .await
+                .map_err(|failure| self.attribute(failure))?
+                .observations
+        } else {
+            self.metadata
+                .observe(&self.path, plan)
+                .await
+                .map_err(|failure| self.attribute(failure))?
+        };
+        let modified = match metadata.timestamps() {
             MetadataObservation::Value { value, .. } => ObservedMtime::Observed(value.modified),
             // The backend cannot report modification time at all. That is not evidence of a
             // difference.
@@ -248,14 +430,24 @@ impl Endpoint {
             | MetadataObservation::NotApplicable
             | MetadataObservation::Unsupported
             | MetadataObservation::Failed { .. } => ObservedMtime::Unobservable,
-        })
+        };
+        if let (Some(before), ObservedMtime::Observed(Some(now))) = (
+            self.input.observation().and_then(ObservedEntry::modified),
+            modified,
+        ) && !same_instant(Some(before), Some(now), Duration::ZERO)
+        {
+            return Err(self.observation_failure(
+                FailureClass::Conflict,
+                "modification time differs from advertised observation",
+            ));
+        }
+        Ok(modified)
     }
 
     /// Streams the whole object and returns its digest and byte count.
     async fn digest(
         &self,
         descriptor: &SourceDescriptor,
-        options: IntegrityOptions,
         cancel: &CancellationToken,
     ) -> Result<([u8; 32], u64), IntegrityFailure> {
         let mut stream = self
@@ -264,15 +456,18 @@ impl Endpoint {
                 path: self.path.clone(),
                 range: None,
                 expected_source: Some(descriptor.source_identity.clone()),
-                maximum_chunk_bytes: options.maximum_chunk_bytes.get(),
-                read_inflight: options.read_inflight.get(),
+                maximum_chunk_bytes: self.read_source.maximum_read_chunk_bytes().max(1),
+                read_inflight: self.read_source.read_concurrency().max(1),
                 read_budget: None,
                 cancel: cancel.clone(),
                 source_qos: None,
-                // An integrity check compares what is current now, and its mtime comes from the
-                // current object: a version that changed since the describe must surface as a
-                // conflict, not be read as the pinned one beside the new one's time.
-                version: SourceVersion::Current,
+                // Path inputs compare what is current now; an observed input reads the version
+                // its validated description selected. The expected identity guards both reads.
+                version: if self.input.observation().is_some() {
+                    descriptor.version().clone()
+                } else {
+                    SourceVersion::Current
+                },
             })
             .await
             .map_err(|failure| self.attribute(failure))?;
@@ -302,81 +497,28 @@ fn is_not_found(failure: &StorageRoleFailure) -> bool {
     }
 }
 
-/// Compares one object on two connected backends.
-///
-/// Absence on either side is a reported difference, not a failure; only a role failure that
-/// prevents the comparison is an error. Cancellation surfaces as the backend's own
-/// `Cancelled` role failure on the side that observed it.
-///
-/// # Errors
-/// Returns the first role failure, attributed to the side that produced it, or a capability
-/// failure when either side lends no read-source or metadata role.
-pub async fn compare(request: IntegrityRequest) -> Result<IntegrityReport, IntegrityFailure> {
-    let source = endpoint(IntegritySide::Source, &request.source, &request.source_path)?;
-    let destination = endpoint(
-        IntegritySide::Destination,
-        &request.destination,
-        &request.destination_path,
-    )?;
-    let (source_entry, destination_entry) =
-        reconcile(futures::join!(source.describe(), destination.describe()))?;
-    let mut report = IntegrityReport {
-        differences: Vec::new(),
-        compared_bytes: 0,
-        digests: None,
-    };
-    let (Some(source_entry), Some(destination_entry)) = (&source_entry, &destination_entry) else {
-        report
-            .differences
-            .extend(missing(source_entry.is_none(), destination_entry.is_none()));
-        return Ok(report);
-    };
-    compare_facts(source_entry, destination_entry, &mut report.differences);
-    if request.options.permissions {
-        compare_permissions(
-            &source,
-            &destination,
-            source_entry,
-            destination_entry,
-            &mut report.differences,
-        )
-        .await?;
-    }
-    compare_modified(
-        &source,
-        &destination,
-        (source_entry, destination_entry),
-        request.options,
-        &mut report.differences,
-    )
-    .await?;
-    if request.options.mode == IntegrityMode::Content
-        && source_entry.kind == EntryKind::File
-        && destination_entry.kind == EntryKind::File
-    {
-        compare_content(
-            &source,
-            &destination,
-            (source_entry, destination_entry),
-            request.options,
-            &request.cancel,
-            &mut report,
-        )
-        .await?;
-    }
-    Ok(report)
-}
-
 fn endpoint(
     side: IntegritySide,
     storage: &Storage,
-    path: &StoragePath,
+    input: IntegrityInput,
 ) -> Result<Endpoint, IntegrityFailure> {
-    Endpoint::new(side, storage, path.clone()).map_err(|error| IntegrityFailure {
+    let path = input.path().clone();
+    if input
+        .observation()
+        .is_some_and(|entry| entry.source_identity().backend() != storage.identity())
+    {
+        return Err(observation_failure(
+            side,
+            &path,
+            FailureClass::InvalidInput,
+            "observation belongs to another storage",
+        ));
+    }
+    Endpoint::new(side, storage, input).map_err(|error| IntegrityFailure {
         side,
         failure: StorageRoleFailure::Entry(
             crate::model::EntryOperationFailure::new(
-                path.clone(),
+                path,
                 crate::model::Operation::Observe,
                 FailureClass::Unsupported,
                 crate::model::Transience::Permanent,
@@ -385,6 +527,27 @@ fn endpoint(
             .unwrap_or_else(|_| unreachable!("capability diagnostics are valid")),
         ),
     })
+}
+
+fn observation_failure(
+    side: IntegritySide,
+    path: &StoragePath,
+    class: FailureClass,
+    reason: &'static str,
+) -> IntegrityFailure {
+    IntegrityFailure {
+        side,
+        failure: StorageRoleFailure::Entry(
+            crate::model::EntryOperationFailure::new(
+                path.clone(),
+                crate::model::Operation::Observe,
+                class,
+                crate::model::Transience::Permanent,
+                reason,
+            )
+            .unwrap_or_else(|_| unreachable!("static observation diagnostics are valid")),
+        ),
+    }
 }
 
 fn missing(source: bool, destination: bool) -> Vec<IntegrityDifference> {
@@ -400,107 +563,6 @@ fn missing(source: bool, destination: bool) -> Vec<IntegrityDifference> {
         });
     }
     differences
-}
-
-fn compare_facts(
-    source: &SourceDescriptor,
-    destination: &SourceDescriptor,
-    differences: &mut Vec<IntegrityDifference>,
-) {
-    if source.kind != destination.kind {
-        differences.push(IntegrityDifference::Kind {
-            source: source.kind,
-            destination: destination.kind,
-        });
-    }
-    if source.size != destination.size {
-        differences.push(IntegrityDifference::Size {
-            source: source.size,
-            destination: destination.size,
-        });
-    }
-}
-
-async fn compare_permissions(
-    source: &Endpoint,
-    destination: &Endpoint,
-    source_entry: &SourceDescriptor,
-    destination_entry: &SourceDescriptor,
-    differences: &mut Vec<IntegrityDifference>,
-) -> Result<(), IntegrityFailure> {
-    use crate::storage::PrincipalIdentity::{Named, Numeric};
-    let (source_facts, destination_facts) = reconcile(futures::join!(
-        async {
-            source
-                .metadata
-                .permissions(source_entry)
-                .await
-                .map_err(|error| source.attribute(error))
-        },
-        async {
-            destination
-                .metadata
-                .permissions(destination_entry)
-                .await
-                .map_err(|error| destination.attribute(error))
-        },
-    ))?;
-    let differs = |a: &Option<crate::storage::PrincipalIdentity>,
-                   b: &Option<crate::storage::PrincipalIdentity>| {
-        matches!((a, b), (Some(Numeric(a)), Some(Numeric(b))) if a != b)
-            || matches!((a, b), (Some(Named(a)), Some(Named(b))) if a != b)
-    };
-    let mode_differs = source_entry.kind != EntryKind::Symlink
-        && destination_entry.kind != EntryKind::Symlink
-        && matches!((source_facts.mode, destination_facts.mode), (Some(a), Some(b)) if a != b);
-    if mode_differs
-        || differs(&source_facts.owner, &destination_facts.owner)
-        || differs(&source_facts.group, &destination_facts.group)
-    {
-        differences.push(IntegrityDifference::Permissions {
-            source: source_facts,
-            destination: destination_facts,
-        });
-    }
-    Ok(())
-}
-
-async fn compare_modified(
-    source: &Endpoint,
-    destination: &Endpoint,
-    entries: (&SourceDescriptor, &SourceDescriptor),
-    options: IntegrityOptions,
-    differences: &mut Vec<IntegrityDifference>,
-) -> Result<(), IntegrityFailure> {
-    let (source_time, destination_time) = reconcile(futures::join!(
-        source.modified(entries.0),
-        destination.modified(entries.1)
-    ))?;
-    let (ObservedMtime::Observed(source_time), ObservedMtime::Observed(destination_time)) =
-        (source_time, destination_time)
-    else {
-        return Ok(());
-    };
-    let equal = match options.mtime_precision {
-        MtimePrecision::Coarsest => {
-            same_instant(source_time, destination_time, options.mtime_tolerance)
-        }
-        MtimePrecision::Exact => match (source_time, destination_time) {
-            (Some(source), Some(destination)) => {
-                source.unix_nanos().abs_diff(destination.unix_nanos())
-                    <= options.mtime_tolerance.as_nanos()
-            }
-            (None, None) => true,
-            _ => false,
-        },
-    };
-    if !equal {
-        differences.push(IntegrityDifference::Modified {
-            source: source_time,
-            destination: destination_time,
-        });
-    }
-    Ok(())
 }
 
 /// Combines two settled role results, keeping the source-side failure when both failed.
@@ -538,30 +600,14 @@ fn same_instant(
     source.unix_nanos().abs_diff(destination.unix_nanos()) <= tolerance.as_nanos()
 }
 
-async fn compare_content(
-    source: &Endpoint,
-    destination: &Endpoint,
-    entries: (&SourceDescriptor, &SourceDescriptor),
-    options: IntegrityOptions,
-    cancel: &CancellationToken,
-    report: &mut IntegrityReport,
-) -> Result<(), IntegrityFailure> {
-    let (source_entry, destination_entry) = entries;
-    let ((source_digest, source_bytes), (destination_digest, destination_bytes)) =
-        reconcile(futures::join!(
-            source.digest(source_entry, options, cancel),
-            destination.digest(destination_entry, options, cancel)
-        ))?;
-    report.compared_bytes = source_bytes;
-    report.digests = Some((source_digest, destination_digest));
-    if source_digest != destination_digest {
-        report.differences.push(IntegrityDifference::Content {
-            source_bytes,
-            destination_bytes,
-        });
-    }
-    Ok(())
-}
+mod acl;
+mod comparison;
+mod permissions;
+
+pub use comparison::compare;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod permission_version_tests;

@@ -6,19 +6,24 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::FuturesOrdered;
+use tokio_util::sync::CancellationToken;
 
 use super::at_destination::write_pointer;
 use super::source::{NfsProtocolFailure, entry_failure, role_failure};
-use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transience};
+use crate::model::{
+    AclEncoding, BackendIdentity, FailureClass, Operation, StoragePath, Transience,
+};
 use crate::storage::artifacts::is_artifact_native;
 use crate::storage::{
-    ByteStream, CheckpointObservation, Metadata, MetadataMutation, PreparedStage,
+    ByteStream, CheckpointObservation, CopiedAclTarget, Metadata, MetadataMutation, PreparedStage,
     PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
     StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 #[path = "positioned_writer.rs"]
 mod positioned_writer;
+#[path = "staged_acl.rs"]
+mod staged_acl;
 
 #[async_trait]
 pub(crate) trait NfsStageFile: Send + Sync {
@@ -60,6 +65,9 @@ pub(crate) trait NfsStagedProtocol: Send + Sync {
     /// the safe answer for a protocol object that does not know.
     fn supports_acl(&self) -> bool {
         false
+    }
+    fn acl_encoding(&self) -> Option<AclEncoding> {
+        self.supports_acl().then_some(AclEncoding::NfsV4)
     }
     /// Whether the negotiated mount stores named attributes.
     fn supports_xattrs(&self) -> bool {
@@ -564,11 +572,10 @@ impl StagedDestination for NfsStagedDestinationAdapter {
                     crate::model::TimePrecision::Nanoseconds,
                 ),
                 ownership: crate::storage::CopiedOwnershipTarget::Numeric,
-                acl: if self.protocol.supports_acl() {
-                    crate::storage::CopiedAclTarget::Encoding(crate::model::AclEncoding::NfsV4)
-                } else {
-                    crate::storage::CopiedAclTarget::Unsupported
-                },
+                acl: self
+                    .protocol
+                    .acl_encoding()
+                    .map_or(CopiedAclTarget::Unsupported, CopiedAclTarget::Encoding),
                 xattrs: if self.protocol.supports_xattrs() {
                     crate::storage::CopiedValueTarget::Supported
                 } else {
@@ -722,6 +729,15 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             verified_bytes: request.expected_size,
             blake3: hash,
         })
+    }
+
+    async fn validate_recovered_metadata(
+        &self,
+        stage: &PreparedStage,
+        mutations: Vec<MetadataMutation>,
+        cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        staged_acl::validate_recovered_metadata(self, stage, mutations, cancel).await
     }
 
     async fn apply_metadata(

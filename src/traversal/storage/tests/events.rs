@@ -62,6 +62,10 @@ pub(super) fn render(item: &TraversalItem) -> String {
             render_counts(&listed.counts)
         ),
         TraversalItem::Checkpoint(_) => "checkpoint".to_owned(),
+        TraversalItem::ObservationFailure(failure) => format!(
+            "observation failure {} {:?} {:?}",
+            failure.path, failure.family, failure.version
+        ),
     }
 }
 
@@ -155,7 +159,7 @@ pub(super) fn assert_well_formed(items: &[TraversalItem], outcome: &TraversalOut
                 }
                 (emitted, failed) = (0, 0);
             }
-            TraversalItem::Checkpoint(_) => {}
+            TraversalItem::Checkpoint(_) | TraversalItem::ObservationFailure(_) => {}
         }
     }
     assert_eq!((emitted, failed), (0, 0), "items after the last block");

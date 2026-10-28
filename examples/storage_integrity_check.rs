@@ -7,7 +7,7 @@ use std::time::Duration;
 #[path = "support/endpoint.rs"]
 mod endpoint_support;
 use data_mover::integrity::{
-    IntegrityMode, IntegrityOptions, IntegrityRequest, MtimePrecision, compare,
+    IntegrityMode, IntegrityOptions, IntegrityPlan, IntegrityRequest, MtimePrecision, compare,
 };
 use data_mover::model::StoragePath;
 use endpoint_support::Result;
@@ -29,6 +29,7 @@ impl From<Mode> for IntegrityMode {
 
 #[derive(Debug, Parser)]
 #[command(about = "Compare one path across two data-mover storage URLs")]
+#[allow(clippy::struct_excessive_bools)] // Independent CLI switches.
 struct Args {
     /// Source storage URL.
     #[arg(long)]
@@ -46,13 +47,27 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Mode::Full)]
     mode: Mode,
 
-    /// Accept modification-time differences up to this many milliseconds.
+    /// Accept modification-time differences up to this many nanoseconds.
     #[arg(long, default_value_t = 0)]
-    mtime_tolerance_ms: u64,
+    mtime_tolerance_ns: u64,
 
     /// Compare mtimes at the coarser apparent timestamp precision.
     #[arg(long)]
     mtime_auto_precision: bool,
+
+    /// Also compare native ACLs when both backends can report the same encoding.
+    #[arg(long)]
+    acl: bool,
+    /// Require complete native ACL observations.
+    #[arg(long)]
+    acl_required: bool,
+    /// Assert a shared numeric identity/group namespace and compare regular-file access.
+    #[arg(long)]
+    acl_equivalent: bool,
+
+    /// Also compare extended attributes when both backends can report them.
+    #[arg(long)]
+    xattrs: bool,
 }
 
 #[tokio::main]
@@ -66,6 +81,12 @@ async fn main() -> Result<()> {
         source_path: path.clone(),
         destination,
         destination_path: path,
+        plan: IntegrityPlan {
+            acl: args.acl || args.acl_required || args.acl_equivalent,
+            xattrs: args.xattrs,
+            acl_required: args.acl_required || args.acl_equivalent,
+            acl_equivalent: args.acl_equivalent,
+        },
         options: IntegrityOptions {
             mode: args.mode.into(),
             mtime_precision: if args.mtime_auto_precision {
@@ -73,9 +94,7 @@ async fn main() -> Result<()> {
             } else {
                 MtimePrecision::Exact
             },
-            mtime_tolerance: Duration::from_millis(args.mtime_tolerance_ms),
-            permissions: true,
-            ..IntegrityOptions::default()
+            mtime_tolerance: Duration::from_nanos(args.mtime_tolerance_ns),
         },
         cancel: tokio_util::sync::CancellationToken::new(),
     })

@@ -218,6 +218,7 @@ async fn the_copied_plan_keeps_the_reasons() {
         },
         Some(0o100_640),
         false,
+        false,
     )
     .unwrap();
     let expected = [

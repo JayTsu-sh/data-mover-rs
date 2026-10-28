@@ -27,8 +27,8 @@
 # the first 1 000-entry page of ListObjectVersions; then (temporary bucket only), with versioning
 # suspended, n written twice (one "null" version).
 #
-# The zero-byte d/ is a directory object (P7 F5, D8): one zero-byte file entry d/ of d (--current),
-# one record of size 0 (histories).
+# The zero-byte d/ folds into Directory d in both modes; with history the Directory retains
+# its one record of size 0, whose raw key is still d/.
 #
 # Checks (versioned): k and gone are ONE entry each; k's records are 2, 3, marker, 4 with only the
 # last latest; gone (deleted now, still listed) a version and a latest marker; p/z one entry of
@@ -38,8 +38,7 @@
 # Unversioned: each key once (k 4 B, p/z 3 B, no gone, no artifact, 999 p/a*);
 # blocks identical at 1, 4, 32.
 #
-# EXPECT_DIR_MARKER (default 1): how many current entries the zero-byte d/ gives (P7 F5); 0 for a
-# store that keeps no such object.
+# Zero-byte markers never produce an extra File entry, with or without history.
 #
 # History order: the entry of a key with a delete marker (k, gone) must carry ` order=inferred`
 # exactly when EXPECT_ORDER=inferred (RustFS 1.0.0 lists each page's delete markers before its
@@ -277,9 +276,9 @@ echo "-- current (without p/a*)"; grep -v ' p/a' "$WORK/current"
 cmp -s "$WORK/blocks-1" "$WORK/blocks-4" && cmp -s "$WORK/blocks-1" "$WORK/blocks-32" \
   && echo "blocks: identical at concurrency 1, 4, 32 ($(wc -l <"$WORK/blocks-1") lines)" \
   || { echo "blocks: output differs between concurrency levels"; FAILED=1; }
-python3 - "$WORK/all" "$WORK/current" "$MODE" "$EXPECT_ORDER" "${EXPECT_DIR_MARKER:-1}" <<'PY' || FAILED=1
+python3 - "$WORK/all" "$WORK/current" "$MODE" "$EXPECT_ORDER" <<'PY' || FAILED=1
 import re, sys
-all_, cur, mode, expect, dir_marker = sys.argv[1:6]
+all_, cur, mode, expect = sys.argv[1:5]
 def rows(path, name):
     # Entry lines of `name`: (segment, complete, records, order), all None without a history.
     out = []
@@ -342,9 +341,8 @@ if mode != "unversioned":
 files = (all_, cur) if mode != "unversioned" else (cur,)
 checks.update({
     "no artifacts": (sum(".data-mover" in l for f in files for l in open(f)), 0),
-    # P7 F5 (D8): the zero-byte marker d/ is a zero-byte file entry of d, once per listing
-    # (EXPECT_DIR_MARKER=0 for a store that keeps no such object, the ONTAP NAS bucket).
-    "current d/ marker": (len(rows(cur, "d/")), int(dir_marker)),
+    # A marker is a Directory in either bucket mode, retaining history on that Directory.
+    "current d/ marker file": (len(rows(cur, "d/")), 0),
     "totals balanced": (sum(l.startswith("totals balanced=true ") for f in files for l in open(f)), len(files)),
     "completed": (sum("outcome=Completed" in l for f in files for l in open(f)), len(files)),
 })

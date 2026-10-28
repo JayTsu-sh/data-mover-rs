@@ -1,0 +1,101 @@
+$ /work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --source-path named.bin --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --destination-path named.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target-ci-1.95/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --key named.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })
+$ /work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --source-path named.bin --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination-path named.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target-ci-1.95/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --key named.bin --input observed --expected match --acl --acl-equivalent --expect-acl equal
+observed source=Some(Current) destination=Some(Current)
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --source-path named.bin --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --destination-path named.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target-ci-1.95/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --key named.bin --input observed --expected match --acl --acl-equivalent --expect-acl equal
+observed source=Some(Current) destination=Some(Current)
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --source-path named.bin --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --destination-path named.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target-ci-1.95/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --key named.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })
+$ /work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src?version=4.1&uid=0&gid=0&noresvport=true --source-path complex-registry-091.bin --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-dst?version=4.1&uid=0&gid=0&noresvport=true --destination-path complex-registry-091.bin --seed-bytes 73 --mark-acl everyone-write-acl --verify-acl --acl-required --expect copied --expect-acl applied
+seeded complex-registry-091.bin bytes=73
+marked source ACL (EveryoneWriteAcl): 3 ACE(s)
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 73 bytes
+source ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1966495), who: "OWNER@" }
+source ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(64), access_mask: AceMask(1179785), who: "GROUP@" }
+source ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1441929), who: "EVERYONE@" }
+destination ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1966495), who: "OWNER@" }
+destination ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(64), access_mask: AceMask(1179785), who: "GROUP@" }
+destination ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1441929), who: "EVERYONE@" }
+ACLs equal and marked: 3 ACE(s)
+$ /work/cargo-target-ci-1.95/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-dst?version=4.1&uid=0&gid=0&noresvport=true --key complex-registry-091.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=73 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })
+$ /work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --source-path named.bin --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --destination-path named.bin --acl-required --expect refused
+refused as expected: transfer Metadata failed on Orchestration: copied metadata was refused while planning: ACL (RequireExact): the source holds a Posix ACL and the destination stores NfsV4; conversion requires the explicit equivalence policy
+$ /work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src?version=4.1&uid=0&gid=0&noresvport=true --source-path complex-registry-091.bin --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/negative?version=3&uid=0&gid=0&noresvport=true --destination-path complex-registry-091.bin --acl-mapping --expect refused
+refused as expected: transfer Metadata failed on Orchestration: copied metadata was refused while planning: ACL (RequireEquivalent): ACL mapping refused: NFSv4 rights are outside the fixed regular-file access profile
+PASS: 4 directional copies/checks, 1 marked native control copy/check, 2 ACL-planning refusals
+
+# Independent kernel NFS read-back after planning refusals
+complex-src exists: 73 bytes, content intact
+complex-dst exists: 73 bytes, content intact
+negative destination absent after ACL-planning refusal

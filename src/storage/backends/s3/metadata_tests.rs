@@ -213,3 +213,89 @@ async fn a_pinned_version_is_observed_as_itself() -> Result {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn tag_entry_failures_keep_their_classification_in_best_effort_and_required_modes() -> Result
+{
+    use super::super::S3ProtocolFailure;
+    let (protocol, metadata) = fixture(None).await?;
+    protocol
+        .put_version(PATH, "v1", Bytes::from_static(b"payload"))
+        .await;
+    let expected = described(&protocol, &metadata).await?;
+    let path = StoragePath::new(PATH)?;
+    for (class, transience) in [
+        (FailureClass::PermissionDenied, Transience::Permanent),
+        (FailureClass::Throttled, Transience::Transient),
+        (FailureClass::Corruption, Transience::Unknown),
+    ] {
+        *protocol.tag_failure.lock().await = Some((
+            "v1".into(),
+            S3ProtocolFailure::entry(class, transience, "specific tag read failure"),
+        ));
+        let observed = metadata
+            .observe_copy_bound_version(
+                &path,
+                &expected,
+                &SourceVersion::Id("v1".into()),
+                ObservationPlan::default().with_tags(ObservationMode::BestEffort),
+            )
+            .await?;
+        assert_eq!(
+            observed.observations.tags(),
+            &MetadataObservation::Failed { class, transience }
+        );
+        let result = metadata
+            .observe_copy_bound_version(
+                &path,
+                &expected,
+                &SourceVersion::Id("v1".into()),
+                ObservationPlan::default().with_tags(ObservationMode::Required),
+            )
+            .await;
+        let Err(StorageRoleFailure::Entry(failure)) = result else {
+            panic!("required tags must retain an entry-scoped failure");
+        };
+        assert_eq!(failure.class(), class);
+        assert_eq!(failure.transience(), transience);
+        assert_eq!(failure.diagnostic(), "specific tag read failure");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tag_session_failures_remain_terminal_even_for_best_effort_observations() -> Result {
+    use super::super::S3ProtocolFailure;
+    let (protocol, metadata) = fixture(None).await?;
+    protocol
+        .put_version(PATH, "v1", Bytes::from_static(b"payload"))
+        .await;
+    let expected = described(&protocol, &metadata).await?;
+    let path = StoragePath::new(PATH)?;
+    for (class, transience) in [
+        (FailureClass::Connectivity, Transience::Transient),
+        (FailureClass::Authentication, Transience::Permanent),
+    ] {
+        *protocol.tag_failure.lock().await = Some((
+            "v1".into(),
+            S3ProtocolFailure::session(class, transience, "specific tag session failure"),
+        ));
+        for mode in [ObservationMode::BestEffort, ObservationMode::Required] {
+            let result = metadata
+                .observe_copy_bound_version(
+                    &path,
+                    &expected,
+                    &SourceVersion::Id("v1".into()),
+                    ObservationPlan::default().with_tags(mode),
+                )
+                .await;
+            let Err(StorageRoleFailure::Session(failure)) = result else {
+                panic!("session failure must terminate the observation in {mode:?} mode");
+            };
+            assert_eq!(failure.class(), class);
+            assert_eq!(failure.transience(), transience);
+            assert_eq!(failure.diagnostic(), "specific tag session failure");
+        }
+    }
+    Ok(())
+}

@@ -224,8 +224,10 @@ For NFS, the common adapter consumes the dialect and negotiated `rsize`/`wsize` 
 owned by `nfs-rs`; data-mover adds no second mount semaphore or blanket request retry. The adapter
 only bounds transfer chunks, applies source QoS/cancellation, and invalidates cached handles for
 the explicitly classified stale-handle, bad-handle, and concurrent-lookup cases. NFSv3, v4.0, and
-v4.1 retain independent capability evidence and real-environment gates. NFSv4 ACLs use a private,
-versioned, lossless codec under the NFS metadata adapter.
+v4.1 retain independent capability evidence and real-environment gates. `model::acl` owns the
+versioned, lossless NFSv4 metadata codec and typed POSIX codec shared by negotiation, integrity,
+and adapters. The NFS metadata adapter converts protocol types through those codecs; it does not
+maintain a second byte format implementation.
 
 ### Namespace
 
@@ -239,6 +241,17 @@ separate from an individual child error. Local, NFS, CIFS, HDFS and unversioned 
 S3 histories are gathered per directory before keys are delivered (at most five million records).
 Dropping a stream signals cancellation; producers finish in-flight operations and close handles.
 
+Traversal calls `Namespace::list_for_traversal(request, is_root)`, which defaults to raw `list`.
+S3 projects common prefixes with a one-level probe: all-zero marker histories become Directory
+entries retaining the full history, any nonzero version keeps the raw trailing-slash File, and
+only actual descendants add a virtual Directory alongside a content object. Raw listing/delete
+semantics stay unchanged. Probes may relist a child directory and fail explicitly rather than
+treating failed inspection as absence; this is not a selectable scan mode. History records on a
+Directory use `ObservedEntry::history_source_path()` to read/replay the raw marker key.
+The backend projection also owns omission of a current-only root marker and the single child
+failure for an unrepresentable root object with content or history. Generic traversal does not
+reclassify backend objects; it observes, filters, counts, and schedules the projected children.
+
 S3 lends `stat` and `list` only: `list` of a path is one delimiter listing of the prefix `<path>/`,
 so a common prefix is a directory. `capabilities().histories` is fixed at connection: enabled or
 suspended versioning, or a refused versioning query, selects `ListObjectVersions`; a bucket never
@@ -251,9 +264,15 @@ A history is a property of each key returned by `list`; there is no separate tra
 
 ### Metadata
 
-Owns backend metadata observation and application plus backend-private encoding. ACL,
+Owns backend metadata observation and application plus protocol-to-model conversion. ACL,
 xattr, tags, ownership/mode, and timestamps are separate capabilities. It never performs an
 implicit source refetch to fill observations omitted during scanning.
+
+`Metadata::permissions(descriptor)` owns permission observation for the descriptor's selected
+version, including independent named-principal facts. Its default handles numeric ownership
+and version-bound mode-only facts; a backend without the selected version refuses it instead
+of reading the current entry. Integrity compares these facts through the role without repeating
+capability checks or protocol-to-permission conversion.
 
 ### NativeTransfer
 
@@ -306,7 +325,7 @@ the snapshot unchanged when reconstruction is required. Reconstruction never re-
 backend, but it needs the endpoint the scan ran on: `ObservedEntry::decode_snapshot(bytes,
 &identity)` takes it from `Storage::identity()` or `storage::endpoint_identity(&config)` offline.
 `SnapshotDecodeError::BackendMismatch` for a whole generation means the endpoint moved or is
-spelled differently; treat it as no previous generation. The only entry format is **DMES v8**,
+spelled differently; treat it as no previous generation. The only entry format is **DMES v10**,
 including entries without history. Other versions return `UnsupportedVersion` and require a fresh
 scan. Every format change increments the version byte and updates golden-byte fixtures. This is
 a development policy; before release, choose N-1 decoding or a documented migration/rescan path
@@ -811,7 +830,7 @@ identity. A backend performs only safe protocol retries; terrasync owns job retr
 | `ResumeContext` | Replaced by the destination pointer beside the final file (ADR-0006) |
 | `StreamHandle`, `DataChunk`, commit callbacks | Make crate-private runtime details or delete |
 | `storage_resume_compat`, `hdfs_legacy_resume`, `.terrasync-part` | Delete |
-| scattered metadata/copy ACL/xattr helpers | Replace with Metadata role; backend codecs private |
+| scattered metadata/copy ACL/xattr helpers | Replace with Metadata role; shared ACL codecs in model, protocol conversions private |
 | whole-file byte convenience and scattered hash helpers | Delete; retain integrity module contracts |
 | NFS export and S3 bucket discovery | Export narrow discovery helpers from `storage`; implementation stays in its backend |
 | verified StorageGRID/DXN/NFS/HDFS/CIFS quirks | Keep inside owning backend adapter |

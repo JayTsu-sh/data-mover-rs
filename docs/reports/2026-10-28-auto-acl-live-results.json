@@ -1,0 +1,197 @@
+{
+  "commands": [
+    {
+      "args": [
+        "/work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy",
+        "--source",
+        "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+        "--source-path",
+        "named.bin",
+        "--destination",
+        "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+        "--destination-path",
+        "named.bin",
+        "--acl",
+        "--expect",
+        "copied",
+        "--expect-acl",
+        "applied"
+      ],
+      "exit": 0,
+      "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nACL conservative fallback: false\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "/work/cargo-target-ci-1.95/debug/examples/integrity_input_probe",
+        "--source",
+        "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+        "--destination",
+        "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+        "--key",
+        "named.bin",
+        "--input",
+        "path",
+        "--expected",
+        "match",
+        "--acl",
+        "--acl-required",
+        "--expect-acl",
+        "equal"
+      ],
+      "exit": 0,
+      "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "/work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy",
+        "--source",
+        "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+        "--source-path",
+        "named.bin",
+        "--destination",
+        "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+        "--destination-path",
+        "named.bin",
+        "--acl",
+        "--expect",
+        "copied",
+        "--expect-acl",
+        "applied-partial-acl"
+      ],
+      "exit": 0,
+      "stdout": "OwnershipMode: Applied\nAcl: AppliedPartialAcl\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Acl: AclPartiallyCopied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nACL conservative fallback: false\nACL omission Acl None: IdentityResolutionUnverified (server identity namespaces and group resolution have not been verified)\nmapping OwnershipMode: Exact\nmapping Acl: Lossy([AclPartiallyCopied])\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "/work/cargo-target-ci-1.95/debug/examples/integrity_input_probe",
+        "--source",
+        "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+        "--destination",
+        "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+        "--key",
+        "named.bin",
+        "--input",
+        "observed",
+        "--expected",
+        "match",
+        "--acl",
+        "--acl-equivalent",
+        "--expect-acl",
+        "equal"
+      ],
+      "exit": 0,
+      "stdout": "observed source=Some(Current) destination=Some(Current)\nmatches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "/work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy",
+        "--source",
+        "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+        "--source-path",
+        "named.bin",
+        "--destination",
+        "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+        "--destination-path",
+        "named.bin",
+        "--acl",
+        "--expect",
+        "copied",
+        "--expect-acl",
+        "applied-partial-acl"
+      ],
+      "exit": 0,
+      "stdout": "OwnershipMode: Applied\nAcl: AppliedPartialAcl\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Acl: AclPartiallyCopied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nACL conservative fallback: false\nACL omission Acl None: IdentityResolutionUnverified (server identity namespaces and group resolution have not been verified)\nmapping OwnershipMode: Exact\nmapping Acl: Lossy([AclPartiallyCopied])\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "/work/cargo-target-ci-1.95/debug/examples/integrity_input_probe",
+        "--source",
+        "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+        "--destination",
+        "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+        "--key",
+        "named.bin",
+        "--input",
+        "observed",
+        "--expected",
+        "match",
+        "--acl",
+        "--acl-equivalent",
+        "--expect-acl",
+        "equal"
+      ],
+      "exit": 0,
+      "stdout": "observed source=Some(Current) destination=Some(Current)\nmatches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "/work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy",
+        "--source",
+        "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+        "--source-path",
+        "named.bin",
+        "--destination",
+        "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+        "--destination-path",
+        "named.bin",
+        "--acl",
+        "--expect",
+        "copied",
+        "--expect-acl",
+        "applied"
+      ],
+      "exit": 0,
+      "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nACL conservative fallback: false\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "/work/cargo-target-ci-1.95/debug/examples/integrity_input_probe",
+        "--source",
+        "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+        "--destination",
+        "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+        "--key",
+        "named.bin",
+        "--input",
+        "path",
+        "--expected",
+        "match",
+        "--acl",
+        "--acl-required",
+        "--expect-acl",
+        "equal"
+      ],
+      "exit": 0,
+      "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })\n",
+      "stderr": ""
+    },
+    {
+      "args": [
+        "/work/cargo-target-ci-1.95/debug/examples/nfs_metadata_copy",
+        "--source",
+        "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src?version=4.1&uid=0&gid=0&noresvport=true",
+        "--source-path",
+        "complex-registry-091.bin",
+        "--destination",
+        "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/negative?version=3&uid=0&gid=0&noresvport=true",
+        "--destination-path",
+        "complex-registry-091.bin",
+        "--acl",
+        "--expect",
+        "copied",
+        "--expect-acl",
+        "applied-partial-acl"
+      ],
+      "exit": 0,
+      "stdout": "OwnershipMode: Applied\nAcl: AppliedPartialAcl\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Acl: AclPartiallyCopied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nACL conservative fallback: false\nACL omission Acl None: IdentityResolutionUnverified (server identity namespaces and group resolution have not been verified)\nACL omission NfsAce { index: 0 } Some(\"OWNER@\"): UnsupportedRights { rights: 524312 } (NFSv4 rights are not preserved)\nACL omission NfsAce { index: 1 } Some(\"GROUP@\"): UnsupportedRights { rights: 8 } (NFSv4 rights are not preserved)\nACL omission NfsAce { index: 2 } Some(\"EVERYONE@\"): UnsupportedRights { rights: 262152 } (NFSv4 rights are not preserved)\nmapping OwnershipMode: Exact\nmapping Acl: Lossy([AclPartiallyCopied])\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 73 bytes\n",
+      "stderr": ""
+    }
+  ]
+}

@@ -34,9 +34,7 @@ use super::{
     Deferred, DescendOutcome, DirectoryWork, Shared, awaits_slot, descend_outcome, entry_candidate,
     entry_name, immediate_decision, throttling_scoped_to,
 };
-use crate::model::{
-    EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
-};
+use crate::model::{EntryKind, EntryOperationFailure, Operation, StoragePath};
 use crate::storage::listing::is_vanished;
 use crate::storage::{DescentHint, ListRequest, ListingPage, SourceDescriptor, StorageRoleFailure};
 use crate::traversal::{TraversalDecision, TraversalTerminalFailure};
@@ -96,9 +94,26 @@ impl Slot {
 /// One listed child the output will show. `deferred` is set when its decision waits for an
 /// observation that needs I/O; otherwise the decision was made when the page was prepared. A
 /// child a decision made then hides never becomes one: it is only counted.
-pub(super) struct Child {
-    pub(super) listed: Listed,
-    pub(super) deferred: Option<Deferred>,
+pub(super) enum Child {
+    Observe {
+        listed: Listed,
+        deferred: Option<Deferred>,
+    },
+    /// Its decision was counted in page facts, but its diagnostics retain this child's place.
+    Filtered(Vec<crate::traversal::ObservationFailure>),
+}
+
+impl Child {
+    #[cfg(test)]
+    pub(super) fn path_len(&self) -> usize {
+        match self {
+            Self::Observe { listed, .. } => listed.path_len(),
+            Self::Filtered(failures) => failures
+                .iter()
+                .map(|failure| failure.path.as_str().len())
+                .sum(),
+        }
+    }
 }
 
 /// What of one page the cursor admits, in this order: the children the listing could not
@@ -164,7 +179,9 @@ async fn read(
     // the traversal is ending then, so what it returns is never used.
     let request = ListRequest::new(work.path.clone(), shared.request.cancel.clone())
         .with_descent_hint(work.hint.clone());
-    let mut stream = shared.namespace.list(request);
+    let mut stream = shared
+        .namespace
+        .list_for_traversal(request, work.child_depth == 1);
     let mut peeked: Option<Option<Item>> = None;
     loop {
         let next = match peeked.take() {
@@ -256,10 +273,7 @@ impl Drop for Reporter {
 /// admission decision made now, and every child that needs no I/O observed now.
 pub(super) fn prepare(shared: &Shared, work: &DirectoryWork, page: ListingPage) -> Page {
     let internal_hidden = u64::from(page.internal_hidden);
-    let (mut entries, mut failures) = page.into_hinted_descriptors(&work.path);
-    if work.child_depth == 1 {
-        root_object(shared, &mut entries, &mut failures);
-    }
+    let (entries, failures) = page.into_hinted_descriptors(&work.path);
     let listed = u64::try_from(entries.len().saturating_add(failures.len())).unwrap_or(u64::MAX);
     // A child gone before the listing could describe it is counted, not reported (Q12).
     let (vanished, failures): (Vec<_>, Vec<_>) = failures
@@ -284,58 +298,6 @@ pub(super) fn prepare(shared: &Shared, work: &DirectoryWork, page: ListingPage) 
     prepared
 }
 
-/// Takes the traversal root's own object out of its listing (P7 F5, D4). The listing of a root
-/// `p/d` hands over the object `p/d/` as a file, but its path relative to the root would be the
-/// root itself, so it is not part of the traversal: a traversal of the parent `p` includes it. A
-/// zero-byte one (a folder marker; every record of its history, delete markers included) is
-/// dropped, uncounted, as the root's directory already stands for it. One holding content — now,
-/// or in any version of its history — is the traversal's `Child` failure at that key
-/// (`Unsupported`), reported once, never silently dropped.
-fn root_object(
-    shared: &Shared,
-    entries: &mut Vec<(SourceDescriptor, Option<DescentHint>)>,
-    failures: &mut Vec<EntryOperationFailure>,
-) {
-    let root = shared.request.root.as_str();
-    if root.is_empty() {
-        // The storage root has no own object; the listing contract refuses one.
-        return;
-    }
-    let mut content = None;
-    entries.retain(|(descriptor, _)| {
-        let own = descriptor.path.as_str().strip_suffix('/') == Some(root);
-        if own && holds_content(descriptor) {
-            content = Some(descriptor.path.clone());
-        }
-        !own
-    });
-    let Some(path) = content else { return };
-    if shared.root_object_reported.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let failure = EntryOperationFailure::new(
-        path,
-        Operation::Traverse,
-        FailureClass::Unsupported,
-        Transience::Permanent,
-        "the traversal root's own directory object holds content but is not part of the \
-         traversal; traverse its parent to include it",
-    )
-    .unwrap_or_else(|_| unreachable!("the static traversal diagnostic is valid"));
-    failures.push(failure);
-}
-
-/// Whether a listed object holds content: its size, or, with a history, any version's.
-fn holds_content(descriptor: &SourceDescriptor) -> bool {
-    match descriptor.listing.history.as_deref() {
-        Some(history) => history
-            .records()
-            .iter()
-            .any(|record| record.size().is_some_and(|size| size > 0)),
-        None => descriptor.size.is_some_and(|size| size > 0),
-    }
-}
-
 /// Decides and, when it needs no I/O, observes one child, and files it into the page.
 ///
 /// Filter dependencies are resolved independently of observations requested only for output.
@@ -350,14 +312,18 @@ fn prepare_child(
 ) {
     let kind = descriptor.kind;
     let plan = shared.policy.observation_plan;
-    if let Some(decision) = immediate_decision(shared, work, &descriptor) {
+    if let Some((decision, metadata)) = immediate_decision(shared, work, &descriptor) {
         let path = &descriptor.path;
         page.tally(shared, kind, path, work.child_depth, decision, hint);
         if decision.emit {
             let listed = observe_listed(shared.metadata.as_ref(), descriptor, plan);
             page.keep(listed, None);
         } else {
-            page.hide();
+            page.hide_with_failures(super::output::metadata_failures(
+                &descriptor.path,
+                descriptor.version(),
+                &metadata,
+            ));
         }
         return;
     }
@@ -372,7 +338,7 @@ fn prepare_child(
     if decision.emit {
         page.keep(listed, None);
     } else {
-        page.hide();
+        page.hide_with_failures(super::output::observation_failures(entry));
     }
 }
 
@@ -381,20 +347,31 @@ fn listed_path(listed: &Listed) -> Option<&StoragePath> {
     match listed {
         Listed::Unobserved(descriptor) => Some(&descriptor.path),
         Listed::Observed(Ok(entry)) => Some(entry.path()),
-        Listed::Observed(Err(StorageRoleFailure::Entry(failure))) => Some(failure.path()),
-        Listed::Observed(Err(StorageRoleFailure::Session(_))) => None,
+        Listed::Observed(Err(error)) => match &error.failure {
+            StorageRoleFailure::Entry(failure) => Some(failure.path()),
+            StorageRoleFailure::Session(_) => None,
+        },
     }
 }
 
 impl Page {
     /// Files a child the output will show.
     fn keep(&mut self, listed: Listed, deferred: Option<Deferred>) {
-        self.batch.children.push_back(Child { listed, deferred });
+        self.batch
+            .children
+            .push_back(Child::Observe { listed, deferred });
     }
 
     /// Counts a child a decision made here keeps out of the output.
     const fn hide(&mut self) {
         self.facts.filtered = self.facts.filtered.saturating_add(1);
+    }
+
+    fn hide_with_failures(&mut self, failures: Vec<crate::traversal::ObservationFailure>) {
+        self.hide();
+        if !failures.is_empty() {
+            self.batch.children.push_back(Child::Filtered(failures));
+        }
     }
 
     /// Files a child whose decision waits for its observation, and, when it is a directory the

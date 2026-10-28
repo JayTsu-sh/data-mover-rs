@@ -7,8 +7,8 @@ use super::protocol::{HdfsProtocol, cancelled, entry_failure};
 use crate::model::{
     FailureClass, MetadataCapabilities, MetadataFamily as F, MetadataObservation,
     MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan,
-    ObservationSupport as S, Operation, StoragePath, StorageTimestamp, TimePrecision,
-    TimestampMetadata, Transience,
+    ObservationSupport as S, Operation, SourceVersion, StoragePath, StorageTimestamp,
+    TimePrecision, TimestampMetadata, Transience,
 };
 use crate::storage::{Metadata, MetadataMutation, StorageRoleFailure};
 
@@ -41,6 +41,9 @@ impl Metadata for HdfsMetadata {
         &self,
         described: &crate::storage::SourceDescriptor,
     ) -> Result<crate::storage::PermissionFacts, StorageRoleFailure> {
+        if !matches!(described.version(), SourceVersion::Current) {
+            return Err(failure(&described.path, FailureClass::Unsupported));
+        }
         super::source::permissions(described)
             .ok_or_else(|| failure(&described.path, FailureClass::Protocol))
     }
@@ -191,5 +194,52 @@ mod tests {
             unavailable::<()>(ObservationMode::Omit),
             MetadataObservation::NotRequested
         );
+    }
+
+    #[tokio::test]
+    async fn named_permissions_survive_unsupported_ownership_but_reject_version_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::protocol::HdfsEntryFacts;
+        use crate::model::{BackendIdentity, BackendKind, EntryKind, SourceVersion};
+        use crate::storage::PrincipalIdentity;
+
+        let identity = BackendIdentity::new(BackendKind::Hdfs, "permission-versions")?;
+        let metadata = HdfsMetadata::new(
+            Arc::new(super::super::contract_tests::MemoryHdfs::default()),
+            identity.clone(),
+        );
+        let facts = HdfsEntryFacts {
+            path: StoragePath::new("file")?,
+            kind: EntryKind::File,
+            size: Some(4),
+            mtime: 10,
+            atime: 0,
+            mode: 0o640,
+            owner: "alice".into(),
+            group: "staff".into(),
+            replication: None,
+            block_size: None,
+        };
+        let mut descriptor =
+            super::super::source::descriptor(&identity, StoragePath::new("file")?, &facts)?;
+        assert_eq!(
+            metadata
+                .observation_capabilities()
+                .support(F::OwnershipMode),
+            S::Unsupported
+        );
+        assert_eq!(
+            metadata.permissions(&descriptor).await?,
+            crate::storage::PermissionFacts {
+                owner: Some(PrincipalIdentity::Named("alice".into())),
+                group: Some(PrincipalIdentity::Named("staff".into())),
+                mode: Some(0o640),
+            }
+        );
+        descriptor.version = SourceVersion::Id("old-version".into());
+        let result = metadata.permissions(&descriptor).await;
+        assert!(matches!(result, Err(StorageRoleFailure::Entry(ref entry))
+            if entry.class() == FailureClass::Unsupported && entry.operation() == Operation::Metadata));
+        Ok(())
     }
 }

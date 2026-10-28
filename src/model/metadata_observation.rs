@@ -1,5 +1,10 @@
 use super::observation::{Cursor, SnapshotDecodeError, decode_time, encode_time, put_bytes};
 use super::{FailureClass, MAX_MODEL_FIELD_BYTES, ModelValueError, StorageTimestamp, Transience};
+#[cfg(test)]
+use super::{MetadataFamily, TimePrecision};
+
+mod failures;
+pub use failures::MetadataObservationFailure;
 
 const MAX_XATTR_COUNT: usize = 4_096;
 const MAX_TAG_COUNT: usize = 1_024;
@@ -350,6 +355,7 @@ pub struct TimestampMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataObservations {
+    pub(crate) retained_failures: Option<Box<[MetadataObservationFailure]>>,
     pub(crate) acl: MetadataObservation<AclMetadata>,
     pub(crate) xattrs: MetadataObservation<Vec<ExtendedAttribute>>,
     pub(crate) tags: MetadataObservation<Vec<ObjectTag>>,
@@ -360,6 +366,7 @@ pub struct MetadataObservations {
 impl Default for MetadataObservations {
     fn default() -> Self {
         Self {
+            retained_failures: None,
             acl: MetadataObservation::NotRequested,
             xattrs: MetadataObservation::NotRequested,
             tags: MetadataObservation::NotRequested,
@@ -379,6 +386,7 @@ impl MetadataObservations {
     ) -> Result<Self, ModelValueError> {
         validate_payload(&acl, &xattrs, &tags)?;
         Ok(Self {
+            retained_failures: None,
             acl,
             xattrs,
             tags,
@@ -485,6 +493,7 @@ pub(crate) fn encode(metadata: &MetadataObservations, output: &mut Vec<u8>) {
         encode_time(output, value.modified);
         encode_time(output, value.created);
     }
+    failures::encode(metadata, output);
 }
 
 fn encode_state<'a, T>(value: &'a MetadataObservation<T>, output: &mut Vec<u8>) -> Option<&'a T> {
@@ -553,8 +562,10 @@ pub(crate) fn decode(cursor: &mut Cursor<'_>) -> Result<MetadataObservations, Sn
     let ownership = finish(owner_state, || decode_ownership(cursor))?;
     let time_state = decode_state(cursor)?;
     let timestamps = finish(time_state, || decode_timestamps(cursor))?;
-    MetadataObservations::new(acl, xattrs, tags, ownership, timestamps)
-        .map_err(|_| SnapshotDecodeError::FieldTooLarge)
+    let mut metadata = MetadataObservations::new(acl, xattrs, tags, ownership, timestamps)
+        .map_err(|_| SnapshotDecodeError::FieldTooLarge)?;
+    metadata.retained_failures = failures::decode(cursor)?;
+    Ok(metadata)
 }
 
 fn decode_tags(

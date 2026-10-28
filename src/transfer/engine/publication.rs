@@ -138,8 +138,13 @@ async fn apply_metadata(
                 source_qos,
             ));
         }
-        // The earlier application report was not persisted; do not invent one.
-        return Ok((transferred, None));
+        // The bound plan is reconstructed from the current source and the published final has
+        // been validated. Its ACL omissions remain useful, but outcomes must say recovery.
+        let report = transferred
+            .copied_metadata_plan
+            .as_ref()
+            .and_then(super::negotiation::CopiedMetadataPlan::recovered_acl_report);
+        return Ok((transferred, report));
     }
     match apply_copied_metadata(
         &transferred,

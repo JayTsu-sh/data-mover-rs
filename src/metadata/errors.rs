@@ -14,6 +14,7 @@ pub enum MetadataPlanErrorKind {
     ObservationFailed,
     ObservationRequired,
     PrincipalMappingFailed,
+    AclMappingRejected,
 }
 
 /// Why one family could not be planned, precise enough to act on: which end lacks it, what the
@@ -33,12 +34,13 @@ pub enum RefusalCause {
     SourceDidNotObserve,
     /// The destination cannot store this family.
     DestinationCannotStore,
-    /// Both ends store ACLs, in different encodings; carrying one needs a mapping that is never
-    /// attempted.
+    /// Both ends store different ACL encodings; the selected policy does not enable conversion.
     EncodingsDiffer {
         source: AclEncoding,
         destination: AclEncoding,
     },
+    /// The requested ACL falls outside the explicitly accepted equivalence profile.
+    AclMappingRejected { reason: &'static str },
     /// The destination needs owner/group mapped to its own principals and no mapper was given.
     PrincipalMapperMissing,
     /// The principal mapper could not map owner/group.
@@ -68,6 +70,7 @@ impl RefusalCause {
             Self::SourceCannotObserve | Self::SourceObservationFailed { .. } => RefusalSide::Source,
             Self::DestinationCannotStore | Self::LossRejected(_) => RefusalSide::Destination,
             Self::SourceDidNotObserve
+            | Self::AclMappingRejected { .. }
             | Self::EncodingsDiffer { .. }
             | Self::PrincipalMapperMissing
             | Self::PrincipalMappingFailed => RefusalSide::Mapping,
@@ -84,6 +87,7 @@ impl RefusalCause {
             Self::EncodingsDiffer { .. } | Self::PrincipalMapperMissing => {
                 MetadataPlanErrorKind::ExternalMappingRequired
             }
+            Self::AclMappingRejected { .. } => MetadataPlanErrorKind::AclMappingRejected,
             Self::PrincipalMappingFailed => MetadataPlanErrorKind::PrincipalMappingFailed,
             Self::LossRejected(_) => MetadataPlanErrorKind::KnownLossRejected,
         }
@@ -106,8 +110,11 @@ impl fmt::Display for RefusalCause {
             } => write!(
                 formatter,
                 "the source holds a {source:?} ACL and the destination stores {destination:?}; \
-                 converting between them is never attempted"
+                 conversion requires the explicit equivalence policy"
             ),
+            Self::AclMappingRejected { reason } => {
+                write!(formatter, "ACL mapping refused: {reason}")
+            }
             Self::PrincipalMapperMissing => formatter.write_str(
                 "the destination needs owner/group mapped to its own principals and no mapper \
                  was given",
@@ -190,6 +197,7 @@ pub(super) const fn family_name(family: MetadataFamily) -> &'static str {
 const fn loss_text(loss: SemanticLoss) -> &'static str {
     match loss {
         SemanticLoss::AclDropped => "the ACL",
+        SemanticLoss::AclPartiallyCopied => "part of the ACL",
         SemanticLoss::XattrsDropped => "the extended attributes",
         SemanticLoss::TagsDropped => "the object tags",
         SemanticLoss::OwnershipModeDropped => "owner, group and mode",
@@ -310,7 +318,7 @@ impl fmt::Display for FamilyFailure {
 #[derive(Debug)]
 pub struct MetadataApplicationFailure {
     /// Never empty.
-    pub(super) failures: Vec<FamilyFailure>,
+    pub(super) failures: Box<[FamilyFailure]>,
     /// In a failure report `Applied` means written to the stage, not durable: the item fails and
     /// is not published, so nothing it wrote is claimed durable.
     pub(super) report: MetadataApplicationReport,

@@ -1,7 +1,7 @@
 //! The listing contract's path arithmetic: a child's path is its directory's path as requested,
 //! a `/`, and its name.
 
-use crate::model::{MAX_MODEL_FIELD_BYTES, ModelValueError, StoragePath};
+use crate::model::{EntryKind, MAX_MODEL_FIELD_BYTES, ModelValueError, StoragePath};
 
 /// The full path of `name` in `directory`: the name itself at the root, otherwise the directory,
 /// `/` and the name. This is the listing contract; no normalisation is applied to either part.
@@ -93,4 +93,11 @@ pub(super) fn child_name<'a>(directory: &StoragePath, path: &'a StoragePath) -> 
 /// [`super::ListedChild::directory_object`] and [`super::ListingPage::push_directory_object`] make.
 pub(super) fn is_segment(name: &str) -> bool {
     !matches!(name, "" | "." | "..") && !name.contains(['/', '\0'])
+}
+
+/// Whether an optional trailing slash names one file key segment. Ordinary child names and
+/// the empty own-object name retain their separate constructor checks.
+pub(super) fn valid_object_suffix(name: &str, kind: EntryKind) -> bool {
+    !name.ends_with('/')
+        || (kind == EntryKind::File && name.strip_suffix('/').is_some_and(is_segment))
 }

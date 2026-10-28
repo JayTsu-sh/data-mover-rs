@@ -16,6 +16,70 @@ fn source(kind: BackendKind, value: &[u8]) -> Result<SourceIdentity, Box<dyn std
     )?)
 }
 
+fn fixture_bytes(hex: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
+    let hex: String = hex.split_whitespace().collect();
+    (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16))
+        .collect()
+}
+
+#[test]
+fn frozen_v8_fixtures_remain_unsupported() -> Result<(), Box<dyn std::error::Error>> {
+    for (kind, endpoint, fixture) in [
+        (
+            BackendKind::Nfs,
+            "nfs://10.0.0.1/export",
+            include_str!("data/snapshot/v8-nfs-file.hex"),
+        ),
+        (
+            BackendKind::S3,
+            "s3://10.0.0.2:9000/bucket",
+            include_str!("data/snapshot/v8-s3-history.hex"),
+        ),
+        (
+            BackendKind::S3,
+            "s3://10.0.0.2:9000/bucket",
+            include_str!("data/snapshot/v8-s3-history-segment.hex"),
+        ),
+    ] {
+        let bytes = fixture_bytes(fixture)?;
+        assert_eq!(bytes[4], 8);
+        assert_eq!(
+            ObservedEntry::decode_snapshot(&bytes, &BackendIdentity::new(kind, endpoint)?),
+            Err(SnapshotDecodeError::UnsupportedVersion),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn v10_marker_snapshot_exposes_the_exact_copyable_object() -> Result<(), Box<dyn std::error::Error>>
+{
+    let backend = BackendIdentity::new(BackendKind::S3, "s3://bucket")?;
+    let bytes = fixture_bytes(include_str!("data/snapshot/v10-s3-directory-marker.hex"))?;
+    let entry = ObservedEntry::decode_snapshot(&bytes, &backend)?;
+    assert_eq!(entry.kind(), EntryKind::Directory);
+    assert_eq!(entry.path().as_str(), "data");
+    assert_eq!(entry.size(), None);
+    let marker = entry.directory_marker_object().ok_or("missing marker")?;
+    assert_eq!(marker.kind(), EntryKind::File);
+    assert_eq!(marker.path().as_str(), "data/");
+    assert_eq!(marker.size(), Some(0));
+    assert_ne!(marker.identity_key(), entry.identity_key());
+    assert!(marker.history().is_none());
+    assert!(marker.directory_marker_object().is_none());
+    let tags = marker.metadata().tags().value().ok_or("missing tags")?;
+    assert_eq!(tags.len(), 1);
+    assert_eq!((tags[0].key(), tags[0].value()), ("marker", "retained"));
+    assert_eq!(entry.encode_snapshot().as_bytes(), bytes);
+    assert_eq!(
+        ObservedEntry::decode_snapshot(marker.encode_snapshot().as_bytes(), &backend)?,
+        *marker,
+    );
+    Ok(())
+}
+
 #[test]
 fn optional_metadata_plan_is_omitted_by_default_and_selective() {
     let default = ObservationPlan::default();
@@ -115,9 +179,9 @@ fn decoder_rejects_unknown_truncated_tampered_and_trailing_data()
     let valid = observed.encode_snapshot().as_bytes().to_vec();
     let local = backend(BackendKind::Local)?;
 
-    assert_eq!(valid[4], 8, "the current format");
+    assert_eq!(valid[4], 10, "the current format");
     // Only the current format is read (P7 C11b): older formats and newer ones alike are refused.
-    for version in [4, 5, 6, 7, 9, 99] {
+    for version in [4, 5, 6, 7, 8, 9, 99] {
         let mut other_version = valid.clone();
         other_version[4] = version;
         assert_eq!(
