@@ -22,7 +22,9 @@ mod compile;
 mod errors;
 
 pub use compile::compile_metadata_plan;
-pub(crate) use compile::{compile_copied_metadata_plan, compile_nothing_stored_plan};
+pub(crate) use compile::{
+    compile_copied_metadata_plan, compile_nothing_stored_plan, compile_unavailable_plan,
+};
 use errors::family_name;
 pub(crate) use errors::role_failure_text;
 pub use errors::{
@@ -35,8 +37,6 @@ pub use crate::model::MetadataFamily;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MetadataPolicy {
     RequireExact,
-    /// Require complete ACL observations and a proven current-access mapping.
-    RequireEquivalent,
     AllowKnownLoss,
     BestEffort,
     #[default]
@@ -165,6 +165,8 @@ pub trait PrincipalMapper: Send + Sync {
 #[non_exhaustive]
 pub enum SemanticLoss {
     AclDropped,
+    /// The ACL was projected with known omissions or a conservative fallback.
+    AclPartiallyCopied,
     XattrsDropped,
     TagsDropped,
     OwnershipModeDropped,
@@ -256,6 +258,16 @@ pub struct MetadataPlan {
     mutations: Vec<(MetadataFamily, MetadataMutation)>,
     losses: LossReport,
     skipped: Vec<SkippedFamily>,
+    acl_copy: Option<AclCopyReport>,
+    acl_source_binding: Option<[u8; 32]>,
+}
+
+/// Details of ACL permissions that could not be copied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AclCopyReport {
+    pub issues: Vec<crate::model::acl::AclCopyIssue>,
+    /// A data-denying ACL was used because no safe projection could be proven.
+    pub conservative_fallback: bool,
 }
 
 impl MetadataPlan {
@@ -267,6 +279,12 @@ impl MetadataPlan {
     #[must_use]
     pub const fn loss_report(&self) -> &LossReport {
         &self.losses
+    }
+
+    /// Detailed ACL omissions and whether a conservative fallback was needed.
+    #[must_use]
+    pub const fn acl_copy_report(&self) -> Option<&AclCopyReport> {
+        self.acl_copy.as_ref()
     }
 
     /// The families asked for that one end cannot do, each with the reason.
@@ -379,7 +397,7 @@ impl MetadataPlan {
         outcomes: Vec<FamilyApplication>,
     ) -> MetadataApplicationFailure {
         MetadataApplicationFailure {
-            failures,
+            failures: failures.into_boxed_slice(),
             report: self.report(outcomes),
         }
     }
@@ -417,13 +435,46 @@ impl MetadataPlan {
         self.finish(failures, outcomes)
     }
 
-    fn report(&self, outcomes: Vec<FamilyApplication>) -> MetadataApplicationReport {
+    fn report(&self, mut outcomes: Vec<FamilyApplication>) -> MetadataApplicationReport {
+        if let Some(acl) = &self.acl_copy
+            && let Some(outcome) = outcomes
+                .iter_mut()
+                .find(|v| v.family == MetadataFamily::Acl)
+            && outcome.outcome == ApplicationOutcome::Applied
+            && (!acl.issues.is_empty() || acl.conservative_fallback)
+        {
+            outcome.outcome = if acl.conservative_fallback {
+                ApplicationOutcome::AppliedConservativeAcl
+            } else {
+                ApplicationOutcome::AppliedPartialAcl
+            };
+        }
         MetadataApplicationReport {
             outcomes,
             mappings: self.mappings.clone(),
             losses: self.losses.clone(),
             skipped: self.skipped.clone(),
+            acl_copy: self.acl_copy.clone().map(Box::new),
         }
+    }
+
+    /// Reconstruct only a checkpoint-backed report; no target mutations are replayed.
+    pub(crate) fn recovered_acl_report(&self) -> Option<MetadataApplicationReport> {
+        if !self.mappings.iter().any(|mapping| {
+            mapping.family == MetadataFamily::Acl
+                && mapping.decision != MappingDecision::OmittedByPolicy
+        }) {
+            return None;
+        }
+        let mut outcomes = self.planned_outcomes();
+        for (family, _) in &self.mutations {
+            set_outcome(
+                &mut outcomes,
+                *family,
+                ApplicationOutcome::RecoveredFromCheckpoint,
+            );
+        }
+        Some(self.report(outcomes))
     }
 
     fn planned_outcomes(&self) -> Vec<FamilyApplication> {
@@ -527,6 +578,12 @@ impl ApplicationTarget<'_> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplicationOutcome {
     Applied,
+    /// The projected ACL was applied with reported omissions.
+    AppliedPartialAcl,
+    /// A data-denying ACL was applied because no safe projection was available.
+    AppliedConservativeAcl,
+    /// A matching publication checkpoint proves the mutation preceded publication.
+    RecoveredFromCheckpoint,
     PreservedByNativeTransfer,
     OmittedByPolicy,
     NotObserved,
@@ -546,9 +603,16 @@ pub struct MetadataApplicationReport {
     mappings: Vec<FamilyMapping>,
     losses: LossReport,
     skipped: Vec<SkippedFamily>,
+    acl_copy: Option<Box<AclCopyReport>>,
 }
 
 impl MetadataApplicationReport {
+    /// Detailed ACL omissions retained after application.
+    #[must_use]
+    pub fn acl_copy_report(&self) -> Option<&AclCopyReport> {
+        self.acl_copy.as_deref()
+    }
+
     /// Planned preservation or equivalence contract for every metadata family.
     #[must_use]
     pub fn mappings(&self) -> &[FamilyMapping] {

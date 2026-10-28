@@ -113,6 +113,17 @@ async fn consume(
                     failure.failure.class()
                 );
             }
+            TraversalItem::ObservationFailure(failure) => {
+                tally.failures += 1;
+                eprintln!(
+                    "metadata failure {} {:?} {:?} {:?} {:?}",
+                    failure.path,
+                    failure.version,
+                    failure.family,
+                    failure.class,
+                    failure.transience
+                );
+            }
             TraversalItem::DirectoryListed(listed) if !*quiet => print_listed(listed),
             TraversalItem::Checkpoint(checkpoint) => {
                 tally.checkpoints += 1;

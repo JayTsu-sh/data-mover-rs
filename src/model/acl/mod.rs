@@ -7,7 +7,14 @@
 //! grants: Linux can bypass their named restrictions when the mode group class is zero.
 mod codec;
 mod mapping;
+mod projection;
+mod projection_nfs;
 mod semantics;
+mod uncopied;
+pub use projection::{
+    AclCopyIssue, AclCopyIssueKind, AclIssueLocation, AclProjection, project_acl, safe_deny_all_acl,
+};
+pub use uncopied::{UncopiedAclEntry, uncopied_acl_entries};
 
 pub use codec::{
     NfsAce, PosixAcl, PosixEntry, decode_nfs4, decode_posix, encode_nfs4, encode_posix,

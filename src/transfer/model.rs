@@ -95,51 +95,22 @@ enum SourceInput {
 /// - **cannot** — not read, not written, and the reason recorded in the report. This is never a
 ///   failure: what the user asked for that the storage cannot do is the caller's to judge.
 ///
-/// Explicit `with_required_acl` / `with_acl_mapping` selection refuses incomplete ACL preservation.
-/// The following default behavior applies to `with_acl` and `with_xattrs`.
+/// ACL requests on regular files automatically project across supported ACL models and report
+/// omitted permissions or an explicit deny-all fallback. Other entry kinds retain compatible
+/// native ACLs and report incompatible ones as skipped.
 ///
 /// A feature both ends can handle is then carried for real: a read that fails, or a write the
 /// destination refuses, fails the transfer — after every other family has been applied, with
 /// every reason listed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[allow(clippy::struct_excessive_bools)] // Independent metadata selectors and explicit ACL strength.
 pub struct CopiedMetadataRequest {
     acl: bool,
     xattrs: bool,
-    acl_required: bool,
-    acl_mapping: bool,
 }
 
 impl CopiedMetadataRequest {
-    /// Requires native ACL preservation; unsupported observations or targets fail the copy.
-    #[must_use]
-    pub const fn with_required_acl(mut self) -> Self {
-        self.acl = true;
-        self.acl_required = true;
-        self
-    }
-
-    /// Allows proven current regular-file access equivalence in a shared numeric namespace.
-    /// Both endpoints must resolve identities and group memberships consistently.
-    #[must_use]
-    pub const fn with_acl_mapping(mut self) -> Self {
-        self.acl = true;
-        self.acl_required = true;
-        self.acl_mapping = true;
-        self
-    }
-
-    #[must_use]
-    pub const fn acl_required(self) -> bool {
-        self.acl_required
-    }
-
-    #[must_use]
-    pub const fn acl_mapping(self) -> bool {
-        self.acl_mapping
-    }
-
-    /// Asks for the access control list.
+    /// Copies the access control list, automatically projecting regular-file permissions.
+    /// Uncopied ACL meanings and conservative fallback are recorded in the metadata report.
     #[must_use]
     pub const fn with_acl(mut self) -> Self {
         self.acl = true;

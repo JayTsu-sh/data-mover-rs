@@ -12,6 +12,10 @@ impl MetadataPlan {
     pub(crate) fn checkpoint_binding(&self) -> [u8; 32] {
         let mut hash = Hasher::new();
         hash.update(b"data-mover planned metadata writes v1\0");
+        if let Some(binding) = self.acl_source_binding {
+            hash.update(b"partial ACL source v1\0");
+            hash.update(&binding);
+        }
         count(&mut hash, self.mutations.len());
         for (_, mutation) in &self.mutations {
             observe(&mut hash, mutation);
@@ -90,7 +94,7 @@ fn tags(hash: &mut Hasher, values: &[ObjectTag]) {
     }
 }
 
-fn acl(hash: &mut Hasher, value: &AclMetadata) {
+pub(super) fn acl(hash: &mut Hasher, value: &AclMetadata) {
     hash.update(&[match value.encoding() {
         AclEncoding::Posix => 0,
         AclEncoding::NfsV4 => 1,
@@ -135,6 +139,8 @@ mod tests {
             mutations: vec![(MetadataFamily::Tags, mutation)],
             losses: LossReport::default(),
             skipped: Vec::new(),
+            acl_copy: None,
+            acl_source_binding: None,
         }
     }
 

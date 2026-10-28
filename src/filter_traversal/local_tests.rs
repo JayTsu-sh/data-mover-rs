@@ -39,6 +39,9 @@ async fn scan(root: &Path, request: TraversalRequest) -> io::Result<Scan> {
             TraversalItem::Checkpoint(checkpoint) => saved.push((paths.clone(), *checkpoint)),
             TraversalItem::DirectoryListed(_) => {}
             TraversalItem::Failure(failure) => panic!("unexpected failure: {failure:?}"),
+            TraversalItem::ObservationFailure(failure) => {
+                panic!("unexpected observation failure: {failure:?}")
+            }
         }
     }
     paths.sort();

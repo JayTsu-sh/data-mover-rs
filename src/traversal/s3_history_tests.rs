@@ -112,7 +112,7 @@ async fn history_entries_survive_a_snapshot() -> TestResult {
     let (items, _) = traverse(&protocol, request()).await?;
     for entry in entries(&items) {
         let snapshot = entry.encode_snapshot();
-        assert_eq!(snapshot.as_bytes()[4], 9);
+        assert_eq!(snapshot.as_bytes()[4], 10);
         let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes(), &identity())?;
         assert_eq!(&rebuilt, entry);
     }

@@ -130,3 +130,82 @@ fn every_failure_class_round_trips_through_its_snapshot_tag() {
     }
     assert_eq!(super::failure_from_tag(13), None);
 }
+
+#[test]
+fn failed_families_are_available_without_discarding_other_observations() {
+    let observations = MetadataObservations {
+        acl: MetadataObservation::Failed {
+            class: FailureClass::PermissionDenied,
+            transience: Transience::Permanent,
+        },
+        tags: MetadataObservation::Failed {
+            class: FailureClass::Throttled,
+            transience: Transience::Transient,
+        },
+        ..MetadataObservations::default()
+    };
+    let failures: Vec<_> = observations.failures().collect();
+    assert_eq!(failures.len(), 2);
+    assert_eq!(failures[0].family, MetadataFamily::Acl);
+    assert_eq!(failures[0].class, FailureClass::PermissionDenied);
+    assert_eq!(failures[0].transience, Transience::Permanent);
+    assert_eq!(failures[1].family, MetadataFamily::Tags);
+    assert_eq!(failures[1].class, FailureClass::Throttled);
+}
+
+#[test]
+fn a_successful_timestamp_fallback_retains_its_failed_attempt_after_snapshot_roundtrip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut metadata = MetadataObservations {
+        timestamps: MetadataObservation::Failed {
+            class: FailureClass::PermissionDenied,
+            transience: Transience::Permanent,
+        },
+        ..MetadataObservations::default()
+    };
+    metadata.retain_failure(MetadataFamily::Timestamps);
+    metadata.retain_failure(MetadataFamily::Timestamps);
+    assert_eq!(metadata.failures().count(), 1);
+    metadata.timestamps = MetadataObservation::Value {
+        value: TimestampMetadata {
+            accessed: None,
+            modified: Some(StorageTimestamp::new(42, TimePrecision::Nanoseconds)?),
+            created: None,
+        },
+        provenance: MetadataProvenance::Inline,
+    };
+    let mut bytes = Vec::new();
+    encode(&metadata, &mut bytes);
+    let decoded = decode(&mut Cursor::new(&bytes))?;
+    assert_eq!(decoded, metadata);
+    assert!(decoded.timestamps().value().is_some());
+    let failures = decoded.failures().collect::<Vec<_>>();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].family, MetadataFamily::Timestamps);
+    assert_eq!(
+        (failures[0].class, failures[0].transience),
+        (FailureClass::PermissionDenied, Transience::Permanent)
+    );
+    Ok(())
+}
+
+#[test]
+fn retained_failure_codec_refuses_unbounded_duplicate_or_unknown_families() {
+    let class = failure_tag(FailureClass::PermissionDenied);
+    let transience = transience_tag(Transience::Permanent);
+    for (tail, expected) in [
+        (vec![6], SnapshotDecodeError::FieldTooLarge),
+        (
+            vec![1, 5, class, transience],
+            SnapshotDecodeError::Malformed,
+        ),
+        (
+            vec![2, 4, class, transience, 4, class, transience],
+            SnapshotDecodeError::Malformed,
+        ),
+    ] {
+        let mut bytes = vec![0; 5];
+        bytes.extend(tail);
+        assert_eq!(decode(&mut Cursor::new(&bytes)), Err(expected));
+    }
+}

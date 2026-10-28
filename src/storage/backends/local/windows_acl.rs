@@ -367,18 +367,47 @@ mod tests {
 
     #[test]
     fn an_empty_acl_stays_non_null() -> io::Result<()> {
-        let mut bytes = vec![0; 28];
-        bytes[0] = 1;
-        bytes[2..4].copy_from_slice(&0x9004u16.to_le_bytes());
-        bytes[16..20].copy_from_slice(&20u32.to_le_bytes());
-        bytes[20] = 2;
-        bytes[22..24].copy_from_slice(&8u16.to_le_bytes());
-        let descriptor = ValidatedDescriptor::new(&bytes)?;
+        let acl = crate::model::acl::safe_deny_all_acl(
+            crate::model::AclEncoding::WindowsSecurityDescriptor,
+        )
+        .map_err(io::Error::other)?;
+        let bytes = acl.access().ok_or_else(invalid_descriptor)?;
+        let descriptor = ValidatedDescriptor::new(bytes)?;
         let (dacl, protected) = descriptor.dacl()?;
         assert!(protected);
         assert!(!dacl.is_null());
         let result = explicit_acl(dacl)?;
         assert!(!result.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn conservative_acl_is_applied_as_a_protected_empty_dacl() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("file");
+        std::fs::write(&path, b"content")?;
+        let file = open_path(&path, true)?;
+        let original = read_handle(&file)?;
+        let acl = crate::model::acl::safe_deny_all_acl(
+            crate::model::AclEncoding::WindowsSecurityDescriptor,
+        )
+        .map_err(io::Error::other)?;
+        apply_handle(&file, acl.access().ok_or_else(invalid_descriptor)?)?;
+        let observed = Descriptor::read(&file);
+        // Restore before asserting, so temp-directory cleanup retains its original access.
+        let restored = apply_handle(&file, &original);
+        let observed = observed?;
+        restored?;
+        let (_, _, dacl) = observed.components();
+        assert!(!dacl.is_null());
+        assert!(observed.protected()?);
+        // SAFETY: GetSecurityInfo returned a live descriptor containing the ACL pointer.
+        #[expect(
+            unsafe_code,
+            reason = "reading the ACL header in a live native descriptor"
+        )]
+        let count = unsafe { (*dacl).AceCount };
+        assert_eq!(count, 0);
         Ok(())
     }
 

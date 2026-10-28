@@ -29,9 +29,9 @@ use crate::model::metadata_observation;
 use crate::model::{RenameEvidence, RenameScheme, SpecialFileKind, TimePrecision};
 
 const MAGIC: &[u8; 4] = b"DMES";
-/// The current format: v9 adds an optional current directory marker observation.
+/// The current format: v10 retains metadata errors when successful fallback facts replace them.
 /// Bump on **any** layout change and update the golden bytes.
-pub(super) const VERSION: u8 = 9;
+pub(super) const VERSION: u8 = 10;
 
 impl PrivateBackendEntryFacts {
     fn encode(&self, output: &mut Vec<u8>) {

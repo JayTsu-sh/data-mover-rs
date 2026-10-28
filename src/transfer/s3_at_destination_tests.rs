@@ -291,14 +291,15 @@ async fn a_failed_upload_is_discarded_without_touching_the_final_key() -> TestRe
         .await
         .insert(FINAL.into(), Bytes::from_static(b"previous"));
     *protocol.part_failure.lock().await = Some((
-        2,
+        3,
         S3ProtocolFailure::entry(
             FailureClass::PermissionDenied,
             Transience::Permanent,
             "denied",
         ),
     ));
-    let failure = transfer(checkpointed(&protocol, FINAL)?)
+    *protocol.part_failure_waits.lock().await = true;
+    let failure = transfer(checkpointed_every(&protocol, FINAL, 8 * MIB)?)
         .await
         .err()
         .ok_or("a failed part must fail the transfer")?;

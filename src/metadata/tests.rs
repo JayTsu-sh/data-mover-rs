@@ -196,6 +196,7 @@ fn the_mode_that_replaces_ownership_is_applied_before_the_acl_too() {
         },
         Some(0o640),
         false,
+        false,
     )
     .unwrap();
     assert!(
@@ -230,6 +231,7 @@ fn owner_names_that_could_not_be_mapped_are_reported_as_such() {
             },
             Some(0o640),
             unmapped,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -258,6 +260,7 @@ fn a_mode_carried_without_its_owner_loses_its_set_id_bits() {
             },
             Some(mode),
             true,
+            false,
         )
         .unwrap();
         assert!(
@@ -768,6 +771,7 @@ fn copied_mode_never_synthesizes_numeric_ownership() {
                 principal_mapper: None,
             },
             Some(0o100_640),
+            false,
             false,
         )
         .unwrap();

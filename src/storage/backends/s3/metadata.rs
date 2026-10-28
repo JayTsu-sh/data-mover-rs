@@ -11,7 +11,7 @@ use crate::model::{
 use crate::storage::{CopiedMetadataObservation, Metadata, MetadataMutation, StorageRoleFailure};
 
 use super::source::{cancelled, classified_entry, entry, object_identity, role_failure};
-use super::{S3ObjectFacts, S3Protocol};
+use super::{S3ObjectFacts, S3Protocol, S3ProtocolFailure};
 
 pub(crate) struct S3Metadata<P> {
     protocol: Arc<P>,
@@ -165,26 +165,22 @@ impl<P: S3Protocol + 'static> S3Metadata<P> {
             match mode {
                 ObservationMode::Omit => MetadataObservation::NotRequested,
                 ObservationMode::InlineOnly => MetadataObservation::Unsupported,
-                ObservationMode::BestEffort => {
+                ObservationMode::BestEffort | ObservationMode::Required => {
                     match self.protocol.get_tags(path.as_str(), version).await {
                         Ok(value) => MetadataObservation::Value {
                             value,
                             provenance: MetadataProvenance::AdditionalCall,
                         },
-                        Err(_) => MetadataObservation::Failed {
-                            class: FailureClass::Protocol,
-                            transience: Transience::Unknown,
-                        },
+                        Err(S3ProtocolFailure::Entry {
+                            class, transience, ..
+                        }) if mode == ObservationMode::BestEffort => {
+                            MetadataObservation::Failed { class, transience }
+                        }
+                        Err(failure) => {
+                            return Err(role_failure(path, Operation::Metadata, failure));
+                        }
                     }
                 }
-                ObservationMode::Required => MetadataObservation::Value {
-                    value: self
-                        .protocol
-                        .get_tags(path.as_str(), version)
-                        .await
-                        .map_err(|e| role_failure(path, Operation::Metadata, e))?,
-                    provenance: MetadataProvenance::AdditionalCall,
-                },
             }
         } else {
             match mode {

@@ -84,6 +84,7 @@ fn entry_paths(items: &[TraversalItem]) -> Vec<String> {
         .filter_map(|item| match item {
             TraversalItem::Entry(entry) => Some(entry.path().as_str().to_owned()),
             TraversalItem::Failure(_)
+            | TraversalItem::ObservationFailure(_)
             | TraversalItem::DirectoryListed(_)
             | TraversalItem::Checkpoint(_) => None,
         })

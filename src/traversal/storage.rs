@@ -409,7 +409,7 @@ fn immediate_decision(
     shared: &Shared,
     parent: &DirectoryWork,
     descriptor: &SourceDescriptor,
-) -> Option<TraversalDecision> {
+) -> Option<(TraversalDecision, MetadataObservations)> {
     let requirements = if parent.filter_children {
         shared.policy.requirements
     } else {
@@ -428,7 +428,10 @@ fn immediate_decision(
         descriptor.size,
         &metadata,
     );
-    Some(shared.policy.decide(parent.filter_children, &candidate))
+    Some((
+        shared.policy.decide(parent.filter_children, &candidate),
+        metadata,
+    ))
 }
 
 /// Whether a deferred child can be descended into at all, so its decision fills a slot.
@@ -508,26 +511,38 @@ struct Resolved {
     below: Option<DirectoryWork>,
 }
 
+struct ResolutionError {
+    terminal: TraversalTerminalFailure,
+    observations: Vec<super::ObservationFailure>,
+}
+
 /// Resolves one child's observation, applying a deferred decision now that it can be made. A
 /// session failure ends the traversal.
 fn resolve(
     shared: &Shared,
-    result: Result<Box<ObservedEntry>, StorageRoleFailure>,
+    result: Result<Box<ObservedEntry>, observe::ObservationError>,
     deferred: Option<Deferred>,
-) -> Result<Resolved, TraversalTerminalFailure> {
+) -> Result<Resolved, ResolutionError> {
+    let (result, observations) = match result {
+        Ok(entry) => (Ok(entry), Vec::new()),
+        Err(error) => (Err(error.failure), error.observations),
+    };
     let (item, below) = match result {
         Ok(entry) => settle_entry(shared, entry, deferred),
         // Gone since the listing: nothing to emit or descend into, and no failure (Q12).
         Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
-            (ChildItem::Vanished, None)
+            (ChildItem::Vanished(observations), None)
         }
-        Err(StorageRoleFailure::Entry(error)) => settle_failure(error, deferred),
+        Err(StorageRoleFailure::Entry(error)) => settle_failure(error, deferred, observations),
         Err(StorageRoleFailure::Session(error)) => {
-            return Err(TraversalTerminalFailure::Session(error));
+            return Err(ResolutionError {
+                terminal: TraversalTerminalFailure::Session(error),
+                observations,
+            });
         }
     };
     let descent = match item {
-        ChildItem::Vanished => None,
+        ChildItem::Vanished(_) => None,
         _ => deferred
             .and_then(|deferred| deferred_descent(&shared.request, deferred, below.is_some())),
     };
@@ -544,6 +559,7 @@ fn resolve(
 fn settle_failure(
     error: EntryOperationFailure,
     deferred: Option<Deferred>,
+    observations: Vec<super::ObservationFailure>,
 ) -> (ChildItem, Option<DirectoryWork>) {
     let descend = deferred
         .filter(|deferred| deferred.ticket.is_some())
@@ -553,10 +569,16 @@ fn settle_failure(
             filter_children: true,
             hint: None,
         });
-    (
-        ChildItem::Item(TraversalItem::Failure(Box::new(ScanFailure::child(error)))),
-        descend,
-    )
+    let failure = Box::new(ScanFailure::child(error));
+    let item = if observations.is_empty() {
+        ChildItem::Item(TraversalItem::Failure(failure))
+    } else {
+        ChildItem::ObservedFailure {
+            failure,
+            observations,
+        }
+    };
+    (item, descend)
 }
 
 /// What the filter sees of an observed child: the same candidate whether the decision is made in
@@ -612,7 +634,7 @@ fn settle_entry(
     let item = if decision.emit {
         ChildItem::Item(TraversalItem::Entry(entry))
     } else {
-        ChildItem::Filtered
+        ChildItem::Filtered(output::observation_failures(&entry))
     };
     (item, descend)
 }

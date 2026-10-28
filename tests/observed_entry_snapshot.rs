@@ -54,10 +54,10 @@ fn frozen_v8_fixtures_remain_unsupported() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
-fn v9_marker_snapshot_exposes_the_exact_copyable_object() -> Result<(), Box<dyn std::error::Error>>
+fn v10_marker_snapshot_exposes_the_exact_copyable_object() -> Result<(), Box<dyn std::error::Error>>
 {
     let backend = BackendIdentity::new(BackendKind::S3, "s3://bucket")?;
-    let bytes = fixture_bytes(include_str!("data/snapshot/v9-s3-directory-marker.hex"))?;
+    let bytes = fixture_bytes(include_str!("data/snapshot/v10-s3-directory-marker.hex"))?;
     let entry = ObservedEntry::decode_snapshot(&bytes, &backend)?;
     assert_eq!(entry.kind(), EntryKind::Directory);
     assert_eq!(entry.path().as_str(), "data");
@@ -179,9 +179,9 @@ fn decoder_rejects_unknown_truncated_tampered_and_trailing_data()
     let valid = observed.encode_snapshot().as_bytes().to_vec();
     let local = backend(BackendKind::Local)?;
 
-    assert_eq!(valid[4], 9, "the current format");
+    assert_eq!(valid[4], 10, "the current format");
     // Only the current format is read (P7 C11b): older formats and newer ones alike are refused.
-    for version in [4, 5, 6, 7, 8, 10, 99] {
+    for version in [4, 5, 6, 7, 8, 9, 99] {
         let mut other_version = valid.clone();
         other_version[4] = version;
         assert_eq!(

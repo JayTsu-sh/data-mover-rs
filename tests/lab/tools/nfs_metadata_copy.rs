@@ -54,12 +54,6 @@ struct Args {
     /// Ask for the ACL to be carried.
     #[arg(long)]
     acl: bool,
-    /// Require native ACL preservation instead of skipping unsupported metadata.
-    #[arg(long)]
-    acl_required: bool,
-    /// Allow proven regular-file access mapping in a shared numeric identity/group namespace.
-    #[arg(long)]
-    acl_mapping: bool,
     /// Ask for extended attributes to be carried.
     #[arg(long)]
     xattrs: bool,
@@ -107,6 +101,9 @@ enum Expect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Outcome {
     Applied,
+    AppliedPartialAcl,
+    AppliedConservativeAcl,
+    RecoveredFromCheckpoint,
     OmittedByPolicy,
     NotObserved,
     Unsupported,
@@ -119,6 +116,9 @@ impl From<ApplicationOutcome> for Outcome {
             ApplicationOutcome::Applied | ApplicationOutcome::PreservedByNativeTransfer => {
                 Self::Applied
             }
+            ApplicationOutcome::AppliedPartialAcl => Self::AppliedPartialAcl,
+            ApplicationOutcome::AppliedConservativeAcl => Self::AppliedConservativeAcl,
+            ApplicationOutcome::RecoveredFromCheckpoint => Self::RecoveredFromCheckpoint,
             ApplicationOutcome::OmittedByPolicy => Self::OmittedByPolicy,
             ApplicationOutcome::NotObserved => Self::NotObserved,
             ApplicationOutcome::Unsupported => Self::Unsupported,
@@ -386,6 +386,18 @@ fn print_report(report: &MetadataApplicationReport) {
     for (family, loss) in report.loss_report().losses() {
         println!("loss {family:?}: {loss:?}");
     }
+    if let Some(acl) = report.acl_copy_report() {
+        println!("ACL conservative fallback: {}", acl.conservative_fallback);
+        for issue in &acl.issues {
+            println!(
+                "ACL omission {:?} {:?}: {:?} ({})",
+                issue.location,
+                issue.principal,
+                issue.kind,
+                issue.kind.reason()
+            );
+        }
+    }
     for skip in report.skipped() {
         println!("{skip}");
     }
@@ -449,12 +461,6 @@ async fn main() -> Result {
     if args.acl {
         copied_metadata = copied_metadata.with_acl();
     }
-    if args.acl_required {
-        copied_metadata = copied_metadata.with_required_acl();
-    }
-    if args.acl_mapping {
-        copied_metadata = copied_metadata.with_acl_mapping();
-    }
     if args.xattrs {
         copied_metadata = copied_metadata.with_xattrs();
     }
@@ -477,6 +483,14 @@ async fn main() -> Result {
             Ok(())
         }
         (Ok(_), Expect::Refused) => Err("the copy succeeded but a refusal was expected".into()),
-        (Err(failure), Expect::Copied) => Err(format!("the copy failed: {failure:?}").into()),
+        (Err(failure), Expect::Copied) => {
+            if let Some(metadata) = failure.metadata_failure() {
+                print_report(metadata.report());
+                for family in metadata.failures() {
+                    eprintln!("{family}");
+                }
+            }
+            Err(format!("the copy failed: {failure}").into())
+        }
     }
 }

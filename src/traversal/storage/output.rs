@@ -13,14 +13,14 @@
 //! moment it is admitted — so a slot that is next in line goes straight onto a ready queue, and
 //! only one that settles ahead of an earlier one waits in the ordered map.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::mem;
 
 use super::blocks::Runtime;
 use crate::model::{ObservedEntry, StoragePath};
 use crate::traversal::{
-    BlockCounts, DirectoryListed, ListingOutcome, ScanFailure, ScanTotals, TraversalItem,
-    TraversalTerminalFailure,
+    BlockCounts, DirectoryListed, ListingOutcome, ObservationFailure, ScanFailure, ScanTotals,
+    TraversalItem, TraversalTerminalFailure,
 };
 
 /// Where one child's own subtree went.
@@ -82,12 +82,18 @@ impl BlockFacts {
 pub(super) enum ChildItem {
     /// An entry or a failure to deliver.
     Item(TraversalItem),
+    ObservedFailure {
+        failure: Box<ScanFailure>,
+        observations: Vec<ObservationFailure>,
+    },
     /// A deferred filter decision kept the child out: the slot keeps its sequence so the slots
     /// behind it stay in order, and emits nothing.
-    Filtered,
+    Filtered(Vec<ObservationFailure>),
+    /// A child filtered in page preparation was already counted in the page's facts.
+    ObservationFailures(Vec<ObservationFailure>),
     /// The child was gone when it was observed: nothing is emitted, and it is counted as
     /// vanished, not failed.
-    Vanished,
+    Vanished(Vec<ObservationFailure>),
 }
 
 /// What settled into one output slot.
@@ -112,6 +118,9 @@ pub(super) struct Output {
     ready: VecDeque<Settled>,
     /// Settled slots waiting behind one that has not settled yet.
     pending: BTreeMap<u64, Settled>,
+    /// Already observed errors carried by a fatal result, independent of unfinished slots.
+    terminal_observations: Vec<ObservationFailure>,
+    terminal_failures: Vec<ScanFailure>,
     /// The slots seen since the last block end, which are one directory's block.
     block: BlockCounts,
     /// What the listing failure among those slots, if any, makes of the block's outcome. The
@@ -136,6 +145,8 @@ impl Output {
             next: 0,
             ready: VecDeque::new(),
             pending: BTreeMap::new(),
+            terminal_observations: Vec::new(),
+            terminal_failures: Vec::new(),
             block: BlockCounts::new(),
             listing: None,
             totals: ScanTotals::new(),
@@ -155,12 +166,16 @@ impl Output {
         self.delivered
     }
 
-    /// Counts what listing a resumed traversal's ancestors again found wrong: one listing failure
-    /// each (delivered on their own, never inside a block, so no block takes their outcome), and
-    /// the ones found gone.
+    /// Counts newly delivered failures from relisted ancestors, outside any directory block.
+    /// Only failed children are counted again; successfully relisted children are not replayed.
     pub(super) fn count_resumed(&mut self, failures: &[ScanFailure], vanished: u64) {
-        for outcome in failures.iter().filter_map(ScanFailure::listing_outcome) {
-            count_listing(&mut self.totals, outcome);
+        for failure in failures {
+            if let Some(outcome) = failure.listing_outcome() {
+                count_listing(&mut self.totals, outcome);
+            } else {
+                self.totals.listed = self.totals.listed.saturating_add(1);
+                self.totals.failed_children = self.totals.failed_children.saturating_add(1);
+            }
         }
         self.totals.vanished_listings = self.totals.vanished_listings.saturating_add(vanished);
     }
@@ -196,11 +211,73 @@ impl Output {
             .saturating_add(u64::try_from(self.ready.len()).unwrap_or(u64::MAX))
     }
 
+    pub(super) fn remember_terminal_observations(&mut self, failures: Vec<ObservationFailure>) {
+        self.terminal_observations.extend(failures);
+    }
+
+    pub(super) fn remember_terminal_failures(&mut self, failures: Vec<ScanFailure>) {
+        self.terminal_failures.extend(failures);
+    }
+
+    pub(super) fn remember_terminal_item(&mut self, item: ChildItem) {
+        let mut errors = Vec::new();
+        terminal_errors(item, &mut errors);
+        for error in errors {
+            match error {
+                TraversalItem::Failure(failure) => self.terminal_failures.push(*failure),
+                TraversalItem::ObservationFailure(failure) => {
+                    self.terminal_observations.push(*failure);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The fatal child's slot remains unfinished. These errors neither advance the checkpoint
+    /// position nor release later entries or directory completion events.
+    pub(super) async fn flush_terminal(
+        &mut self,
+        runtime: &Runtime<'_>,
+    ) -> Result<(), TraversalTerminalFailure> {
+        let failures = mem::take(&mut self.terminal_observations);
+        let mut batch = mem::take(&mut self.terminal_failures)
+            .into_iter()
+            .map(|failure| TraversalItem::Failure(Box::new(failure)))
+            .collect::<Vec<_>>();
+        observation_items(failures, Tallied::Nothing).push_into(&mut batch);
+        let pending = mem::take(&mut self.pending);
+        for settled in self.ready.drain(..).chain(pending.into_values()) {
+            if let Settled::Child { item, .. } = settled {
+                terminal_errors(item, &mut batch);
+            }
+        }
+        self.cut = true;
+        let mut seen = HashSet::new();
+        batch.retain(|item| match item {
+            TraversalItem::ObservationFailure(failure) => seen.insert((
+                failure.path.clone(),
+                failure.version.clone(),
+                failure.family,
+                failure.class as u8,
+                failure.transience as u8,
+            )),
+            _ => true,
+        });
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let _ = emit(runtime, batch).await?;
+        Ok(())
+    }
+
     /// Emits every settled slot that is next in sequence, as one batch.
     pub(super) async fn flush(
         &mut self,
         runtime: &Runtime<'_>,
     ) -> Result<(), TraversalTerminalFailure> {
+        if self.cut {
+            return Ok(());
+        }
         let mut batch = Vec::with_capacity(self.ready.len());
         while let Some(settled) = self.ready.pop_front() {
             let items = match settled {
@@ -261,13 +338,40 @@ impl Output {
     }
 }
 
+pub(super) fn terminal_errors(item: ChildItem, batch: &mut Vec<TraversalItem>) {
+    match item {
+        ChildItem::Item(TraversalItem::Entry(entry)) => {
+            observation_items(observation_failures(&entry), Tallied::Nothing).push_into(batch);
+        }
+        ChildItem::Item(
+            item @ (TraversalItem::Failure(_) | TraversalItem::ObservationFailure(_)),
+        ) => {
+            batch.push(item);
+        }
+        ChildItem::Filtered(failures) | ChildItem::ObservationFailures(failures) => {
+            observation_items(failures, Tallied::Nothing).push_into(batch);
+        }
+        ChildItem::ObservedFailure {
+            failure,
+            observations,
+        } => {
+            observation_items(observations, Tallied::One(TraversalItem::Failure(failure)))
+                .push_into(batch);
+        }
+        ChildItem::Vanished(observations) => {
+            observation_items(observations, Tallied::Nothing).push_into(batch);
+        }
+        ChildItem::Item(TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_)) => {}
+    }
+}
+
 /// What one child's tally hands the session, in order: nothing (a child the filter kept out, or
-/// one that vanished), its item, or the segments of a key's history longer than one entry
-/// carries (P7 Q8) — which the caller delivers together, in one batch.
+/// one that vanished), its item, or supplementary observation failures and history segments
+/// (P7 Q8), which the caller delivers together in one batch.
 pub(super) enum Tallied {
     Nothing,
     One(TraversalItem),
-    Segments(Vec<TraversalItem>),
+    Many(Vec<TraversalItem>),
 }
 
 impl Tallied {
@@ -276,7 +380,7 @@ impl Tallied {
         match self {
             Self::Nothing => {}
             Self::One(item) => batch.push(item),
-            Self::Segments(items) => batch.extend(items),
+            Self::Many(items) => batch.extend(items),
         }
     }
 }
@@ -304,19 +408,30 @@ pub(super) fn tally_child(
     }
     let item = match item {
         ChildItem::Item(item) => item,
-        ChildItem::Filtered => {
+        ChildItem::Filtered(failures) => {
             block.filtered = block.filtered.saturating_add(1);
-            return Tallied::Nothing;
+            return observation_items(failures, Tallied::Nothing);
         }
-        ChildItem::Vanished => {
+        ChildItem::ObservationFailures(failures) => {
+            return observation_items(failures, Tallied::Nothing);
+        }
+        ChildItem::ObservedFailure {
+            failure,
+            observations,
+        } => {
+            block.failed_children = block.failed_children.saturating_add(1);
+            return observation_items(observations, Tallied::One(TraversalItem::Failure(failure)));
+        }
+        ChildItem::Vanished(observations) => {
             block.vanished = block.vanished.saturating_add(1);
-            return Tallied::Nothing;
+            return observation_items(observations, Tallied::Nothing);
         }
     };
     match item {
         TraversalItem::Entry(entry) => {
             block.count_emitted(&entry);
-            return segmented(entry, segment);
+            let failures = observation_failures(&entry);
+            return observation_items(failures, segmented(entry, segment));
         }
         TraversalItem::Failure(ref failure) if failure.listing_outcome().is_none() => {
             block.failed_children = block.failed_children.saturating_add(1);
@@ -324,10 +439,71 @@ pub(super) fn tally_child(
         // Naming both rather than wildcarding makes the next variant added to `TraversalItem` a
         // compile error at this tally.
         TraversalItem::Failure(_)
+        | TraversalItem::ObservationFailure(_)
         | TraversalItem::DirectoryListed(_)
         | TraversalItem::Checkpoint(_) => {}
     }
     Tallied::One(item)
+}
+
+/// Extract once before segmenting a key; its current metadata duplicates its current record.
+pub(super) fn observation_failures(entry: &ObservedEntry) -> Vec<ObservationFailure> {
+    let mut failures = Vec::new();
+    if let Some(history) = entry.history() {
+        let path = crate::model::ObjectHistory::source_path(entry.path(), entry.kind())
+            .unwrap_or_else(|_| entry.path().clone());
+        for record in history.records() {
+            if let (Some(metadata), Some(version)) = (record.metadata(), record.source()) {
+                failures.extend(metadata_failures(&path, &version, metadata));
+            }
+        }
+        if let Some(version) = entry.source_version() {
+            for failure in metadata_failures(&path, &version, entry.metadata()) {
+                if !failures.contains(&failure) {
+                    failures.push(failure);
+                }
+            }
+        }
+    } else {
+        failures.extend(metadata_failures(
+            entry.path(),
+            &crate::model::SourceVersion::Current,
+            entry.metadata(),
+        ));
+    }
+    if let Some(marker) = entry.directory_marker_object() {
+        failures.extend(observation_failures(marker));
+    }
+    failures
+}
+
+pub(super) fn metadata_failures(
+    path: &StoragePath,
+    version: &crate::model::SourceVersion,
+    metadata: &crate::model::MetadataObservations,
+) -> Vec<ObservationFailure> {
+    metadata
+        .failures()
+        .map(|failure| ObservationFailure {
+            path: path.clone(),
+            version: version.clone(),
+            family: failure.family,
+            class: failure.class,
+            transience: failure.transience,
+        })
+        .collect()
+}
+
+fn observation_items(failures: Vec<ObservationFailure>, item: Tallied) -> Tallied {
+    if failures.is_empty() {
+        return item;
+    }
+    let mut items = failures
+        .into_iter()
+        .map(|failure| TraversalItem::ObservationFailure(Box::new(failure)))
+        .collect::<Vec<_>>();
+    item.push_into(&mut items);
+    Tallied::Many(items)
 }
 
 /// `entry` as delivered: itself, or, when its history holds more than `segment` records, its
@@ -339,7 +515,7 @@ fn segmented(entry: Box<ObservedEntry>, segment: usize) -> Tallied {
     {
         return Tallied::One(TraversalItem::Entry(entry));
     }
-    Tallied::Segments(
+    Tallied::Many(
         entry
             .into_segments(segment)
             .into_iter()

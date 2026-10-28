@@ -31,7 +31,23 @@ async fn main() -> Result {
             }
             TraversalItem::Failure(failure) => {
                 failures += 1;
-                eprintln!("{}: {:?}", failure.path.as_str(), failure.failure);
+                eprintln!(
+                    "{}: {} — {}",
+                    failure.path.as_str(),
+                    failure.failure,
+                    failure.failure.diagnostic()
+                );
+            }
+            TraversalItem::ObservationFailure(failure) => {
+                failures += 1;
+                eprintln!(
+                    "{}: {:?} {:?} ({:?}, {:?})",
+                    failure.path,
+                    failure.version,
+                    failure.family,
+                    failure.class,
+                    failure.transience
+                );
             }
             TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_) => {}
             other => {

@@ -662,9 +662,13 @@ async fn main() -> ContractResult {
     validate_streaming_copy(&source, &destination).await?;
     if args.dialect != ContractDialect::Nfs3 {
         eprintln!("contract stage: cancellation and restart upload");
-        (source, destination) =
-            validate_cancel_and_restart(&source, &destination, &args.source, &args.destination)
-                .await?;
+        (source, destination) = Box::pin(validate_cancel_and_restart(
+            &source,
+            &destination,
+            &args.source,
+            &args.destination,
+        ))
+        .await?;
     }
     eprintln!("contract stage: durable recovery");
     validate_recovery(&source, destination, &args.destination).await?;

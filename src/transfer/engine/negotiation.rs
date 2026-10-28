@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use super::{TransferFailure, TransferPhase, TransferSide, Transferred};
 use crate::metadata::{
-    AclTarget, MetadataApplicationFailure, MetadataFamily, MetadataPlan, MetadataPlanError,
-    MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget,
-    RefusalCause, RefusalSide, TimestampTarget, TimestampTargetCapability, ValueTarget,
-    compile_copied_metadata_plan, compile_nothing_stored_plan, role_failure_text,
+    AclTarget, MetadataApplicationFailure, MetadataPlan, MetadataPlanError, MetadataPlanRequest,
+    MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget, RefusalCause, RefusalSide,
+    TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
+    compile_nothing_stored_plan, compile_unavailable_plan, role_failure_text,
 };
 use crate::model::{
     EntryKind, MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan,
@@ -58,6 +58,12 @@ impl CopiedMetadataPlan {
             .await
     }
 
+    pub(super) fn recovered_acl_report(
+        &self,
+    ) -> Option<crate::metadata::MetadataApplicationReport> {
+        self.plan.recovered_acl_report()
+    }
+
     pub(super) fn checkpoint_binding(&self) -> [u8; 32] {
         self.plan.checkpoint_binding()
     }
@@ -65,17 +71,23 @@ impl CopiedMetadataPlan {
 
 /// Bind selectors even when capabilities yielded no plan or no mutations. Domain/version also
 /// pins the ordinary copy policy, not just the values it happened to produce this attempt.
+/// ACL requests bind the automatic projection policy as v2. Requests without ACLs retain their
+/// v1 binding, including the two reserved bytes formerly used by ACL strength selectors.
 pub(super) fn checkpoint_metadata_binding(
     request: &TransferRequest,
     copied: Option<&CopiedMetadataPlan>,
 ) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"data-mover ordinary copied metadata policy v1\0");
+    hash.update(if request.copied_metadata.acl() {
+        b"data-mover ordinary copied metadata policy v2\0"
+    } else {
+        b"data-mover ordinary copied metadata policy v1\0"
+    });
     hash.update(&[
         u8::from(request.copied_metadata.acl()),
         u8::from(request.copied_metadata.xattrs()),
-        u8::from(request.copied_metadata.acl_required()),
-        u8::from(request.copied_metadata.acl_mapping()),
+        0,
+        0,
         u8::from(request.copies_tags()),
         u8::from(copied.is_some()),
     ]);
@@ -98,13 +110,27 @@ pub(super) async fn copied_metadata_plan(
         target,
     }) = metadata_roles(request)
     else {
-        return if requested.acl_required() {
-            Err(missing_acl_roles(request))
+        if !requested.acl() {
+            return Ok(None);
+        }
+        let source_missing = request
+            .source
+            .metadata()
+            .ok()
+            .is_none_or(|metadata| metadata.copied_metadata_observation_plan().is_none());
+        let reason = if source_missing {
+            RefusalCause::SourceCannotObserve
         } else {
-            Ok(None)
+            RefusalCause::DestinationCannotStore
         };
+        let policies = MetadataPolicies::default()
+            .with_acl(optional_policy(requested.acl()))
+            .with_xattrs(optional_policy(requested.xattrs()))
+            .with_tags(optional_policy(copy_tags));
+        return Ok(Some(CopiedMetadataPlan {
+            plan: compile_unavailable_plan(policies, reason),
+        }));
     };
-    validate_acl_target(requested, descriptor.kind, target.acl)?;
     // Unselected optional capabilities must not trigger source metadata I/O.
     let requested_target = CopiedMetadataTarget {
         acl: if requested.acl() {
@@ -169,6 +195,7 @@ pub(super) async fn copied_metadata_plan(
         },
         observations.mode_without_ownership,
         observations.owner_names_unmapped,
+        requested.acl() && descriptor.kind == EntryKind::File,
     )
     .map(|plan| Some(CopiedMetadataPlan { plan }))
     .map_err(TransferFailure::refused_metadata)
@@ -182,7 +209,7 @@ fn nothing_stored(requested: CopiedMetadataRequest, copy_tags: bool) -> CopiedMe
     let policies = MetadataPolicies::default()
         .with_ownership_mode(MetadataPolicy::AllowKnownLoss)
         .with_timestamps(MetadataPolicy::AllowKnownLoss)
-        .with_acl(acl_policy(requested))
+        .with_acl(optional_policy(requested.acl()))
         .with_xattrs(optional_policy(requested.xattrs()))
         .with_tags(optional_policy(copy_tags));
     CopiedMetadataPlan {
@@ -199,9 +226,8 @@ struct MetadataRoles {
     target: CopiedMetadataTarget,
 }
 
-/// Both ends' metadata roles, or `None` when an end has none. The copy then goes on without
-/// metadata and without a report — today only a non-unix Local, the one role without a copy
-/// baseline or a destination target.
+/// Both ends' metadata roles, or `None` when an end has none. An ACL request then receives
+/// an unavailable-family report; a copy without ACL continues without a metadata plan.
 fn metadata_roles(request: &TransferRequest) -> Option<MetadataRoles> {
     let source = request.source.metadata().ok()?;
     let baseline = source.copied_metadata_observation_plan()?;
@@ -290,9 +316,7 @@ fn copied_policies(
     mode_without_ownership: bool,
     timestamps_stored: bool,
 ) -> MetadataPolicies {
-    let ownership_policy = if requested.acl_required() {
-        MetadataPolicy::RequireExact
-    } else if mode_without_ownership {
+    let ownership_policy = if mode_without_ownership {
         MetadataPolicy::AllowKnownLoss
     } else {
         ownership_policy
@@ -304,66 +328,9 @@ fn copied_policies(
         } else {
             MetadataPolicy::BestEffort
         })
-        .with_acl(acl_policy(requested))
+        .with_acl(optional_policy(requested.acl()))
         .with_xattrs(optional_policy(requested.xattrs()))
         .with_tags(optional_policy(copy_tags))
-}
-
-fn missing_acl_roles(request: &TransferRequest) -> TransferFailure {
-    let source_missing = request
-        .source
-        .metadata()
-        .ok()
-        .is_none_or(|metadata| metadata.copied_metadata_observation_plan().is_none());
-    required_acl_refusal(
-        request.copied_metadata,
-        if source_missing {
-            RefusalCause::SourceCannotObserve
-        } else {
-            RefusalCause::DestinationCannotStore
-        },
-    )
-}
-
-fn validate_acl_target(
-    requested: CopiedMetadataRequest,
-    kind: EntryKind,
-    target: CopiedAclTarget,
-) -> Result<(), TransferFailure> {
-    if requested.acl_required() && target == CopiedAclTarget::Unsupported {
-        return Err(required_acl_refusal(
-            requested,
-            RefusalCause::DestinationCannotStore,
-        ));
-    }
-    if requested.acl_mapping() && kind != EntryKind::File {
-        return Err(required_acl_refusal(
-            requested,
-            RefusalCause::AclMappingRejected {
-                reason: "ACL equivalence mapping requires a regular file",
-            },
-        ));
-    }
-    Ok(())
-}
-
-fn required_acl_refusal(requested: CopiedMetadataRequest, cause: RefusalCause) -> TransferFailure {
-    TransferFailure::refused_metadata(MetadataPlanError::new(
-        MetadataFamily::Acl,
-        acl_policy(requested),
-        cause,
-    ))
-}
-
-/// Strict ACL selection is explicit and never becomes an ignored family.
-const fn acl_policy(requested: CopiedMetadataRequest) -> MetadataPolicy {
-    if requested.acl_mapping() {
-        MetadataPolicy::RequireEquivalent
-    } else if requested.acl_required() {
-        MetadataPolicy::RequireExact
-    } else {
-        optional_policy(requested.acl())
-    }
 }
 
 /// How an optional feature is planned: not asked for, it is not even read; asked for, it is
@@ -430,7 +397,7 @@ const fn observation_mode(asked: bool) -> ObservationMode {
 mod tests {
     use super::*;
     use crate::metadata::{MetadataFamily, RefusalCause};
-    use crate::model::AclEncoding;
+    use crate::model::{AclEncoding, StoragePath};
 
     /// Not asked for, a feature is not even read; asked for, the source reads it as far as it can.
     #[test]
@@ -441,9 +408,7 @@ mod tests {
         assert_eq!(optional_policy(true), MetadataPolicy::BestEffort);
     }
 
-    #[test]
-    fn acl_strength_is_bound_even_without_a_planned_mutation()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn selector_request() -> Result<TransferRequest, Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let source = crate::storage::backends::local::test_source_storage(
             root.path(),
@@ -454,23 +419,94 @@ mod tests {
             root.path(),
             "acl-selector-target",
         )?;
-        let request = TransferRequest::new(
+        Ok(TransferRequest::new(
             source,
-            crate::model::StoragePath::new("file")?,
+            StoragePath::new("file")?,
             destination,
             tokio_util::sync::CancellationToken::new(),
-        );
+        ))
+    }
+
+    fn legacy_binding(request: &TransferRequest) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"data-mover ordinary copied metadata policy v1\0");
+        hash.update(&[
+            u8::from(request.copied_metadata.acl()),
+            u8::from(request.copied_metadata.xattrs()),
+            0,
+            0,
+            u8::from(request.copies_tags()),
+            0,
+        ]);
+        *hash.finalize().as_bytes()
+    }
+
+    #[test]
+    fn automatic_acl_selection_is_distinct_and_invalidates_old_acl_checkpoints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = selector_request()?;
         let mut bindings = std::collections::HashSet::new();
         for selectors in [
             CopiedMetadataRequest::default(),
             CopiedMetadataRequest::default().with_acl(),
-            CopiedMetadataRequest::default().with_required_acl(),
-            CopiedMetadataRequest::default().with_acl_mapping(),
+            CopiedMetadataRequest::default().with_xattrs(),
+            CopiedMetadataRequest::default().with_acl().with_xattrs(),
         ] {
             let request = request.clone().with_copied_metadata(selectors);
-            bindings.insert(checkpoint_metadata_binding(&request, None));
+            let binding = checkpoint_metadata_binding(&request, None);
+            assert_eq!(binding == legacy_binding(&request), !selectors.acl());
+            bindings.insert(binding);
         }
         assert_eq!(bindings.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn acl_selection_keeps_the_existing_ownership_policy() {
+        let expected = MetadataPolicies::default()
+            .with_ownership_mode(MetadataPolicy::AllowKnownLoss)
+            .with_timestamps(MetadataPolicy::AllowKnownLoss)
+            .with_acl(MetadataPolicy::BestEffort);
+        assert_eq!(
+            copied_policies(
+                CopiedMetadataRequest::default().with_acl(),
+                false,
+                MetadataPolicy::AllowKnownLoss,
+                true,
+                true
+            ),
+            expected,
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn automatic_acl_projection_is_limited_to_regular_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("file"), b"ACL")?;
+        std::fs::create_dir(root.path().join("directory"))?;
+        let source =
+            crate::storage::backends::local::test_source_storage(root.path(), "acl-kind-source")?.0;
+        let destination = crate::storage::backends::local::test_destination_storage(
+            root.path(),
+            "acl-kind-target",
+        )?;
+        for name in ["file", "directory"] {
+            let path = StoragePath::new(name)?;
+            let descriptor = source.read_source()?.describe(&path).await?;
+            let request = TransferRequest::new(
+                source.clone(),
+                path,
+                destination.clone(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .with_copied_metadata(CopiedMetadataRequest::default().with_acl());
+            let copied = copied_metadata_plan(&request, &descriptor)
+                .await?
+                .ok_or("metadata plan missing")?;
+            assert_eq!(copied.plan.acl_copy_report().is_some(), name == "file");
+        }
         Ok(())
     }
 
@@ -571,6 +607,7 @@ mod tests {
                 principal_mapper: None,
             },
             None,
+            false,
             false,
         )?;
         assert_eq!(

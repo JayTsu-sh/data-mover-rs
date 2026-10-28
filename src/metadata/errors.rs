@@ -197,6 +197,7 @@ pub(super) const fn family_name(family: MetadataFamily) -> &'static str {
 const fn loss_text(loss: SemanticLoss) -> &'static str {
     match loss {
         SemanticLoss::AclDropped => "the ACL",
+        SemanticLoss::AclPartiallyCopied => "part of the ACL",
         SemanticLoss::XattrsDropped => "the extended attributes",
         SemanticLoss::TagsDropped => "the object tags",
         SemanticLoss::OwnershipModeDropped => "owner, group and mode",
@@ -317,7 +318,7 @@ impl fmt::Display for FamilyFailure {
 #[derive(Debug)]
 pub struct MetadataApplicationFailure {
     /// Never empty.
-    pub(super) failures: Vec<FamilyFailure>,
+    pub(super) failures: Box<[FamilyFailure]>,
     /// In a failure report `Applied` means written to the stage, not durable: the item fails and
     /// is not published, so nothing it wrote is claimed durable.
     pub(super) report: MetadataApplicationReport,

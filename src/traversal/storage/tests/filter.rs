@@ -453,7 +453,9 @@ async fn a_deferred_observation_failure_still_lists_the_directory() {
         match item {
             TraversalItem::Entry(entry) => emitted.push(entry.path().as_str().to_owned()),
             TraversalItem::Failure(failure) => failed.push((failure.scope, failure.path.as_str())),
-            TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_) => {}
+            TraversalItem::DirectoryListed(_)
+            | TraversalItem::Checkpoint(_)
+            | TraversalItem::ObservationFailure(_) => {}
         }
     }
     // The directory's own observation failed: that is its failure as a child, not its listing's.

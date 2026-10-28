@@ -371,7 +371,9 @@ async fn an_undescribable_child_is_a_failure_item_without_hiding_its_siblings() 
         match item {
             TraversalItem::Entry(entry) => entries.push(entry.path().as_str().to_owned()),
             TraversalItem::Failure(failure) => failures.push(failure.path.as_str().to_owned()),
-            TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_) => {}
+            TraversalItem::DirectoryListed(_)
+            | TraversalItem::Checkpoint(_)
+            | TraversalItem::ObservationFailure(_) => {}
         }
     }
     assert_eq!(entries, ["dir", "dir/ok"]);
@@ -492,5 +494,6 @@ mod resume_blocks;
 mod slots;
 mod streaming;
 mod streaming_bounds;
+mod terminal_errors;
 mod unordered;
 mod vanish;

@@ -8,9 +8,9 @@ pub(super) const WRITE: u32 = 2 | 4;
 pub(super) const EXECUTE: u32 = 0x20;
 pub(super) const DATA: u32 = READ | WRITE | EXECUTE;
 // READ_ATTRIBUTES | READ_ACL | SYNCHRONIZE apply to every principal in the template.
-const COMMON_METADATA_READ_PERMISSIONS: u32 = 0x80 | 0x2_0000 | 0x10_0000;
+pub(super) const COMMON_METADATA_READ_PERMISSIONS: u32 = 0x80 | 0x2_0000 | 0x10_0000;
 // WRITE_ATTRIBUTES | WRITE_ACL preserve the owner's metadata administration rights.
-const OWNER_METADATA_WRITE_PERMISSIONS: u32 = 0x100 | 0x4_0000;
+pub(super) const OWNER_METADATA_WRITE_PERMISSIONS: u32 = 0x100 | 0x4_0000;
 
 pub(super) fn map(
     source: &AclMetadata,

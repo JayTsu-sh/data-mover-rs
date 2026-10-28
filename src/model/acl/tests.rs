@@ -3,7 +3,7 @@
 use super::codec::*;
 use super::*;
 
-const OWNER: OwnershipMode = OwnershipMode {
+pub(super) const OWNER: OwnershipMode = OwnershipMode {
     uid: 42000,
     gid: 42001,
     mode: 0o640,
@@ -17,7 +17,7 @@ fn entry(tag: u32, id: u32, permissions: u32) -> PosixEntry {
     }
 }
 
-fn fixture() -> AclMetadata {
+pub(super) fn fixture() -> AclMetadata {
     encode_posix(&PosixAcl {
         access: vec![
             entry(USER_OBJ, UNDEFINED, 6),

@@ -45,6 +45,8 @@ use crate::model::{EntryOperationFailure, FailureClass, StoragePath};
 use crate::storage::DescentHint;
 use crate::traversal::{ScanFailure, TraversalTerminalFailure};
 
+mod terminal;
+
 /// Why the cursor stopped advancing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Step {
@@ -702,7 +704,7 @@ impl Cursor {
                 + frame
                     .children
                     .iter()
-                    .map(|child| child.listed.path_len())
+                    .map(super::stream::Child::path_len)
                     .sum::<usize>();
             if let Some((_, listing)) = &frame.listing {
                 sample.descend_slots += listing.slots.len();
@@ -750,7 +752,7 @@ fn listing_path_bytes(listing: &Listing) -> usize {
             batch
                 .children
                 .iter()
-                .map(|child| child.listed.path_len())
+                .map(super::stream::Child::path_len)
                 .chain(
                     batch
                         .failures

@@ -1,4 +1,4 @@
-//! The current entry snapshot format, byte for byte (P7 §10.4): four v9 golden fixtures under
+//! The current entry snapshot format, byte for byte (P7 §10.4): four v10 golden fixtures under
 //! `tests/data/snapshot/` — a plain NFS file, an S3 key's whole history (versions, delete markers,
 //! the `"null"` version, an inferred order) and a later, incomplete segment whose records carry
 //! metadata, and a directory carrying a current marker object with metadata. Any change to the
@@ -15,10 +15,10 @@ use crate::model::{
     ObjectTag, RecordKind, TimePrecision, TimestampMetadata, VersionRecord,
 };
 
-const NFS_FILE: &str = include_str!("../../tests/data/snapshot/v9-nfs-file.hex");
-const S3_HISTORY: &str = include_str!("../../tests/data/snapshot/v9-s3-history.hex");
-const S3_SEGMENT: &str = include_str!("../../tests/data/snapshot/v9-s3-history-segment.hex");
-const S3_MARKER: &str = include_str!("../../tests/data/snapshot/v9-s3-directory-marker.hex");
+const NFS_FILE: &str = include_str!("../../tests/data/snapshot/v10-nfs-file.hex");
+const S3_HISTORY: &str = include_str!("../../tests/data/snapshot/v10-s3-history.hex");
+const S3_SEGMENT: &str = include_str!("../../tests/data/snapshot/v10-s3-history-segment.hex");
+const S3_MARKER: &str = include_str!("../../tests/data/snapshot/v10-s3-directory-marker.hex");
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut hex, byte| {
@@ -148,11 +148,11 @@ fn s3_segment() -> ObservedEntry {
 
 fn fixtures() -> [(&'static str, ObservedEntry, &'static str); 4] {
     [
-        ("v9-nfs-file", nfs_file(), NFS_FILE),
-        ("v9-s3-history", s3_history(), S3_HISTORY),
-        ("v9-s3-history-segment", s3_segment(), S3_SEGMENT),
+        ("v10-nfs-file", nfs_file(), NFS_FILE),
+        ("v10-s3-history", s3_history(), S3_HISTORY),
+        ("v10-s3-history-segment", s3_segment(), S3_SEGMENT),
         (
-            "v9-s3-directory-marker",
+            "v10-s3-directory-marker",
             super::directory_marker_tests::directory_marker_fixture(),
             S3_MARKER,
         ),
@@ -188,9 +188,9 @@ fn the_current_format_is_pinned_byte_for_byte() {
 
 #[test]
 fn another_version_byte_is_unsupported_never_misread() {
-    assert_eq!(VERSION, 9);
+    assert_eq!(VERSION, 10);
     for (name, entry, golden) in fixtures() {
-        for version in [4, 5, 6, 7, 8, 10, 0, u8::MAX] {
+        for version in [4, 5, 6, 7, 8, 9, 11, 0, u8::MAX] {
             let mut bytes = unhex(golden);
             bytes[4] = version;
             assert_eq!(

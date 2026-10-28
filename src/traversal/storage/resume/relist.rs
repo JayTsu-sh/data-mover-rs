@@ -7,10 +7,10 @@
 //! subdirectory whose decision waits for an observation that needs I/O is observed here, one at a
 //! time (a one-off cost of a resume, and only with a filter that needs `modified`).
 //!
-//! Its block was delivered before the checkpoint, so none of it is delivered again, and nothing
-//! is counted but a listing that failed or found the directory gone: a failure is reported as the
-//! directory's [`FailureScope::Listing`](crate::traversal::FailureScope::Listing) failure (its
-//! subtree takes no part in deletion), and a directory that is gone has nothing left below it.
+//! Its block was delivered before the checkpoint, so successful children are not delivered again.
+//! Newly encountered child and listing failures are reported and counted; a listing failure
+//! excludes the directory's subtree from deletion. A directory found gone has nothing left below
+//! it. Session failures still end the traversal, even when the child has no descent slot.
 
 use futures::StreamExt as _;
 
@@ -18,31 +18,29 @@ use super::descent_name;
 use crate::model::FailureClass;
 use crate::storage::{DescentHint, ListRequest, ListingPage};
 use crate::traversal::storage::observe::{Listed, observe};
+use crate::traversal::storage::output::{ChildItem, observation_failures};
 use crate::traversal::storage::stream::{self, Arrival, Child, Page, Slot};
 use crate::traversal::storage::{DirectoryWork, Resolved, Shared, resolve};
-use crate::traversal::{ScanFailure, TraversalTerminalFailure};
+use crate::traversal::{ObservationFailure, ScanFailure, TraversalItem, TraversalTerminalFailure};
 
 /// What listing one ancestor again found.
 #[derive(Default)]
 pub(crate) struct Relisted {
     /// Subdirectories still to descend into, in descent order.
     pub(crate) works: Vec<DirectoryWork>,
-    /// The listing stopped: the directory's own failure.
-    pub(crate) failure: Option<ScanFailure>,
+    /// Newly encountered child failures, followed by the directory's own listing failure.
+    pub(crate) failures: Vec<ScanFailure>,
+    /// Metadata errors do not replace an entry or affect child/deletion accounting.
+    pub(crate) observation_failures: Vec<ObservationFailure>,
     /// The directory was gone before its listing returned anything.
     pub(crate) vanished: bool,
+    /// Stops the session after failures already encountered here have been delivered.
+    pub(crate) terminal: Option<TraversalTerminalFailure>,
 }
 
 /// Lists `work` again and keeps its subdirectories named after `after`. A cancelled traversal
 /// returns what it had; the caller notices the cancellation.
-///
-/// # Errors
-/// A session failure, which ends the traversal.
-pub(crate) async fn remaining(
-    shared: &Shared,
-    work: &DirectoryWork,
-    after: &str,
-) -> Result<Relisted, TraversalTerminalFailure> {
+pub(crate) async fn remaining(shared: &Shared, work: &DirectoryWork, after: &str) -> Relisted {
     let request = ListRequest::new(work.path.clone(), shared.request.cancel.clone())
         .with_descent_hint(work.hint.clone());
     let mut stream = shared
@@ -54,21 +52,24 @@ pub(crate) async fn remaining(
         if shared.request.cancel.is_cancelled() {
             break;
         }
-        match item {
-            Ok(page) => {
-                listed = listed.saturating_add(
-                    keep_page(shared, work, page, after, &mut relisted.works).await?,
-                );
-            }
-            Err(failure) => {
-                end(
-                    work,
-                    stream::failed(&work.path, failure),
-                    listed,
-                    &mut relisted,
-                )?;
-                break;
-            }
+        let ended = item.is_err();
+        let result = match item {
+            Ok(page) => keep_page(shared, work, page, after, &mut relisted)
+                .await
+                .map(|count| listed = listed.saturating_add(count)),
+            Err(failure) => end(
+                work,
+                stream::failed(&work.path, failure),
+                listed,
+                &mut relisted,
+            ),
+        };
+        if let Err(failure) = result {
+            relisted.terminal = Some(failure);
+            break;
+        }
+        if ended {
+            break;
         }
     }
     relisted
@@ -77,7 +78,7 @@ pub(crate) async fn remaining(
     relisted
         .works
         .dedup_by(|later, earlier| later.path == earlier.path);
-    Ok(relisted)
+    relisted
 }
 
 /// How the listing's failure ends the relisting.
@@ -94,7 +95,9 @@ fn end(
             relisted.vanished = true;
         }
         Arrival::Failed(failure) => {
-            relisted.failure = Some(ScanFailure::listing(work.path.clone(), failure, listed));
+            relisted
+                .failures
+                .push(ScanFailure::listing(work.path.clone(), failure, listed));
         }
         Arrival::Terminal(failure) => return Err(failure),
         Arrival::Page(_) | Arrival::End => return Err(TraversalTerminalFailure::Internal),
@@ -109,7 +112,7 @@ async fn keep_page(
     work: &DirectoryWork,
     page: ListingPage,
     after: &str,
-    works: &mut Vec<DirectoryWork>,
+    relisted: &mut Relisted,
 ) -> Result<u64, TraversalTerminalFailure> {
     let Page {
         batch,
@@ -118,9 +121,12 @@ async fn keep_page(
     } = stream::prepare(shared, work, page);
     let mut keep = |below: DirectoryWork| {
         if descent_name(&below.path) > after {
-            works.push(below);
+            relisted.works.push(below);
         }
     };
+    relisted
+        .failures
+        .extend(batch.failures.into_iter().map(ScanFailure::child));
     let mut pending = Vec::new();
     for slot in slots {
         match slot {
@@ -129,30 +135,46 @@ async fn keep_page(
         }
     }
     for child in batch.children {
-        if let Some(below) = decide_pending(shared, child, &mut pending).await? {
+        if let Some(below) = decide_pending(
+            shared,
+            child,
+            &mut pending,
+            &mut relisted.failures,
+            &mut relisted.observation_failures,
+        )
+        .await?
+        {
             keep(below);
         }
     }
     Ok(facts.listed)
 }
 
-/// The subdirectory a child whose descent waited for its observation descends into, if any,
-/// observing it now when that needs I/O. `None` for a child with no pending slot.
+/// Resolves pending descent and retains any already observed failure, including children with no
+/// pending slot. Children needed only for the previous block's output cause no additional I/O.
 async fn decide_pending(
     shared: &Shared,
     child: Child,
     pending: &mut Vec<(u64, Option<DescentHint>)>,
+    failures: &mut Vec<ScanFailure>,
+    observations: &mut Vec<ObservationFailure>,
 ) -> Result<Option<DirectoryWork>, TraversalTerminalFailure> {
-    let Child { listed, deferred } = child;
-    let Some(ticket) = deferred.and_then(|deferred| deferred.ticket) else {
-        return Ok(None);
+    let (listed, deferred) = match child {
+        Child::Observe { listed, deferred } => (listed, deferred),
+        Child::Filtered(failures) => {
+            observations.extend(failures);
+            return Ok(None);
+        }
     };
-    let Some(at) = pending.iter().position(|(known, _)| *known == ticket) else {
-        return Ok(None);
-    };
-    let (_, hint) = pending.swap_remove(at);
+    let hint = deferred
+        .and_then(|deferred| deferred.ticket)
+        .and_then(|ticket| pending.iter().position(|(known, _)| *known == ticket))
+        .map(|at| pending.swap_remove(at).1);
     let result = match listed {
+        // Ready failures have happened even without a descent slot; session failures never
+        // get a slot because they have no child's path. Do not repeat output-only I/O.
         Listed::Observed(result) => result,
+        Listed::Unobserved(_) if hint.is_none() => return Ok(None),
         Listed::Unobserved(descriptor) => {
             let plan = shared.policy.observation_plan;
             observe(
@@ -166,6 +188,39 @@ async fn decide_pending(
             .map(Box::new)
         }
     };
-    let Resolved { below, .. } = resolve(shared, result, deferred)?;
-    Ok(below.map(|below| below.with_hint(hint)))
+    if let Ok(entry) = &result {
+        observations.extend(observation_failures(entry));
+        if hint.is_none() {
+            return Ok(None);
+        }
+    }
+    let resolved = match resolve(shared, result, deferred) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            observations.extend(error.observations);
+            return Err(error.terminal);
+        }
+    };
+    let Resolved { item, below, .. } = resolved;
+    remember_failure(item, failures, observations);
+    Ok(below.map(|below| below.with_hint(hint.flatten())))
+}
+
+fn remember_failure(
+    item: ChildItem,
+    failures: &mut Vec<ScanFailure>,
+    observations: &mut Vec<ObservationFailure>,
+) {
+    match item {
+        ChildItem::Item(TraversalItem::Failure(failure)) => failures.push(*failure),
+        ChildItem::ObservedFailure {
+            failure,
+            observations: details,
+        } => {
+            failures.push(*failure);
+            observations.extend(details);
+        }
+        ChildItem::Vanished(details) => observations.extend(details),
+        _ => {}
+    }
 }

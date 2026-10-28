@@ -94,9 +94,26 @@ impl Slot {
 /// One listed child the output will show. `deferred` is set when its decision waits for an
 /// observation that needs I/O; otherwise the decision was made when the page was prepared. A
 /// child a decision made then hides never becomes one: it is only counted.
-pub(super) struct Child {
-    pub(super) listed: Listed,
-    pub(super) deferred: Option<Deferred>,
+pub(super) enum Child {
+    Observe {
+        listed: Listed,
+        deferred: Option<Deferred>,
+    },
+    /// Its decision was counted in page facts, but its diagnostics retain this child's place.
+    Filtered(Vec<crate::traversal::ObservationFailure>),
+}
+
+impl Child {
+    #[cfg(test)]
+    pub(super) fn path_len(&self) -> usize {
+        match self {
+            Self::Observe { listed, .. } => listed.path_len(),
+            Self::Filtered(failures) => failures
+                .iter()
+                .map(|failure| failure.path.as_str().len())
+                .sum(),
+        }
+    }
 }
 
 /// What of one page the cursor admits, in this order: the children the listing could not
@@ -295,14 +312,18 @@ fn prepare_child(
 ) {
     let kind = descriptor.kind;
     let plan = shared.policy.observation_plan;
-    if let Some(decision) = immediate_decision(shared, work, &descriptor) {
+    if let Some((decision, metadata)) = immediate_decision(shared, work, &descriptor) {
         let path = &descriptor.path;
         page.tally(shared, kind, path, work.child_depth, decision, hint);
         if decision.emit {
             let listed = observe_listed(shared.metadata.as_ref(), descriptor, plan);
             page.keep(listed, None);
         } else {
-            page.hide();
+            page.hide_with_failures(super::output::metadata_failures(
+                &descriptor.path,
+                descriptor.version(),
+                &metadata,
+            ));
         }
         return;
     }
@@ -317,7 +338,7 @@ fn prepare_child(
     if decision.emit {
         page.keep(listed, None);
     } else {
-        page.hide();
+        page.hide_with_failures(super::output::observation_failures(entry));
     }
 }
 
@@ -326,20 +347,31 @@ fn listed_path(listed: &Listed) -> Option<&StoragePath> {
     match listed {
         Listed::Unobserved(descriptor) => Some(&descriptor.path),
         Listed::Observed(Ok(entry)) => Some(entry.path()),
-        Listed::Observed(Err(StorageRoleFailure::Entry(failure))) => Some(failure.path()),
-        Listed::Observed(Err(StorageRoleFailure::Session(_))) => None,
+        Listed::Observed(Err(error)) => match &error.failure {
+            StorageRoleFailure::Entry(failure) => Some(failure.path()),
+            StorageRoleFailure::Session(_) => None,
+        },
     }
 }
 
 impl Page {
     /// Files a child the output will show.
     fn keep(&mut self, listed: Listed, deferred: Option<Deferred>) {
-        self.batch.children.push_back(Child { listed, deferred });
+        self.batch
+            .children
+            .push_back(Child::Observe { listed, deferred });
     }
 
     /// Counts a child a decision made here keeps out of the output.
     const fn hide(&mut self) {
         self.facts.filtered = self.facts.filtered.saturating_add(1);
+    }
+
+    fn hide_with_failures(&mut self, failures: Vec<crate::traversal::ObservationFailure>) {
+        self.hide();
+        if !failures.is_empty() {
+            self.batch.children.push_back(Child::Filtered(failures));
+        }
     }
 
     /// Files a child whose decision waits for its observation, and, when it is a directory the

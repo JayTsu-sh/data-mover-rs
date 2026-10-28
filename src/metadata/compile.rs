@@ -17,8 +17,9 @@ pub(crate) fn compile_copied_metadata_plan(
     request: &MetadataPlanRequest<'_>,
     mode_without_ownership: Option<u32>,
     owner_names_unmapped: bool,
+    auto_acl_mapping: bool,
 ) -> Result<MetadataPlan, MetadataPlanError> {
-    let mut plan = compile_copied_observations(request, mode_without_ownership.is_some())?;
+    let mut plan = compile_copied_observations(request, mode_without_ownership, auto_acl_mapping)?;
     if let Some(mode) = mode_without_ownership
         .filter(|_| request.policies.get(MetadataFamily::OwnershipMode) != MetadataPolicy::Omit)
     {
@@ -60,11 +61,21 @@ pub(crate) fn compile_copied_metadata_plan(
 pub fn compile_metadata_plan(
     request: &MetadataPlanRequest<'_>,
 ) -> Result<MetadataPlan, MetadataPlanError> {
+    compile_metadata_plan_inner(request, false, None)
+}
+
+fn compile_metadata_plan_inner(
+    request: &MetadataPlanRequest<'_>,
+    auto_acl_mapping: bool,
+    mode_hint: Option<u32>,
+) -> Result<MetadataPlan, MetadataPlanError> {
     let mut plan = MetadataPlan {
         mappings: Vec::with_capacity(5),
         mutations: Vec::with_capacity(5),
         losses: LossReport::default(),
         skipped: Vec::new(),
+        acl_copy: None,
+        acl_source_binding: None,
     };
     // Ownership first, and mode with it: writing permission bits recomputes the ACL — the POSIX
     // mask entry, and on most NFSv4 servers (ONTAP among them) the whole ACL. Compiling the ACL
@@ -72,7 +83,7 @@ pub fn compile_metadata_plan(
     // the copied ACL would be silently overwritten by the mode that follows it and the report
     // would still say it was applied.
     compile_ownership(request, &mut plan)?;
-    compile_acl(request, &mut plan)?;
+    compile_acl(request, &mut plan, auto_acl_mapping, mode_hint)?;
     compile_value(
         MetadataFamily::Xattrs,
         request.observations.xattrs(),
@@ -102,7 +113,8 @@ const fn mode_only(mode: u32) -> u32 {
 
 fn compile_copied_observations(
     request: &MetadataPlanRequest<'_>,
-    omit_ownership: bool,
+    mode_without_ownership: Option<u32>,
+    auto_acl_mapping: bool,
 ) -> Result<MetadataPlan, MetadataPlanError> {
     // A copy never fetches object tags that its destination cannot store. Keep that known
     // destination refusal distinct from a source that was simply not observed.
@@ -116,14 +128,15 @@ fn compile_copied_observations(
     let projected = MetadataPlanRequest {
         observations: request.observations,
         target: request.target,
-        policies: if omit_ownership {
+        policies: if mode_without_ownership.is_some() {
             policies.with_ownership_mode(MetadataPolicy::Omit)
         } else {
             policies
         },
         principal_mapper: request.principal_mapper,
     };
-    let mut plan = compile_metadata_plan(&projected)?;
+    let mut plan =
+        compile_metadata_plan_inner(&projected, auto_acl_mapping, mode_without_ownership)?;
     if tags_unstored {
         plan.mappings
             .retain(|mapping| mapping.family != MetadataFamily::Tags);
@@ -144,11 +157,20 @@ fn compile_copied_observations(
 /// its strength: what a destination cannot store at all is not the copy's to refuse. The reason
 /// is always the destination's, even where the source could not have read the family either.
 pub(crate) fn compile_nothing_stored_plan(policies: MetadataPolicies) -> MetadataPlan {
+    compile_unavailable_plan(policies, RefusalCause::DestinationCannotStore)
+}
+
+pub(crate) fn compile_unavailable_plan(
+    policies: MetadataPolicies,
+    reason: RefusalCause,
+) -> MetadataPlan {
     let mut plan = MetadataPlan {
         mappings: Vec::with_capacity(5),
         mutations: Vec::new(),
         losses: LossReport::default(),
         skipped: Vec::new(),
+        acl_copy: None,
+        acl_source_binding: None,
     };
     for family in [
         MetadataFamily::OwnershipMode,
@@ -168,10 +190,7 @@ pub(crate) fn compile_nothing_stored_plan(policies: MetadataPolicies) -> Metadat
             family,
             decision: MappingDecision::Unsupported,
         });
-        plan.skipped.push(SkippedFamily {
-            family,
-            reason: RefusalCause::DestinationCannotStore,
-        });
+        plan.skipped.push(SkippedFamily { family, reason });
     }
     plan
 }
@@ -179,11 +198,13 @@ pub(crate) fn compile_nothing_stored_plan(policies: MetadataPolicies) -> Metadat
 fn compile_acl(
     request: &MetadataPlanRequest<'_>,
     plan: &mut MetadataPlan,
+    auto_acl_mapping: bool,
+    mode_hint: Option<u32>,
 ) -> Result<(), MetadataPlanError> {
     let family = MetadataFamily::Acl;
     let policy = request.policies.get(family);
-    if policy == MetadataPolicy::RequireEquivalent {
-        return acl_mapping::compile(request, plan);
+    if auto_acl_mapping && policy != MetadataPolicy::Omit {
+        return acl_mapping::compile(request, plan, mode_hint);
     }
     if policy == MetadataPolicy::RequireExact
         && matches!(
@@ -337,10 +358,7 @@ fn carry_mode_only(
     mode: u32,
 ) -> Result<(), MetadataPlanError> {
     let family = MetadataFamily::OwnershipMode;
-    if matches!(
-        policy,
-        MetadataPolicy::RequireExact | MetadataPolicy::RequireEquivalent
-    ) {
+    if matches!(policy, MetadataPolicy::RequireExact) {
         return Err(MetadataPlanError::new(
             family,
             policy,
@@ -428,10 +446,7 @@ fn compile_timestamps(
         exact(plan, family, MetadataMutation::Timestamps(mapped));
         return Ok(());
     }
-    if matches!(
-        policy,
-        MetadataPolicy::RequireExact | MetadataPolicy::RequireEquivalent
-    ) {
+    if matches!(policy, MetadataPolicy::RequireExact) {
         return Err(MetadataPlanError::new(
             family,
             policy,
@@ -571,13 +586,11 @@ fn drop_with_losses(
             });
             Ok(())
         }
-        MetadataPolicy::RequireExact | MetadataPolicy::RequireEquivalent | MetadataPolicy::Omit => {
-            Err(MetadataPlanError::new(
-                family,
-                policy,
-                RefusalCause::LossRejected(losses[0]),
-            ))
-        }
+        MetadataPolicy::RequireExact | MetadataPolicy::Omit => Err(MetadataPlanError::new(
+            family,
+            policy,
+            RefusalCause::LossRejected(losses[0]),
+        )),
     }
 }
 

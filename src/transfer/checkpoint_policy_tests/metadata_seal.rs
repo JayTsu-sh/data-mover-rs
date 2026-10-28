@@ -153,6 +153,14 @@ fn s3_request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
 }
 
 async fn leave_s3_final(protocol: &Arc<MemoryS3>, tags: &[ObjectTag]) -> TestResult<String> {
+    leave_s3_final_requested(protocol, tags, s3_request(protocol)?).await
+}
+
+async fn leave_s3_final_requested(
+    protocol: &Arc<MemoryS3>,
+    tags: &[ObjectTag],
+    request: TransferRequest,
+) -> TestResult<String> {
     seed_multipart_source(protocol).await?;
     let descriptor = s3_source_descriptor(protocol).await?;
     protocol
@@ -168,7 +176,7 @@ async fn leave_s3_final(protocol: &Arc<MemoryS3>, tags: &[ObjectTag]) -> TestRes
             "retain publication root",
         ),
     ));
-    let failure = transfer(s3_request(protocol)?)
+    let failure = transfer(request)
         .await
         .err()
         .ok_or("checkpoint release must fail after publication")?;
@@ -235,7 +243,7 @@ async fn changed_source_tags_with_unchanged_payload_cannot_adopt_the_previous_fi
 {
     let protocol = Arc::new(MemoryS3::default());
     let old_tags = vec![ObjectTag::new("generation", "old")?];
-    let pointer = leave_s3_final(&protocol, &old_tags).await?;
+    let pointer = Box::pin(leave_s3_final(&protocol, &old_tags)).await?;
     let descriptor = s3_source_descriptor(&protocol).await?;
     let new_tags = vec![ObjectTag::new("generation", "new")?];
     change_tags_without_changing_payload(&protocol, &new_tags).await?;
@@ -311,7 +319,7 @@ async fn recovered_final_validates_tags_without_reapplying_them() -> TestResult 
         ObjectTag::new("first", "one")?,
         ObjectTag::new("second", "two")?,
     ];
-    let pointer = leave_s3_final(&protocol, &tags).await?;
+    let pointer = Box::pin(leave_s3_final(&protocol, &tags)).await?;
     let published_version = protocol
         .head("file")
         .await
@@ -386,4 +394,65 @@ async fn reject_changed_s3_metadata(protocol: &Arc<MemoryS3>) -> TestResult {
     assert!(failure.has_pending_cleanup());
     assert_eq!(failure.source_qos().source_read_operations, 0);
     Ok(())
+}
+
+#[tokio::test]
+async fn recovered_transfer_reports_acl_skip_and_checkpoint_mutations_without_replaying_writes()
+-> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    let tags = vec![ObjectTag::new("retained", "after-recovery")?];
+    let request =
+        s3_request(&protocol)?.with_copied_metadata(CopiedMetadataRequest::default().with_acl());
+    let pointer = leave_s3_final_requested(&protocol, &tags, request.clone()).await?;
+    *protocol.delete_failure.lock().await = None;
+    *protocol.tag_write_failure.lock().await = Some(S3ProtocolFailure::session(
+        FailureClass::Unsupported,
+        Transience::Permanent,
+        "recovered transfer must not replay tag writes",
+    ));
+    let copies_before = *protocol.native_copies.lock().await;
+    let qos = crate::runtime::qos::SourceQosGroup::new(crate::runtime::qos::SourceQosPolicy::new(
+        None,
+        CHUNK as u64,
+        None,
+    )?);
+    let outcome = transfer(request.with_source_qos(qos)).await?;
+    let report = outcome.metadata.ok_or("recovered ACL report missing")?;
+    assert_recovered_acl_skip(&report);
+    assert_eq!(*protocol.native_copies.lock().await, copies_before);
+    assert_eq!(outcome.source_qos.source_read_operations, 0);
+    assert_eq!(
+        protocol
+            .get_tags("file", None)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        tags
+    );
+    assert!(!protocol.objects.lock().await.contains_key(&pointer));
+    Ok(())
+}
+
+fn assert_recovered_acl_skip(report: &crate::metadata::MetadataApplicationReport) {
+    use crate::metadata::{ApplicationOutcome, MetadataFamily, RefusalCause};
+    assert!(
+        report
+            .skipped()
+            .iter()
+            .any(|item| item.family == MetadataFamily::Acl
+                && item.reason == RefusalCause::DestinationCannotStore)
+    );
+    assert!(
+        report
+            .outcomes()
+            .iter()
+            .any(|item| item.family == MetadataFamily::Acl
+                && item.outcome == ApplicationOutcome::Unsupported)
+    );
+    assert!(
+        report
+            .outcomes()
+            .iter()
+            .any(|item| item.family == MetadataFamily::Tags
+                && item.outcome == ApplicationOutcome::RecoveredFromCheckpoint)
+    );
 }

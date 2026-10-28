@@ -396,7 +396,7 @@ async fn an_observation_failing_in_the_listing_task_still_lists_the_directory_in
             TraversalItem::Entry(entry) => entries.push(entry.path().as_str().to_owned()),
             TraversalItem::Failure(failure) => failures.push(failure.path.as_str().to_owned()),
             TraversalItem::DirectoryListed(done) => listed.push(done.path.as_str().to_owned()),
-            TraversalItem::Checkpoint(_) => {}
+            TraversalItem::Checkpoint(_) | TraversalItem::ObservationFailure(_) => {}
         }
     }
     assert!(matches!(

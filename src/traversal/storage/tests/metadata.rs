@@ -46,6 +46,7 @@ enum Reply {
     Value,
     Unsupported,
     Failed,
+    CallFailed,
 }
 
 struct Observed {
@@ -64,9 +65,15 @@ impl Metadata for Observed {
 
     async fn observe(
         &self,
-        _path: &StoragePath,
+        path: &StoragePath,
         plan: ObservationPlan,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
+        if matches!(self.reply, Reply::CallFailed) {
+            return Err(StorageRoleFailure::Entry(entry_failure(
+                path,
+                FailureClass::PermissionDenied,
+            )));
+        }
         if let Some(decided) = &self.decided {
             assert_eq!(decided.load(Ordering::SeqCst), 1);
         }
@@ -82,6 +89,7 @@ impl Metadata for Observed {
                     provenance: MetadataProvenance::AdditionalCall,
                 },
                 Reply::Unsupported => MetadataObservation::Unsupported,
+                Reply::CallFailed => unreachable!("failed before observing individual families"),
                 Reply::Failed => MetadataObservation::Failed {
                     class: FailureClass::PermissionDenied,
                     transience: Transience::Permanent,
@@ -420,6 +428,7 @@ async fn additional_dependencies_are_observed_once_and_their_states_reach_the_fi
                 Reply::Value => "Value",
                 Reply::Failed => "Failed",
                 Reply::Unsupported => "Unsupported",
+                Reply::CallFailed => unreachable!("this matrix uses family replies"),
             };
             assert!(
                 filter
@@ -542,3 +551,5 @@ async fn a_required_dependency_failure_on_a_directory_still_visits_its_subtree()
         assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
     }
 }
+
+mod observation_failures;

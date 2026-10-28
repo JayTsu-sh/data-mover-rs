@@ -22,8 +22,8 @@ use futures::{FutureExt as _, StreamExt as _};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use super::super::observe::Listed;
-use super::super::output::{ChildItem, count_listing, tally_child};
+use super::super::observe::{Listed, ObservationError};
+use super::super::output::{ChildItem, count_listing, tally_child, terminal_errors};
 use super::super::stream::{self, Arrival, Batch, Child, Page, Slot};
 use super::super::{Deferred, DirectoryWork, Resolved, Shared, resolve};
 use super::page_io::{self, Job};
@@ -32,7 +32,8 @@ use crate::model::{FailureClass, ObservedEntry};
 use crate::storage::{DescentHint, ListRequest, ListingPage, ListingStream, StorageRoleFailure};
 use crate::traversal::channel::ItemSender;
 use crate::traversal::{
-    BlockCounts, ScanFailure, ScanTotals, TraversalItem, TraversalTerminalFailure,
+    BlockCounts, ObservationFailure, ScanFailure, ScanTotals, TraversalItem,
+    TraversalTerminalFailure,
 };
 
 /// How one directory's processing ended.
@@ -173,10 +174,11 @@ impl Worker {
             let segment = self.shared.probe.history_segment();
             tally_child(&mut self.block, item, None, segment).push_into(&mut batch);
         }
-        self.settle(settled, hints, &mut batch, &mut below)?;
+        let settled = self.settle(settled, hints, &mut batch, &mut below);
         if !self.send(batch).await? {
             return Ok(false);
         }
+        settled?;
         // Only now: the entries of these directories are in the session.
         self.pool.push(self.me, below);
         self.checkpoint_if_due().await;
@@ -211,12 +213,42 @@ impl Worker {
         batch: &mut Vec<TraversalItem>,
         below: &mut Vec<DirectoryWork>,
     ) -> Result<(), TraversalTerminalFailure> {
-        for (result, deferred) in settled {
+        let mut settled = settled.into_iter();
+        while let Some(child) = settled.next() {
+            let (result, deferred) = match child {
+                Settled::Observed(result, deferred) => (result, deferred),
+                Settled::Filtered(failures) => {
+                    tally_child(
+                        &mut self.block,
+                        ChildItem::ObservationFailures(failures),
+                        None,
+                        self.shared.probe.history_segment(),
+                    )
+                    .push_into(batch);
+                    continue;
+                }
+                Settled::Pending(_) => return Err(TraversalTerminalFailure::Internal),
+            };
+            let resolved = match resolve(&self.shared, result, deferred) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    batch.extend(
+                        error
+                            .observations
+                            .into_iter()
+                            .map(|failure| TraversalItem::ObservationFailure(Box::new(failure))),
+                    );
+                    for known in settled {
+                        known.terminal_errors(&self.shared, batch);
+                    }
+                    return Err(error.terminal);
+                }
+            };
             let Resolved {
                 item,
                 descent,
                 below: descend,
-            } = resolve(&self.shared, result, deferred)?;
+            } = resolved;
             if let Some(descend) = descend {
                 let hint = deferred
                     .and_then(|deferred| deferred.ticket)
@@ -237,11 +269,18 @@ impl Worker {
     ) -> Result<Option<Vec<Settled>>, TraversalTerminalFailure> {
         let mut settled = Vec::new();
         let mut jobs: Vec<Job> = Vec::new();
-        for (place, Child { listed, deferred }) in children.into_iter().enumerate() {
-            match listed {
-                Listed::Observed(result) => settled.push((Some(result), deferred)),
-                Listed::Unobserved(descriptor) => {
-                    settled.push((None, deferred));
+        for (place, child) in children.into_iter().enumerate() {
+            match child {
+                Child::Filtered(failures) => settled.push(Settled::Filtered(failures)),
+                Child::Observe {
+                    listed: Listed::Observed(result),
+                    deferred,
+                } => settled.push(Settled::Observed(result, deferred)),
+                Child::Observe {
+                    listed: Listed::Unobserved(descriptor),
+                    deferred,
+                } => {
+                    settled.push(Settled::Pending(deferred));
                     jobs.push((place, descriptor));
                 }
             }
@@ -260,20 +299,16 @@ impl Worker {
                 };
             }
             for (place, result) in done {
-                if let Some(slot) = settled.get_mut(place) {
-                    slot.0 = Some(result);
-                }
+                let Some(slot) = settled.get_mut(place) else {
+                    return Err(TraversalTerminalFailure::Internal);
+                };
+                let Settled::Pending(deferred) = slot else {
+                    return Err(TraversalTerminalFailure::Internal);
+                };
+                *slot = Settled::Observed(result, *deferred);
             }
         }
-        settled
-            .into_iter()
-            .map(|(result, deferred)| {
-                result
-                    .map(|result| (result, deferred))
-                    .ok_or(TraversalTerminalFailure::Internal)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
+        Ok(Some(settled))
     }
 
     /// Ends the listing: hands over its failure, when it failed. A subdirectory gone before its
@@ -337,10 +372,38 @@ impl Worker {
 }
 
 /// One child's observation and the deferred decision it settles, if any.
-type Settled = (
-    Result<Box<ObservedEntry>, StorageRoleFailure>,
-    Option<Deferred>,
-);
+enum Settled {
+    Observed(
+        Result<Box<ObservedEntry>, ObservationError>,
+        Option<Deferred>,
+    ),
+    Filtered(Vec<ObservationFailure>),
+    Pending(Option<Deferred>),
+}
+
+impl Settled {
+    /// Every observation in this page has finished. Keep known errors after a fatal sibling,
+    /// without running another filter decision or delivering its entry.
+    fn terminal_errors(self, shared: &Shared, batch: &mut Vec<TraversalItem>) {
+        let result = match self {
+            Self::Observed(result, _) => result,
+            Self::Filtered(failures) => {
+                terminal_errors(ChildItem::ObservationFailures(failures), batch);
+                return;
+            }
+            Self::Pending(_) => return,
+        };
+        match resolve(shared, result, None) {
+            Ok(resolved) => terminal_errors(resolved.item, batch),
+            Err(error) => batch.extend(
+                error
+                    .observations
+                    .into_iter()
+                    .map(|failure| TraversalItem::ObservationFailure(Box::new(failure))),
+            ),
+        }
+    }
+}
 
 /// The subdirectories a page decided to descend into, and the hints of the ones whose decision
 /// waited for an observation, by ticket.

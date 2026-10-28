@@ -16,8 +16,8 @@ mod source_version;
 pub use history::{HistoryOrder, MAX_HISTORY_RECORDS, ObjectHistory, RecordKind, VersionRecord};
 pub use metadata_observation::{
     AclEncoding, AclMetadata, ExtendedAttribute, MappedOwnership, MetadataObservation,
-    MetadataObservations, MetadataProvenance, ObjectTag, ObservationMode, ObservationPlan,
-    OwnershipMode, TimestampMetadata,
+    MetadataObservationFailure, MetadataObservations, MetadataProvenance, ObjectTag,
+    ObservationMode, ObservationPlan, OwnershipMode, TimestampMetadata,
 };
 pub use metadata_requirements::{
     MetadataCapabilities, MetadataFamily, MetadataRequirements, ObservationSupport,

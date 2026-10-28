@@ -23,7 +23,8 @@ pub use checkpoint::{Resumable, ResumeRefusal};
 pub use configuration::TraversalConfigurationError;
 pub use counts::{BlockCounts, ScanTotals};
 pub use events::{
-    Checkpoint, DirectoryListed, FailureScope, ListingOutcome, ScanFailure, TraversalItem,
+    Checkpoint, DirectoryListed, FailureScope, ListingOutcome, ObservationFailure, ScanFailure,
+    TraversalItem,
 };
 pub use storage::StorageTraversalSource;
 #[cfg(test)]

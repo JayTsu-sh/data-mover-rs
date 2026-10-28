@@ -75,6 +75,7 @@ fn a_source_without_an_owner_keeps_its_own_loss() {
         },
         Some(0o100_640),
         false,
+        false,
     )
     .unwrap();
     assert_eq!(
