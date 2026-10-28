@@ -286,6 +286,7 @@ async fn compare_content(args: &Args) -> Result<Value> {
                 .as_deref()
                 .ok_or("--destination-path")?,
         )?,
+        plan: data_mover::integrity::IntegrityPlan::default(),
         options: IntegrityOptions {
             mode: IntegrityMode::Content,
             ..IntegrityOptions::default()

@@ -54,18 +54,34 @@ check_path() {
     --mode "$mode"
 }
 
+check_input() {
+  local input="$1"
+  local source_backend="$2"
+  local destination_backend="$3"
+  local key="$4"
+  local expected="$5"
+  shift 5
+  cargo run --quiet --locked --example integrity_input_probe -- \
+    --source "$(storage_url source "$source_backend")" \
+    --destination "$(storage_url destination "$destination_backend")" \
+    --key "$key" \
+    --input "$input" \
+    --expected "$expected" \
+    "$@"
+}
+
 check_path_with_mtime_options() {
   local source_backend="$1"
   local destination_backend="$2"
   local key="$3"
-  local tolerance_ms="$4"
+  local tolerance_ns="$4"
   shift 4
   cargo run --quiet --locked --example storage_integrity_check -- \
     --source "$(storage_url source "$source_backend")" \
     --destination "$(storage_url destination "$destination_backend")" \
     --path "$key" \
     --mode quick \
-    --mtime-tolerance-ms "$tolerance_ms" \
+    --mtime-tolerance-ns "$tolerance_ns" \
     "$@"
 }
 
@@ -194,6 +210,7 @@ for source_backend in "${backends[@]}"; do
   for destination_backend in "${backends[@]}"; do
     key="${source_backend}-to-${destination_backend}.txt"
     check_path "$source_backend" "$destination_backend" "$key"
+    check_input observed "$source_backend" "$destination_backend" "$key" match
   done
 done
 
@@ -258,8 +275,8 @@ for backend in "${nas_backends[@]}"; do
     "$backend" "$backend" "$type_key" quick
 done
 
-# Timestamp comparison remains exact by default. Explicit options can accept a
-# bounded clock/precision difference without weakening existing callers.
+# The example uses exact timestamp precision with zero default tolerance.
+# Explicit options can accept a larger bounded clock/precision difference.
 mtime_key="integrity-mtime-options-local.bin"
 printf 'mtime-options' > "$local_root/source/$mtime_key"
 cp "$local_root/source/$mtime_key" "$local_root/destination/$mtime_key"
@@ -267,13 +284,24 @@ touch -m -d '@1700000400.000000000' "$local_root/source/$mtime_key"
 touch -m -d '@1700000400.005000000' "$local_root/destination/$mtime_key"
 expect_mismatch 'Modified.*source:.*destination:' "local-mtime-exact-default" \
   local local "$mtime_key" quick
-check_path_with_mtime_options local local "$mtime_key" 5
+check_path_with_mtime_options local local "$mtime_key" 5000000
 
 # Both local endpoints report nanosecond precision, so automatic precision remains
 # exact for this pair. Coarser-precision behavior is covered by integrity unit tests.
 touch -m -d '@1700000400.000000000' "$local_root/destination/$mtime_key"
 check_path_with_mtime_options local local "$mtime_key" 0 --mtime-auto-precision
 echo "mtime precision and tolerance options verified"
+
+# Permissions are optional. Keep bytes and timestamps equal so only the
+# permission flag can make this pair differ.
+permission_key="integrity-permissions-local.bin"
+printf 'permission-evidence' > "$local_root/source/$permission_key"
+cp --preserve=mode,timestamps "$local_root/source/$permission_key" \
+  "$local_root/destination/$permission_key"
+chmod 0640 "$local_root/source/$permission_key"
+chmod 0600 "$local_root/destination/$permission_key"
+check_input path local local "$permission_key" mismatch
+check_input observed local local "$permission_key" mismatch
 
 # Quick mode must not read content. Preserve metadata after corrupting one byte,
 # then require Quick to pass and Full to report the exact first bad offset.
@@ -310,11 +338,13 @@ for check in "${negative_checks[@]}"; do
   seed_large_negative_case \
     "$source_backend" "$destination_backend" "$key" "$negative_fixture_root"
   check_path "$source_backend" "$destination_backend" "$key" full
+  check_input observed "$source_backend" "$destination_backend" "$key" match
 
   replace_destination_byte \
     "$destination_backend" "$key" "$negative_fixture_root" "$mismatch_offset"
   expect_mismatch 'Content.*source_bytes: [0-9]+, destination_bytes: [0-9]+' "$description-content" \
     "$source_backend" "$destination_backend" "$key" full
+  check_input observed "$source_backend" "$destination_backend" "$key" mismatch
 
   append_destination_byte "$destination_backend" "$key" "$negative_fixture_root"
   expect_mismatch 'Size.*source: Some\([0-9]+\), destination: Some\([0-9]+\)' "$description-size" \

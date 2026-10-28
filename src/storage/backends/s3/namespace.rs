@@ -152,6 +152,23 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
         })
     }
 
+    fn list_for_traversal(&self, request: ListRequest, is_root: bool) -> ListingStream {
+        if !self.protocol.bucket_capabilities().directory_objects {
+            return self.list(request);
+        }
+        let namespace = Self {
+            protocol: Arc::clone(&self.protocol),
+            identity: self.identity.clone(),
+            limits: self.limits,
+            histories: self.histories,
+        };
+        let identity = self.identity.clone();
+        ListingStream::from_producer(request.path.clone(), move |sink| async move {
+            super::traversal_listing::produce(&namespace, &identity, &request, is_root, &sink)
+                .await;
+        })
+    }
+
     async fn read_link(&self, path: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
         Err(failure(
             path,
@@ -264,9 +281,10 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
     }
 
     fn listing_resume_key(&self) -> &[u8] {
-        // Preserve the checkpoint fingerprint's existing encoding while keeping the meaning
-        // private to S3. Suspended buckets and refused versioning probes also list histories.
-        if self.histories { &[1] } else { &[0] }
+        // Revision 2 classifies full marker histories and lifts content objects into their
+        // parent's block. Old checkpoints must not mix block membership/counting semantics.
+        // Suspended buckets and refused versioning probes also list histories.
+        if self.histories { &[1, 2] } else { &[0, 2] }
     }
 
     /// Object buckets keep content under keys ending in `/` (`directory_objects`,

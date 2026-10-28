@@ -1,0 +1,2392 @@
+{
+  "recorded_at": "2026-10-28T05:56:52.421694+00:00",
+  "matrix": {
+    "run": "acl-four-20261028-final-2000",
+    "commands": [
+      {
+        "args": [
+          "timeout",
+          "25",
+          "mount",
+          "-t",
+          "nfs",
+          "-o",
+          "vers=3,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0,noresvport,mountproto=tcp,acl,nolock",
+          "10.131.9.12:/srv/nfs/v3",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "timeout",
+          "25",
+          "mount",
+          "-t",
+          "nfs",
+          "-o",
+          "vers=3,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0,noresvport,mountproto=tcp,acl,nolock",
+          "10.131.9.13:/srv/nfs/v3",
+          "/work/tmp/dm-acl-four-mount-1n2uni8a"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "timeout",
+          "25",
+          "mount",
+          "-t",
+          "nfs",
+          "-o",
+          "vers=4.1,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0,noresvport",
+          "10.128.61.200:/ontap_lisaauto_nfs",
+          "/work/tmp/dm-acl-four-mount-6vce9tre"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "setfacl",
+          "-n",
+          "--set",
+          "u::rw-,u:42421:r--,g::r--,g:42422:r--,m::r--,o::---",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/named.bin"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "getfacl",
+          "-cpn",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/named.bin"
+        ],
+        "exit": 0,
+        "stdout": "user::rw-\nuser:42421:r--\ngroup::r--\ngroup:42422:r--\nmask::r--\nother::---\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "named.bin",
+          "--destination-path",
+          "named.bin",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "named.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "named.bin",
+          "--destination-path",
+          "named.bin",
+          "--acl-mapping",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Equivalent\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--key",
+          "named.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "named.bin",
+          "--destination-path",
+          "named.bin",
+          "--acl-mapping",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Equivalent\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "named.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "named.bin",
+          "--destination-path",
+          "named.bin",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+          "--key",
+          "named.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "getfacl",
+          "-cpn",
+          "/work/tmp/dm-acl-four-mount-1n2uni8a/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p/named.bin"
+        ],
+        "exit": 0,
+        "stdout": "user::rw-\nuser:42421:r--\ngroup::r--\ngroup:42422:r--\nmask::r--\nother::---\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "nfs4_getfacl",
+          "/work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/named.bin"
+        ],
+        "exit": 0,
+        "stdout": "# file: /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/named.bin\nA::OWNER@:rwatTcCy\nA::42421:rtcy\nA:g:GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "setfacl",
+          "-n",
+          "--set",
+          "u::rw-,u:42421:rwx,g::---,g:42422:rwx,m::r--,o::---",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/masked.bin"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "getfacl",
+          "-cpn",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/masked.bin"
+        ],
+        "exit": 0,
+        "stdout": "user::rw-\nuser:42421:rwx\t#effective:r--\ngroup::---\ngroup:42422:rwx\t#effective:r--\nmask::r--\nother::---\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "masked.bin",
+          "--destination-path",
+          "masked.bin",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "masked.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "masked.bin",
+          "--destination-path",
+          "masked.bin",
+          "--acl-mapping",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Equivalent\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--key",
+          "masked.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "masked.bin",
+          "--destination-path",
+          "masked.bin",
+          "--acl-mapping",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Equivalent\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "masked.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "masked.bin",
+          "--destination-path",
+          "masked.bin",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+          "--key",
+          "masked.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "getfacl",
+          "-cpn",
+          "/work/tmp/dm-acl-four-mount-1n2uni8a/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p/masked.bin"
+        ],
+        "exit": 0,
+        "stdout": "user::rw-\nuser:42421:r--\ngroup::---\ngroup:42422:r--\nmask::r--\nother::---\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "nfs4_getfacl",
+          "/work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/masked.bin"
+        ],
+        "exit": 0,
+        "stdout": "# file: /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/masked.bin\nA::OWNER@:rwatTcCy\nA::42421:rtcy\nA:g:GROUP@:tcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "setfacl",
+          "-n",
+          "--set",
+          "u::rw-,u:42421:---,g::---,g:42422:---,m::r--,o::r--",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/precedence.bin"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "getfacl",
+          "-cpn",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/precedence.bin"
+        ],
+        "exit": 0,
+        "stdout": "user::rw-\nuser:42421:---\ngroup::---\ngroup:42422:---\nmask::r--\nother::r--\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "precedence.bin",
+          "--destination-path",
+          "precedence.bin",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "precedence.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "precedence.bin",
+          "--destination-path",
+          "precedence.bin",
+          "--acl-mapping",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Equivalent\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--key",
+          "precedence.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "precedence.bin",
+          "--destination-path",
+          "precedence.bin",
+          "--acl-mapping",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Equivalent\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "precedence.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "precedence.bin",
+          "--destination-path",
+          "precedence.bin",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+          "--key",
+          "precedence.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "getfacl",
+          "-cpn",
+          "/work/tmp/dm-acl-four-mount-1n2uni8a/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p/precedence.bin"
+        ],
+        "exit": 0,
+        "stdout": "user::rw-\nuser:42421:---\ngroup::---\ngroup:42422:---\nmask::rwx\nother::r--\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "nfs4_getfacl",
+          "/work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/precedence.bin"
+        ],
+        "exit": 0,
+        "stdout": "# file: /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/precedence.bin\nA::OWNER@:rwatTcCy\nD::42421:r\nA::42421:tcy\nA:g:GROUP@:tcy\nA:g:42422:tcy\nD:g:GROUP@:r\nD:g:42422:r\nA::EVERYONE@:rtcy\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "setfacl",
+          "-n",
+          "--set",
+          "u::rw-,g::---,g:42422:r--,g:42424:rw-,m::rw-,o::---",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/chain.bin"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "getfacl",
+          "-cpn",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/chain.bin"
+        ],
+        "exit": 0,
+        "stdout": "user::rw-\ngroup::---\ngroup:42422:r--\ngroup:42424:rw-\nmask::rw-\nother::---\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "chain.bin",
+          "--destination-path",
+          "chain.bin",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "chain.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "chain.bin",
+          "--destination-path",
+          "chain.bin",
+          "--acl-mapping",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Equivalent\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--key",
+          "chain.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "chain.bin",
+          "--destination-path",
+          "chain.bin",
+          "--acl-mapping",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Equivalent\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "chain.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "chain.bin",
+          "--destination-path",
+          "chain.bin",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+          "--key",
+          "chain.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "getfacl",
+          "-cpn",
+          "/work/tmp/dm-acl-four-mount-1n2uni8a/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p/chain.bin"
+        ],
+        "exit": 0,
+        "stdout": "user::rw-\ngroup::---\ngroup:42422:r--\ngroup:42424:rw-\nmask::rw-\nother::---\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "nfs4_getfacl",
+          "/work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/chain.bin"
+        ],
+        "exit": 0,
+        "stdout": "# file: /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/chain.bin\nA::OWNER@:rwatTcCy\nA:g:GROUP@:tcy\nA:g:42422:rtcy\nA:g:42424:rwatcy\nA::EVERYONE@:tcy\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "setfacl",
+          "-n",
+          "--set",
+          "u::rw-,g::---,g:42422:r--,g:42424:-w-,m::rw-,o::---",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/split.bin"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "getfacl",
+          "-cpn",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/split.bin"
+        ],
+        "exit": 0,
+        "stdout": "user::rw-\ngroup::---\ngroup:42422:r--\ngroup:42424:-w-\nmask::rw-\nother::---\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "split.bin",
+          "--destination-path",
+          "split.bin",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "split.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "split.bin",
+          "--destination-path",
+          "split.bin",
+          "--acl-mapping",
+          "--expect",
+          "refused"
+        ],
+        "exit": 0,
+        "stdout": "refused as expected: transfer Metadata failed on Orchestration: copied metadata was refused while planning: ACL (RequireEquivalent): ACL mapping refused: cross-model group permissions do not form an inclusion chain\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "setfacl",
+          "-n",
+          "--set",
+          "u::rw-,u:42421:---,g::---,g:42422:---,m::---,o::r--",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/zero-mask.bin"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "getfacl",
+          "-cpn",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/zero-mask.bin"
+        ],
+        "exit": 0,
+        "stdout": "user::rw-\nuser:42421:---\ngroup::---\ngroup:42422:---\nmask::---\nother::r--\n\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "zero-mask.bin",
+          "--destination-path",
+          "zero-mask.bin",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "zero-mask.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "zero-mask.bin",
+          "--destination-path",
+          "zero-mask.bin",
+          "--acl-mapping",
+          "--expect",
+          "refused"
+        ],
+        "exit": 0,
+        "stdout": "refused as expected: transfer Metadata failed on Orchestration: copied metadata was refused while planning: ACL (RequireEquivalent): ACL mapping refused: zero POSIX mask with named entries and other grants is outside the Linux access profile\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--key",
+          "named.bin",
+          "--input",
+          "observed",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "observed source=Some(Current) destination=Some(Current)\nmatches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "named.bin",
+          "--input",
+          "observed",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "observed source=Some(Current) destination=Some(Current)\nmatches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "setfacl",
+          "-n",
+          "-m",
+          "u:42421:---",
+          "/work/tmp/dm-acl-four-mount-1n2uni8a/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p/named.bin"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "named.bin",
+          "--input",
+          "path",
+          "--expected",
+          "mismatch",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "different"
+        ],
+        "exit": 0,
+        "stdout": "matches=false bytes=43 differences=[Acl { encoding: NfsV4 }] ignored=[] acl_scope=None\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "named.bin",
+          "--destination-path",
+          "named.bin",
+          "--acl-mapping",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "OwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Equivalent\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 43 bytes\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true",
+          "--key",
+          "named.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-equivalent",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-dst?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "complex.bin",
+          "--destination-path",
+          "complex.bin",
+          "--seed-bytes",
+          "73",
+          "--mark-acl",
+          "everyone-write-acl",
+          "--verify-acl",
+          "--acl-required",
+          "--expect",
+          "copied",
+          "--expect-acl",
+          "applied"
+        ],
+        "exit": 0,
+        "stdout": "seeded complex.bin bytes=73\nmarked source ACL (EveryoneWriteAcl): 3 ACE(s)\nOwnershipMode: Applied\nAcl: Applied\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nmapping OwnershipMode: Exact\nmapping Acl: Exact\nmapping Xattrs: OmittedByPolicy\nmapping Tags: OmittedByPolicy\nmapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])\ncopied 73 bytes\nsource ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1966495), who: \"OWNER@\" }\nsource ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(64), access_mask: AceMask(1179785), who: \"GROUP@\" }\nsource ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1441929), who: \"EVERYONE@\" }\ndestination ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1966495), who: \"OWNER@\" }\ndestination ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(64), access_mask: AceMask(1179785), who: \"GROUP@\" }\ndestination ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1441929), who: \"EVERYONE@\" }\nACLs equal and marked: 3 ACE(s)\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/integrity_input_probe",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-dst?version=4.1&uid=0&gid=0&noresvport=true",
+          "--key",
+          "complex.bin",
+          "--input",
+          "path",
+          "--expected",
+          "match",
+          "--acl",
+          "--acl-required",
+          "--expect-acl",
+          "equal"
+        ],
+        "exit": 0,
+        "stdout": "matches=true bytes=73 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src?version=4.1&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/negative?version=3&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "complex.bin",
+          "--destination-path",
+          "complex.bin",
+          "--acl-mapping",
+          "--expect",
+          "refused"
+        ],
+        "exit": 0,
+        "stdout": "refused as expected: transfer Metadata failed on Orchestration: copied metadata was refused while planning: ACL (RequireEquivalent): ACL mapping refused: NFSv4 rights are outside the fixed regular-file access profile\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "/work/cargo-target/debug/examples/nfs_metadata_copy",
+          "--source",
+          "nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true",
+          "--destination",
+          "nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true",
+          "--source-path",
+          "named.bin",
+          "--destination-path",
+          "named.bin",
+          "--acl-required",
+          "--expect",
+          "refused"
+        ],
+        "exit": 0,
+        "stdout": "refused as expected: transfer Metadata failed on Orchestration: copied metadata was refused while planning: ACL (RequireExact): the source holds a Posix ACL and the destination stores NfsV4; conversion requires the explicit equivalence policy\n",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "umount",
+          "/work/tmp/dm-acl-four-mount-6vce9tre"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "umount",
+          "/work/tmp/dm-acl-four-mount-1n2uni8a"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "args": [
+          "umount",
+          "/work/tmp/dm-acl-four-mount-3yuvu_36"
+        ],
+        "exit": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    ],
+    "retained": [
+      "data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix",
+      "data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp",
+      "data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p",
+      "data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4",
+      "data-mover-test/integrity-plan/acl-four-20261028-final-2000/44",
+      "data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src",
+      "data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-dst",
+      "data-mover-test/integrity-plan/acl-four-20261028-final-2000/negative"
+    ],
+    "status": "PASS"
+  },
+  "actual_access": [
+    {
+      "case": "named",
+      "subject": "named-user",
+      "uid": 42421,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "named",
+      "subject": "named-group",
+      "uid": 42425,
+      "primary_gid": 42422,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "named",
+      "subject": "other",
+      "uid": 42426,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "named",
+      "subject": "chain-group",
+      "uid": 42425,
+      "primary_gid": 42424,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "masked",
+      "subject": "named-user",
+      "uid": 42421,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "masked",
+      "subject": "named-group",
+      "uid": 42425,
+      "primary_gid": 42422,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "masked",
+      "subject": "other",
+      "uid": 42426,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "masked",
+      "subject": "chain-group",
+      "uid": 42425,
+      "primary_gid": 42424,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "precedence",
+      "subject": "named-user",
+      "uid": 42421,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "precedence",
+      "subject": "named-group",
+      "uid": 42425,
+      "primary_gid": 42422,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "precedence",
+      "subject": "other",
+      "uid": 42426,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "precedence",
+      "subject": "chain-group",
+      "uid": 42425,
+      "primary_gid": 42424,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "chain",
+      "subject": "named-user",
+      "uid": 42421,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "chain",
+      "subject": "named-group",
+      "uid": 42425,
+      "primary_gid": 42422,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "chain",
+      "subject": "other",
+      "uid": 42426,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "chain",
+      "subject": "chain-group",
+      "uid": 42425,
+      "primary_gid": 42424,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": true,
+          "read_write": true,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": true,
+          "read_write": true,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": true,
+          "read_write": true,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": true,
+          "read_write": true,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": true,
+          "read_write": true,
+          "execute": false
+        }
+      },
+      "equal": true
+    }
+  ],
+  "actual_access_before_zero_mask_fix": [
+    {
+      "case": "named",
+      "subject": "named-user",
+      "uid": 42421,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "named",
+      "subject": "named-group",
+      "uid": 42425,
+      "primary_gid": 42422,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "named",
+      "subject": "other",
+      "uid": 42426,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "named",
+      "subject": "chain-group",
+      "uid": 42425,
+      "primary_gid": 42424,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "masked",
+      "subject": "named-user",
+      "uid": 42421,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "masked",
+      "subject": "named-group",
+      "uid": 42425,
+      "primary_gid": 42422,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "masked",
+      "subject": "other",
+      "uid": 42426,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "masked",
+      "subject": "chain-group",
+      "uid": 42425,
+      "primary_gid": 42424,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": true
+    },
+    {
+      "case": "precedence",
+      "subject": "named-user",
+      "uid": 42421,
+      "primary_gid": 42420,
+      "supplementary_groups": [],
+      "observations": {
+        "source-posix": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "pp": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "p4": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "4p": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        },
+        "44": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute": false
+        }
+      },
+      "equal": false
+    }
+  ],
+  "zero_mask_local_repro": "{\"mask\": \"---\", \"read_allowed\": true, \"stderr\": \"\"}\nuser::rw-\nuser:42421:---\ngroup::---\ngroup:42422:---\nmask::---\nother::r--\n\n\n{\"mask\": \"r--\", \"read_allowed\": false, \"stderr\": \"Traceback (most recent call last):\\n  File \\\"<string>\\\", line 1, in <module>\\nPermissionError: [Errno 13] Permission denied: '/work/tmp/dm-acl-mask-repro-jvxchn_a/mask3r00'\\n\"}\nuser::rw-\nuser:42421:---\ngroup::---\ngroup:42422:---\nmask::r--\nother::r--\n\n\nretained_local /work/tmp/dm-acl-mask-repro-jvxchn_a\n",
+  "native_protocol_summary": "# Native NFSACL v3 real-server evidence, 2026-10-28 UTC\n\n## Scope and result\n\nThe new public `nfs_rs::Mount::{get_posix_acl,set_posix_acl}` API passed on both\nLinux nfsd exports:\n\n| Server | Export | Protocol and identity | Result |\n| --- | --- | --- | --- |\n| 10.131.9.12 | /srv/nfs/v3 | NFSv3, uid=0, gid=0, noresvport=true | 6/6 assertions passed |\n| 10.131.9.13 | /srv/nfs/v3 | NFSv3, uid=0, gid=0, noresvport=true | 6/6 assertions passed |\n\nBoth mounts reported `posix_acl=true`, `acl=false`; capability detection used the\nactual NFSACL extension probe. Root mode-only ACLs returned four raw entries,\nincluding the protocol-synthesized mask, demonstrating that this transport does\nnot silently normalize masks away.\n\n## Assertions on each server\n\n1. Write and read back a regular file ACL containing named user 42421 and group\n   42422 with **raw rwx permissions**, restricted by **mask r--**. All access\n   entries and the empty default list matched after normalizing non-named IDs.\n2. Write and read back directory access and default ACLs with the same named\n   subjects, raw permissions, and restrictive mask.\n3. Clear the complete directory default ACL using an explicitly empty default\n   list; verify it is empty and every access entry remains intact.\n4. Restore the directory default ACL and verify complete access/default state.\n5. Unmount, create a fresh public client, and read back the file ACL unchanged.\n6. Read back complete directory access/default ACLs through the fresh client.\n\nACL comparison normalized the ID field only for POSIX object/mask/other tags,\nbecause NFSACL transmits actual owner/group IDs and zero for mask/other while\nPOSIX xattrs use undefined IDs. No permission bits, masks, or entries were\ndiscarded for comparison.\n\n## Independent kernel readback\n\nEach export was then mounted locally using the Linux kernel NFSv3 client in\nread-only mode (`ro,vers=3,proto=tcp,nolock,noresvport`). `getfacl -cpn` confirmed\nthe public API's results on both servers:\n\n```text\n# native-file\nuser::rw-\nuser:42421:rwx                  #effective:r--\ngroup::r--\ngroup:42422:rwx                 #effective:r--\nmask::r--\nother::---\n\n# native-directory, access and default have identical entries below\nuser::rwx\nuser:42421:rwx                  #effective:r--\ngroup::r-x                     #effective:r--\ngroup:42422:rwx                 #effective:r--\nmask::r--\nother::---\n```\n\nBoth temporary read-only kernel mounts were unmounted after inspection. No server\nconfiguration was changed.\n\n## Retained fixtures\n\nOn **both** exports:\n\n```text\ndata-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-file\ndata-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory\n```\n\nThe directory retains its restored default ACL. Only isolated test directories\nand these files were created or changed.\n\n## Optional ONTAP NFSv3 probe\n\nThe read-only optional probe of\n`nfs://10.128.61.200/ontap_lisaauto_nfs?version=3&uid=0&gid=0&noresvport=true`\nfailed during mount with `Rpc(\"could not parse response due to bad status\")`.\nConsequently **no ONTAP POSIX ACL unsupported result was asserted**; the mount\nfailure is separate from the successful Linux ACL tests. It caused the combined\ntemporary harness to exit 1 after both Linux `END ... RESULT=PASS` records.\n\n## Raw artifacts\n\n- `/tmp/acl-native-protocol-20261028.log`: complete direct public API output,\n  including all raw ACL entries, twelve successful assertions and ONTAP mount\n  failure.\n- `/tmp/acl-native-kernel-readback-20261028.log`: independent `getfacl` output for\n  both Linux servers.\n- `/tmp/acl-native-lab/src/main.rs`: exact temporary public API harness.\n\nVendor unit gate also passed: `cargo test --manifest-path\nvendor/nfs-rs/Cargo.toml --lib --no-default-features`: **595 passed, 0 failed**,\nincluding six public-client TCP wire tests for ACL success/failure cases.\n",
+  "recovery_regression": {
+    "red": "   Compiling data-mover v0.3.0 (/root/jay/rust/github/data-mover-rs)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.52s\nwarning: the following packages contain code that will be rejected by a future version of Rust: binrw v0.15.1\nnote: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`\n     Running unittests src/lib.rs (/work/cargo-target/debug/deps/data_mover-b3a4da3b1c693efe)\n\nrunning 5 tests\ntest storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_keeps_numeric_only_metadata_a_noop ... ok\ntest storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_accepts_matching_owner_and_acl_proven_low_mode_difference ... ok\ntest storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_requires_observable_owner_only_when_numeric_owner_was_expected ... FAILED\ntest storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_special_mode_bits_with_unchanged_acl ... FAILED\ntest storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_owner_or_group_with_unchanged_acl ... FAILED\n\nfailures:\n\n---- storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_requires_observable_owner_only_when_numeric_owner_was_expected stdout ----\n\nthread 'storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_requires_observable_owner_only_when_numeric_owner_was_expected' (1660914) panicked at src/storage/backends/nfs/native_acl_tests.rs:573:13:\nOk(())\n\n---- storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_special_mode_bits_with_unchanged_acl stdout ----\n\nthread 'storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_special_mode_bits_with_unchanged_acl' (1660913) panicked at src/storage/backends/nfs/native_acl_tests.rs:498:9:\nOk(())\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n---- storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_owner_or_group_with_unchanged_acl stdout ----\n\nthread 'storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_owner_or_group_with_unchanged_acl' (1660912) panicked at src/storage/backends/nfs/native_acl_tests.rs:469:9:\nOk(())\n\n\nfailures:\n    storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_owner_or_group_with_unchanged_acl\n    storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_special_mode_bits_with_unchanged_acl\n    storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_requires_observable_owner_only_when_numeric_owner_was_expected\n\ntest result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 1999 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `--lib`\n",
+    "green_summary": "ok. 235 passed; 0 failed; 0 ignored; 0 measured; 1769 filtered out; finished in 0.35s",
+    "read_only": true,
+    "checks": [
+      "UID/GID equality when numeric ownership was expected",
+      "0o7000 special mode bits",
+      "complete ACL proof with expected and actual owners",
+      "no ACL mutation remains a no-op",
+      "no SET during recovery"
+    ]
+  },
+  "gates": {
+    "make_ci": "PASS",
+    "library": {
+      "passed": 1995,
+      "failed": 0,
+      "ignored": 9
+    },
+    "vendor_library": {
+      "passed": 595,
+      "failed": 0
+    },
+    "nfs_backend": {
+      "passed": 235,
+      "failed": 0
+    },
+    "common_acl": {
+      "passed": 19,
+      "failed": 0
+    },
+    "clippy_all_targets": "zero warnings",
+    "examples": "PASS",
+    "local_e2e": "PASS",
+    "diff_check": "PASS",
+    "ci_log": "2026-10-28-nfs-acl-four-way-ci.log"
+  },
+  "source_evidence": {
+    "git_head": "c527a01115ec8669c12a162d2568e200a3d814c0",
+    "working_tree_uncommitted": true,
+    "sha256": {
+      "src/model/acl/semantics.rs": "8fbb99a1a7f9738325c1cd056dffc43e5ac4457febfce620b14c121ca0323fcf",
+      "src/model/acl/mod.rs": "9969e716bb323d8b4f092bc637b5955d285bef03c9a6e3d9ff50c1cc9dbfd99e",
+      "src/model/acl/tests.rs": "9ed9b5dcfdb293cb2d07a597067115e06ea28ff73b426ee6573d7f0f00bf5da3",
+      "src/model/acl/mapping.rs": "1194b9846d46e223a3b2efd5b7c26e75e413b198e27b6922aefbfbbe5ea760a2",
+      "src/model/acl/codec.rs": "81a1c0d7b74c88998121fddd580e0291fe03d94fa1b5a99a832d6d8c249af3e2",
+      "src/model/mod.rs": "5c1a2fbeef1eca392f3beb86a0938f0a9b41cbc72d2fd3dd3f0ad673947788ea",
+      "src/metadata/acl_mapping.rs": "268f2c18c53adc958f8544652b3b5c78f00704a81d65b5df7fcf52e3bdda25bc",
+      "src/metadata/mod.rs": "57ba314f45f4302cf02a4b89073bd2d71d58a6943cc2657424d07030cf10da31",
+      "src/metadata/compile.rs": "c6f7dc96430a8a74327635107465a861ea458afd1a6f78c6335ef4d9851386fa",
+      "src/metadata/errors.rs": "8f5da45679695f007b9677cd85daa57512a2806f6526a715559306277c59a024",
+      "src/integrity/mod.rs": "da9b2a582221bdb0429432aeae38b84581762cd967713a4cfd18b85673f385e8",
+      "src/integrity/acl.rs": "6f17150f0a4291af395b4a6224340019a5774dfde331b1d935fd50091fc1f23e",
+      "src/integrity/permissions.rs": "ec0676ef7094317af2441b733d02c95fbb87bba805dcf94d290338e7bbe864e1",
+      "src/transfer/model.rs": "5238d9c708d765ee6184300512262c5f3d173a25822673b16ed6bf887e6408d3",
+      "src/transfer/engine/negotiation.rs": "a8ef426e4e12139686b574dea66de594b1894d0ef2e912007ef66a078b9eaec8",
+      "src/transfer/engine/failure.rs": "12c9fbbc6fdec0bff8b3f1938df1c625847353c2b979d7156dc92fd636f5385f",
+      "src/storage/backends/nfs/acl.rs": "df56229bc5beb2f781e1f78a6729300ae7299d6438eb5a3a1bce62df34e08422",
+      "src/storage/backends/nfs/metadata.rs": "5a2b6ed8a118a08e7d2d420a3584180e11578f9bda4f47a465c92046f49a70ff",
+      "src/storage/backends/nfs/client/role_metadata.rs": "f81315104649ebb08c3f3b711baac636957e4d40bc9c17a5d168ae4729b22dd6",
+      "src/storage/backends/nfs/staged_acl.rs": "559f47fbe0d71ad83f85fd2e84adc4cbcb86adbf07b9378c51285846b6ff3368",
+      "vendor/nfs-rs/src/nfs3/acl.rs": "7e1827cad1b9591e171f03a5a89ee5f892101122da86beb6239b87345a185e9d"
+    },
+    "completed_at": "2026-10-28T06:10:40.153716+00:00"
+  }
+}

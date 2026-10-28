@@ -9,7 +9,8 @@
 //! it has the segment that is complete; a resumed traversal delivers a key's segments again from 0.
 
 use super::{
-    MetadataObservations, ModelValueError, SourceIdentity, SourceVersion, StorageTimestamp,
+    EntryKind, MetadataObservations, ModelValueError, SourceIdentity, SourceVersion, StoragePath,
+    StorageTimestamp,
 };
 
 /// The most records one entry's history carries (P7 Q8); a longer history is split into segments.
@@ -212,6 +213,19 @@ pub struct ObjectHistory {
 }
 
 impl ObjectHistory {
+    /// A Directory carries its own marker object's history; all other histories name the
+    /// entry's path directly. Kept in the model so observation and snapshot replay agree.
+    pub(crate) fn source_path(
+        path: &StoragePath,
+        kind: EntryKind,
+    ) -> Result<StoragePath, ModelValueError> {
+        if kind == EntryKind::Directory {
+            StoragePath::new(format!("{}/", path.as_str()))
+        } else {
+            Ok(path.clone())
+        }
+    }
+
     /// A key's whole history as a listing gathered it: segment 0, complete, any length (a traversal
     /// splits it into segments of at most [`MAX_HISTORY_RECORDS`] before handing it over).
     ///

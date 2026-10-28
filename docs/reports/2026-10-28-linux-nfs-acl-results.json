@@ -1,0 +1,1430 @@
+{
+  "inventory": [
+    {
+      "vmid": 100,
+      "name": "nexus-vm",
+      "ip": "10.131.9.17",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 101,
+      "name": "ubuntu-24c",
+      "ip": "10.131.9.10",
+      "rpc": [],
+      "nfs3": false,
+      "status": "probed"
+    },
+    {
+      "vmid": 102,
+      "name": "ubuntu-24d",
+      "ip": "10.131.9.11",
+      "rpc": [],
+      "nfs3": false,
+      "status": "probed"
+    },
+    {
+      "vmid": 103,
+      "name": "ubuntu-24e",
+      "ip": "10.131.9.12",
+      "rpc": [
+        "    100005    1   udp  40502  mountd",
+        "    100005    1   tcp  36347  mountd",
+        "    100005    2   udp  37877  mountd",
+        "    100005    2   tcp  38125  mountd",
+        "    100005    3   udp  33300  mountd",
+        "    100005    3   tcp  53187  mountd",
+        "    100003    3   tcp   2049  nfs",
+        "    100003    4   tcp   2049  nfs",
+        "    100227    3   tcp   2049  nfs_acl"
+      ],
+      "nfs3": true,
+      "exports": "Export list for 10.131.9.12:\n/srv/nfs/v4 10.10.1.0/24,10.131.0.0/20,10.128.100.99/32\n/srv/nfs/v3 10.10.1.0/24,10.131.0.0/20,10.128.100.99/32\n",
+      "export_error": "",
+      "status": "probed"
+    },
+    {
+      "vmid": 104,
+      "name": "ubuntu-24f",
+      "ip": "10.131.9.13",
+      "rpc": [
+        "    100005    1   udp  43353  mountd",
+        "    100005    1   tcp  43863  mountd",
+        "    100005    2   udp  35891  mountd",
+        "    100005    2   tcp  43495  mountd",
+        "    100005    3   udp  48965  mountd",
+        "    100005    3   tcp  36937  mountd",
+        "    100003    3   tcp   2049  nfs",
+        "    100003    4   tcp   2049  nfs",
+        "    100227    3   tcp   2049  nfs_acl"
+      ],
+      "nfs3": true,
+      "exports": "Export list for 10.131.9.13:\n/srv/nfs/v4 10.10.1.0/24,10.131.0.0/20,10.128.100.99/32\n/srv/nfs/v3 10.10.1.0/24,10.131.0.0/20,10.128.100.99/32\n",
+      "export_error": "",
+      "status": "probed"
+    },
+    {
+      "vmid": 105,
+      "name": "ubuntu-24g",
+      "ip": "10.131.9.14",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 201,
+      "name": "vm-201-mgmt",
+      "ip": "10.131.9.21",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 202,
+      "name": "vm-202-biz1",
+      "ip": "10.131.9.22",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 203,
+      "name": "vm-203-biz2",
+      "ip": "10.131.9.23",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 301,
+      "name": "hdfs-namenode",
+      "ip": "10.131.9.30",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 302,
+      "name": "hdfs-datanode1",
+      "ip": "10.131.9.31",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 303,
+      "name": "hdfs-datanode2",
+      "ip": "10.131.9.32",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 304,
+      "name": "hdfs-namenode2",
+      "ip": "10.131.9.33",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 401,
+      "name": "juicefs",
+      "ip": "10.131.9.41",
+      "rpc": [],
+      "nfs3": false,
+      "status": "probed"
+    },
+    {
+      "vmid": 402,
+      "name": "curvine",
+      "ip": "10.131.9.42",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 403,
+      "name": "curvine-hsm-1",
+      "ip": "10.131.9.80",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 404,
+      "name": "curvine-hsm-2",
+      "ip": "10.131.9.81",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 405,
+      "name": "curvine-hsm-3",
+      "ip": "10.131.9.82",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 406,
+      "name": "hsm-controller",
+      "ip": "10.131.9.83",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 510,
+      "name": "holo-vtl",
+      "ip": "10.131.9.70",
+      "status": "network probe only; no guest exec",
+      "rpc": [],
+      "nfs3": false
+    },
+    {
+      "vmid": 511,
+      "name": "ee1",
+      "ip": "10.131.9.71",
+      "status": "network probe only; no guest exec",
+      "rpc": [],
+      "nfs3": false
+    },
+    {
+      "vmid": 512,
+      "name": "ee2",
+      "ip": "10.131.9.72",
+      "status": "network probe only; no guest exec",
+      "rpc": [],
+      "nfs3": false
+    },
+    {
+      "vmid": 513,
+      "name": "tsclient",
+      "ip": "10.131.9.73",
+      "status": "network probe only; no guest exec",
+      "rpc": [],
+      "nfs3": false
+    },
+    {
+      "vmid": 514,
+      "name": "ee3",
+      "ip": "10.131.9.74",
+      "status": "network probe only; no guest exec",
+      "rpc": [],
+      "nfs3": false
+    },
+    {
+      "vmid": 601,
+      "name": "fdb-node1",
+      "ip": "10.131.9.44",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 602,
+      "name": "fdb-node2",
+      "ip": "10.131.9.45",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 603,
+      "name": "fdb-node3",
+      "ip": "10.131.9.46",
+      "status": "rpcbind unavailable: ConnectionRefusedError"
+    },
+    {
+      "vmid": 604,
+      "name": "pnfs-mds",
+      "ip": "10.131.9.164",
+      "rpc": [
+        "    100005    3   tcp  20048  mountd",
+        "    100005    3   udp  20048  mountd"
+      ],
+      "nfs3": false,
+      "status": "probed"
+    },
+    {
+      "vmid": 605,
+      "name": "pnfs-ds",
+      "ip": null,
+      "status": "address unavailable"
+    }
+  ],
+  "main": {
+    "run": "linux3-to-ontap41-20261028",
+    "cases": [
+      {
+        "case": "named",
+        "source_posix": "user::rw-\nuser:42421:r--\ngroup::r--\ngroup:42422:r--\nmask::r--\nother::---\n\n",
+        "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA::GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n",
+        "destination_native": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA:g:GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n",
+        "native_text_equal": false,
+        "access": [
+          {
+            "subject": "named_user",
+            "uid": 42421,
+            "gid": 42420,
+            "groups": [],
+            "source": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "named_group",
+            "uid": 42425,
+            "gid": 42422,
+            "groups": [],
+            "source": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "other",
+            "uid": 42426,
+            "gid": 42420,
+            "groups": [],
+            "source": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "overlapping_groups",
+            "uid": 42425,
+            "gid": 42422,
+            "groups": [
+              42424
+            ],
+            "source": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          }
+        ]
+      },
+      {
+        "case": "masked",
+        "source_posix": "user::rw-\nuser:42421:rwx\t#effective:r--\ngroup::---\ngroup:42422:rwx\t#effective:r--\nmask::r--\nother::---\n\n",
+        "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA::GROUP@:tcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n",
+        "destination_native": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA:g:GROUP@:tcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n",
+        "native_text_equal": false,
+        "access": [
+          {
+            "subject": "named_user",
+            "uid": 42421,
+            "gid": 42420,
+            "groups": [],
+            "source": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "named_group",
+            "uid": 42425,
+            "gid": 42422,
+            "groups": [],
+            "source": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "other",
+            "uid": 42426,
+            "gid": 42420,
+            "groups": [],
+            "source": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "overlapping_groups",
+            "uid": 42425,
+            "gid": 42422,
+            "groups": [
+              42424
+            ],
+            "source": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          }
+        ]
+      },
+      {
+        "case": "precedence",
+        "source_posix": "user::rw-\nuser:42421:---\ngroup::---\ngroup:42422:---\nmask::r--\nother::r--\n\n",
+        "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nD::42421:r\nA::42421:tcy\nA::GROUP@:tcy\nA:g:42422:tcy\nD::GROUP@:r\nD:g:42422:r\nA::EVERYONE@:rtcy\n",
+        "destination_native": "A::OWNER@:rwatTcCy\nD::42421:r\nA::42421:tcy\nA:g:GROUP@:tcy\nA:g:42422:tcy\nD:g:GROUP@:r\nD:g:42422:r\nA::EVERYONE@:rtcy\n",
+        "native_text_equal": false,
+        "access": [
+          {
+            "subject": "named_user",
+            "uid": 42421,
+            "gid": 42420,
+            "groups": [],
+            "source": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "named_group",
+            "uid": 42425,
+            "gid": 42422,
+            "groups": [],
+            "source": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "other",
+            "uid": 42426,
+            "gid": 42420,
+            "groups": [],
+            "source": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "overlapping_groups",
+            "uid": 42425,
+            "gid": 42422,
+            "groups": [
+              42424
+            ],
+            "source": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          }
+        ]
+      },
+      {
+        "case": "overlapping",
+        "source_posix": "user::rw-\ngroup::---\ngroup:42422:r--\ngroup:42424:-w-\nmask::rw-\nother::---\n\n",
+        "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nA::GROUP@:tcy\nA:g:42422:rtcy\nA:g:42424:watcy\nA::EVERYONE@:tcy\n",
+        "destination_native": "A::OWNER@:rwatTcCy\nA:g:GROUP@:tcy\nA:g:42422:rtcy\nA:g:42424:watcy\nA::EVERYONE@:tcy\n",
+        "native_text_equal": false,
+        "access": [
+          {
+            "subject": "named_user",
+            "uid": 42421,
+            "gid": 42420,
+            "groups": [],
+            "source": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "named_group",
+            "uid": 42425,
+            "gid": 42422,
+            "groups": [],
+            "source": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "other",
+            "uid": 42426,
+            "gid": 42420,
+            "groups": [],
+            "source": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": 13,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "equal": true
+          },
+          {
+            "subject": "overlapping_groups",
+            "uid": 42425,
+            "gid": 42422,
+            "groups": [
+              42424
+            ],
+            "source": {
+              "read": true,
+              "write": 13,
+              "read_write": 13,
+              "execute_access": false
+            },
+            "destination": {
+              "read": true,
+              "write": true,
+              "read_write": true,
+              "execute_access": false
+            },
+            "equal": false
+          }
+        ]
+      }
+    ],
+    "mounts": [
+      {
+        "server": "10.131.9.12:/srv/nfs/v3",
+        "version": "3"
+      },
+      {
+        "server": "10.131.9.12:/srv/nfs/v3",
+        "version": "4.1"
+      },
+      {
+        "server": "10.128.61.200:/ontap_lisaauto_nfs",
+        "version": "4.1"
+      }
+    ],
+    "project_copy": "OwnershipMode: Applied\nAcl: Unsupported\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nACL skipped: the source cannot read it\ncopied 33 bytes\n",
+    "project_compare": "matches=true bytes=33 differences=[] ignored=[Acl { source: None, destination: Some(NfsV4) }]\n",
+    "project_source_posix": "user::rw-\nuser:42421:r--\ngroup::r--\ngroup:42422:r--\nmask::r--\nother::---\n\n",
+    "project_destination_native": "A::OWNER@:rwatTnNcCoy\nA:g:GROUP@:rtncy\nA::EVERYONE@:tcy\n",
+    "project_access": [
+      {
+        "subject": "named_user",
+        "uid": 42421,
+        "gid": 42420,
+        "groups": [],
+        "source": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute_access": false
+        },
+        "destination": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute_access": false
+        },
+        "equal": false
+      },
+      {
+        "subject": "named_group",
+        "uid": 42425,
+        "gid": 42422,
+        "groups": [],
+        "source": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute_access": false
+        },
+        "destination": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute_access": false
+        },
+        "equal": false
+      },
+      {
+        "subject": "other",
+        "uid": 42426,
+        "gid": 42420,
+        "groups": [],
+        "source": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute_access": false
+        },
+        "destination": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute_access": false
+        },
+        "equal": true
+      },
+      {
+        "subject": "overlapping_groups",
+        "uid": 42425,
+        "gid": 42422,
+        "groups": [
+          42424
+        ],
+        "source": {
+          "read": true,
+          "write": 13,
+          "read_write": 13,
+          "execute_access": false
+        },
+        "destination": {
+          "read": 13,
+          "write": 13,
+          "read_write": 13,
+          "execute_access": false
+        },
+        "equal": false
+      }
+    ],
+    "directory": {
+      "source_posix": "user::rwx\ngroup::r-x\nother::r-x\ndefault:user::rwx\ndefault:user:42421:r-x\ndefault:group::r-x\ndefault:group:42422:r--\ndefault:mask::r-x\ndefault:other::r-x\n\n",
+      "linux_nfsd_projection": "A::OWNER@:rwaDxtTcCy\nA::GROUP@:rxtcy\nA::EVERYONE@:rxtcy\nA:fdi:OWNER@:rwaDxtTcCy\nA:fdi:42421:rxtcy\nA:fdi:GROUP@:rxtcy\nA:fdig:42422:rtcy\nD:fdig:42422:x\nA:fdi:EVERYONE@:rxtcy\n",
+      "destination_native": "A::OWNER@:rwaDxtTcCy\nA:g:GROUP@:rxtcy\nA::EVERYONE@:rxtcy\nA:fdi:OWNER@:rwaDxtTcCy\nA:fdi:42421:rxtcy\nA:fdig:GROUP@:rxtcy\nA:fdig:42422:rtcy\nD:fdig:42422:x\nA:fdi:EVERYONE@:rxtcy\n",
+      "children": [
+        {
+          "creation_mode": "0o600",
+          "source_posix": "user::rw-\nuser:42421:r-x\t#effective:---\ngroup::r-x\t#effective:---\ngroup:42422:r--\t#effective:---\nmask::---\nother::---\n\n",
+          "source_native": "A::OWNER@:rwatTcCy\nA::42421:tcy\nA::GROUP@:tcy\nA:g:42422:tcy\nA::EVERYONE@:tcy\n",
+          "destination_native": "A::OWNER@:rwatTnNcCoy\nA::42421:rxtcy\nA:g:GROUP@:tcy\nA:g:42422:rtcy\nD:g:42422:x\nA::EVERYONE@:tcy\n",
+          "access": [
+            {
+              "subject": "named_user",
+              "uid": 42421,
+              "gid": 42420,
+              "groups": [],
+              "source": {
+                "read": 13,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "equal": false
+            },
+            {
+              "subject": "named_group",
+              "uid": 42425,
+              "gid": 42422,
+              "groups": [],
+              "source": {
+                "read": 13,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "equal": false
+            },
+            {
+              "subject": "other",
+              "uid": 42426,
+              "gid": 42420,
+              "groups": [],
+              "source": {
+                "read": 13,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": 13,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "equal": true
+            },
+            {
+              "subject": "overlapping_groups",
+              "uid": 42425,
+              "gid": 42422,
+              "groups": [
+                42424
+              ],
+              "source": {
+                "read": 13,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "equal": false
+            }
+          ]
+        },
+        {
+          "creation_mode": "0o644",
+          "source_posix": "user::rw-\nuser:42421:r-x\t#effective:r--\ngroup::r-x\t#effective:r--\ngroup:42422:r--\nmask::r--\nother::r--\n\n",
+          "source_native": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA::GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:rtcy\n",
+          "destination_native": "A::OWNER@:rwatTnNcCoy\nA::42421:rxtcy\nA:g:GROUP@:rtncy\nA:g:42422:rtcy\nD:g:42422:x\nA::EVERYONE@:rtncy\n",
+          "access": [
+            {
+              "subject": "named_user",
+              "uid": 42421,
+              "gid": 42420,
+              "groups": [],
+              "source": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "equal": true
+            },
+            {
+              "subject": "named_group",
+              "uid": 42425,
+              "gid": 42422,
+              "groups": [],
+              "source": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "equal": true
+            },
+            {
+              "subject": "other",
+              "uid": 42426,
+              "gid": 42420,
+              "groups": [],
+              "source": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "equal": true
+            },
+            {
+              "subject": "overlapping_groups",
+              "uid": 42425,
+              "gid": 42422,
+              "groups": [
+                42424
+              ],
+              "source": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "equal": true
+            }
+          ]
+        },
+        {
+          "creation_mode": "0o666",
+          "source_posix": "user::rw-\nuser:42421:r-x\t#effective:r--\ngroup::r-x\t#effective:r--\ngroup:42422:r--\nmask::r--\nother::r--\n\n",
+          "source_native": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA::GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:rtcy\n",
+          "destination_native": "A::OWNER@:rwatTnNcCoy\nA::42421:rxtcy\nA:g:GROUP@:rwatTnNcy\nA:g:42422:rtcy\nD:g:42422:x\nA::EVERYONE@:rwatTnNcy\n",
+          "access": [
+            {
+              "subject": "named_user",
+              "uid": 42421,
+              "gid": 42420,
+              "groups": [],
+              "source": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": true,
+                "read_write": true,
+                "execute_access": false
+              },
+              "equal": false
+            },
+            {
+              "subject": "named_group",
+              "uid": 42425,
+              "gid": 42422,
+              "groups": [],
+              "source": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": true,
+                "read_write": true,
+                "execute_access": false
+              },
+              "equal": false
+            },
+            {
+              "subject": "other",
+              "uid": 42426,
+              "gid": 42420,
+              "groups": [],
+              "source": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": true,
+                "read_write": true,
+                "execute_access": false
+              },
+              "equal": false
+            },
+            {
+              "subject": "overlapping_groups",
+              "uid": 42425,
+              "gid": 42422,
+              "groups": [
+                42424
+              ],
+              "source": {
+                "read": true,
+                "write": 13,
+                "read_write": 13,
+                "execute_access": false
+              },
+              "destination": {
+                "read": true,
+                "write": true,
+                "read_write": true,
+                "execute_access": false
+              },
+              "equal": false
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "fresh_subjects": [
+    {
+      "subject": "read_group",
+      "uid": 42501,
+      "gid": 42422,
+      "groups": [],
+      "source": {
+        "read": true,
+        "write": 13,
+        "read_write": 13,
+        "execute_access": false
+      },
+      "destination": {
+        "read": true,
+        "write": 13,
+        "read_write": 13,
+        "execute_access": false
+      },
+      "equal": true
+    },
+    {
+      "subject": "write_group",
+      "uid": 42502,
+      "gid": 42424,
+      "groups": [],
+      "source": {
+        "read": 13,
+        "write": true,
+        "read_write": 13,
+        "execute_access": false
+      },
+      "destination": {
+        "read": 13,
+        "write": true,
+        "read_write": 13,
+        "execute_access": false
+      },
+      "equal": true
+    },
+    {
+      "subject": "both_groups",
+      "uid": 42503,
+      "gid": 42422,
+      "groups": [
+        42424
+      ],
+      "source": {
+        "read": true,
+        "write": 13,
+        "read_write": 13,
+        "execute_access": false
+      },
+      "destination": {
+        "read": true,
+        "write": true,
+        "read_write": true,
+        "execute_access": false
+      },
+      "equal": false
+    }
+  ],
+  "source_server_group_settings": {
+    "/etc/nfs.conf": [
+      "# manage-gids=n",
+      "manage-gids=y"
+    ],
+    "/etc/default/nfs-kernel-server": [],
+    "/proc/net/rpc/auth.unix.gid/content": [
+      "42425 0:"
+    ]
+  },
+  "direct_source_posix_probe": {
+    "uid": 42603,
+    "gid": 42422,
+    "groups": [
+      42424
+    ],
+    "read": true,
+    "write": true,
+    "read_write": 13
+  },
+  "fresh_mount_and_comparator": {
+    "posix_vs_nfsv4_comparator": "matches=true bytes=36 differences=[] ignored=[Acl { source: Some(Posix), destination: Some(NfsV4) }]\n",
+    "native_vs_native_comparator": "matches=false bytes=36 differences=[Acl { encoding: NfsV4 }] ignored=[]\n",
+    "fresh_access": {
+      "named": [
+        {
+          "subject": "named_user",
+          "uid": 42421,
+          "gid": 42420,
+          "groups": [],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        },
+        {
+          "subject": "named_group",
+          "uid": 42425,
+          "gid": 42422,
+          "groups": [],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        },
+        {
+          "subject": "other",
+          "uid": 42426,
+          "gid": 42420,
+          "groups": [],
+          "source": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        },
+        {
+          "subject": "overlapping_groups",
+          "uid": 42425,
+          "gid": 42422,
+          "groups": [
+            42424
+          ],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        }
+      ],
+      "masked": [
+        {
+          "subject": "named_user",
+          "uid": 42421,
+          "gid": 42420,
+          "groups": [],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        },
+        {
+          "subject": "named_group",
+          "uid": 42425,
+          "gid": 42422,
+          "groups": [],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        },
+        {
+          "subject": "other",
+          "uid": 42426,
+          "gid": 42420,
+          "groups": [],
+          "source": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        },
+        {
+          "subject": "overlapping_groups",
+          "uid": 42425,
+          "gid": 42422,
+          "groups": [
+            42424
+          ],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        }
+      ],
+      "precedence": [
+        {
+          "subject": "named_user",
+          "uid": 42421,
+          "gid": 42420,
+          "groups": [],
+          "source": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        },
+        {
+          "subject": "named_group",
+          "uid": 42425,
+          "gid": 42422,
+          "groups": [],
+          "source": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        },
+        {
+          "subject": "other",
+          "uid": 42426,
+          "gid": 42420,
+          "groups": [],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        },
+        {
+          "subject": "overlapping_groups",
+          "uid": 42425,
+          "gid": 42422,
+          "groups": [
+            42424
+          ],
+          "source": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        }
+      ],
+      "inherit_600": [
+        {
+          "subject": "named_user",
+          "uid": 42421,
+          "gid": 42420,
+          "groups": [],
+          "source": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": false
+        },
+        {
+          "subject": "named_group",
+          "uid": 42425,
+          "gid": 42422,
+          "groups": [],
+          "source": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": false
+        },
+        {
+          "subject": "other",
+          "uid": 42426,
+          "gid": 42420,
+          "groups": [],
+          "source": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": true
+        },
+        {
+          "subject": "overlapping_groups",
+          "uid": 42425,
+          "gid": 42422,
+          "groups": [
+            42424
+          ],
+          "source": {
+            "read": 13,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "equal": false
+        }
+      ],
+      "inherit_666": [
+        {
+          "subject": "named_user",
+          "uid": 42421,
+          "gid": 42420,
+          "groups": [],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": true,
+            "read_write": true,
+            "execute_access": false
+          },
+          "equal": false
+        },
+        {
+          "subject": "named_group",
+          "uid": 42425,
+          "gid": 42422,
+          "groups": [],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": true,
+            "read_write": true,
+            "execute_access": false
+          },
+          "equal": false
+        },
+        {
+          "subject": "other",
+          "uid": 42426,
+          "gid": 42420,
+          "groups": [],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": true,
+            "read_write": true,
+            "execute_access": false
+          },
+          "equal": false
+        },
+        {
+          "subject": "overlapping_groups",
+          "uid": 42425,
+          "gid": 42422,
+          "groups": [
+            42424
+          ],
+          "source": {
+            "read": true,
+            "write": 13,
+            "read_write": 13,
+            "execute_access": false
+          },
+          "destination": {
+            "read": true,
+            "write": true,
+            "read_write": true,
+            "execute_access": false
+          },
+          "equal": false
+        }
+      ]
+    }
+  }
+}

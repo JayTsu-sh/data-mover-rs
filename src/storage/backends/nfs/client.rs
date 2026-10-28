@@ -915,6 +915,10 @@ impl NfsStagedProtocol for NFSStorage {
         Self::supports_acl(self)
     }
 
+    fn acl_encoding(&self) -> Option<crate::model::AclEncoding> {
+        Self::acl_encoding(self)
+    }
+
     fn supports_xattrs(&self) -> bool {
         Self::supports_xattr(self)
     }
@@ -1957,7 +1961,19 @@ impl NFSStorage {
     /// 返回当前已协商实例报告的 ACL 能力。
     #[must_use]
     pub fn supports_acl(&self) -> bool {
-        self.mount.capabilities().acl
+        let capabilities = self.mount.capabilities();
+        capabilities.acl || capabilities.posix_acl
+    }
+
+    pub(crate) fn acl_encoding(&self) -> Option<crate::model::AclEncoding> {
+        let capabilities = self.mount.capabilities();
+        if capabilities.acl {
+            Some(crate::model::AclEncoding::NfsV4)
+        } else if capabilities.posix_acl {
+            Some(crate::model::AclEncoding::Posix)
+        } else {
+            None
+        }
     }
 
     /// 返回当前已协商实例报告的 named-attribute 能力。

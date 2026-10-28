@@ -13,6 +13,10 @@ use crate::storage::{
     StorageRoleFailure,
 };
 
+mod acl_mapping;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod acl_policy_tests;
 mod checkpoint_binding;
 mod compile;
 mod errors;
@@ -31,6 +35,8 @@ pub use crate::model::MetadataFamily;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MetadataPolicy {
     RequireExact,
+    /// Require complete ACL observations and a proven current-access mapping.
+    RequireEquivalent,
     AllowKnownLoss,
     BestEffort,
     #[default]
@@ -179,6 +185,8 @@ pub enum SemanticLoss {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MappingDecision {
     Exact,
+    /// Proven current regular-file access equivalence across ACL models.
+    Equivalent,
     Lossy(Vec<SemanticLoss>),
     RequiresExternalMapping,
     Unsupported,
@@ -412,6 +420,7 @@ impl MetadataPlan {
     fn report(&self, outcomes: Vec<FamilyApplication>) -> MetadataApplicationReport {
         MetadataApplicationReport {
             outcomes,
+            mappings: self.mappings.clone(),
             losses: self.losses.clone(),
             skipped: self.skipped.clone(),
         }
@@ -534,11 +543,18 @@ pub struct FamilyApplication {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataApplicationReport {
     outcomes: Vec<FamilyApplication>,
+    mappings: Vec<FamilyMapping>,
     losses: LossReport,
     skipped: Vec<SkippedFamily>,
 }
 
 impl MetadataApplicationReport {
+    /// Planned preservation or equivalence contract for every metadata family.
+    #[must_use]
+    pub fn mappings(&self) -> &[FamilyMapping] {
+        &self.mappings
+    }
+
     /// Known semantic losses retained from planning, including unmapped principals.
     #[must_use]
     pub const fn loss_report(&self) -> &LossReport {
@@ -560,7 +576,7 @@ impl MetadataApplicationReport {
 
 fn planned_outcome(decision: &MappingDecision, has_mutation: bool) -> ApplicationOutcome {
     match decision {
-        MappingDecision::Exact => ApplicationOutcome::NotObserved,
+        MappingDecision::Exact | MappingDecision::Equivalent => ApplicationOutcome::NotObserved,
         MappingDecision::Lossy(_) if has_mutation => ApplicationOutcome::NotObserved,
         MappingDecision::Lossy(_) | MappingDecision::OmittedByPolicy => {
             ApplicationOutcome::OmittedByPolicy

@@ -1,7 +1,7 @@
 //! Directory objects (P7 F5): a directory's own object `p/d/`, handed over by the listing of `p/d`
-//! as the child with the empty name, is a file entry of that block — counted, filtered and cut by
-//! `max_depth` like its siblings, named after its directory — except for the traversal root's own
-//! object, which is not part of the traversal.
+//! as the child with the empty name, is a file entry of that block when it holds content or
+//! history. Current-only zero-byte markers are folded into their directory before filtering and
+//! counting. The traversal root's own object is not part of the traversal.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -28,6 +28,13 @@ fn own_object(key: &str, size: u64) -> SourceDescriptor {
 
 #[async_trait]
 impl Namespace for ObjectsNamespace {
+    fn capabilities(&self) -> crate::storage::NamespaceCapabilities {
+        crate::storage::NamespaceCapabilities {
+            directory_objects: true,
+            ..crate::storage::NamespaceCapabilities::default()
+        }
+    }
+
     fn list(&self, request: ListRequest) -> ListingStream {
         let directory = request.path;
         let children = match directory.as_str() {
@@ -97,7 +104,6 @@ async fn directory_objects_are_entries_counted_as_files() {
             "p/d Directory None",
             "p/ File Some(5)",
             "p/d/x File Some(3)",
-            "p/d/ File Some(0)",
         ]
     );
     let entries: Vec<bool> = items
@@ -107,13 +113,13 @@ async fn directory_objects_are_entries_counted_as_files() {
             _ => None,
         })
         .collect();
-    assert_eq!(entries, [false, false, false, false, true, false, true]);
+    assert_eq!(entries, [false, false, false, false, true, false]);
     assert_eq!(
         totals(&outcome),
         ScanTotals {
-            listed: 7,
-            emitted: 7,
-            files: 5,
+            listed: 6,
+            emitted: 6,
+            files: 4,
             directories: 2,
             bytes: 14,
             all_versions_bytes: 14,
@@ -136,11 +142,10 @@ async fn the_traversal_roots_own_object_is_reported_not_emitted() {
             "p/f File Some(3)",
             "p/d Directory None",
             "p/d/x File Some(3)",
-            "p/d/ File Some(0)",
         ]
     );
     let scan = totals(&outcome);
-    assert_eq!((scan.listed, scan.emitted, scan.failed_children), (5, 4, 1));
+    assert_eq!((scan.listed, scan.emitted, scan.failed_children), (4, 3, 1));
 
     let (items, outcome) = drain(traverse("p/d", None)).await;
     assert_well_formed(&items, &outcome);
@@ -175,8 +180,8 @@ impl TraversalFilter for Recording {
     }
 }
 
-/// D7: the filter sees `p/d/` as a file named after its directory (`d`, never empty), at the path
-/// with its trailing `/`, relative to the traversal root.
+/// The filter sees the directory but never its folded marker; paths stay relative to the
+/// specified traversal root, not the bucket root.
 #[tokio::test]
 async fn filters_see_a_directory_object_by_its_directory_name() {
     let recording = Arc::new(Recording::default());
@@ -196,12 +201,7 @@ async fn filters_see_a_directory_object_by_its_directory_name() {
     seen.sort();
     assert_eq!(
         seen,
-        [
-            "d name=d Directory",
-            "d/ name=d File",
-            "d/x name=x File",
-            "f name=f File",
-        ]
+        ["d name=d Directory", "d/x name=x File", "f name=f File",]
     );
 }
 

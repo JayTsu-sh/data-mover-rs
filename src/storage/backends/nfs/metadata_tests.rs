@@ -1,9 +1,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::super::acl;
 use super::super::source::role_failure;
 use super::*;
 use crate::model::{FailureClass, Transience};
+
+#[path = "native_acl_tests.rs"]
+mod native_acl_tests;
+
+#[path = "permission_tests.rs"]
+mod permission_tests;
 
 struct CancellingProtocol {
     cancel: tokio_util::sync::CancellationToken,

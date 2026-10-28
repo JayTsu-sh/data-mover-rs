@@ -19,6 +19,8 @@ use crate::storage::{
 
 #[path = "positioned_writer.rs"]
 mod positioned_writer;
+#[path = "staged_acl.rs"]
+mod staged_acl;
 
 #[async_trait]
 pub(crate) trait NfsStageFile: Send + Sync {
@@ -60,6 +62,10 @@ pub(crate) trait NfsStagedProtocol: Send + Sync {
     /// the safe answer for a protocol object that does not know.
     fn supports_acl(&self) -> bool {
         false
+    }
+    fn acl_encoding(&self) -> Option<crate::model::AclEncoding> {
+        self.supports_acl()
+            .then_some(crate::model::AclEncoding::NfsV4)
     }
     /// Whether the negotiated mount stores named attributes.
     fn supports_xattrs(&self) -> bool {
@@ -564,11 +570,10 @@ impl StagedDestination for NfsStagedDestinationAdapter {
                     crate::model::TimePrecision::Nanoseconds,
                 ),
                 ownership: crate::storage::CopiedOwnershipTarget::Numeric,
-                acl: if self.protocol.supports_acl() {
-                    crate::storage::CopiedAclTarget::Encoding(crate::model::AclEncoding::NfsV4)
-                } else {
-                    crate::storage::CopiedAclTarget::Unsupported
-                },
+                acl: self.protocol.acl_encoding().map_or(
+                    crate::storage::CopiedAclTarget::Unsupported,
+                    crate::storage::CopiedAclTarget::Encoding,
+                ),
                 xattrs: if self.protocol.supports_xattrs() {
                     crate::storage::CopiedValueTarget::Supported
                 } else {
@@ -722,6 +727,15 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             verified_bytes: request.expected_size,
             blake3: hash,
         })
+    }
+
+    async fn validate_recovered_metadata(
+        &self,
+        stage: &PreparedStage,
+        mutations: Vec<MetadataMutation>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        staged_acl::validate_recovered_metadata(self, stage, mutations, cancel).await
     }
 
     async fn apply_metadata(

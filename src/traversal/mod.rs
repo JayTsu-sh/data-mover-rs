@@ -312,6 +312,12 @@ impl TraversalRequest {
     /// deleted now included — and a history longer than
     /// [`MAX_HISTORY_RECORDS`](crate::model::MAX_HISTORY_RECORDS) comes in several entries of the
     /// same key, its segments, in order and together; there is nothing to choose.
+    ///
+    /// A zero-byte marker (`dir/`), including a history whose object versions are all zero,
+    /// is represented by Directory `dir`, retaining its history. Any nonzero version makes
+    /// the whole key a File `dir/`. Only actual descendants add a separate Directory for it.
+    /// The root itself is not emitted; list its parent to include its own object. Content or
+    /// history at that unrepresentable root key is reported as `Unsupported`, never discarded.
     #[must_use]
     pub fn new(root: StoragePath) -> Self {
         Self {

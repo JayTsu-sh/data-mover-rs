@@ -110,13 +110,15 @@ impl BlockCounts {
     /// Counts one emitted entry — a key with its whole history, before it is segmented.
     pub(crate) fn count_emitted(&mut self, entry: &ObservedEntry) {
         self.emitted = self.emitted.saturating_add(1);
+        if let Some(history) = entry.history() {
+            self.count_history(history);
+        }
         let tally = match entry.kind() {
             EntryKind::File => {
                 let size = entry.size().unwrap_or(0);
                 self.bytes = self.bytes.saturating_add(size);
-                match entry.history() {
-                    Some(history) => self.count_history(history),
-                    None => self.all_versions_bytes = self.all_versions_bytes.saturating_add(size),
+                if entry.history().is_none() {
+                    self.all_versions_bytes = self.all_versions_bytes.saturating_add(size);
                 }
                 &mut self.files
             }

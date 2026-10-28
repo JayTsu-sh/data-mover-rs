@@ -698,10 +698,20 @@ pub trait Metadata: Send + Sync {
 
     /// Permission facts bound to a description. Reuses inline facts when available; named
     /// principal backends override this instead of fabricating numeric owner identifiers.
+    /// Known unsupported or inapplicable ownership returns no facts without backend I/O;
+    /// backends with independent permission facts override this method.
     async fn permissions(
         &self,
         descriptor: &SourceDescriptor,
     ) -> Result<super::PermissionFacts, StorageRoleFailure> {
+        if matches!(
+            self.observation_capabilities()
+                .support(crate::model::MetadataFamily::OwnershipMode),
+            crate::model::ObservationSupport::NotApplicable
+                | crate::model::ObservationSupport::Unsupported
+        ) {
+            return Ok(super::PermissionFacts::default());
+        }
         let plan = ObservationPlan::default()
             .with_ownership_mode(crate::model::ObservationMode::BestEffort);
         let observations = match self.observe_listed(descriptor, plan) {

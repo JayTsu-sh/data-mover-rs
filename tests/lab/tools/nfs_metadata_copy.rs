@@ -38,6 +38,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
 #[derive(Debug, Parser)]
 #[command(about = "Copy one file with optional ACL / xattr policies and check the outcome")]
+#[allow(clippy::struct_excessive_bools)] // Independent CLI switches.
 struct Args {
     #[arg(long)]
     source: String,
@@ -53,6 +54,12 @@ struct Args {
     /// Ask for the ACL to be carried.
     #[arg(long)]
     acl: bool,
+    /// Require native ACL preservation instead of skipping unsupported metadata.
+    #[arg(long)]
+    acl_required: bool,
+    /// Allow proven regular-file access mapping in a shared numeric identity/group namespace.
+    #[arg(long)]
+    acl_mapping: bool,
     /// Ask for extended attributes to be carried.
     #[arg(long)]
     xattrs: bool,
@@ -240,9 +247,13 @@ async fn seed(source: &Storage, path: &str, bytes: usize) -> Result {
         Ok(_) => return Err(format!("{path} already exists; seed a new path").into()),
     }
     let local = tempfile::tempdir()?;
-    fs::write(local.path().join("seed"), vec![b'x'; bytes])?;
+    let local_path = local.path().join(path);
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(local_path, vec![b'x'; bytes])?;
     let local = connect(&local.path().to_string_lossy()).await?;
-    transfer(request(&local, "seed", source, path)?).await?;
+    transfer(request(&local, path, source, path)?).await?;
     println!("seeded {path} bytes={bytes}");
     Ok(())
 }
@@ -385,6 +396,9 @@ async fn copied(args: &Args, outcome: TransferOutcome) -> Result {
         .metadata
         .ok_or("the copy produced no metadata report")?;
     print_report(&report);
+    for mapping in report.mappings() {
+        println!("mapping {:?}: {:?}", mapping.family, mapping.decision);
+    }
     let outcome_of = |family| {
         report
             .outcomes()
@@ -434,6 +448,12 @@ async fn main() -> Result {
     let mut copied_metadata = CopiedMetadataRequest::default();
     if args.acl {
         copied_metadata = copied_metadata.with_acl();
+    }
+    if args.acl_required {
+        copied_metadata = copied_metadata.with_required_acl();
+    }
+    if args.acl_mapping {
+        copied_metadata = copied_metadata.with_acl_mapping();
     }
     if args.xattrs {
         copied_metadata = copied_metadata.with_xattrs();

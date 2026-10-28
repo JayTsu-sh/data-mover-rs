@@ -253,16 +253,49 @@ checkpoint observation.
 These limitations have been reproduced against the current DXN lab endpoint.
 They do not change standard S3 or StorageGRID behavior.
 
+### Integrity-check inputs
+
+`integrity::compare` accepts an `IntegrityRequest`. Its `source_path` and
+`destination_path` can each be a `StoragePath`, `ObservedEntry`, or
+`Box<ObservedEntry>`. A path compares the current entry. An observation is
+revalidated against its connected storage before comparison; a stale or foreign
+observation fails on that side. An observed versioned entry selects the version
+that was current when it was observed.
+
+`IntegrityRequest.plan` independently selects native ACL and xattr comparisons.
+Its default omits both. Owner, group, and mode are selected automatically from
+the facts each backend can supply: each comparable fact is checked, and each
+unavailable or incompatible fact is reported as ignored. Numeric and named
+principals are never mapped implicitly. Kind, size, and modification time are
+checked independently, while content depends on
+`IntegrityOptions.mode`. Requesting ACLs or xattrs on a backend that cannot
+report them adds an `IntegrityIgnored` fact. A DXN NFSv4 endpoint can use
+`IntegrityPlan::default()` to avoid requesting its unsupported ACL and xattr
+families.
+
 ### Integrity-check timestamp options
 
-Integrity checks compare modification timestamps exactly by default. Callers
-that need to accommodate endpoints with coarser timestamp resolution can use
-`IntegrityCheckOptions` with `MtimePrecision::Auto` and an explicit
-`mtime_tolerance`. The tolerance is inclusive and represented as a Rust
-`Duration`; existing `IntegrityCheck` methods retain exact comparison.
+`IntegrityOptions` controls modification-time comparison.
+The library defaults to `MtimePrecision::Coarsest`, which treats modification
+times in the same tick of the coarser observed precision as equal. Set
+`mtime_precision` to `MtimePrecision::Exact` to compare observed nanoseconds.
+The default `mtime_tolerance` is `Duration::ZERO`; either precision mode also
+accepts an absolute timestamp difference up to and including the configured
+`Duration`.
 
-The `storage_integrity_check` example exposes the same behavior through
-`--mtime-auto-precision` and `--mtime-tolerance-ms`.
+Strict ACL checks are explicit: `CopiedMetadataRequest::with_required_acl()` requires native
+preservation; `with_acl_mapping()` permits the proven POSIX/NFSv4 regular-file access subset
+under shared numeric identities and group resolution. NFSv3 POSIX ACLs require the actual
+NFSACL extension. `IntegrityPlan::with_required_acl()` and `with_acl_equivalence()` never
+ignore missing required ACLs. `IntegrityReport::acl_scope()` names the proven scope.
+See the [four-way validation report](docs/reports/2026-10-28-nfs-acl-four-way-validation.md).
+
+The `storage_integrity_check` example defaults to exact precision. Pass
+`--mtime-auto-precision` to use the coarser observed precision, and
+`--mtime-tolerance-ns` to set an inclusive tolerance in nanoseconds (default `0`).
+The example checks owner/group/mode; pass `--acl` or `--xattrs` to
+request those optional families. Content checks use each backend's own read
+chunk and concurrency limits.
 
 ### SMB/CIFS connection
 

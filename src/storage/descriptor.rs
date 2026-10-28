@@ -27,6 +27,9 @@ pub(crate) struct ListingFacts {
     /// The key's whole history, from the listing of a versioned bucket; carried onto the observed
     /// entry, each record observed on its own when the plan asks for more than the listing gave.
     pub(crate) history: Option<Box<ObjectHistory>>,
+    /// A real unversioned zero-byte object represented by this logical directory. Absent on
+    /// virtual directories; retained separately so object-store copies do not invent or lose keys.
+    pub(crate) directory_marker: Option<Box<SourceDescriptor>>,
     /// Nothing behind the child itself can be observed: an S3 common prefix, or a key whose latest
     /// record is a delete marker (the records of its history still can be). The traversal takes
     /// what the listing gave for the entry and asks the metadata role nothing about it.

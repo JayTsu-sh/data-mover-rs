@@ -98,7 +98,7 @@ async fn consume(
                     tally.snapshots += entry.encode_snapshot().as_bytes().len() as u64;
                 }
                 if !*quiet {
-                    print_entry(entry, command);
+                    print_entry(entry, command)?;
                 }
                 if *cancel_after_entries == Some(tally.entries) {
                     cancel.cancel();
@@ -130,7 +130,7 @@ async fn consume(
 /// One line per entry, with what the flags ask for, then one per record of its history — or,
 /// with `--current`, the current object alone (nothing for a key deleted now, or a segment that
 /// is not the key's last).
-fn print_entry(entry: &ObservedEntry, command: &Command) {
+fn print_entry(entry: &ObservedEntry, command: &Command) -> Result<(), Error> {
     let Command::Traverse {
         sizes,
         identity,
@@ -144,7 +144,7 @@ fn print_entry(entry: &ObservedEntry, command: &Command) {
     };
     let history = entry.history();
     if *current && history.is_some_and(|history| history.current().is_none()) {
-        return;
+        return Ok(());
     }
     let history = history.filter(|_| !*current);
     let identity = if *identity {
@@ -174,8 +174,9 @@ fn print_entry(entry: &ObservedEntry, command: &Command) {
         history.map_or_else(String::new, history_of)
     );
     if let Some(history) = history {
-        print_records(entry, history);
+        print_records(entry, history)?;
     }
+    Ok(())
 }
 
 fn print_listed(listed: &DirectoryListed) {
@@ -342,11 +343,14 @@ fn history_of(history: &ObjectHistory) -> String {
 
 /// `Record <path> <segment>.<n> version=<id|null> latest=<0|1> marker=<0|1> size=<n|->`, one
 /// line per record of the segment, oldest first.
-fn print_records(entry: &ObservedEntry, history: &ObjectHistory) {
+fn print_records(entry: &ObservedEntry, history: &ObjectHistory) -> Result<(), Error> {
+    let path = entry
+        .history_source_path()?
+        .ok_or("history has no source object key")?;
     for (index, record) in history.records().iter().enumerate() {
         println!(
             "Record {} {}.{} version={} latest={} marker={} size={}",
-            entry.path(),
+            path,
             history.segment(),
             index + 1,
             record.version_id().unwrap_or("null"),
@@ -357,6 +361,7 @@ fn print_records(entry: &ObservedEntry, history: &ObjectHistory) {
                 .map_or_else(|| "-".to_string(), |size| size.to_string()),
         );
     }
+    Ok(())
 }
 
 /// ` owner=<uid>:<gid>:<mode, octal>/<provenance>`, or the observation that stands in for it.

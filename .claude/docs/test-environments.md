@@ -15,7 +15,7 @@
 | CIFS | ONTAP FAS2750 SVM `lizy` | SMB 3.x（签名） | WSL | share `ontap_lisaauto_cifs` 下的测试目录；匿名测试 share `dm_anon_share`；只读 share `dm_ro_share`（只读，不写） | `.claude/skills/e2e-cifs/.env` |
 | NFS | ONTAP FAS2750 SVM `lizy` `/ontap_lisaauto_nfs` | **v3** | **10.131.9.10（root）** | 导出下的测试子目录 | `e2e-nfs/.env` 的主机 / 导出，URL 不带 `noresvport` |
 | NFS | 同上 | **v4.0、v4.1** | WSL | 同上 | `e2e-nfs/.env`（`NFS_OPTIONS` 里 `version=4.0` / `4.1`） |
-| NFS | DXN-2 `10.128.136.211:/nfv3_v4` | **v3、v4.0** | WSL | 只 `data-mover-test/` 子目录 | `e2e-nfs/dxn-v3/.env`、`e2e-nfs/dxn-v40/.env` |
+| NFS | DXN-2 `10.128.136.211:/nfs` | **v4.0**（2026-10-28 复测；v3 待复测） | 10.131.9.10 | `data-mover-test/integrity-plan/`（用户批准创建并保留） | `nfs://10.128.136.211/nfs:/data-mover-test/integrity-plan?version=4.0&noresvport=true&uid=0&gid=0`；旧 profile 的 `/nfv3_v4` 已不存在 |
 | NFS | openfs m1-source（`10.131.5.221` / node1 直连 `192.168.131.214`） | v3 | WSL（慢）/ node1 | 已有导出下的子目录（不建新导出） | URL 见 §3.3 |
 | SMB | openfs m1-source / m1-target | SMB | — | — | guest 登录目前失败（§3.3） |
 | S3 | MinIO（VM 102） | S3 | WSL | 桶 `data-mover-test`；临时版本桶 `data-mover-*`（用完删光） | `.claude/skills/e2e-s3/.env` |
@@ -70,6 +70,12 @@
     有快照的卷（例如 `/dm_s3_nas`，只读探过）里快照子项 v3 READDIRPLUS 同样不带属性。
     `.snapshot` 是只读文件系统：在它下面 MKDIR 回 `NFS3ERR_ROFS` / `NFS4ERR_ROFS`（2026-09-27），`e2e-nfs` 的
     `NFS_RO_PATH={scratch}/.snapshot` 拿它当只读导出的替身（只尝试建目录、必被拒）；没有真正的只读 NFS 导出。
+  - **2026-10-28 ACL 跨版本真机对照**：当前 ONTAP 的 RPC 列表未公布 `nfs_acl`（100227），NFSv3 上给测试文件或目录添加 POSIX ACL 的 `setfacl` 返回 `Operation not supported`。
+    基本 `0640` 文件经生产库 v3→v4.1 拷贝后，内容 SHA-256、uid/gid/mode 与原生 NFSv4 ACL 均相同。
+    随后通过 v4.1 视图给源文件加入 `A::42421:r` 命名 ACE，再经 v3 读取并拷贝，目标丢失该 ACE，而内容和 mode 仍相同。
+    这不是扩展 POSIX ACL 转换成功的证据：v3 对 `system.posix_acl_access` 返回 `EOPNOTSUPP`，`getfacl` 只显示 mode 派生的三个基本条目。
+    拷贝明确报告 `Acl: Unsupported`；compare 即使 `plan.acl=true` 也报告 `ignored=[Acl { source: None, destination: Some(NfsV4) }]`，因此 `matches=true` 不证明 ACL 相同。
+    夹具保留在 `/ontap_lisaauto_nfs/data-mover-test/integrity-plan/ontap3-to-ontap41-20261028/{source,destination}/access.bin`。
 - **S3**（SVM `lizy` 的 object store server `s3lizy.com`，`http://10.128.61.200:80`，path-style），用户 `data-mover-test`（只在 `e2e-s3/ontap/.env`）：
   - `data-mover-test`（无版本，FlexGroup `fg_oss_1790405106`）、`data-mover-test-ver`（开版本，`fg_oss_1790405136`）：两个卷是建桶时 ONTAP 新建的
     （FAS2750_01_SSD_1 × 3 成员，thin 100 GB），后台重删 + 压缩。我们的用户**不能建桶**，脚本要用已有桶、跑完清空。
@@ -103,12 +109,20 @@
 
 ### 2.3 DXN-2（NAS，10.128.136.211）
 
-- **2026-10-12 当前状态：环境受限，停止远端操作**。用户确认底层 ThinkFS 文件系统故障，并要求先完成代码验收、
+- **2026-10-28 当前状态：NFS 恢复可访问，导出已变化**。只读 `list_exports` 当前返回 `/caohui`、`/nfs`；旧 `/nfv3_v4` 的 v4.0 挂载返回 `NOENT`。
+  用户本轮批准创建并保留专用测试路径，已在 `/nfs/data-mover-test/integrity-plan/` 建立隔离目录。
+  运行 `nightly-plan-20261028-113021` 的 7 项检查通过：播种两侧、path / observed 默认 plan 比较、xattr 请求、ACL 读取比较、自动 mode 差异检测。
+  当前该导出的 GETACL 可用，xattr 报 `Unsupported`；本轮未验证 SETACL。未修改导出、服务或设备配置。
+  该运行子目录与两份 8 KiB 夹具经用户授权保留，可供复测。旧 profile 在更新前不要直接复用。
+- **2026-10-28 NFSv3 POSIX ACL 探测**：DXN-1、DXN-2 均注册 `nfs_acl` v3（100227，2052）。两端原生 v3 挂载后，命名 access ACL 与 default ACL 的 `setfacl` 都返回 `EOPNOTSUPP`。
+  DXN-2 抓包确认 GETACL 成功但测试文件 ACL count 为 0，SETACL 的服务端状态为 `10004 (NOTSUPP)`。`getfacl` 显示的三个基本条目来自 mode，不能据此认定扩展 POSIX ACL 可读写。
+  DXN-2 夹具保留在 `/nfs/data-mover-test/integrity-plan/posix-v3-20261028/`；未改服务或导出配置。
+- **2026-10-12 历史故障记录**。用户确认底层 ThinkFS 文件系统故障，并要求先完成代码验收、
   不再尝试该环境。原生 `nfs-tfs.service` 与 v3 / v4 导出已经配置，不能根据通用 Linux exports 或 Kubernetes
   清单判断设备没有 NFS。当前全部 MDS down、无 active IOA，NFS 没有 2049 监听 / mountd 注册；本轮 NFS 矩阵未验证。
   调查未修改任何配置，也未启动、停止或重启服务。下列可挂载与用例结果属于此前的历史记录；恢复测试需另行安排。
 - NFS 导出 `/nfv3`（只 v3）、`/nfv3_v4`（v3 + v4.0）、`/share1`、`/along_nfs`，都是别人的；另开着 SMB（445）与 Web（80/443）。
-- **我们只写 `/nfv3_v4/data-mover-test/`**（用户 2026-09-26 批准，目录已建）。环境文件把导出写成 `/nfv3_v4:/data-mover-test`，
+- **历史写入范围 `/nfv3_v4/data-mover-test/`**（用户 2026-09-26 批准，现已不存在）。旧环境文件把导出写成 `/nfv3_v4:/data-mover-test`，
   URL 根就落在子目录里，`nfs_opt_dir` 之类的写操作不会越界。v3 与 v4.0 都从 WSL 用 `noresvport=true` 可挂。
 - 用法：`set -a; . .claude/skills/e2e-nfs/dxn-v3/.env; set +a; python3 .claude/skills/e2e-nfs/scripts/run.py`（进程环境覆盖 skill 的 `.env`），v4.0 换 `dxn-v40`。
 - 没有 `.snapshot`（v3 / v4.0 LOOKUP 都 `NOENT`）。能建名叫 `.snapshot` 的真目录，READDIRPLUS 给它完整属性与句柄，
@@ -117,6 +131,7 @@
 ### 2.4 PVE 实验室（10.131.9.x，宿主 10.131.9.20）
 
 - 看 VM：`qm guest exec <id>`（101 / 401 / 402 无 guest agent，510–514 禁 exec）。VM 只收公钥 SSH。
+- **Linux nfsd（2026-10-28 复测）**：VM 103 / 104（`10.131.9.12` / `.13`）均导出 `/srv/nfs/v3`、`/srv/nfs/v4`，内核启用 `+3 +4 +4.1 -4.2`，RPC `100227 v3` 可用。两台的 NFSv3 命名 POSIX ACL、default ACL 及重挂读回均通过；VM 103 配置 `manage-gids=y`，跨服务器测试不能假设其采用客户端补充组。与 ONTAP 的限定文件正例及目录继承反例见 [实测报告](../../docs/reports/2026-10-28-linux-nfs-acl-validation.md)。本次夹具保留在导出内 `data-mover-test/integrity-plan/` 下的独立运行目录。
 - **MinIO**（VM 102 容器 `milvus-minio`，RELEASE.2023-03-20）`http://10.131.9.11:9000`：桶 `data-mover-test`；**`a-bucket` 是 Milvus 数据，绝不写**；
   `data-mover-test` 不开版本，临时版本桶可建（用完删光）。已知：ListMultipartUploads 只按精确 key；不支持条件 PUT；
   DeleteObjects 要 Content-MD5；upload id 列举里是裸 uuid；最新已是删除标记时再 DELETE 不新建标记；stale upload 24 h 过期。

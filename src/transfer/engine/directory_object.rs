@@ -3,9 +3,10 @@
 //!
 //! - Between object stores it is copied like any file, to the same key.
 //! - A filesystem (Local, NFS, CIFS, HDFS) cannot store content on a directory. A consumer decides
-//!   each entry with [`directory_object_action`] before it builds any request: a zero-byte one (a
-//!   folder marker) or a delete marker is nothing to do — the directory entry already creates the
-//!   directory — and one holding content is skipped with [`DIRECTORY_OBJECT_SKIP_REASON`].
+//!   each entry with [`directory_object_action`] before it builds any request: any content version
+//!   in the full history skips the whole key with [`DIRECTORY_OBJECT_SKIP_REASON`], on every
+//!   segment. All-zero markers use the ordinary directory workflow; raw zero-byte or delete-only
+//!   markers remain nothing to do for compatibility with callers using raw namespace listings.
 //!   data-mover builds no sidecar file: any sidecar name can collide with a real key. A consumer
 //!   that wants one maps `final_path` itself; the engine copies that like any file.
 //! - Given the destination [`Storage`], the same helper also answers what the engine would refuse
@@ -23,8 +24,8 @@
 //!   else the destination cannot write: an ONTAP NAS bucket's size and key limits, P7 §14.2).
 
 use crate::model::{
-    EntryOperationFailure, FailureClass, ObjectHistory, ObservedEntry, Operation, StoragePath,
-    Transience, VersionRecord,
+    EntryKind, EntryOperationFailure, FailureClass, ObjectHistory, ObservedEntry, Operation,
+    StoragePath, Transience,
 };
 use crate::storage::{NamespaceCapabilities, StagedDestination, Storage, StorageRoleFailure};
 
@@ -91,9 +92,10 @@ pub enum DirectoryObjectAction {
     /// Request the transfer as usual: the entry is no directory object, or the destination holds
     /// directory objects (an object store: the key is recreated with its bytes).
     Copy,
-    /// Nothing to copy: a zero-byte directory object (a folder marker) or a delete marker, bound
-    /// for a destination that cannot hold directory objects. The directory entry already creates
-    /// the directory; nothing is lost.
+    /// Nothing to copy: a raw folder marker or delete marker with no content anywhere in its
+    /// history, bound for a destination that cannot hold directory objects. Kept for raw-listing
+    /// compatibility. Also returned for a scanned marker directory whose history is deleted
+    /// currently or whose segment is not final, so it does not create a directory on its own.
     NothingToDo,
     /// Do not copy; record the reason. Not a failure of the transfer job:
     /// [`DIRECTORY_OBJECT_SKIP_REASON`] — the entry holds content the destination cannot store on
@@ -103,8 +105,9 @@ pub enum DirectoryObjectAction {
 }
 
 /// Decides one listed entry for `destination`: its [`Storage`] (the full answer), or its
-/// namespace's capabilities (no size limit known). Only directory objects are decided here; any
-/// other entry is [`DirectoryObjectAction::Copy`] (the ordinary rules apply).
+/// namespace's capabilities (no size limit known). Directory objects and directory entries
+/// carrying marker history are decided here; other entries are [`DirectoryObjectAction::Copy`]
+/// (the ordinary rules apply).
 ///
 /// To a destination that holds directory objects, one it would refuse for size — more than its
 /// limit, or of unknown size — is `Skip(`[`DIRECTORY_OBJECT_TOO_LARGE_REASON`]`)`. This is the
@@ -114,10 +117,14 @@ pub enum DirectoryObjectAction {
 /// (a replay that stops part way would leave the destination's history with a gap, D11); its
 /// delete markers are replayed, not written, and never too large.
 ///
-/// To one that holds none, only the current state can be copied: the entry — or, for a key with
-/// its history, its current version — holding content is `Skip(`[`DIRECTORY_OBJECT_SKIP_REASON`]`)`;
-/// one without a size, a zero-byte one, a key deleted now (its latest record is a delete marker)
-/// or a segment of a history that is not its last is [`DirectoryObjectAction::NothingToDo`].
+/// To one that holds none, any nonzero version anywhere in the key's full history means
+/// `Skip(`[`DIRECTORY_OBJECT_SKIP_REASON`]`)` on every segment, including when the current version
+/// is empty or deleted. Without history, a nonzero size means the same. Raw markers with no
+/// content history, or entries without history whose size is zero or unknown, retain the
+/// [`DirectoryObjectAction::NothingToDo`] fallback. Scanned all-zero markers are directory
+/// entries and use the ordinary directory workflow only when their history has a current object.
+/// Deleted marker directories and non-final history segments return `NothingToDo` to destinations
+/// that hold no directory objects. Children are decided independently and can create their parents.
 ///
 /// `destination` is taken by conversion: pass `&Storage` or `&NamespaceCapabilities` itself (a
 /// `&Arc<Storage>` needs `&*`).
@@ -126,10 +133,18 @@ pub fn directory_object_action(
     entry: &ObservedEntry,
     destination: impl Into<DirectoryObjectDestination>,
 ) -> DirectoryObjectAction {
+    let destination = destination.into();
+    if entry.kind() == EntryKind::Directory
+        && !destination.holds
+        && entry
+            .history()
+            .is_some_and(|history| history.current().is_none())
+    {
+        return DirectoryObjectAction::NothingToDo;
+    }
     if !entry.is_directory_object() {
         return DirectoryObjectAction::Copy;
     }
-    let destination = destination.into();
     if destination.holds {
         let too_large = match entry.history() {
             Some(history) => any_version_over(destination.limit, history),
@@ -142,7 +157,7 @@ pub fn directory_object_action(
         };
     }
     let size = match entry.history() {
-        Some(history) => history.current().and_then(VersionRecord::size),
+        Some(history) => history.largest_version(),
         None => entry.size(),
     };
     if size.unwrap_or(0) == 0 {

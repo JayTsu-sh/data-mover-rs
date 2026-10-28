@@ -421,6 +421,7 @@ async fn compare(storage: Storage, args: &Args, command: &Command) -> Result<(),
         source_path: StoragePath::new(path.clone())?,
         destination,
         destination_path: StoragePath::new(path.clone())?,
+        plan: data_mover::integrity::IntegrityPlan::default(),
         options: IntegrityOptions {
             mode: if *content {
                 IntegrityMode::Content

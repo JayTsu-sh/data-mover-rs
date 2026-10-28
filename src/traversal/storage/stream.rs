@@ -164,7 +164,9 @@ async fn read(
     // the traversal is ending then, so what it returns is never used.
     let request = ListRequest::new(work.path.clone(), shared.request.cancel.clone())
         .with_descent_hint(work.hint.clone());
-    let mut stream = shared.namespace.list(request);
+    let mut stream = shared
+        .namespace
+        .list_for_traversal(request, work.child_depth == 1);
     let mut peeked: Option<Option<Item>> = None;
     loop {
         let next = match peeked.take() {
@@ -260,6 +262,9 @@ pub(super) fn prepare(shared: &Shared, work: &DirectoryWork, page: ListingPage) 
     if work.child_depth == 1 {
         root_object(shared, &mut entries, &mut failures);
     }
+    if shared.namespace.capabilities().directory_objects {
+        entries.retain(|(descriptor, _)| !is_directory_marker(descriptor));
+    }
     let listed = u64::try_from(entries.len().saturating_add(failures.len())).unwrap_or(u64::MAX);
     // A child gone before the listing could describe it is counted, not reported (Q12).
     let (vanished, failures): (Vec<_>, Vec<_>) = failures
@@ -284,13 +289,22 @@ pub(super) fn prepare(shared: &Shared, work: &DirectoryWork, page: ListingPage) 
     prepared
 }
 
+/// The parent listing already represents this marker as a directory. Fold it before filtering,
+/// observation and counting, without changing raw namespace listings (used by deletion too).
+/// A history, even of only zero-byte versions or delete markers, is never a folder marker.
+fn is_directory_marker(descriptor: &SourceDescriptor) -> bool {
+    descriptor.kind == EntryKind::File
+        && descriptor.path.names_directory_object()
+        && descriptor.size == Some(0)
+        && descriptor.listing.history.is_none()
+}
+
 /// Takes the traversal root's own object out of its listing (P7 F5, D4). The listing of a root
 /// `p/d` hands over the object `p/d/` as a file, but its path relative to the root would be the
 /// root itself, so it is not part of the traversal: a traversal of the parent `p` includes it. A
-/// zero-byte one (a folder marker; every record of its history, delete markers included) is
-/// dropped, uncounted, as the root's directory already stands for it. One holding content — now,
-/// or in any version of its history — is the traversal's `Child` failure at that key
-/// (`Unsupported`), reported once, never silently dropped.
+/// zero-byte one without history (a folder marker) is dropped, uncounted, as the root's directory
+/// already stands for it. One holding content or any history is the traversal's `Child` failure
+/// at that key (`Unsupported`), reported once, never silently dropped.
 fn root_object(
     shared: &Shared,
     entries: &mut Vec<(SourceDescriptor, Option<DescentHint>)>,
@@ -304,7 +318,7 @@ fn root_object(
     let mut content = None;
     entries.retain(|(descriptor, _)| {
         let own = descriptor.path.as_str().strip_suffix('/') == Some(root);
-        if own && holds_content(descriptor) {
+        if own && !is_directory_marker(descriptor) {
             content = Some(descriptor.path.clone());
         }
         !own
@@ -318,22 +332,11 @@ fn root_object(
         Operation::Traverse,
         FailureClass::Unsupported,
         Transience::Permanent,
-        "the traversal root's own directory object holds content but is not part of the \
+        "the traversal root's own directory object holds content or history but is not part of the \
          traversal; traverse its parent to include it",
     )
     .unwrap_or_else(|_| unreachable!("the static traversal diagnostic is valid"));
     failures.push(failure);
-}
-
-/// Whether a listed object holds content: its size, or, with a history, any version's.
-fn holds_content(descriptor: &SourceDescriptor) -> bool {
-    match descriptor.listing.history.as_deref() {
-        Some(history) => history
-            .records()
-            .iter()
-            .any(|record| record.size().is_some_and(|size| size > 0)),
-        None => descriptor.size.is_some_and(|size| size > 0),
-    }
 }
 
 /// Decides and, when it needs no I/O, observes one child, and files it into the page.

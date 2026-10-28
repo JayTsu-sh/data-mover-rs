@@ -239,6 +239,14 @@ separate from an individual child error. Local, NFS, CIFS, HDFS and unversioned 
 S3 histories are gathered per directory before keys are delivered (at most five million records).
 Dropping a stream signals cancellation; producers finish in-flight operations and close handles.
 
+Traversal calls `Namespace::list_for_traversal(request, is_root)`, which defaults to raw `list`.
+S3 projects common prefixes with a one-level probe: all-zero marker histories become Directory
+entries retaining the full history, any nonzero version keeps the raw trailing-slash File, and
+only actual descendants add a virtual Directory alongside a content object. Raw listing/delete
+semantics stay unchanged. Probes may relist a child directory and fail explicitly rather than
+treating failed inspection as absence; this is not a selectable scan mode. History records on a
+Directory use `ObservedEntry::history_source_path()` to read/replay the raw marker key.
+
 S3 lends `stat` and `list` only: `list` of a path is one delimiter listing of the prefix `<path>/`,
 so a common prefix is a directory. `capabilities().histories` is fixed at connection: enabled or
 suspended versioning, or a refused versioning query, selects `ListObjectVersions`; a bucket never
@@ -306,7 +314,7 @@ the snapshot unchanged when reconstruction is required. Reconstruction never re-
 backend, but it needs the endpoint the scan ran on: `ObservedEntry::decode_snapshot(bytes,
 &identity)` takes it from `Storage::identity()` or `storage::endpoint_identity(&config)` offline.
 `SnapshotDecodeError::BackendMismatch` for a whole generation means the endpoint moved or is
-spelled differently; treat it as no previous generation. The only entry format is **DMES v8**,
+spelled differently; treat it as no previous generation. The only entry format is **DMES v9**,
 including entries without history. Other versions return `UnsupportedVersion` and require a fresh
 scan. Every format change increments the version byte and updates golden-byte fixtures. This is
 a development policy; before release, choose N-1 decoding or a documented migration/rescan path

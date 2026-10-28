@@ -9,8 +9,12 @@
 //! ```text
 //! "DMES" | version u8 | backend kind u8 | path | kind u8 | symlink target | size | modified |
 //! identity strength u8 | endpoint fingerprint [4] | identity bytes | 2 | metadata |
-//! backend facts | history section (history_codec) | rename evidence | identity key [32]
+//! backend facts | history section (history_codec) | rename evidence | marker section |
+//! identity key [32]
 //! ```
+//! The marker section is `0`, or `1` followed by one leaf entry in this same format. A leaf's
+//! marker section must be `0`: decoding never recurses. Its path, kind, size and backend must
+//! satisfy [`ObservedEntry::with_directory_marker_object`].
 //!
 //! The backend identity is not stored — every entry of one scan shares it, and the caller supplies
 //! it when decoding; the 4-byte endpoint fingerprint tells a wrong endpoint from a corrupted key.
@@ -25,9 +29,9 @@ use crate::model::metadata_observation;
 use crate::model::{RenameEvidence, RenameScheme, SpecialFileKind, TimePrecision};
 
 const MAGIC: &[u8; 4] = b"DMES";
-/// The current format: v8 adds independent optional rename evidence after the history section.
+/// The current format: v9 adds an optional current directory marker observation.
 /// Bump on **any** layout change and update the golden bytes.
-pub(super) const VERSION: u8 = 8;
+pub(super) const VERSION: u8 = 9;
 
 impl PrivateBackendEntryFacts {
     fn encode(&self, output: &mut Vec<u8>) {
@@ -47,11 +51,28 @@ impl PrivateBackendEntryFacts {
 impl ObservedEntry {
     pub(super) fn encode(&self) -> EntrySnapshot {
         let mut output = Vec::new();
+        self.encode_fields(&mut output);
+        match self.marker.as_deref() {
+            Some(marker) => {
+                output.push(1);
+                marker.encode_fields(&mut output);
+                output.push(0); // A marker is a leaf, never another container.
+                output.extend_from_slice(marker.identity_key.as_bytes());
+            }
+            None => output.push(0),
+        }
+        output.extend_from_slice(self.identity_key.as_bytes());
+        EntrySnapshot(output)
+    }
+
+    /// Fields shared by an outer entry and its nonrecursive marker leaf, before their marker
+    /// tag and identity key.
+    fn encode_fields(&self, output: &mut Vec<u8>) {
         output.extend_from_slice(MAGIC);
         output.push(VERSION);
         output.push(backend_tag(self.backend_kind));
-        put_bytes(&mut output, self.path.as_str().as_bytes());
-        encode_kind(&mut output, self.kind);
+        put_bytes(output, self.path.as_str().as_bytes());
+        encode_kind(output, self.kind);
         match &self.symlink_target {
             Some(target) => {
                 output.push(1);
@@ -59,19 +80,19 @@ impl ObservedEntry {
                     SymlinkTargetEncoding::UnixBytes => 0,
                     SymlinkTargetEncoding::WindowsWide => 1,
                 });
-                put_bytes(&mut output, target.as_bytes());
+                put_bytes(output, target.as_bytes());
             }
             None => output.push(0),
         }
-        encode_size(&mut output, self.size);
-        encode_time(&mut output, self.modified);
+        encode_size(output, self.size);
+        encode_time(output, self.modified);
         output.push(self.source_identity.strength.tag());
         output.extend_from_slice(&endpoint_fingerprint(&self.source_identity.backend));
-        put_bytes(&mut output, self.source_identity.stable_bytes.as_slice());
+        put_bytes(output, self.source_identity.stable_bytes.as_slice());
         output.push(2);
-        metadata_observation::encode(&self.metadata, &mut output);
-        self.backend_fact.encode(&mut output);
-        history_codec::encode(&mut output, self.history.as_deref());
+        metadata_observation::encode(&self.metadata, output);
+        self.backend_fact.encode(output);
+        history_codec::encode(output, self.history.as_deref());
         match self.rename_evidence {
             Some(evidence) => {
                 output.push(evidence.scheme().tag());
@@ -79,8 +100,6 @@ impl ObservedEntry {
             }
             None => output.push(0),
         }
-        output.extend_from_slice(self.identity_key.as_bytes());
-        EntrySnapshot(output)
     }
 }
 
@@ -131,6 +150,38 @@ pub(super) fn decode_snapshot(
     backend: &BackendIdentity,
 ) -> Result<ObservedEntry, SnapshotDecodeError> {
     let mut cursor = Cursor::new(bytes);
+    let mut entry = decode_fields(&mut cursor, backend)?;
+    let marker = match cursor.byte()? {
+        0 => None,
+        1 => Some(Box::new(decode_marker_leaf(&mut cursor, backend)?)),
+        _ => return Err(SnapshotDecodeError::Malformed),
+    };
+    entry.identity_key = decode_identity_key(&mut cursor, &entry.source_identity)?;
+    if cursor.offset != bytes.len() {
+        return Err(SnapshotDecodeError::TrailingData);
+    }
+    entry
+        .with_directory_marker_object(marker)
+        .map_err(|_| SnapshotDecodeError::Malformed)
+}
+
+/// Reads only a leaf: a nested marker tag fails before any nested entry is decoded.
+fn decode_marker_leaf(
+    cursor: &mut Cursor<'_>,
+    backend: &BackendIdentity,
+) -> Result<ObservedEntry, SnapshotDecodeError> {
+    let mut marker = decode_fields(cursor, backend)?;
+    if cursor.byte()? != 0 {
+        return Err(SnapshotDecodeError::Malformed);
+    }
+    marker.identity_key = decode_identity_key(cursor, &marker.source_identity)?;
+    Ok(marker)
+}
+
+fn decode_fields(
+    cursor: &mut Cursor<'_>,
+    backend: &BackendIdentity,
+) -> Result<ObservedEntry, SnapshotDecodeError> {
     if cursor.take(4)? != MAGIC {
         return Err(SnapshotDecodeError::InvalidMagic);
     }
@@ -140,22 +191,21 @@ pub(super) fn decode_snapshot(
     let backend_kind = backend_from_tag(cursor.byte()?).ok_or(SnapshotDecodeError::Malformed)?;
     let path = std::str::from_utf8(cursor.bytes()?).map_err(|_| SnapshotDecodeError::Malformed)?;
     let path = StoragePath::new(path).map_err(|_| SnapshotDecodeError::Malformed)?;
-    let kind = decode_kind(&mut cursor)?;
-    let symlink_target = decode_symlink_target(&mut cursor, kind)?;
-    let size = decode_size(&mut cursor)?;
-    let modified = decode_time(&mut cursor)?;
-    let source_identity = decode_source_identity(&mut cursor, backend_kind, backend)?;
+    let kind = decode_kind(cursor)?;
+    let symlink_target = decode_symlink_target(cursor, kind)?;
+    let size = decode_size(cursor)?;
+    let modified = decode_time(cursor)?;
+    let source_identity = decode_source_identity(cursor, backend_kind, backend)?;
     let schema_version = cursor.byte()?;
     if schema_version != 2 {
         return Err(SnapshotDecodeError::Malformed);
     }
-    let metadata = metadata_observation::decode(&mut cursor)?;
-    let backend_fact = decode_facts(&mut cursor, backend_kind)?;
-    let history = history_codec::decode(&mut cursor, backend)?;
-    let rename_evidence = decode_rename_evidence(&mut cursor)?;
-    let identity_key = decode_identity_key(&mut cursor, bytes.len(), &source_identity)?;
+    let metadata = metadata_observation::decode(cursor)?;
+    let backend_fact = decode_facts(cursor, backend_kind)?;
+    let history = history_codec::decode(cursor, backend)?;
+    let rename_evidence = decode_rename_evidence(cursor)?;
     Ok(ObservedEntry {
-        identity_key,
+        identity_key: source_identity.identity_key(),
         backend_kind,
         path,
         kind,
@@ -167,6 +217,7 @@ pub(super) fn decode_snapshot(
         metadata,
         backend_fact,
         history,
+        marker: None,
     })
 }
 
@@ -183,18 +234,14 @@ fn decode_rename_evidence(
     Ok(Some(RenameEvidence::from_encoded(scheme, bytes)))
 }
 
-/// The stored identity key, which must end the snapshot and match the key `source_identity`
-/// derives.
+/// The stored identity key must match the key `source_identity` derives. The caller checks
+/// framing: a leaf ends here, while the outer entry must also exhaust the input.
 fn decode_identity_key(
     cursor: &mut Cursor<'_>,
-    len: usize,
     source_identity: &SourceIdentity,
 ) -> Result<EntryIdentityKey, SnapshotDecodeError> {
     let mut encoded_key = [0; 32];
     encoded_key.copy_from_slice(cursor.take(32)?);
-    if cursor.offset != len {
-        return Err(SnapshotDecodeError::TrailingData);
-    }
     let identity_key = source_identity.identity_key();
     if encoded_key != *identity_key.as_bytes() {
         return Err(SnapshotDecodeError::IdentityMismatch);

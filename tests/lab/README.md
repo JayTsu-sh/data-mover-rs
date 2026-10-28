@@ -375,8 +375,14 @@ repository and must not be printed or uploaded.
 
 `run-integrity-e2e.sh` independently re-reads both the small and large complete
 4-by-4 directed matrices through Local, NFSv3, NFSv4.1, and S3: four
-same-backend paths plus all twelve cross-protocol paths in each matrix. It also
-checks the dedicated large NFSv4.1 fixture using the negotiated effective read
+same-backend paths plus all twelve cross-protocol paths in each matrix. It
+compares traversal observations for every small-matrix pair and for the
+cross-protocol negative ring, checking that observed inputs match before
+corruption and report a difference afterward. Local path and observed inputs
+also verify that permission comparison is opt-in. The lab bucket is not
+assumed to be versioned; pinned S3 version comparisons have separate
+versioned-backend unit tests. The gate checks the dedicated large NFSv4.1 fixture
+using the negotiated effective read
 size and proves that Quick mode does not read content. A cross-protocol negative
 ring mutates each configured destination
 backend in turn. Each negative case uses a `12 MiB + 123 byte` fixture and
@@ -388,9 +394,10 @@ destinations. Local, NFSv3, and NFSv4.1 additionally cover matching
 directories, file/directory type mismatches, and POSIX mtime mismatches. S3 is
 excluded from directory and POSIX metadata cases because it exposes prefixes
 rather than real directories and cannot faithfully represent those fields.
-Timestamp coverage also proves that comparison remains exact by default, that
-an explicit inclusive tolerance accepts a bounded difference, and that the
-opt-in automatic precision mode compares at the coarser apparent resolution.
+Timestamp coverage also proves that the example uses exact timestamp precision
+with the library's default zero tolerance, that an explicit inclusive
+tolerance accepts a bounded difference, and that the opt-in automatic precision
+mode compares at the coarser apparent resolution.
 The lab has no CIFS endpoint, so CIFS remains covered by the shared stream
 contract tests until a real SMB service is added.
 

@@ -30,6 +30,10 @@
 //! byte and a trailing `/` is never normalised away, so `p/d/` and the file or directory `p/d` are
 //! different entries.
 //!
+//! A logical traversal may instead classify that object in its parent's block. The dedicated
+//! `push_child_object` constructor permits one File name ending in `/` (`d/`), not arbitrary
+//! multi-segment names. Raw listings keep the empty-named own-object representation.
+//!
 //! Single-directory callers (recursive delete, the NDX walk) collect a whole listing with
 //! [`collect_listing`].
 //!
@@ -206,6 +210,37 @@ impl ListingPage {
         }
         self.children
             .push(ListedChild::from_descriptor(String::new(), descriptor));
+    }
+
+    /// A content object named `<child>/`, classified in its parent's traversal listing rather
+    /// than as the child's own empty-named file. Only one segment plus the final slash is valid;
+    /// this does not permit arbitrary descendant paths or normalise away the object's slash.
+    pub(crate) fn push_child_object(
+        &mut self,
+        directory: &StoragePath,
+        descriptor: SourceDescriptor,
+    ) {
+        let valid = descriptor
+            .path
+            .as_str()
+            .strip_suffix('/')
+            .and_then(|path| StoragePath::new(path).ok())
+            .and_then(|path| child_name(directory, &path).map(str::to_owned))
+            .filter(|_| descriptor.kind == EntryKind::File);
+        if let Some(name) = valid {
+            self.children
+                .push(ListedChild::from_descriptor(format!("{name}/"), descriptor));
+        } else {
+            self.failures.push(ChildFailure::from_failure(
+                directory,
+                listing_failure(
+                    &descriptor.path,
+                    FailureClass::Protocol,
+                    Transience::Permanent,
+                    "the traversal directory object is not one child key ending in '/'",
+                ),
+            ));
+        }
     }
 
     /// Adds the listed child of `directory` that `descriptor` describes, carrying `hint` for the
@@ -677,6 +712,17 @@ fn too_long(directory: &StoragePath, name: &str) -> EntryOperationFailure {
 /// Why an empty-named child cannot be handed over: at the storage root its path would be the root
 /// itself, and a directory object is always a file (P7 F5). `None` for any other child.
 fn misplaced_object(directory: &StoragePath, child: &ListedChild) -> Option<EntryOperationFailure> {
+    if child.name.ends_with('/')
+        && (child.kind != EntryKind::File
+            || !names::is_segment(child.name.strip_suffix('/').unwrap_or_default()))
+    {
+        return Some(listing_failure(
+            directory,
+            FailureClass::Protocol,
+            Transience::Permanent,
+            "a trailing slash is only valid on one file key segment",
+        ));
+    }
     if !child.is_directory_object() {
         return None;
     }

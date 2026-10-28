@@ -1,0 +1,439 @@
+2026-10-28 Linux NFSv3 POSIX ACL to ONTAP NFSv4.1 authorized live validation.
+Test files retained; no server configuration or identity database changes.
+
+VM103 POSIX ACL setup and remount
+10.131.9.12:/srv/nfs/v3 nfs    rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,soft,nolock,nosharecache,proto=tcp,timeo=20,retrans=1,sec=sys,mountaddr=10.131.9.12,mountvers=3,mountport=53187,mountproto=tcp,local_lock=all,addr=10.131.9.12
+INITIAL ACCESS ACL
+user::rw-
+user:42421:r--
+group::r--
+group:42422:r--
+mask::r--
+other::---
+
+INITIAL DEFAULT ACL
+user::rwx
+group::r-x
+other::r-x
+default:user::rwx
+default:user:42421:r-x
+default:group::r-x
+default:group:42422:r--
+default:mask::r-x
+default:other::r-x
+
+10.131.9.12:/srv/nfs/v3 nfs    rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,soft,nolock,nosharecache,proto=tcp,timeo=20,retrans=1,sec=sys,mountaddr=10.131.9.12,mountvers=3,mountport=53187,mountproto=tcp,local_lock=all,addr=10.131.9.12
+FRESH MOUNT ACCESS ACL
+user::rw-
+user:42421:r--
+group::r--
+group:42422:r--
+mask::r--
+other::---
+FRESH MOUNT DEFAULT ACL
+user::rwx
+group::r-x
+other::r-x
+default:user::rwx
+default:user:42421:r-x
+default:group::r-x
+default:group:42422:r--
+default:mask::r-x
+default:other::r-x
+FRESH MOUNT INHERITED CHILD ACL
+user::rw-
+user:42421:r-x	#effective:r--
+group::r-x	#effective:r--
+group:42422:r--
+mask::r--
+other::r--
+PASS access ACL, default ACL, and inheritance survived independent NFSv3 remount: 10.131.9.12:/srv/nfs/v3/data-mover-test/integrity-plan/linux3-to-ontap41-20261028
+
+VM104 POSIX ACL setup and remount
+10.131.9.13:/srv/nfs/v3 nfs    rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,soft,nolock,nosharecache,proto=tcp,timeo=20,retrans=1,sec=sys,mountaddr=10.131.9.13,mountvers=3,mountport=36937,mountproto=tcp,local_lock=all,addr=10.131.9.13
+INITIAL ACCESS ACL
+user::rw-
+user:42421:r--
+group::r--
+group:42422:r--
+mask::r--
+other::---
+
+INITIAL DEFAULT ACL
+user::rwx
+group::r-x
+other::r-x
+default:user::rwx
+default:user:42421:r-x
+default:group::r-x
+default:group:42422:r--
+default:mask::r-x
+default:other::r-x
+
+10.131.9.13:/srv/nfs/v3 nfs    rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,soft,nolock,nosharecache,proto=tcp,timeo=20,retrans=1,sec=sys,mountaddr=10.131.9.13,mountvers=3,mountport=36937,mountproto=tcp,local_lock=all,addr=10.131.9.13
+FRESH MOUNT ACCESS ACL
+user::rw-
+user:42421:r--
+group::r--
+group:42422:r--
+mask::r--
+other::---
+FRESH MOUNT DEFAULT ACL
+user::rwx
+group::r-x
+other::r-x
+default:user::rwx
+default:user:42421:r-x
+default:group::r-x
+default:group:42422:r--
+default:mask::r-x
+default:other::r-x
+FRESH MOUNT INHERITED CHILD ACL
+user::rw-
+user:42421:r-x	#effective:r--
+group::r-x	#effective:r--
+group:42422:r--
+mask::r--
+other::r--
+PASS access ACL, default ACL, and inheritance survived independent NFSv3 remount: 10.131.9.13:/srv/nfs/v3/data-mover-test/integrity-plan/posix-v3-104-20261028
+
+Project transfer, Linux nfsd mapping, access and inheritance
+$ timeout 20 mount -t nfs -o vers=3,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0,mountproto=tcp,acl,nolock 10.131.9.12:/srv/nfs/v3 /work/tmp/dm-acl-map-472yqmfn
+$ timeout 20 mount -t nfs -o vers=4.1,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0 10.131.9.12:/srv/nfs/v3 /work/tmp/dm-acl-map-uh3xp1g0
+$ timeout 20 mount -t nfs -o vers=4.1,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0 10.128.61.200:/ontap_lisaauto_nfs /work/tmp/dm-acl-map-s8rl01b5
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/linux3-to-ontap41-20261028?version=3&noresvport=true&uid=0&gid=0 --source-path access.bin --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/project?version=4.1&noresvport=true&uid=0&gid=0 --destination-path access.bin --acl --expect copied --expect-acl unsupported
+OwnershipMode: Applied
+Acl: Unsupported
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+ACL skipped: the source cannot read it
+copied 33 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --key access.bin --input path --expected match --acl --expect-acl ignored
+matches=true bytes=33 differences=[] ignored=[Acl { source: None, destination: Some(NfsV4) }]
+$ getfacl -cpn /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/access.bin
+user::rw-
+user:42421:r--
+group::r--
+group:42422:r--
+mask::r--
+other::---
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/project/access.bin
+# file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/project/access.bin
+A::OWNER@:rwatTnNcCoy
+A:g:GROUP@:rtncy
+A::EVERYONE@:tcy
+
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}
+$ setfacl --set u::rw-,u:42421:r--,g::r--,g:42422:r--,m::r--,o::--- /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/named.bin
+$ getfacl -cpn /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/named.bin
+user::rw-
+user:42421:r--
+group::r--
+group:42422:r--
+mask::r--
+other::---
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/named.bin
+# file: /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/named.bin
+A::OWNER@:rwatTcCy
+A::42421:rtcy
+A::GROUP@:rtcy
+A:g:42422:rtcy
+A::EVERYONE@:tcy
+
+APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/named.bin: exit=0 
+$ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/named.bin
+# file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/named.bin
+A::OWNER@:rwatTcCy
+A::42421:rtcy
+A:g:GROUP@:rtcy
+A:g:42422:rtcy
+A::EVERYONE@:tcy
+
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+CASE {"case": "named", "source_posix": "user::rw-\nuser:42421:r--\ngroup::r--\ngroup:42422:r--\nmask::r--\nother::---\n\n", "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA::GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n", "destination_native": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA:g:GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n", "native_text_equal": false, "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}]}
+$ setfacl --set u::rw-,u:42421:rwx,g::---,g:42422:rwx,m::r--,o::--- /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/masked.bin
+$ getfacl -cpn /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/masked.bin
+user::rw-
+user:42421:rwx	#effective:r--
+group::---
+group:42422:rwx	#effective:r--
+mask::r--
+other::---
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/masked.bin
+# file: /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/masked.bin
+A::OWNER@:rwatTcCy
+A::42421:rtcy
+A::GROUP@:tcy
+A:g:42422:rtcy
+A::EVERYONE@:tcy
+
+APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/masked.bin: exit=0 
+$ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/masked.bin
+# file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/masked.bin
+A::OWNER@:rwatTcCy
+A::42421:rtcy
+A:g:GROUP@:tcy
+A:g:42422:rtcy
+A::EVERYONE@:tcy
+
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+CASE {"case": "masked", "source_posix": "user::rw-\nuser:42421:rwx\t#effective:r--\ngroup::---\ngroup:42422:rwx\t#effective:r--\nmask::r--\nother::---\n\n", "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA::GROUP@:tcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n", "destination_native": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA:g:GROUP@:tcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n", "native_text_equal": false, "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}]}
+$ setfacl --set u::rw-,u:42421:---,g::---,g:42422:---,m::r--,o::r-- /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/precedence.bin
+$ getfacl -cpn /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/precedence.bin
+user::rw-
+user:42421:---
+group::---
+group:42422:---
+mask::r--
+other::r--
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/precedence.bin
+# file: /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/precedence.bin
+A::OWNER@:rwatTcCy
+D::42421:r
+A::42421:tcy
+A::GROUP@:tcy
+A:g:42422:tcy
+D::GROUP@:r
+D:g:42422:r
+A::EVERYONE@:rtcy
+
+APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/precedence.bin: exit=0 
+$ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/precedence.bin
+# file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/precedence.bin
+A::OWNER@:rwatTcCy
+D::42421:r
+A::42421:tcy
+A:g:GROUP@:tcy
+A:g:42422:tcy
+D:g:GROUP@:r
+D:g:42422:r
+A::EVERYONE@:rtcy
+
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+CASE {"case": "precedence", "source_posix": "user::rw-\nuser:42421:---\ngroup::---\ngroup:42422:---\nmask::r--\nother::r--\n\n", "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nD::42421:r\nA::42421:tcy\nA::GROUP@:tcy\nA:g:42422:tcy\nD::GROUP@:r\nD:g:42422:r\nA::EVERYONE@:rtcy\n", "destination_native": "A::OWNER@:rwatTcCy\nD::42421:r\nA::42421:tcy\nA:g:GROUP@:tcy\nA:g:42422:tcy\nD:g:GROUP@:r\nD:g:42422:r\nA::EVERYONE@:rtcy\n", "native_text_equal": false, "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}]}
+$ setfacl --set u::rw-,g::---,g:42422:r--,g:42424:-w-,m::rw-,o::--- /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/overlapping.bin
+$ getfacl -cpn /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/overlapping.bin
+user::rw-
+group::---
+group:42422:r--
+group:42424:-w-
+mask::rw-
+other::---
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/overlapping.bin
+# file: /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/cases/overlapping.bin
+A::OWNER@:rwatTcCy
+A::GROUP@:tcy
+A:g:42422:rtcy
+A:g:42424:watcy
+A::EVERYONE@:tcy
+
+APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/overlapping.bin: exit=0 
+$ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/overlapping.bin
+# file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/overlapping.bin
+A::OWNER@:rwatTcCy
+A:g:GROUP@:tcy
+A:g:42422:rtcy
+A:g:42424:watcy
+A::EVERYONE@:tcy
+
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
+CASE {"case": "overlapping", "source_posix": "user::rw-\ngroup::---\ngroup:42422:r--\ngroup:42424:-w-\nmask::rw-\nother::---\n\n", "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nA::GROUP@:tcy\nA:g:42422:rtcy\nA:g:42424:watcy\nA::EVERYONE@:tcy\n", "destination_native": "A::OWNER@:rwatTcCy\nA:g:GROUP@:tcy\nA:g:42422:rtcy\nA:g:42424:watcy\nA::EVERYONE@:tcy\n", "native_text_equal": false, "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}]}
+$ nfs4_getfacl /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance
+# file: /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance
+A::OWNER@:rwaDxtTcCy
+A::GROUP@:rxtcy
+A::EVERYONE@:rxtcy
+A:fdi:OWNER@:rwaDxtTcCy
+A:fdi:42421:rxtcy
+A:fdi:GROUP@:rxtcy
+A:fdig:42422:rtcy
+D:fdig:42422:x
+A:fdi:EVERYONE@:rxtcy
+
+APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance: exit=0 
+$ getfacl -cpn /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance
+user::rwx
+group::r-x
+other::r-x
+default:user::rwx
+default:user:42421:r-x
+default:group::r-x
+default:group:42422:r--
+default:mask::r-x
+default:other::r-x
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance
+# file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance
+A::OWNER@:rwaDxtTcCy
+A:g:GROUP@:rxtcy
+A::EVERYONE@:rxtcy
+A:fdi:OWNER@:rwaDxtTcCy
+A:fdi:42421:rxtcy
+A:fdig:GROUP@:rxtcy
+A:fdig:42422:rtcy
+D:fdig:42422:x
+A:fdi:EVERYONE@:rxtcy
+
+$ getfacl -cpn /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance/created-600.bin
+user::rw-
+user:42421:r-x	#effective:---
+group::r-x	#effective:---
+group:42422:r--	#effective:---
+mask::---
+other::---
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance/created-600.bin
+# file: /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance/created-600.bin
+A::OWNER@:rwatTcCy
+A::42421:tcy
+A::GROUP@:tcy
+A:g:42422:tcy
+A::EVERYONE@:tcy
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance/created-600.bin
+# file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance/created-600.bin
+A::OWNER@:rwatTnNcCoy
+A::42421:rxtcy
+A:g:GROUP@:tcy
+A:g:42422:rtcy
+D:g:42422:x
+A::EVERYONE@:tcy
+
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}
+$ getfacl -cpn /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance/created-644.bin
+user::rw-
+user:42421:r-x	#effective:r--
+group::r-x	#effective:r--
+group:42422:r--
+mask::r--
+other::r--
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance/created-644.bin
+# file: /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance/created-644.bin
+A::OWNER@:rwatTcCy
+A::42421:rtcy
+A::GROUP@:rtcy
+A:g:42422:rtcy
+A::EVERYONE@:rtcy
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance/created-644.bin
+# file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance/created-644.bin
+A::OWNER@:rwatTnNcCoy
+A::42421:rxtcy
+A:g:GROUP@:rtncy
+A:g:42422:rtcy
+D:g:42422:x
+A::EVERYONE@:rtncy
+
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+$ getfacl -cpn /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance/created-666.bin
+user::rw-
+user:42421:r-x	#effective:r--
+group::r-x	#effective:r--
+group:42422:r--
+mask::r--
+other::r--
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance/created-666.bin
+# file: /work/tmp/dm-acl-map-uh3xp1g0/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance/created-666.bin
+A::OWNER@:rwatTcCy
+A::42421:rtcy
+A::GROUP@:rtcy
+A:g:42422:rtcy
+A::EVERYONE@:rtcy
+
+$ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance/created-666.bin
+# file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance/created-666.bin
+A::OWNER@:rwatTnNcCoy
+A::42421:rxtcy
+A:g:GROUP@:rwatTnNcy
+A:g:42422:rtcy
+D:g:42422:x
+A::EVERYONE@:rwatTnNcy
+
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
+RESULTS {"run": "linux3-to-ontap41-20261028", "cases": [{"case": "named", "source_posix": "user::rw-\nuser:42421:r--\ngroup::r--\ngroup:42422:r--\nmask::r--\nother::---\n\n", "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA::GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n", "destination_native": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA:g:GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n", "native_text_equal": false, "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}]}, {"case": "masked", "source_posix": "user::rw-\nuser:42421:rwx\t#effective:r--\ngroup::---\ngroup:42422:rwx\t#effective:r--\nmask::r--\nother::---\n\n", "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA::GROUP@:tcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n", "destination_native": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA:g:GROUP@:tcy\nA:g:42422:rtcy\nA::EVERYONE@:tcy\n", "native_text_equal": false, "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}]}, {"case": "precedence", "source_posix": "user::rw-\nuser:42421:---\ngroup::---\ngroup:42422:---\nmask::r--\nother::r--\n\n", "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nD::42421:r\nA::42421:tcy\nA::GROUP@:tcy\nA:g:42422:tcy\nD::GROUP@:r\nD:g:42422:r\nA::EVERYONE@:rtcy\n", "destination_native": "A::OWNER@:rwatTcCy\nD::42421:r\nA::42421:tcy\nA:g:GROUP@:tcy\nA:g:42422:tcy\nD:g:GROUP@:r\nD:g:42422:r\nA::EVERYONE@:rtcy\n", "native_text_equal": false, "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}]}, {"case": "overlapping", "source_posix": "user::rw-\ngroup::---\ngroup:42422:r--\ngroup:42424:-w-\nmask::rw-\nother::---\n\n", "linux_nfsd_projection": "A::OWNER@:rwatTcCy\nA::GROUP@:tcy\nA:g:42422:rtcy\nA:g:42424:watcy\nA::EVERYONE@:tcy\n", "destination_native": "A::OWNER@:rwatTcCy\nA:g:GROUP@:tcy\nA:g:42422:rtcy\nA:g:42424:watcy\nA::EVERYONE@:tcy\n", "native_text_equal": false, "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}]}], "mounts": [{"server": "10.131.9.12:/srv/nfs/v3", "version": "3"}, {"server": "10.131.9.12:/srv/nfs/v3", "version": "4.1"}, {"server": "10.128.61.200:/ontap_lisaauto_nfs", "version": "4.1"}], "project_copy": "OwnershipMode: Applied\nAcl: Unsupported\nXattrs: OmittedByPolicy\nTags: OmittedByPolicy\nTimestamps: Applied\nloss Timestamps: AccessedTimestampDropped\nloss Timestamps: CreatedTimestampDropped\nACL skipped: the source cannot read it\ncopied 33 bytes\n", "project_compare": "matches=true bytes=33 differences=[] ignored=[Acl { source: None, destination: Some(NfsV4) }]\n", "project_source_posix": "user::rw-\nuser:42421:r--\ngroup::r--\ngroup:42422:r--\nmask::r--\nother::---\n\n", "project_destination_native": "A::OWNER@:rwatTnNcCoy\nA:g:GROUP@:rtncy\nA::EVERYONE@:tcy\n", "project_access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}], "directory": {"source_posix": "user::rwx\ngroup::r-x\nother::r-x\ndefault:user::rwx\ndefault:user:42421:r-x\ndefault:group::r-x\ndefault:group:42422:r--\ndefault:mask::r-x\ndefault:other::r-x\n\n", "linux_nfsd_projection": "A::OWNER@:rwaDxtTcCy\nA::GROUP@:rxtcy\nA::EVERYONE@:rxtcy\nA:fdi:OWNER@:rwaDxtTcCy\nA:fdi:42421:rxtcy\nA:fdi:GROUP@:rxtcy\nA:fdig:42422:rtcy\nD:fdig:42422:x\nA:fdi:EVERYONE@:rxtcy\n", "destination_native": "A::OWNER@:rwaDxtTcCy\nA:g:GROUP@:rxtcy\nA::EVERYONE@:rxtcy\nA:fdi:OWNER@:rwaDxtTcCy\nA:fdi:42421:rxtcy\nA:fdig:GROUP@:rxtcy\nA:fdig:42422:rtcy\nD:fdig:42422:x\nA:fdi:EVERYONE@:rxtcy\n", "children": [{"creation_mode": "0o600", "source_posix": "user::rw-\nuser:42421:r-x\t#effective:---\ngroup::r-x\t#effective:---\ngroup:42422:r--\t#effective:---\nmask::---\nother::---\n\n", "source_native": "A::OWNER@:rwatTcCy\nA::42421:tcy\nA::GROUP@:tcy\nA:g:42422:tcy\nA::EVERYONE@:tcy\n", "destination_native": "A::OWNER@:rwatTnNcCoy\nA::42421:rxtcy\nA:g:GROUP@:tcy\nA:g:42422:rtcy\nD:g:42422:x\nA::EVERYONE@:tcy\n", "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}]}, {"creation_mode": "0o644", "source_posix": "user::rw-\nuser:42421:r-x\t#effective:r--\ngroup::r-x\t#effective:r--\ngroup:42422:r--\nmask::r--\nother::r--\n\n", "source_native": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA::GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:rtcy\n", "destination_native": "A::OWNER@:rwatTnNcCoy\nA::42421:rxtcy\nA:g:GROUP@:rtncy\nA:g:42422:rtcy\nD:g:42422:x\nA::EVERYONE@:rtncy\n", "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}]}, {"creation_mode": "0o666", "source_posix": "user::rw-\nuser:42421:r-x\t#effective:r--\ngroup::r-x\t#effective:r--\ngroup:42422:r--\nmask::r--\nother::r--\n\n", "source_native": "A::OWNER@:rwatTcCy\nA::42421:rtcy\nA::GROUP@:rtcy\nA:g:42422:rtcy\nA::EVERYONE@:rtcy\n", "destination_native": "A::OWNER@:rwatTnNcCoy\nA::42421:rxtcy\nA:g:GROUP@:rwatTnNcy\nA:g:42422:rtcy\nD:g:42422:x\nA::EVERYONE@:rwatTnNcy\n", "access": [{"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}, {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}, {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}, {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}]}]}}
+$ timeout 15 umount /work/tmp/dm-acl-map-s8rl01b5
+$ timeout 15 umount /work/tmp/dm-acl-map-uh3xp1g0
+$ timeout 15 umount /work/tmp/dm-acl-map-472yqmfn
+
+Fresh independent subjects for overlapping groups
+$ timeout 20 mount -t nfs -o vers=3,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0,mountproto=tcp,acl,nolock 10.131.9.12:/srv/nfs/v3 /work/tmp/dm-acl-map-ttfrn7jy
+$ timeout 20 mount -t nfs -o vers=4.1,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0 10.128.61.200:/ontap_lisaauto_nfs /work/tmp/dm-acl-map-8g5t_ykv
+ACCESS {"subject": "read_group", "uid": 42501, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "write_group", "uid": 42502, "gid": 42424, "groups": [], "source": {"read": 13, "write": true, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": true, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "both_groups", "uid": 42503, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
+$ timeout 15 umount /work/tmp/dm-acl-map-8g5t_ykv
+$ timeout 15 umount /work/tmp/dm-acl-map-ttfrn7jy
+
+Source local POSIX group probe
+{
+   "exitcode" : 0,
+   "exited" : 1,
+   "out-data" : "{\"uid\": 42603, \"gid\": 42422, \"groups\": [42424], \"read\": true, \"write\": true, \"read_write\": 13}\n\n\n"
+}
+
+
+
+Comparator and fresh-mount verification
+$ timeout 20 mount -t nfs -o vers=3,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0,mountproto=tcp,acl,nolock 10.131.9.12:/srv/nfs/v3 /work/tmp/dm-acl-map-w13n5vc6
+$ timeout 20 mount -t nfs -o vers=4.1,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0 10.128.61.200:/ontap_lisaauto_nfs /work/tmp/dm-acl-map-__uzm7sy
+$ /work/cargo-target/debug/examples/integrity_input_probe --key named.bin --input path --expected match --acl --expect-acl ignored
+matches=true bytes=36 differences=[] ignored=[Acl { source: Some(Posix), destination: Some(NfsV4) }]
+$ /work/cargo-target/debug/examples/integrity_input_probe --key named.bin --input path --expected mismatch --acl --expect-acl different
+matches=false bytes=36 differences=[Acl { encoding: NfsV4 }] ignored=[]
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "equal": true}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": 13, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "equal": false}
+ACCESS {"subject": "named_user", "uid": 42421, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
+ACCESS {"subject": "named_group", "uid": 42425, "gid": 42422, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
+ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
+ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
+$ timeout 15 umount /work/tmp/dm-acl-map-__uzm7sy
+$ timeout 15 umount /work/tmp/dm-acl-map-w13n5vc6
+

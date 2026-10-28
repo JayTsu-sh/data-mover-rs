@@ -234,9 +234,8 @@ async fn entries(storage: &Storage, directory: &str) -> TestResult<Vec<ObservedE
     descriptors.iter().map(observation).collect()
 }
 
-/// D2: to a bucket every entry is `Copy`; to a filesystem a folder marker, or a key whose latest
-/// record is a delete marker, is nothing to do, content is skipped with the reason, and any other
-/// entry is `Copy`.
+/// D2: raw namespace folder markers remain nothing to do on a filesystem. Any content in a
+/// key's history skips it, even when deleted now; other entries and bucket destinations copy.
 #[tokio::test]
 async fn directory_object_action_decides_per_destination() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
@@ -281,7 +280,7 @@ async fn directory_object_action_decides_per_destination() -> TestResult {
             ("d/x".to_string(), false, copy, copy),
             ("e/".to_string(), false, nothing, copy),
             // The key `m/`: a content version, then its latest record, a delete marker.
-            ("m/".to_string(), true, nothing, copy),
+            ("m/".to_string(), true, skip, copy),
         ]
     );
     Ok(())
@@ -346,14 +345,24 @@ async fn directory_object_action_answers_too_large_up_front() -> TestResult {
         assert_eq!(decided, (to_bucket, to_filesystem, copy), "{path} {size:?}");
         assert_eq!(directory_object_action(&entry, nas), to_filesystem);
     }
-    // A key with its history (R3): to a bucket it is replayed record by record, so one version
-    // too large skips the whole key; to a filesystem only its current version counts.
+    Ok(())
+}
+
+/// A version too large skips the whole history to a bucket; any content skips it to a filesystem.
+#[tokio::test]
+async fn directory_object_action_checks_history_size_on_every_segment() -> TestResult {
+    let storage = bucket(&Arc::new(MemoryS3::default()))?;
+    let root = tempfile::tempdir()?;
+    let local = test_destination_storage(root.path(), "directory-object-history-size")?;
+    let copy = DirectoryObjectAction::Copy;
+    let too_large = DirectoryObjectAction::Skip(DIRECTORY_OBJECT_TOO_LARGE_REASON);
+    let skip = DirectoryObjectAction::Skip(DIRECTORY_OBJECT_SKIP_REASON);
     for (sizes, to_bucket, to_filesystem) in [
         (vec![Some(OVER_ONE_REQUEST), Some(1)], too_large, skip),
         (vec![Some(1), Some(OVER_ONE_REQUEST)], too_large, skip),
-        (vec![Some(OVER_ONE_REQUEST), None], too_large, nothing),
-        (vec![Some(5), Some(0)], copy, nothing),
-        (vec![Some(5), None], copy, nothing),
+        (vec![Some(OVER_ONE_REQUEST), None], too_large, skip),
+        (vec![Some(5), Some(0)], copy, skip),
+        (vec![Some(5), None], copy, skip),
         (vec![None, Some(3)], copy, skip),
     ] {
         let entry = with_history("d/", &sizes)?;
@@ -369,13 +378,157 @@ async fn directory_object_action_answers_too_large_up_front() -> TestResult {
         // writes the part before a version too large to write.
         for segment in entry.clone().into_segments(1) {
             assert_eq!(
-                directory_object_action(&segment, &storage),
-                to_bucket,
+                (
+                    directory_object_action(&segment, &storage),
+                    directory_object_action(&segment, &local)
+                ),
+                (to_bucket, to_filesystem),
                 "{sizes:?}"
             );
         }
     }
     Ok(())
+}
+
+/// Empty/deleted latest versions and segments without content still belong to a content key.
+#[test]
+fn directory_object_action_skips_whole_content_history_to_unsupported_destinations() -> TestResult {
+    let storage = bucket(&Arc::new(MemoryS3::default()))?;
+    let nas = bucket(&Arc::new(MemoryS3::nas_bucket()))?;
+    let root = tempfile::tempdir()?;
+    let local = test_destination_storage(root.path(), "directory-object-history")?;
+    assert!(!nas.holds_directory_objects());
+    let skip = DirectoryObjectAction::Skip(DIRECTORY_OBJECT_SKIP_REASON);
+    for sizes in [
+        vec![Some(7), Some(0)],
+        vec![Some(0), Some(7)],
+        vec![Some(7), None],
+        vec![Some(7), Some(0), None],
+    ] {
+        let entry = with_history("d/", &sizes)?;
+        for segment in std::iter::once(entry.clone()).chain(entry.into_segments(1)) {
+            for (destination, capabilities) in [
+                (&local, NamespaceCapabilities::BASIC),
+                (&nas, nas.namespace()?.capabilities()),
+            ] {
+                assert_eq!(
+                    directory_object_action(&segment, destination),
+                    skip,
+                    "{sizes:?}"
+                );
+                assert_eq!(
+                    directory_object_action(&segment, &capabilities),
+                    skip,
+                    "{sizes:?}"
+                );
+            }
+            for destination in [
+                DirectoryObjectDestination::from(&storage),
+                DirectoryObjectDestination::from(&storage.namespace()?.capabilities()),
+            ] {
+                assert_eq!(
+                    directory_object_action(&segment, destination),
+                    DirectoryObjectAction::Copy,
+                    "{sizes:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compatibility for raw namespace callers: zero-only and delete-only histories stay no-ops.
+#[test]
+fn directory_object_action_keeps_raw_marker_fallback() -> TestResult {
+    let unsupported = DirectoryObjectDestination::new(false, Some(ONE_REQUEST));
+    let supported = DirectoryObjectDestination::new(true, Some(ONE_REQUEST));
+    for sizes in [
+        vec![Some(0), Some(0)],
+        vec![Some(0), None],
+        vec![None, Some(0)],
+        vec![None, None],
+    ] {
+        let entry = with_history("d/", &sizes)?;
+        for segment in std::iter::once(entry.clone()).chain(entry.into_segments(1)) {
+            assert_eq!(
+                directory_object_action(&segment, unsupported),
+                DirectoryObjectAction::NothingToDo,
+                "{sizes:?}"
+            );
+            assert_eq!(
+                directory_object_action(&segment, supported),
+                DirectoryObjectAction::Copy
+            );
+        }
+    }
+    let directory = ObservedEntry::new(
+        StoragePath::new("d")?,
+        EntryKind::Directory,
+        None,
+        None,
+        SourceIdentity::new(identity(), IdentityStrength::PathScoped, b"d")?,
+    )?;
+    assert_eq!(
+        directory_object_action(&directory, unsupported),
+        DirectoryObjectAction::Copy
+    );
+    Ok(())
+}
+
+/// Marker directories create a destination directory only from the live final segment.
+#[test]
+fn marker_directory_history_decides_creation_per_destination() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let local = test_destination_storage(root.path(), "marker-directory-history")?;
+    let nas = bucket(&Arc::new(MemoryS3::nas_bucket()))?;
+    let storage = bucket(&Arc::new(MemoryS3::default()))?;
+    let copy = DirectoryObjectAction::Copy;
+    let nothing = DirectoryObjectAction::NothingToDo;
+    for (sizes, current_action) in [
+        (vec![Some(0), Some(0)], copy),
+        (vec![None, Some(0)], copy),
+        (vec![Some(0), None], nothing),
+        (vec![None, None], nothing),
+        (vec![Some(0), Some(0), None], nothing),
+    ] {
+        let directory = directory_with_history(&sizes)?;
+        let last = sizes.len() - 1;
+        let entries = std::iter::once((last, directory.clone()))
+            .chain(directory.into_segments(1).into_iter().enumerate());
+        for (index, entry) in entries {
+            let expected = if index == last {
+                current_action
+            } else {
+                nothing
+            };
+            for destination in [&local, &nas] {
+                assert_eq!(
+                    directory_object_action(&entry, destination),
+                    expected,
+                    "{sizes:?}, segment {index}"
+                );
+            }
+            assert_eq!(directory_object_action(&entry, &storage), copy);
+        }
+    }
+    // Skipping the deleted parent marker does not suppress an independently traversed child.
+    let child = observed("d/child", Some(7))?;
+    for destination in [&local, &nas, &storage] {
+        assert_eq!(directory_object_action(&child, destination), copy);
+    }
+    Ok(())
+}
+
+fn directory_with_history(sizes: &[Option<u64>]) -> TestResult<ObservedEntry> {
+    let raw = with_history("d/", sizes)?;
+    Ok(ObservedEntry::new(
+        StoragePath::new("d")?,
+        EntryKind::Directory,
+        None,
+        None,
+        SourceIdentity::new(identity(), IdentityStrength::PathScoped, b"d")?,
+    )?
+    .with_history(raw.history().cloned().map(Box::new)))
 }
 
 /// `path` with a history of one record per size, oldest first: a version of that size, or a

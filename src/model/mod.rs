@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 pub(crate) const MAX_MODEL_FIELD_BYTES: usize = 16 * 1024 * 1024;
 
+pub mod acl;
 mod history;
 mod metadata_observation;
 mod metadata_requirements;

@@ -114,6 +114,36 @@ fn a_child_name_is_one_segment() {
     assert_eq!(child("a b.txt").name(), "a b.txt");
 }
 
+#[test]
+fn a_projected_child_object_keeps_its_slash_and_validates_its_kind() {
+    let parent = path("p");
+    let mut page = ListingPage::default();
+    page.push_child_object(&parent, descriptor("p/d/"));
+    assert_eq!(names(&page), ["d/"]);
+    let (entries, failures) = page.clone().into_descriptors(&parent);
+    assert!(failures.is_empty());
+    assert_eq!(entries[0].path, path("p/d/"));
+    assert_eq!(
+        page.children[0]
+            .clone()
+            .into_descriptor(&parent)
+            .unwrap_or_else(|error| panic!("valid child object: {error}"))
+            .path,
+        path("p/d/")
+    );
+    page.children[0].kind = EntryKind::Directory;
+    assert!(page.children[0].clone().into_descriptor(&parent).is_err());
+    let (entries, failures) = page.into_descriptors(&parent);
+    assert!(entries.is_empty());
+    assert_eq!(failures.len(), 1);
+    for invalid in ["p/", "p/d//", "p/a/b/", "p/./", "p/../", "other/d/"] {
+        let mut page = ListingPage::default();
+        page.push_child_object(&parent, descriptor(invalid));
+        assert!(page.children.is_empty(), "{invalid}");
+        assert_eq!(page.failures.len(), 1, "{invalid}");
+    }
+}
+
 /// A descriptor whose path is not the directory and one name becomes a child failure at the path
 /// it carried; one that is keeps everything but its path, which it gets back when joined.
 #[test]

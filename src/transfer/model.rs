@@ -95,16 +95,50 @@ enum SourceInput {
 /// - **cannot** — not read, not written, and the reason recorded in the report. This is never a
 ///   failure: what the user asked for that the storage cannot do is the caller's to judge.
 ///
+/// Explicit `with_required_acl` / `with_acl_mapping` selection refuses incomplete ACL preservation.
+/// The following default behavior applies to `with_acl` and `with_xattrs`.
+///
 /// A feature both ends can handle is then carried for real: a read that fails, or a write the
 /// destination refuses, fails the transfer — after every other family has been applied, with
 /// every reason listed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // Independent metadata selectors and explicit ACL strength.
 pub struct CopiedMetadataRequest {
     acl: bool,
     xattrs: bool,
+    acl_required: bool,
+    acl_mapping: bool,
 }
 
 impl CopiedMetadataRequest {
+    /// Requires native ACL preservation; unsupported observations or targets fail the copy.
+    #[must_use]
+    pub const fn with_required_acl(mut self) -> Self {
+        self.acl = true;
+        self.acl_required = true;
+        self
+    }
+
+    /// Allows proven current regular-file access equivalence in a shared numeric namespace.
+    /// Both endpoints must resolve identities and group memberships consistently.
+    #[must_use]
+    pub const fn with_acl_mapping(mut self) -> Self {
+        self.acl = true;
+        self.acl_required = true;
+        self.acl_mapping = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn acl_required(self) -> bool {
+        self.acl_required
+    }
+
+    #[must_use]
+    pub const fn acl_mapping(self) -> bool {
+        self.acl_mapping
+    }
+
     /// Asks for the access control list.
     #[must_use]
     pub const fn with_acl(mut self) -> Self {
@@ -172,6 +206,9 @@ impl TransferRequest {
     /// This copies one object, not every version of a history. Validation checks the backend's
     /// identity, size, and modification time when both observations provide it; it does not
     /// turn an observation into a content snapshot.
+    /// A real unversioned directory marker is unwrapped to its original File observation when
+    /// the destination holds directory objects. Virtual directories are never synthesized into
+    /// objects; versioned marker directories use history replay at `history_source_path()`.
     ///
     /// # Errors
     /// Rejects an observation from another storage, a non-file entry, a deleted key, or a
@@ -182,6 +219,14 @@ impl TransferRequest {
         destination: Storage,
         cancel: CancellationToken,
     ) -> Result<Self, TransferValueError> {
+        let observation = if destination.holds_directory_objects() {
+            observation
+                .directory_marker_object()
+                .cloned()
+                .unwrap_or(observation)
+        } else {
+            observation
+        };
         if observation.source_identity().backend() != source.identity() {
             return Err(TransferValueError(
                 "observation belongs to another source storage",

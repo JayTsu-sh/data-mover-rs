@@ -2,9 +2,17 @@
 
 ## 底层依赖
 
-- **crate**：`nfs-rs` (0.8.6，crates.io)。
+- **crate**：`nfs-rs` 0.8.8，`vendor/nfs-rs` 路径依赖；补丁见 `vendor/nfs-rs/PATCHES.md`。
 - 支持 NFSv3 和 NFSv4 (自动协商 / 升级)。
 - 属性缓存用 `moka` (0.12.15)，减少冗余 GETATTR RPC。
+
+## ACL 能力（2026-10-28）
+
+NFSv3 仅在实际探测到 NFSACL RPC 100227 v3 扩展时声明 `posix_acl`；后端以 typed POSIX
+access/default ACL 读写，保留原始条目权限与 mask。NFSv4 根据协商结果声明 `acl`，保留 FATTR4_ACL 有序 ACE。
+ACL SET 后完整读回验证；默认 ACL 使用明确的空集合清除，未知/失败观察不会当作空 ACL。
+NFSv3 GET 可重放；SET 使用单次传输尝试，传输结果不确定时返回失败，不能声称权限已正确复制。
+URL 协议版本本身不构成 ACL 能力证明。四种组合及显式策略见 [元数据协商](metadata-negotiation.md#严格-acl-复制与比对2026-10-28)。
 
 ## 读写块大小
 

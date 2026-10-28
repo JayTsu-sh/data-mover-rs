@@ -309,6 +309,54 @@ async fn unordered_resumes_a_gathered_directory_whole() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn marker_directory_segments_and_content_leaf_resume_without_losing_history() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    for _ in 0..3 {
+        put(&protocol, "d/", b"").await?;
+    }
+    put(&protocol, "d/child", b"x").await?;
+    put(&protocol, "leaf/", b"content").await?;
+    protocol.listing().page_size = 1;
+    for order in ORDERS {
+        let make_request = || {
+            request()
+                .order(order)
+                .resumable(Resumable::On {
+                    every: Duration::ZERO,
+                })
+                .cancel(CancellationToken::new())
+        };
+        let source = source(&protocol, 1)?.output_capacity(NonZeroUsize::MIN);
+        let (baseline, outcome) = run(&source, make_request(), None).await?;
+        assert!(matches!(outcome, Ok(TraversalOutcome::Completed(_))));
+        let expected = records(&baseline);
+        for after in [1, 2, 3] {
+            let (partial, _) = run(&source, make_request(), Some(after)).await?;
+            let (_, checkpoint) = checkpoints(&partial).pop().ok_or("missing checkpoint")?;
+            let (resumed, outcome) =
+                run(&source, make_request().resume_from(checkpoint), None).await?;
+            assert!(matches!(outcome, Ok(TraversalOutcome::Completed(_))));
+            let mut delivered = records(&partial);
+            delivered.extend(records(&resumed));
+            assert_eq!(delivered, expected, "{order:?}, cancel after {after}");
+            for entry in entries(&resumed) {
+                if entry.path().as_str() == "d" {
+                    assert_eq!(entry.kind(), EntryKind::Directory);
+                    assert_eq!(
+                        entry.history_source_path()?.ok_or("raw key")?.as_str(),
+                        "d/"
+                    );
+                }
+                assert_ne!(entry.path().as_str(), "d/");
+                assert_ne!(entry.path().as_str(), "leaf");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A checkpoint of a traversal that listed histories is another traversal's for a connection
 /// that lists none (the bucket's versioning changed between the runs): refused before any I/O.
 #[tokio::test]

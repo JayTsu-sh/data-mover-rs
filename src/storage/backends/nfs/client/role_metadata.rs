@@ -85,6 +85,77 @@ impl NfsMetadataProtocol for NFSStorage {
         NFSStorage::supports_acl(self)
     }
 
+    fn acl_encoding(&self) -> Option<crate::model::AclEncoding> {
+        NFSStorage::acl_encoding(self)
+    }
+
+    async fn get_native_acl(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> Result<crate::model::AclMetadata, NfsProtocolFailure> {
+        if self.acl_encoding() != Some(crate::model::AclEncoding::Posix) {
+            let value = self.get_acl(path).await?;
+            return crate::storage::backends::nfs::acl::encode(&value)
+                .map_err(|_| NfsProtocolFailure::protocol());
+        }
+        let native = Path::new(path.as_str());
+        for attempt in 0..=MAX_STALE_RETRIES {
+            let object = self.lookup_fh(native).await.map_err(classify_role_error)?;
+            let generation = self.refresh_generation.load(Ordering::Acquire);
+            match self.mount.get_posix_acl(object.fh.clone()).await {
+                Ok(mut value) => {
+                    if value.access.is_empty() {
+                        let attrs = self
+                            .mount
+                            .getattr(object.fh)
+                            .await
+                            .map_err(classify_error)?;
+                        value.access =
+                            crate::storage::backends::nfs::acl::posix_from_mode(attrs.file_mode);
+                    }
+                    return crate::storage::backends::nfs::acl::encode_posix(&value)
+                        .map_err(|_| NfsProtocolFailure::protocol());
+                }
+                Err(error)
+                    if is_retryable_with_invalidation(&error) && attempt < MAX_STALE_RETRIES =>
+                {
+                    self.invalidate_acl_lookup(native, generation).await?;
+                }
+                Err(error) => return Err(classify_error(error)),
+            }
+        }
+        unreachable!("bounded ACL retry loop always returns")
+    }
+
+    async fn set_native_acl(
+        &self,
+        path: &crate::model::StoragePath,
+        value: &crate::model::AclMetadata,
+    ) -> Result<(), NfsProtocolFailure> {
+        if value.encoding() != crate::model::AclEncoding::Posix {
+            let value =
+                crate::storage::backends::nfs::acl::decode(value).map_err(|_| invalid_acl())?;
+            return self.set_acl(path, &value).await;
+        }
+        let value =
+            crate::storage::backends::nfs::acl::decode_posix(value).map_err(|_| invalid_acl())?;
+        let native = Path::new(path.as_str());
+        for attempt in 0..=MAX_STALE_RETRIES {
+            let object = self.lookup_fh(native).await.map_err(classify_role_error)?;
+            let generation = self.refresh_generation.load(Ordering::Acquire);
+            match self.mount.set_posix_acl(object.fh, &value).await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_retryable_with_invalidation(&error) && attempt < MAX_STALE_RETRIES =>
+                {
+                    self.invalidate_acl_lookup(native, generation).await?;
+                }
+                Err(error) => return Err(classify_error(error)),
+            }
+        }
+        unreachable!("bounded ACL retry loop always returns")
+    }
+
     fn supports_xattrs(&self) -> bool {
         NFSStorage::supports_xattr(self)
     }
@@ -237,4 +308,11 @@ impl NfsMetadataProtocol for NFSStorage {
         self.setattr_role(path, atime, mtime, None, None, None)
             .await
     }
+}
+
+fn invalid_acl() -> NfsProtocolFailure {
+    NfsProtocolFailure::new(
+        crate::model::FailureClass::InvalidInput,
+        crate::model::Transience::Permanent,
+    )
 }

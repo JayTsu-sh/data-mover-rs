@@ -25,6 +25,7 @@ mod source;
 #[cfg(test)]
 mod source_pipeline_tests;
 mod staged;
+mod traversal_listing;
 
 pub(crate) use body::S3Body;
 use std::sync::Arc;

@@ -195,16 +195,19 @@ impl TraversalFilter for PruneSkip {
     }
 }
 
-/// A subtree the filter prunes, or `max_depth` stops at, is never listed: S3 prunes on the
-/// server side, one prefix at a time.
+/// Classification probes one level before filtering/depth decisions. Pruned subtrees are not
+/// traversed further and their contents are never emitted; the probe is not a whole-tree scan.
 #[tokio::test]
-async fn pruned_and_truncated_prefixes_are_never_listed() -> TestResult {
+async fn pruned_and_truncated_prefixes_are_only_probed_for_classification() -> TestResult {
     let protocol = tree().await?;
     let mut pruned = request();
     pruned.filter = Some(Arc::new(PruneSkip));
     let (items, _) = traverse(&protocol, pruned).await?;
     assert!(!rendered(&items).iter().any(|item| item.contains("skip")));
-    assert_eq!(protocol.listing().calls, ["", "keep/", "keep/deep/"]);
+    assert_eq!(
+        protocol.listing().calls,
+        ["", "keep/", "skip/", "keep/", "keep/deep/", "keep/deep/"]
+    );
 
     protocol.listing().calls.clear();
     // Never versioned, refusing to say: its keys are listed with their histories (P7 Q26).
@@ -212,7 +215,7 @@ async fn pruned_and_truncated_prefixes_are_never_listed() -> TestResult {
     let mut shallow = request();
     shallow.max_depth = Some(limit(1));
     let (items, _) = traverse(&protocol, shallow).await?;
-    assert_eq!(protocol.listing().calls, [""]);
+    assert_eq!(protocol.listing().calls, ["", "keep/", "skip/"]);
     assert_eq!(
         rendered(&items),
         [

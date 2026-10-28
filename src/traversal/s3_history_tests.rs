@@ -112,7 +112,7 @@ async fn history_entries_survive_a_snapshot() -> TestResult {
     let (items, _) = traverse(&protocol, request()).await?;
     for entry in entries(&items) {
         let snapshot = entry.encode_snapshot();
-        assert_eq!(snapshot.as_bytes()[4], 8);
+        assert_eq!(snapshot.as_bytes()[4], 9);
         let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes(), &identity())?;
         assert_eq!(&rebuilt, entry);
     }
@@ -272,9 +272,8 @@ async fn a_repeated_name_keeps_the_listing_order() -> TestResult {
 
 /// A directory whose listing pages in a loop (a MinIO-style server serving its first page again,
 /// the same continuation marker coming back) fails that directory alone: the traversal lists the
-/// directories beside it and finishes. A versioned bucket's directory is gathered whole, so nothing
-/// of `a` is handed over and it is `Unreadable`; listed by current objects it streams, its first
-/// page (`a/x`) handed over before the loop showed, so it is `Interrupted` after it.
+/// directories beside it and finishes. Classification cannot establish the own object/subtree
+/// before successful inspection, so it reports the prefix as a failed child, not an empty leaf.
 #[tokio::test]
 async fn a_looping_listing_fails_only_its_directory() -> TestResult {
     for histories in [true, false] {
@@ -297,11 +296,7 @@ async fn a_looping_listing_fails_only_its_directory() -> TestResult {
         let rendered = rendered(&items);
         let files = |item: &&String| item.starts_with("b/z File") || item.starts_with("c File");
         assert_eq!(rendered.iter().filter(files).count(), 2, "{rendered:?}");
-        let expected: &[&str] = if histories {
-            &["failure Listing a", "listed a Unreadable"]
-        } else {
-            &["a/x File", "failure Listing a", "listed a Interrupted"]
-        };
+        let expected: &[&str] = &["failure Child a"];
         let around_a: Vec<&String> = rendered
             .iter()
             .filter(|item| {
@@ -314,15 +309,19 @@ async fn a_looping_listing_fails_only_its_directory() -> TestResult {
             _ => None,
         });
         assert!(
-            failure.is_some_and(|f| f.scope == FailureScope::Listing
+            failure.is_some_and(|f| f.scope == FailureScope::Child
                 && f.failure.class() == FailureClass::Protocol
                 && f.failure.transience() == Transience::Permanent),
             "{failure:?}"
         );
         let totals = totals(&outcome);
         assert_eq!(
-            (totals.listing_failures, totals.interrupted_listings),
-            (1, u64::from(!histories)),
+            (
+                totals.failed_children,
+                totals.listing_failures,
+                totals.interrupted_listings
+            ),
+            (1, 0, 0),
             "histories={histories}: {totals:?}"
         );
     }

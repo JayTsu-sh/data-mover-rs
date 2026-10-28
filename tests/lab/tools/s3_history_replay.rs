@@ -10,8 +10,9 @@
 //!
 //! Endpoints as in `transfer_resume` (`s3:<prefix>` is `S3_BUCKET`, `s3@<bucket>:<prefix>` another
 //! bucket of the same server). The source's records are the history the role-based traversal of a
-//! versioned bucket gives each key (P7 §10: the key's parent, one level deep — a directory object
-//! `m/` is a file of `m`), segment after segment until the complete one.
+//! versioned bucket gives each key (P7 §10: the key's parent, one level deep). All-zero `m/`
+//! history is carried by Directory `m`, content history by File `m/`; `history_source_path`
+//! recovers the raw key in both cases, segment after segment until the complete one.
 //!
 //! - A destination that keeps histories (`transfer::destination_keeps_history`: versioning
 //!   `Enabled` now) gets every record, strictly one after another: each object version is a
@@ -93,12 +94,12 @@ struct Replay {
     destination: Storage,
 }
 
-/// Where `key` is listed: its parent directory, and how deep below it (a directory object `m/` is
-/// a file of the directory `m`, one level further down).
+/// Where `key` is listed: its parent directory. A directory object and a history-bearing
+/// directory marker are both classified in that parent's block.
 fn listed_at(key: &str) -> (&str, usize) {
     let (spelled, depth) = key
         .strip_suffix('/')
-        .map_or((key, 1), |directory| (directory, 2));
+        .map_or((key, 1), |directory| (directory, 1));
     let parent = spelled.rsplit_once('/').map_or("", |(parent, _)| parent);
     (parent, depth)
 }
@@ -125,7 +126,14 @@ async fn records(source: &Storage, key: &str) -> Result<(Vec<VersionRecord>, His
     let mut segments: Vec<ObservedEntry> = Vec::new();
     while let Some(item) = session.next_item().await {
         match item {
-            TraversalItem::Entry(entry) if entry.path().as_str() == key => segments.push(*entry),
+            TraversalItem::Entry(entry)
+                if entry
+                    .history_source_path()?
+                    .as_ref()
+                    .is_some_and(|path| path.as_str() == key) =>
+            {
+                segments.push(*entry);
+            }
             // A failure at the key or at a directory above it: the history may be incomplete.
             TraversalItem::Failure(failure) if at_or_above(key, failure.path.as_str()) => {
                 return Err(format!("{key}: {:?}", failure.failure).into());

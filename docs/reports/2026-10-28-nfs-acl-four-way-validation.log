@@ -1,0 +1,1016 @@
+
+=== matrix ===
+$ timeout 25 mount -t nfs -o vers=3,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0,noresvport,mountproto=tcp,acl,nolock 10.131.9.12:/srv/nfs/v3 /work/tmp/dm-acl-four-mount-3yuvu_36
+$ timeout 25 mount -t nfs -o vers=3,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0,noresvport,mountproto=tcp,acl,nolock 10.131.9.13:/srv/nfs/v3 /work/tmp/dm-acl-four-mount-1n2uni8a
+$ timeout 25 mount -t nfs -o vers=4.1,proto=tcp,nosharecache,soft,timeo=20,retrans=1,actimeo=0,noresvport 10.128.61.200:/ontap_lisaauto_nfs /work/tmp/dm-acl-four-mount-6vce9tre
+$ setfacl -n --set u::rw-,u:42421:r--,g::r--,g:42422:r--,m::r--,o::--- /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/named.bin
+$ getfacl -cpn /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/named.bin
+user::rw-
+user:42421:r--
+group::r--
+group:42422:r--
+mask::r--
+other::---
+
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --source-path named.bin --destination-path named.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --key named.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --source-path named.bin --destination-path named.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --key named.bin --input path --expected match --acl --acl-equivalent --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --source-path named.bin --destination-path named.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --key named.bin --input path --expected match --acl --acl-equivalent --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --source-path named.bin --destination-path named.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --key named.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })
+$ getfacl -cpn /work/tmp/dm-acl-four-mount-1n2uni8a/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p/named.bin
+user::rw-
+user:42421:r--
+group::r--
+group:42422:r--
+mask::r--
+other::---
+
+$ nfs4_getfacl /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/named.bin
+# file: /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/named.bin
+A::OWNER@:rwatTcCy
+A::42421:rtcy
+A:g:GROUP@:rtcy
+A:g:42422:rtcy
+A::EVERYONE@:tcy
+
+$ setfacl -n --set u::rw-,u:42421:rwx,g::---,g:42422:rwx,m::r--,o::--- /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/masked.bin
+$ getfacl -cpn /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/masked.bin
+user::rw-
+user:42421:rwx	#effective:r--
+group::---
+group:42422:rwx	#effective:r--
+mask::r--
+other::---
+
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --source-path masked.bin --destination-path masked.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --key masked.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --source-path masked.bin --destination-path masked.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --key masked.bin --input path --expected match --acl --acl-equivalent --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --source-path masked.bin --destination-path masked.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --key masked.bin --input path --expected match --acl --acl-equivalent --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --source-path masked.bin --destination-path masked.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --key masked.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })
+$ getfacl -cpn /work/tmp/dm-acl-four-mount-1n2uni8a/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p/masked.bin
+user::rw-
+user:42421:r--
+group::---
+group:42422:r--
+mask::r--
+other::---
+
+$ nfs4_getfacl /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/masked.bin
+# file: /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/masked.bin
+A::OWNER@:rwatTcCy
+A::42421:rtcy
+A:g:GROUP@:tcy
+A:g:42422:rtcy
+A::EVERYONE@:tcy
+
+$ setfacl -n --set u::rw-,u:42421:---,g::---,g:42422:---,m::r--,o::r-- /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/precedence.bin
+$ getfacl -cpn /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/precedence.bin
+user::rw-
+user:42421:---
+group::---
+group:42422:---
+mask::r--
+other::r--
+
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --source-path precedence.bin --destination-path precedence.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --key precedence.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --source-path precedence.bin --destination-path precedence.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --key precedence.bin --input path --expected match --acl --acl-equivalent --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --source-path precedence.bin --destination-path precedence.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --key precedence.bin --input path --expected match --acl --acl-equivalent --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --source-path precedence.bin --destination-path precedence.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --key precedence.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })
+$ getfacl -cpn /work/tmp/dm-acl-four-mount-1n2uni8a/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p/precedence.bin
+user::rw-
+user:42421:---
+group::---
+group:42422:---
+mask::rwx
+other::r--
+
+$ nfs4_getfacl /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/precedence.bin
+# file: /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/precedence.bin
+A::OWNER@:rwatTcCy
+D::42421:r
+A::42421:tcy
+A:g:GROUP@:tcy
+A:g:42422:tcy
+D:g:GROUP@:r
+D:g:42422:r
+A::EVERYONE@:rtcy
+
+$ setfacl -n --set u::rw-,g::---,g:42422:r--,g:42424:rw-,m::rw-,o::--- /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/chain.bin
+$ getfacl -cpn /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/chain.bin
+user::rw-
+group::---
+group:42422:r--
+group:42424:rw-
+mask::rw-
+other::---
+
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --source-path chain.bin --destination-path chain.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --key chain.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --source-path chain.bin --destination-path chain.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --key chain.bin --input path --expected match --acl --acl-equivalent --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --source-path chain.bin --destination-path chain.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --key chain.bin --input path --expected match --acl --acl-equivalent --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --source-path chain.bin --destination-path chain.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --key chain.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })
+$ getfacl -cpn /work/tmp/dm-acl-four-mount-1n2uni8a/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p/chain.bin
+user::rw-
+group::---
+group:42422:r--
+group:42424:rw-
+mask::rw-
+other::---
+
+$ nfs4_getfacl /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/chain.bin
+# file: /work/tmp/dm-acl-four-mount-6vce9tre/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4/chain.bin
+A::OWNER@:rwatTcCy
+A:g:GROUP@:tcy
+A:g:42422:rtcy
+A:g:42424:rwatcy
+A::EVERYONE@:tcy
+
+$ setfacl -n --set u::rw-,g::---,g:42422:r--,g:42424:-w-,m::rw-,o::--- /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/split.bin
+$ getfacl -cpn /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/split.bin
+user::rw-
+group::---
+group:42422:r--
+group:42424:-w-
+mask::rw-
+other::---
+
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --source-path split.bin --destination-path split.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --key split.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --source-path split.bin --destination-path split.bin --acl-mapping --expect refused
+refused as expected: transfer Metadata failed on Orchestration: copied metadata was refused while planning: ACL (RequireEquivalent): ACL mapping refused: cross-model group permissions do not form an inclusion chain
+$ setfacl -n --set u::rw-,u:42421:---,g::---,g:42422:---,m::---,o::r-- /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/zero-mask.bin
+$ getfacl -cpn /work/tmp/dm-acl-four-mount-3yuvu_36/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix/zero-mask.bin
+user::rw-
+user:42421:---
+group::---
+group:42422:---
+mask::---
+other::r--
+
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --source-path zero-mask.bin --destination-path zero-mask.bin --acl-required --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/pp?version=3&uid=0&gid=0&noresvport=true --key zero-mask.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: Posix })
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --source-path zero-mask.bin --destination-path zero-mask.bin --acl-mapping --expect refused
+refused as expected: transfer Metadata failed on Orchestration: copied metadata was refused while planning: ACL (RequireEquivalent): ACL mapping refused: zero POSIX mask with named entries and other grants is outside the Linux access profile
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --key named.bin --input observed --expected match --acl --acl-equivalent --expect-acl equal
+observed source=Some(Current) destination=Some(Current)
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --key named.bin --input observed --expected match --acl --acl-equivalent --expect-acl equal
+observed source=Some(Current) destination=Some(Current)
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ setfacl -n -m u:42421:--- /work/tmp/dm-acl-four-mount-1n2uni8a/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p/named.bin
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --key named.bin --input path --expected mismatch --acl --acl-equivalent --expect-acl different
+matches=false bytes=43 differences=[Acl { encoding: NfsV4 }] ignored=[] acl_scope=None
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --source-path named.bin --destination-path named.bin --acl-mapping --expect copied --expect-acl applied
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Equivalent
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 43 bytes
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/p4?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/4p?version=3&uid=0&gid=0&noresvport=true --key named.bin --input path --expected match --acl --acl-equivalent --expect-acl equal
+matches=true bytes=43 differences=[] ignored=[] acl_scope=Some(CurrentRegularFileAccess)
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-dst?version=4.1&uid=0&gid=0&noresvport=true --source-path complex.bin --destination-path complex.bin --seed-bytes 73 --mark-acl everyone-write-acl --verify-acl --acl-required --expect copied --expect-acl applied
+seeded complex.bin bytes=73
+marked source ACL (EveryoneWriteAcl): 3 ACE(s)
+OwnershipMode: Applied
+Acl: Applied
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: CreatedTimestampDropped
+mapping OwnershipMode: Exact
+mapping Acl: Exact
+mapping Xattrs: OmittedByPolicy
+mapping Tags: OmittedByPolicy
+mapping Timestamps: Lossy([AccessedTimestampDropped, CreatedTimestampDropped])
+copied 73 bytes
+source ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1966495), who: "OWNER@" }
+source ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(64), access_mask: AceMask(1179785), who: "GROUP@" }
+source ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1441929), who: "EVERYONE@" }
+destination ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1966495), who: "OWNER@" }
+destination ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(64), access_mask: AceMask(1179785), who: "GROUP@" }
+destination ACE NfsAce { ace_type: AccessAllowed, flags: AceFlags(0), access_mask: AceMask(1441929), who: "EVERYONE@" }
+ACLs equal and marked: 3 ACE(s)
+$ /work/cargo-target/debug/examples/integrity_input_probe --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-dst?version=4.1&uid=0&gid=0&noresvport=true --key complex.bin --input path --expected match --acl --acl-required --expect-acl equal
+matches=true bytes=73 differences=[] ignored=[] acl_scope=Some(NativeConfiguration { encoding: NfsV4 })
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/complex-src?version=4.1&uid=0&gid=0&noresvport=true --destination nfs://10.131.9.13/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/negative?version=3&uid=0&gid=0&noresvport=true --source-path complex.bin --destination-path complex.bin --acl-mapping --expect refused
+refused as expected: transfer Metadata failed on Orchestration: copied metadata was refused while planning: ACL (RequireEquivalent): ACL mapping refused: NFSv4 rights are outside the fixed regular-file access profile
+$ /work/cargo-target/debug/examples/nfs_metadata_copy --source nfs://10.131.9.12/srv/nfs/v3:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/posix?version=3&uid=0&gid=0&noresvport=true --destination nfs://10.128.61.200/ontap_lisaauto_nfs:/data-mover-test/integrity-plan/acl-four-20261028-final-2000/44?version=4.1&uid=0&gid=0&noresvport=true --source-path named.bin --destination-path named.bin --acl-required --expect refused
+refused as expected: transfer Metadata failed on Orchestration: copied metadata was refused while planning: ACL (RequireExact): the source holds a Posix ACL and the destination stores NfsV4; conversion requires the explicit equivalence policy
+$ umount /work/tmp/dm-acl-four-mount-6vce9tre
+$ umount /work/tmp/dm-acl-four-mount-1n2uni8a
+$ umount /work/tmp/dm-acl-four-mount-3yuvu_36
+
+=== actual_access ===
+{"case": "named", "subject": "named-user", "uid": 42421, "primary_gid": 42420, "supplementary_groups": [], "observations": {"source-posix": {"read": true, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": true, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": true, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": true, "write": 13, "read_write": 13, "execute": false}, "44": {"read": true, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "named", "subject": "named-group", "uid": 42425, "primary_gid": 42422, "supplementary_groups": [], "observations": {"source-posix": {"read": true, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": true, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": true, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": true, "write": 13, "read_write": 13, "execute": false}, "44": {"read": true, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "named", "subject": "other", "uid": 42426, "primary_gid": 42420, "supplementary_groups": [], "observations": {"source-posix": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "44": {"read": 13, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "named", "subject": "chain-group", "uid": 42425, "primary_gid": 42424, "supplementary_groups": [], "observations": {"source-posix": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "44": {"read": 13, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "masked", "subject": "named-user", "uid": 42421, "primary_gid": 42420, "supplementary_groups": [], "observations": {"source-posix": {"read": true, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": true, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": true, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": true, "write": 13, "read_write": 13, "execute": false}, "44": {"read": true, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "masked", "subject": "named-group", "uid": 42425, "primary_gid": 42422, "supplementary_groups": [], "observations": {"source-posix": {"read": true, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": true, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": true, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": true, "write": 13, "read_write": 13, "execute": false}, "44": {"read": true, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "masked", "subject": "other", "uid": 42426, "primary_gid": 42420, "supplementary_groups": [], "observations": {"source-posix": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "44": {"read": 13, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "masked", "subject": "chain-group", "uid": 42425, "primary_gid": 42424, "supplementary_groups": [], "observations": {"source-posix": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "44": {"read": 13, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "precedence", "subject": "named-user", "uid": 42421, "primary_gid": 42420, "supplementary_groups": [], "observations": {"source-posix": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "44": {"read": 13, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "precedence", "subject": "named-group", "uid": 42425, "primary_gid": 42422, "supplementary_groups": [], "observations": {"source-posix": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "44": {"read": 13, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "precedence", "subject": "other", "uid": 42426, "primary_gid": 42420, "supplementary_groups": [], "observations": {"source-posix": {"read": true, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": true, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": true, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": true, "write": 13, "read_write": 13, "execute": false}, "44": {"read": true, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "precedence", "subject": "chain-group", "uid": 42425, "primary_gid": 42424, "supplementary_groups": [], "observations": {"source-posix": {"read": true, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": true, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": true, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": true, "write": 13, "read_write": 13, "execute": false}, "44": {"read": true, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "chain", "subject": "named-user", "uid": 42421, "primary_gid": 42420, "supplementary_groups": [], "observations": {"source-posix": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "44": {"read": 13, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "chain", "subject": "named-group", "uid": 42425, "primary_gid": 42422, "supplementary_groups": [], "observations": {"source-posix": {"read": true, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": true, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": true, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": true, "write": 13, "read_write": 13, "execute": false}, "44": {"read": true, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "chain", "subject": "other", "uid": 42426, "primary_gid": 42420, "supplementary_groups": [], "observations": {"source-posix": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "pp": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "p4": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "4p": {"read": 13, "write": 13, "read_write": 13, "execute": false}, "44": {"read": 13, "write": 13, "read_write": 13, "execute": false}}, "equal": true}
+{"case": "chain", "subject": "chain-group", "uid": 42425, "primary_gid": 42424, "supplementary_groups": [], "observations": {"source-posix": {"read": true, "write": true, "read_write": true, "execute": false}, "pp": {"read": true, "write": true, "read_write": true, "execute": false}, "p4": {"read": true, "write": true, "read_write": true, "execute": false}, "4p": {"read": true, "write": true, "read_write": true, "execute": false}, "44": {"read": true, "write": true, "read_write": true, "execute": false}}, "equal": true}
+PASS 16 subject/case comparisons; 320 operation outcomes across 5 endpoints
+
+=== native_protocol ===
+    Updating crates.io index
+     Locking 117 packages to latest Rust 1.98.1 compatible versions
+      Adding psm v0.1.24 (available: v0.1.32)
+ Downloading crates ...
+  Downloaded cc v1.10.0
+  Downloaded yoke-derive v0.8.4
+  Downloaded icu_locale_core v2.4.0
+  Downloaded unicode-ident v1.0.27
+  Downloaded smallvec v1.16.4
+  Downloaded yoke v0.8.4
+  Downloaded icu_normalizer_data v2.4.0
+  Downloaded pest v2.9.5
+  Downloaded find-msvc-tools v0.1.15
+  Downloaded pest_derive v2.9.5
+  Downloaded pest_stack_guard v1.0.0
+  Downloaded psm v0.1.24
+  Downloaded stacker v0.1.25
+  Downloaded tinystr v0.8.5
+  Downloaded zerovec-derive v0.11.7
+  Downloaded pest_generator v2.9.5
+  Downloaded pest_meta v2.9.5
+  Downloaded zerocopy v0.8.63
+  Downloaded icu_provider v2.4.0
+  Downloaded icu_collections v2.4.0
+  Downloaded icu_properties v2.4.0
+  Downloaded icu_properties_data v2.4.0
+  Downloaded zerovec v0.11.9
+  Downloaded icu_normalizer v2.4.0
+  Downloaded tokio v1.54.1
+    Blocking waiting for file lock on package cache
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling cfg-if v1.0.5
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.15
+   Compiling libc v0.2.191
+   Compiling memchr v2.8.3
+   Compiling pest_stack_guard v1.0.0
+   Compiling writeable v0.6.4
+   Compiling smallvec v1.16.4
+   Compiling litemap v0.8.3
+   Compiling icu_properties_data v2.4.0
+   Compiling icu_normalizer_data v2.4.0
+   Compiling zerocopy v0.8.63
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-sink v0.3.34
+   Compiling futures-core v0.3.34
+   Compiling parking_lot_core v0.9.12
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling futures-task v0.3.34
+   Compiling futures-io v0.3.34
+   Compiling cfg_aliases v0.2.2
+   Compiling slab v0.4.12
+   Compiling scopeguard v1.2.0
+   Compiling once_cell v1.21.4
+   Compiling nix v0.29.0
+   Compiling cc v1.10.0
+   Compiling futures-channel v0.3.34
+   Compiling lock_api v0.4.14
+   Compiling thiserror v2.0.21
+   Compiling serde_json v1.0.154
+   Compiling bitflags v2.13.2
+   Compiling bytes v1.12.1
+   Compiling itoa v1.0.18
+   Compiling tracing-core v0.1.36
+   Compiling syn v3.0.9
+   Compiling syn v2.0.119
+   Compiling psm v0.1.24
+   Compiling stacker v0.1.25
+   Compiling getrandom v0.3.4
+   Compiling errno v0.3.14
+   Compiling mio v1.2.4
+   Compiling socket2 v0.6.5
+   Compiling socket2 v0.5.10
+   Compiling pest v2.9.5
+   Compiling signal-hook-registry v1.4.8
+   Compiling rand_core v0.9.5
+   Compiling parking_lot v0.12.5
+   Compiling pest_meta v2.9.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.5
+   Compiling thiserror-impl v1.0.69
+   Compiling tracing-attributes v0.1.31
+   Compiling synstructure v0.14.0
+   Compiling pest_generator v2.9.5
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.4
+   Compiling zerovec-derive v0.11.7
+   Compiling displaydoc v0.2.7
+   Compiling futures-macro v0.3.34
+   Compiling thiserror-impl v2.0.21
+   Compiling tokio-macros v2.7.2
+   Compiling async-trait v0.1.92
+   Compiling pest_derive v2.9.5
+   Compiling thiserror v1.0.69
+   Compiling tracing v0.1.44
+   Compiling fastxdr v1.0.2
+   Compiling tokio v1.54.1
+   Compiling futures-util v0.3.34
+   Compiling zerofrom v0.1.8
+   Compiling yoke v0.8.4
+   Compiling zerovec v0.11.9
+   Compiling zerotrie v0.2.5
+   Compiling nfs-rs v0.8.6 (/root/jay/rust/github/data-mover-rs/vendor/nfs-rs)
+   Compiling tinystr v0.8.5
+   Compiling potential_utf v0.1.6
+   Compiling icu_collections v2.4.0
+   Compiling icu_locale_core v2.4.0
+   Compiling icu_provider v2.4.0
+   Compiling icu_properties v2.4.0
+   Compiling icu_normalizer v2.4.0
+   Compiling futures-executor v0.3.34
+   Compiling futures v0.3.34
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling acl-native-lab v0.1.0 (/tmp/acl-native-lab)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 35.64s
+     Running `/tmp/nfs-acl-protocol-target/debug/acl-native-lab native-protocol-1828`
+BEGIN url=nfs://10.131.9.12/srv/nfs/v3?version=3&uid=0&gid=0&noresvport=true retained=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828
+CAPABILITIES MountCapabilities { acl: false, posix_acl: true, named_attributes: false, locks: false, callbacks: false, delegation_retention: false, pnfs: false, session_diagnostics: false }
+ROOT_ACL raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 7 }, PosixAclEntry { tag: 32, id: 0, permissions: 7 }], default: [] }
+SET file=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-file acl=PosixAcl { access: [PosixAclEntry { tag: 1, id: 4294967295, permissions: 6 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 4294967295, permissions: 4 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 4294967295, permissions: 4 }, PosixAclEntry { tag: 32, id: 4294967295, permissions: 0 }], default: [] }
+READBACK label=file_access_raw_mask_latent_bits path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-file raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 6 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 4 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [] }
+PASS label=file_access_raw_mask_latent_bits
+SET directory=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory acl=PosixAcl { access: [PosixAclEntry { tag: 1, id: 4294967295, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 4294967295, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 4294967295, permissions: 4 }, PosixAclEntry { tag: 32, id: 4294967295, permissions: 0 }], default: [PosixAclEntry { tag: 1, id: 4294967295, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 4294967295, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 4294967295, permissions: 4 }, PosixAclEntry { tag: 32, id: 4294967295, permissions: 0 }] }
+READBACK label=directory_access_default_preserve path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }] }
+PASS label=directory_access_default_preserve
+READBACK label=directory_default_clear path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [] }
+PASS label=directory_default_clear
+READBACK label=directory_default_restore path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }] }
+PASS label=directory_default_restore
+READBACK label=remount_file_persistent path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-file raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 6 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 4 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [] }
+PASS label=remount_file_persistent
+READBACK label=remount_directory_default_persistent path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }] }
+PASS label=remount_directory_default_persistent
+END host=10.131.9.12 RESULT=PASS retained=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828
+BEGIN url=nfs://10.131.9.13/srv/nfs/v3?version=3&uid=0&gid=0&noresvport=true retained=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828
+CAPABILITIES MountCapabilities { acl: false, posix_acl: true, named_attributes: false, locks: false, callbacks: false, delegation_retention: false, pnfs: false, session_diagnostics: false }
+ROOT_ACL raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 7 }, PosixAclEntry { tag: 32, id: 0, permissions: 7 }], default: [] }
+SET file=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-file acl=PosixAcl { access: [PosixAclEntry { tag: 1, id: 4294967295, permissions: 6 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 4294967295, permissions: 4 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 4294967295, permissions: 4 }, PosixAclEntry { tag: 32, id: 4294967295, permissions: 0 }], default: [] }
+READBACK label=file_access_raw_mask_latent_bits path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-file raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 6 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 4 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [] }
+PASS label=file_access_raw_mask_latent_bits
+SET directory=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory acl=PosixAcl { access: [PosixAclEntry { tag: 1, id: 4294967295, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 4294967295, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 4294967295, permissions: 4 }, PosixAclEntry { tag: 32, id: 4294967295, permissions: 0 }], default: [PosixAclEntry { tag: 1, id: 4294967295, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 4294967295, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 4294967295, permissions: 4 }, PosixAclEntry { tag: 32, id: 4294967295, permissions: 0 }] }
+READBACK label=directory_access_default_preserve path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }] }
+PASS label=directory_access_default_preserve
+READBACK label=directory_default_clear path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [] }
+PASS label=directory_default_clear
+READBACK label=directory_default_restore path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }] }
+PASS label=directory_default_restore
+READBACK label=remount_file_persistent path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-file raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 6 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 4 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [] }
+PASS label=remount_file_persistent
+READBACK label=remount_directory_default_persistent path=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory raw=PosixAcl { access: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }], default: [PosixAclEntry { tag: 1, id: 0, permissions: 7 }, PosixAclEntry { tag: 2, id: 42421, permissions: 7 }, PosixAclEntry { tag: 4, id: 0, permissions: 5 }, PosixAclEntry { tag: 8, id: 42422, permissions: 7 }, PosixAclEntry { tag: 16, id: 0, permissions: 4 }, PosixAclEntry { tag: 32, id: 0, permissions: 0 }] }
+PASS label=remount_directory_default_persistent
+END host=10.131.9.13 RESULT=PASS retained=data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828
+BEGIN readonly_unsupported url=nfs://10.128.61.200/ontap_lisaauto_nfs?version=3&uid=0&gid=0&noresvport=true
+Error: Rpc("could not parse response due to bad status")
+
+=== native_kernel_readback ===
+BEGIN independent_kernel_readback host=10.131.9.12 export=/srv/nfs/v3
+PATH data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-file
+user::rw-
+user:42421:rwx	#effective:r--
+group::r--
+group:42422:rwx	#effective:r--
+mask::r--
+other::---
+
+PATH data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory
+user::rwx
+user:42421:rwx	#effective:r--
+group::r-x	#effective:r--
+group:42422:rwx	#effective:r--
+mask::r--
+other::---
+default:user::rwx
+default:user:42421:rwx	#effective:r--
+default:group::r-x	#effective:r--
+default:group:42422:rwx	#effective:r--
+default:mask::r--
+default:other::---
+
+END independent_kernel_readback RESULT=PASS
+BEGIN independent_kernel_readback host=10.131.9.13 export=/srv/nfs/v3
+PATH data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-file
+user::rw-
+user:42421:rwx	#effective:r--
+group::r--
+group:42422:rwx	#effective:r--
+mask::r--
+other::---
+
+PATH data-mover-test/integrity-plan/acl-four-20261028-native-protocol-1828/native-directory
+user::rwx
+user:42421:rwx	#effective:r--
+group::r-x	#effective:r--
+group:42422:rwx	#effective:r--
+mask::r--
+other::---
+default:user::rwx
+default:user:42421:rwx	#effective:r--
+default:group::r-x	#effective:r--
+default:group:42422:rwx	#effective:r--
+default:mask::r--
+default:other::---
+
+END independent_kernel_readback RESULT=PASS
+
+=== zero_mask_regression ===
+{"mask": "---", "read_allowed": true, "stderr": ""}
+user::rw-
+user:42421:---
+group::---
+group:42422:---
+mask::---
+other::r--
+
+
+{"mask": "r--", "read_allowed": false, "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nPermissionError: [Errno 13] Permission denied: '/work/tmp/dm-acl-mask-repro-jvxchn_a/mask3r00'\n"}
+user::rw-
+user:42421:---
+group::---
+group:42422:---
+mask::r--
+other::r--
+
+
+retained_local /work/tmp/dm-acl-mask-repro-jvxchn_a
+
+=== recovery_regression_red ===
+   Compiling data-mover v0.3.0 (/root/jay/rust/github/data-mover-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.52s
+warning: the following packages contain code that will be rejected by a future version of Rust: binrw v0.15.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/work/cargo-target/debug/deps/data_mover-b3a4da3b1c693efe)
+
+running 5 tests
+test storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_keeps_numeric_only_metadata_a_noop ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_accepts_matching_owner_and_acl_proven_low_mode_difference ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_requires_observable_owner_only_when_numeric_owner_was_expected ... FAILED
+test storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_special_mode_bits_with_unchanged_acl ... FAILED
+test storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_owner_or_group_with_unchanged_acl ... FAILED
+
+failures:
+
+---- storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_requires_observable_owner_only_when_numeric_owner_was_expected stdout ----
+
+thread 'storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_requires_observable_owner_only_when_numeric_owner_was_expected' (1660914) panicked at src/storage/backends/nfs/native_acl_tests.rs:573:13:
+Ok(())
+
+---- storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_special_mode_bits_with_unchanged_acl stdout ----
+
+thread 'storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_special_mode_bits_with_unchanged_acl' (1660913) panicked at src/storage/backends/nfs/native_acl_tests.rs:498:9:
+Ok(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_owner_or_group_with_unchanged_acl stdout ----
+
+thread 'storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_owner_or_group_with_unchanged_acl' (1660912) panicked at src/storage/backends/nfs/native_acl_tests.rs:469:9:
+Ok(())
+
+
+failures:
+    storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_owner_or_group_with_unchanged_acl
+    storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_special_mode_bits_with_unchanged_acl
+    storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_requires_observable_owner_only_when_numeric_owner_was_expected
+
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 1999 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+
+=== recovery_regression_green ===
+   Compiling data-mover v0.3.0 (/root/jay/rust/github/data-mover-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 34.93s
+warning: the following packages contain code that will be rejected by a future version of Rust: binrw v0.15.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (/work/cargo-target/debug/deps/data_mover-b3a4da3b1c693efe)
+
+running 235 tests
+test storage::backends::nfs::acl::tests::empty_protocol_acl_uses_mode_without_inventing_named_entries ... ok
+test storage::backends::nfs::acl::tests::native_posix_codec_rejects_bad_permissions_and_unknown_tags ... ok
+test storage::backends::nfs::acl::tests::decoder_rejects_wrong_encoding_truncation_and_trailing_data ... ok
+test storage::backends::nfs::acl::tests::nfs_v4_acl_round_trips_in_order_without_principal_loss ... ok
+test storage::backends::nfs::acl::tests::native_posix_codec_preserves_named_masked_permissions_and_defaults ... ok
+test storage::backends::nfs::acl::tests::native_posix_set_conversion_orders_valid_entries_for_linux ... ok
+test storage::backends::nfs::at_destination::tests::only_a_collision_at_the_name_is_transient ... ok
+test storage::backends::nfs::client::owner::tests::nfsv3_ids_are_taken_as_sent ... ok
+test storage::backends::nfs::at_destination::tests::a_failed_first_pointer_removes_the_fresh_stage ... ok
+test storage::backends::nfs::client::role_create::tests::a_failed_parent_lookup_keeps_the_role_classification ... ok
+test storage::backends::nfs::client::role_create::tests::a_deeper_level_named_by_a_nested_creation_is_kept ... ok
+test storage::backends::nfs::client::owner::tests::nfsv4_owners_nfs_rs_did_not_really_parse_are_not_ids ... ok
+test storage::backends::nfs::at_destination::tests::hash_checkpoint_tests::hash_only_pointer_does_not_promote_confirmed_writes ... ok
+test storage::backends::nfs::at_destination::tests::new_data_file_is_readable_but_checkpoint_is_private_from_creation ... ok
+test storage::backends::nfs::client::role_create::tests::an_existing_file_is_the_typed_collision ... ok
+test storage::backends::nfs::client::role_create::tests::every_level_below_the_cached_ones_is_created_in_order ... ok
+test storage::backends::nfs::client::role_create::tests::refused_parents_are_the_refusal ... ok
+test storage::backends::nfs::client::role_create::tests::other_failures_stop_at_their_level_without_a_probe ... ok
+test storage::backends::nfs::client::role_create::tests::stale_and_busy_retries_are_bounded_and_report_the_last_cause ... ok
+test storage::backends::nfs::client::role_listing::tests::a_failure_mid_directory_ends_the_read_after_the_entries_before_it ... ok
+test storage::backends::nfs::client::role_listing::tests::a_listed_childs_ownership_and_times_are_what_a_getattr_reports ... ok
+test storage::backends::nfs::client::role_listing::tests::a_looked_up_snapshot_that_is_not_a_directory_is_an_ordinary_child ... ok
+test storage::backends::nfs::client::role_listing::tests::a_lookup_failure_of_the_session_or_the_directory_ends_the_read ... ok
+test storage::backends::nfs::client::role_listing::tests::a_read_failure_says_what_reading_anew_could_do ... ok
+test storage::backends::nfs::client::role_listing::tests::a_snapshot_that_cannot_be_looked_up_fails_with_the_lookups_class ... ok
+test storage::backends::nfs::client::role_listing::tests::a_stopped_listing_takes_no_further_entry ... ok
+test storage::backends::nfs::client::role_listing::tests::an_entry_without_attributes_or_handle_fails_alone ... ok
+test storage::backends::nfs::client::role_listing::tests::an_entry_already_taken_is_skipped_before_it_is_looked_at ... ok
+test storage::backends::nfs::client::role_listing::tests::an_nfsv3_snapshot_directory_without_attributes_is_hidden ... ok
+test storage::backends::nfs::client::role_listing::tests::completion::a_listed_handle_failure_does_not_resolve_the_parent_again ... ok
+test storage::backends::nfs::client::role_listing::tests::completion::an_empty_lookup_handle_fails_without_sending_getattr ... ok
+test storage::backends::nfs::client::role_listing::tests::completion::completion_aborts_on_parent_staleness_transport_and_throttling ... ok
+test storage::backends::nfs::client::role_listing::tests::completion::completion_preserves_child_failure_classes_and_siblings ... ok
+test storage::backends::nfs::client::role_listing::tests::completion::completion_skips_hidden_invalid_replayed_and_stopped_children ... ok
+test storage::backends::nfs::client::role_listing::tests::completion::incomplete_v4_children_are_not_reinterpreted_as_v3_omissions ... ok
+test storage::backends::nfs::client::role_listing::tests::completion::incomplete_v3_children_are_completed_with_the_fewest_requests ... ok
+test storage::backends::nfs::client::role_listing::tests::completion::lookup_replaces_both_handle_and_attributes ... ok
+test storage::backends::nfs::client::role_listing::tests::completion::nested_listing_looks_up_only_the_child_name ... ok
+test storage::backends::nfs::client::role_listing::tests::only_an_nfsv3_snapshot_without_attributes_is_hidden ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_directory_made_by_a_concurrent_task_before_our_removal_is_success ... ok
+test storage::backends::nfs::client::role_listing::tests::reading_a_directory_caches_no_handle ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_level_gone_between_mkdir_and_lookup_is_retried ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_new_level_is_one_mkdir_and_is_cached ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_non_directory_in_the_way_is_replaced_by_the_directory ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_non_directory_that_keeps_returning_is_a_conflict ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_parent_deleted_after_it_was_cached_is_rebuilt_within_the_call ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_parent_gone_again_after_its_rebuild_is_transient ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_parent_that_cannot_be_resolved_stops_before_mkdir ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_refused_mkdir_is_a_permanent_permission_failure_naming_the_status ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_refused_rebuild_reports_its_own_failure ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_refused_removal_is_reported_as_the_refusal ... ok
+test storage::backends::nfs::client::role_namespace::tests::a_stale_parent_handle_is_forgotten_and_the_level_retried ... ok
+test storage::backends::nfs::client::role_namespace::tests::an_existing_directory_is_success_in_either_dialect ... ok
+test storage::backends::nfs::client::role_namespace::tests::other_answers_keep_their_own_class ... ok
+test storage::backends::nfs::client::role_namespace::tests::retries_are_bounded_and_report_the_last_cause ... ok
+test storage::backends::nfs::client::role_rename::tests::a_failed_forget_stops_the_rename ... ok
+test storage::backends::nfs::client::role_rename::tests::a_refused_parent_lookup_is_the_failure ... ok
+test storage::backends::nfs::client::role_rename::tests::a_refused_rename_is_classified_from_the_server_status ... ok
+test storage::backends::nfs::client::role_rename::tests::a_rename_resolves_both_parents_and_forgets_the_renamed_names ... ok
+test storage::backends::nfs::client::role_rename::tests::an_uncertain_rename_is_not_sent_again ... ok
+test storage::backends::nfs::client::role_rename::tests::stale_handles_are_forgotten_and_retried_a_bounded_number_of_times ... ok
+test storage::backends::nfs::client::role_symlink::tests::timestamp_conversion_preserves_nfs_second_and_nanosecond_fields ... ok
+test storage::backends::nfs::client::role_symlink::tests::timestamp_conversion_rejects_values_outside_nfs_time_range ... ok
+test storage::backends::nfs::client::tests::a_backfilled_cache_key_is_the_one_lookup_will_ask_for ... ok
+test storage::backends::nfs::client::tests::a_cached_handle_does_not_share_the_reply_buffer ... ok
+test storage::backends::nfs::client::tests::deferred_write_retains_payload_only_when_server_commit_is_required ... ok
+test storage::backends::nfs::client::tests::negotiated_read_and_write_limits_are_independent ... ok
+test storage::backends::nfs::client::tests::a_removed_or_renamed_directory_forgets_its_cached_subtree ... ok
+test storage::backends::nfs::client::tests::test_is_nfs_noent_io_notfound ... ok
+test storage::backends::nfs::client::tests::test_is_nfs_noent_io_other ... ok
+test storage::backends::nfs::client::tests::test_is_retryable_with_invalidation_excludes_delay ... ok
+test storage::backends::nfs::client::tests::test_is_retryable_with_invalidation_excludes_unrelated ... ok
+test storage::backends::nfs::client::tests::test_is_retryable_with_invalidation_noent_concurrency_race ... ok
+test storage::backends::nfs::client::tests::test_is_retryable_with_invalidation_stale ... ok
+test storage::backends::nfs::client::tests::test_is_stale_handle_excludes_delay ... ok
+test storage::backends::nfs::client::tests::test_is_stale_handle_excludes_noent ... ok
+test storage::backends::nfs::client::tests::test_is_stale_handle_nfs3err_badhandle ... ok
+test storage::backends::nfs::client::tests::test_is_stale_handle_nfs3err_stale ... ok
+test storage::backends::nfs::client::tests::test_is_stale_handle_nfs4err_badhandle ... ok
+test storage::backends::nfs::client::tests::test_is_stale_handle_nfs4err_stale ... ok
+test storage::backends::nfs::client::tests::test_is_stale_handle_unrelated_errors ... ok
+test storage::backends::nfs::common::tests::dialects_remain_independent_facts ... ok
+test storage::backends::nfs::common::tests::instance_facts_reject_unevidenced_or_impossible_claims ... ok
+test storage::backends::nfs::common::tests::retry_is_bounded_and_only_invalidates_safe_protocol_states ... ok
+test storage::backends::nfs::client::tests::test_parse_nfs_url ... ok
+test storage::backends::nfs::client::role_create::tests::a_failure_is_reported_at_the_level_that_failed ... ok
+test storage::backends::nfs::client::role_create::tests::a_refused_level_that_is_a_directory_passes ... ok
+test storage::backends::nfs::client::role_create::tests::a_refused_level_that_is_missing_or_not_a_directory_stays_refused ... ok
+test storage::backends::nfs::client::role_create::tests::a_parent_deleted_after_it_was_cached_is_rebuilt_within_the_call ... ok
+test storage::backends::nfs::client::role_create::tests::a_probe_that_fails_beyond_the_level_reports_itself ... ok
+test storage::backends::nfs::client::role_create::tests::a_parent_missing_before_any_stale_handle_is_not_rebuilt ... ok
+test storage::backends::nfs::client::role_create::tests::a_failure_beyond_the_level_is_not_tagged_with_it ... ok
+test storage::backends::nfs::client::role_create::tests::a_parent_gone_again_after_its_rebuild_fails_without_a_second_rebuild ... ok
+test storage::backends::nfs::client::role_create::tests::a_refused_create_is_a_permanent_permission_failure_naming_the_status ... ok
+test storage::backends::nfs::client::role_create::tests::a_new_file_creates_its_parents_first ... ok
+test storage::backends::nfs::create_dir_tests::refused_existing_levels_are_passed_on_nfs ... ok
+test storage::backends::nfs::create_dir_tests::a_new_level_below_a_writable_directory_is_created_and_one_in_a_read_only_one_refused ... ok
+test storage::backends::nfs::listing::tests::a_hidden_entry_is_counted_not_listed ... ok
+test storage::backends::nfs::listing::tests::a_hinted_listing_reads_the_hinted_handle_without_a_lookup ... ok
+test storage::backends::nfs::listing::tests::a_hint_from_another_namespace_is_not_read ... ok
+test storage::backends::nfs::listing::tests::a_failure_after_the_first_page_ends_the_listing_after_what_was_read ... ok
+test storage::backends::nfs::listing::tests::a_stale_hint_falls_back_to_a_lookup ... ok
+test storage::backends::nfs::listing::tests::a_failure_before_the_first_page_restarts_the_directory_once_resolved_again ... ok
+test storage::backends::nfs::listing::tests::an_empty_directory_is_one_empty_page ... ok
+test storage::backends::nfs::listing::tests::cancelling_during_a_backoff_ends_the_listing_with_a_cancelled_signal ... ok
+test storage::backends::nfs::listing::tests::a_busy_server_before_the_first_page_is_backed_off ... ok
+test storage::backends::nfs::listing::tests::first_page::a_changed_handle_before_the_first_page_rewinds_and_deduplicates ... ok
+test storage::backends::nfs::listing::tests::first_page::an_entry_seen_but_not_taken_is_not_lost_on_continuation ... ok
+test storage::backends::nfs::listing::tests::a_safe_transport_failure_is_resent_before_the_first_page_and_ends_only_the_listing_after ... ok
+test storage::backends::nfs::listing::tests::first_page::an_uncurable_failure_flushes_the_pre_page_buffer_and_keeps_its_scope ... ok
+test storage::backends::nfs::listing::tests::first_page::cancellation_during_a_pre_page_retry_stops_without_publishing_the_buffer ... ok
+test storage::backends::nfs::listing::tests::first_page::new_entries_refill_retries_before_the_first_page ... ok
+test storage::backends::nfs::listing::tests::first_page::rejected_or_empty_continuations_rewind_without_discarding_the_buffer ... ok
+test storage::backends::nfs::listing::tests::first_page::replay_preserves_hidden_and_child_failure_counts_once ... ok
+test storage::backends::nfs::listing::tests::first_page::repeated_rewinds_or_relookups_without_progress_are_bounded ... ok
+test storage::backends::nfs::listing::tests::listed_directories_carry_their_handle_as_a_hint ... ok
+test storage::backends::nfs::listing::tests::first_page::replay_without_new_entries_exhausts_the_pre_page_retry_budget ... ok
+test storage::backends::nfs::listing::tests::looping_cookies_end_the_listing ... ok
+test storage::backends::nfs::listing::tests::relooking_up_is_bounded_and_other_failures_are_not_retried ... ok
+test storage::backends::nfs::listing::tests::reading_from_the_start_again_is_bounded ... ok
+test storage::backends::nfs::at_destination::tests::a_fresh_stage_publishes_and_leaves_no_artifact ... ok
+test storage::backends::nfs::listing::tests::rereading_after_a_pause_keeps_the_hinted_handle ... ok
+test storage::backends::nfs::listing_resume::tests::a_position_is_kept_per_handle_and_loops_are_per_read ... ok
+test storage::backends::nfs::listing_resume::tests::an_entry_is_remembered_once_taken ... ok
+test storage::backends::nfs::at_destination::tests::a_lost_rename_reply_and_a_leftover_temporary_are_settled ... ok
+test storage::backends::nfs::listing::tests::a_server_that_restarts_on_a_cookie_hands_nothing_over_twice ... ok
+test storage::backends::nfs::metadata::tests::a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not ... ok
+test storage::backends::nfs::metadata::tests::an_unmapped_owner_is_copied_as_mode_only ... ok
+test storage::backends::nfs::metadata::tests::an_unmapped_owner_is_never_reported_as_an_id ... ok
+test storage::backends::nfs::metadata::tests::automatic_metadata_does_not_substitute_root_for_unknown_ownership ... ok
+test storage::backends::nfs::metadata::tests::automatic_metadata_is_bound_to_the_described_handle ... ok
+test storage::backends::nfs::metadata::tests::mode_only_apply_never_observes_or_rewrites_numeric_ownership ... ok
+test storage::backends::nfs::metadata::tests::modes_avoid_unrequested_or_unsupported_storage_calls ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::absent_posix_access_is_materialized_from_mode_and_clears_extended_acl ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_accepts_matching_owner_and_acl_proven_low_mode_difference ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_keeps_numeric_only_metadata_a_noop ... ok
+test storage::backends::nfs::metadata::tests::a_listed_child_is_observed_exactly_as_a_getattr_would ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_owner_or_group_with_unchanged_acl ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_rejects_changed_special_mode_bits_with_unchanged_acl ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::acl_recovery_requires_observable_owner_only_when_numeric_owner_was_expected ... ok
+test storage::backends::nfs::at_destination::tests::a_lost_publication_reply_still_removes_the_pointer ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::advertised_posix_acl_read_failure_cannot_become_empty_or_successful_acl ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::native_nfs4_application_keeps_order_and_requires_readback ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::native_nfs4_readback_accepts_only_protocol_defined_special_group_flag_change ... ok
+test storage::backends::nfs::listing::tests::progress_refills_the_retries ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::native_nfs4_readback_rejects_changed_ace_order ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::posix_readback_detects_default_loss_with_identical_access_acl ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::posix_application_clears_default_acl_and_reads_back_complete_configuration ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::posix_observation_preserves_masked_bits_and_default_acl ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::posix_readback_detects_loss_of_masked_raw_permissions ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::recovered_acl_validation_reads_final_and_never_reapplies_acl ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::refused_posix_set_is_a_failure_with_the_original_class ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::staged_destination_advertises_the_negotiated_native_acl_model ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::unsupported_capability_refuses_application_before_any_set ... ok
+test storage::backends::nfs::metadata::tests::native_acl_tests::wrong_model_and_malformed_acl_are_refused_before_any_set ... ok
+test storage::backends::nfs::metadata::tests::optional_failure_policy_preserves_entry_scope ... ok
+test storage::backends::nfs::metadata::tests::remove_xattr_preserves_protocol_success_and_refusal_classes ... ok
+test storage::backends::nfs::metadata::tests::remove_xattr_rejects_unsupported_or_invalid_names_before_io ... ok
+test storage::backends::nfs::metadata::tests::xattr_apply_stops_before_the_next_remote_mutation_after_cancel ... ok
+test storage::backends::nfs::metadata::tests::permission_tests::permissions_keep_mode_when_nfs_owner_names_cannot_be_mapped ... ok
+test storage::backends::nfs::namespace::tests::a_refused_destination_parent_is_reported_at_its_level ... ok
+test storage::backends::nfs::namespace::tests::a_lossily_decoded_name_is_an_unnamed_failure ... ok
+test storage::backends::nfs::namespace::tests::a_trailing_slash_request_keeps_its_spelling_in_the_children ... ok
+test storage::backends::nfs::namespace::tests::a_whole_listing_has_no_failures_and_a_failed_directory_fails_whole ... ok
+test storage::backends::nfs::namespace::tests::an_undescribable_child_fails_alone ... ok
+test storage::backends::nfs::namespace::tests::create_symlink_forwards_target_and_attributes ... ok
+test storage::backends::nfs::protocol::tests::a_refused_write_names_the_nfs_status ... ok
+test storage::backends::nfs::namespace::tests::create_symlink_maps_typed_protocol_failure_to_entry ... ok
+test storage::backends::nfs::protocol::tests::classify_error_keeps_the_nfs_status_name ... ok
+test storage::backends::nfs::namespace::tests::namespace_paths_are_confined_and_root_mutation_is_refused ... ok
+test storage::backends::nfs::protocol::tests::exact_dialects_are_distinct_and_ambiguous_v4_is_rejected ... ok
+test storage::backends::nfs::protocol::tests::refusals_for_the_state_met_are_classified ... ok
+test storage::backends::nfs::protocol::tests::role_errors_preserve_actionable_taxonomy ... ok
+test storage::backends::nfs::protocol::tests::structured_outcomes_preserve_retry_and_verification_safety ... ok
+test storage::backends::nfs::source::tests::connectivity_is_session_scoped_not_entry_scoped ... ok
+test storage::backends::nfs::source::tests::a_failed_missing_parent_is_reported_at_its_level ... ok
+test storage::backends::nfs::listing::tests::the_first_page_arrives_before_the_directory_is_read_to_its_end ... ok
+test storage::backends::nfs::source::tests::opened_identity_detects_change_and_precancel_avoids_another_open ... ok
+test storage::backends::nfs::listing::tests::a_rejected_or_forgotten_cookie_reads_the_directory_from_its_start ... ok
+test storage::backends::nfs::source::tests::negotiated_protocol_limit_prevents_internal_read_resplitting ... ok
+test storage::backends::nfs::staged::tests::automatic_recovery_uses_the_same_64_mib_threshold_as_local ... ok
+test storage::backends::nfs::at_destination::tests::hash_checkpoint_tests::takeover_fences_hash_only_updates_and_release ... ok
+test storage::backends::nfs::source::tests::one_stream_uses_one_open_cursor_and_exact_ranges ... ok
+test storage::backends::nfs::at_destination::tests::a_new_adapter_resumes_from_the_pointers_prefix ... ok
+test storage::backends::nfs::at_destination::tests::hash_checkpoint_tests::sparse_checkpoint_survives_error_and_prepare_then_fills_only_the_hole ... ok
+test storage::backends::nfs::staged::tests::atomic_replace_uses_unstable_writes_without_a_commit_checkpoint ... ok
+test storage::backends::nfs::staged::tests::checkpointed_below_threshold_commits_final_data_without_a_pointer ... ok
+test storage::backends::nfs::staged::tests::eight_slot_write_starts_before_input_refill ... ok
+test storage::backends::nfs::source::tests::positioned_nfs_read_does_not_wait_for_delayed_first_range ... ok
+test storage::backends::nfs::staged::tests::ephemeral_discard_closes_created_handle_and_removes_stage ... ok
+test storage::backends::nfs::source::tests::shared_budget_bounds_nfs_prefetch_without_serializing_reads ... ok
+test storage::backends::nfs::staged::tests::final_and_stage_paths_are_confined ... ok
+test storage::backends::nfs::listing::tests::cancelling_stops_reading_with_a_cancelled_signal ... ok
+test storage::backends::nfs::listing::tests::dropping_the_stream_stops_reading ... ok
+test storage::backends::nfs::staged::tests::checkpointed_prepare_keeps_the_created_handle_for_first_write ... ok
+test storage::backends::nfs::staged::tests::only_the_deterministic_stage_name_is_accepted ... ok
+test storage::backends::nfs::staged::tests::ephemeral_prepare_reuses_created_handle_for_first_write ... ok
+test storage::backends::nfs::listing::tests::after_the_first_page_a_read_continues_from_the_last_cookie ... ok
+test storage::backends::nfs::at_destination::tests::a_damaged_or_lone_pointer_restarts ... ok
+test storage::backends::nfs::staged::tests::checkpointed_writes_its_pointer_after_the_first_durable_interval ... ok
+test storage::backends::nfs::staged::tests::ordered_nfs_writer_preserves_empty_chunk_and_empty_file_support ... ok
+test storage::backends::nfs::at_destination::tests::a_stage_taken_over_by_another_writer_is_left_to_it ... ok
+test storage::backends::nfs::staged::tests::discarding_one_files_stage_leaves_another_files_stage_and_pointer ... ok
+test storage::backends::nfs::staged::tests::positioned_nfs_rejects_holes_and_overlap_and_drains_writes ... ok
+test storage::backends::nfs::staged::tests::a_resume_whose_result_is_lost_is_resumed_again ... ok
+test storage::backends::nfs::staged::tests::checkpointed_persists_every_completed_checkpoint_interval ... ok
+test storage::backends::nfs::staged::tests::precancelled_verification_does_not_open_remote_state ... ok
+test storage::backends::nfs::staged::tests::positioned_nfs_writes_completed_later_read_before_prefix_arrives ... ok
+test storage::backends::nfs::staged::tests::failed_lower_offset_truncates_completed_higher_writes ... ok
+test storage::backends::nfs::staged::tests::missing_stage_makes_rename_failure_ambiguous_when_final_is_missing_or_mismatched ... ok
+test storage::backends::nfs::tests::certified_nfs_roles_are_supported ... ok
+test storage::backends::nfs::tests::nfs_roles_reject_a_non_nfs_identity ... ok
+test storage::backends::nfs::staged::tests::staged_write_keeps_multiple_nfs_writes_inflight ... ok
+test storage::backends::nfs::staged::tests::staged_verification_does_not_issue_a_separate_size_rpc ... ok
+test storage::backends::nfs::at_destination::tests::hash_checkpoint_tests::published_checkpoint_tests::changed_final_fails_without_recreating_stage_or_removing_hash_evidence ... ok
+test storage::backends::nfs::staged::tests::staged_write_splits_at_the_negotiated_protocol_limit ... ok
+test storage::backends::nfs::listing::tests::the_listing_reads_no_further_ahead_than_a_page_or_two ... ok
+test storage::backends::nfs::staged::tests::staged_verification_rejects_a_trailing_byte ... ok
+test storage::backends::nfs::staged::tests::nonperiodic_recovery_keeps_unstable_batching_and_stable_writes_skip_it ... ok
+test storage::backends::nfs::listing::tests::a_new_handle_after_the_first_page_reads_from_the_start ... ok
+test storage::backends::nfs::staged::tests::positioned_nfs_checkpoint_tracks_prefix_with_sparse_accepted_suffix ... ok
+test storage::backends::nfs::at_destination::tests::what_is_found_restarts_for_each_reason ... ok
+test storage::backends::nfs::staged::tests::positioned_nfs_threshold_crossing_at_eof_still_writes_its_pointer ... ok
+test storage::backends::nfs::staged::tests::staged_lifecycle_writes_verifies_publishes_and_closes_handles ... ok
+test storage::backends::nfs::at_destination::tests::hash_checkpoint_tests::published_hash_pointer_is_retained_until_fenced_idempotent_release ... ok
+test storage::backends::nfs::staged::tests::staged_verification_keeps_multiple_ordered_nfs_reads_inflight ... ok
+test storage::backends::nfs::staged::tests::checkpoint_record_overlaps_next_writes_but_settles_before_finish_or_next_barrier ... ok
+test storage::backends::nfs::listing_resume::tests::remembering_is_bounded ... ok
+test storage::backends::nfs::staged::tests::hash_checkpoint_larger_than_legacy_pointer_uses_negotiated_io_and_restores ... ok
+test storage::backends::nfs::at_destination::tests::hash_checkpoint_tests::published_checkpoint_tests::missing_stage_recovers_both_publication_phases_and_verifies_final ... ok
+test storage::backends::nfs::staged::tests::positioned_nfs_checkpoint_coalesces_thresholds_and_rebases_next_interval ... ok
+test storage::backends::nfs::staged::tests::periodic_checkpoints_own_commit_cadence_before_and_after_the_first_pointer ... ok
+test storage::backends::nfs::listing::tests::first_page::a_published_listing_cannot_fall_back_after_remembrance_runs_out ... ok
+test storage::backends::nfs::listing::tests::first_page::fallback_never_reenables_remembrance_or_refills_retries ... ok
+test storage::backends::nfs::listing::tests::first_page::an_unpublished_listing_can_fall_back_after_remembrance_runs_out ... ok
+
+test result: ok. 235 passed; 0 failed; 0 ignored; 0 measured; 1769 filtered out; finished in 0.35s
+

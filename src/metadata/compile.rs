@@ -181,6 +181,21 @@ fn compile_acl(
 ) -> Result<(), MetadataPlanError> {
     let family = MetadataFamily::Acl;
     let policy = request.policies.get(family);
+    if policy == MetadataPolicy::RequireEquivalent {
+        return super::acl_mapping::compile(request, plan);
+    }
+    if policy == MetadataPolicy::RequireExact
+        && matches!(
+            request.observations.acl(),
+            MetadataObservation::NotApplicable
+        )
+    {
+        return Err(MetadataPlanError::new(
+            family,
+            policy,
+            RefusalCause::SourceCannotObserve,
+        ));
+    }
     let Some(value) = observed_value(request.observations.acl(), family, policy, plan)? else {
         return Ok(());
     };
@@ -321,7 +336,10 @@ fn carry_mode_only(
     mode: u32,
 ) -> Result<(), MetadataPlanError> {
     let family = MetadataFamily::OwnershipMode;
-    if policy == MetadataPolicy::RequireExact {
+    if matches!(
+        policy,
+        MetadataPolicy::RequireExact | MetadataPolicy::RequireEquivalent
+    ) {
         return Err(MetadataPlanError::new(
             family,
             policy,
@@ -409,7 +427,10 @@ fn compile_timestamps(
         exact(plan, family, MetadataMutation::Timestamps(mapped));
         return Ok(());
     }
-    if policy == MetadataPolicy::RequireExact {
+    if matches!(
+        policy,
+        MetadataPolicy::RequireExact | MetadataPolicy::RequireEquivalent
+    ) {
         return Err(MetadataPlanError::new(
             family,
             policy,
@@ -549,11 +570,13 @@ fn drop_with_losses(
             });
             Ok(())
         }
-        MetadataPolicy::RequireExact | MetadataPolicy::Omit => Err(MetadataPlanError::new(
-            family,
-            policy,
-            RefusalCause::LossRejected(losses[0]),
-        )),
+        MetadataPolicy::RequireExact | MetadataPolicy::RequireEquivalent | MetadataPolicy::Omit => {
+            Err(MetadataPlanError::new(
+                family,
+                policy,
+                RefusalCause::LossRejected(losses[0]),
+            ))
+        }
     }
 }
 

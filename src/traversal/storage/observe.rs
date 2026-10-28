@@ -34,6 +34,7 @@ use crate::model::{
 use crate::storage::{Metadata, Namespace, SourceDescriptor, StorageRoleFailure};
 use crate::traversal::TraversalTerminalFailure;
 
+mod marker;
 mod metadata;
 pub(super) use metadata::{dependency_without_io, without_io as metadata_without_io};
 
@@ -91,7 +92,14 @@ async fn observe_history(
     plan: ObservationPlan,
     cancel: &CancellationToken,
 ) -> Result<ObservedEntry, StorageRoleFailure> {
-    let path = &descriptor.path;
+    let history_path =
+        ObjectHistory::source_path(&descriptor.path, descriptor.kind).map_err(|_| {
+            StorageRoleFailure::Entry(super::entry_failure(
+                &descriptor.path,
+                FailureClass::Unsupported,
+            ))
+        })?;
+    let path = &history_path;
     let capabilities = metadata_role.observation_capabilities();
     for record in history.records_mut() {
         if record.is_delete_marker() {
@@ -258,6 +266,9 @@ pub(super) fn observe_listed(
     mut descriptor: SourceDescriptor,
     plan: ObservationPlan,
 ) -> Listed {
+    if let Some(marker) = descriptor.listing.directory_marker.take() {
+        return marker::listed(metadata_role, descriptor, *marker, plan);
+    }
     if descriptor.kind == EntryKind::Symlink {
         return Listed::Unobserved(Box::new(descriptor));
     }
@@ -293,6 +304,9 @@ pub(super) async fn observe(
     plan: ObservationPlan,
     cancel: &CancellationToken,
 ) -> Result<ObservedEntry, StorageRoleFailure> {
+    if let Some(marker) = descriptor.listing.directory_marker.take() {
+        return marker::observe(namespace, metadata_role, descriptor, *marker, plan).await;
+    }
     if let Some(history) = descriptor.listing.history.take() {
         return observe_history(metadata_role, descriptor, history, plan, cancel).await;
     }

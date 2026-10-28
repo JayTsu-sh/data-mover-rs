@@ -30,6 +30,9 @@ pub const KB: u64 = 1024;
 pub const MB: u64 = 1024 * KB;
 
 #[cfg(test)]
+mod s3_transfer_tests;
+
+#[cfg(test)]
 trait AssertTestValue {
     type Value;
 
