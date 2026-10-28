@@ -284,12 +284,20 @@ The default `mtime_tolerance` is `Duration::ZERO`; either precision mode also
 accepts an absolute timestamp difference up to and including the configured
 `Duration`.
 
-Strict ACL checks are explicit: `CopiedMetadataRequest::with_required_acl()` requires native
-preservation; `with_acl_mapping()` permits the proven POSIX/NFSv4 regular-file access subset
-under shared numeric identities and group resolution. NFSv3 POSIX ACLs require the actual
-NFSACL extension. `IntegrityPlan::with_required_acl()` and `with_acl_equivalence()` never
-ignore missing required ACLs. `IntegrityReport::acl_scope()` names the proven scope.
-See the [four-way validation report](docs/reports/2026-10-28-nfs-acl-four-way-validation.md).
+`CopiedMetadataRequest::with_acl()` automatically carries a native ACL or maps the supported
+POSIX/NFSv4 regular-file access subset. `TransferOutcome.metadata` exposes an ACL report with
+omitted rights, their original locations and reasons, as well as any conservative data-denying
+fallback. Source and destination numeric identities and group memberships are not verified;
+cross-model results explicitly report this limitation. NFSv3 POSIX ACLs require NFSACL.
+`IntegrityPlan::with_required_acl()` and `with_acl_equivalence()` independently control
+strict integrity comparisons. See the [four-way validation report](docs/reports/2026-10-28-nfs-acl-four-way-validation.md).
+
+During traversal, consume `TraversalItem::Failure` for a failed child or directory listing and
+`TraversalItem::ObservationFailure` for a metadata family that could not be observed, including
+failures on filtered entries and individual versions. The latter carries the path, version,
+family, failure class and transience; the underlying backend diagnostic is not always retained.
+After consuming the stream, call `finish()` to receive session-wide failures or cancellation.
+A completed traversal can still have delivered individual failure events.
 
 The `storage_integrity_check` example defaults to exact precision. Pass
 `--mtime-auto-precision` to use the coarser observed precision, and

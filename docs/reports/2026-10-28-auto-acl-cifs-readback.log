@@ -1,0 +1,34 @@
+CASE copy
+OwnershipMode: OmittedByPolicy
+Acl: Failed
+Xattrs: OmittedByPolicy
+Tags: OmittedByPolicy
+Timestamps: Applied
+loss OwnershipMode: OwnershipModeDropped
+loss Acl: AclPartiallyCopied
+loss Timestamps: AccessedTimestampDropped
+loss Timestamps: TimestampPrecisionReduced
+loss Timestamps: CreatedTimestampDropped
+ACL conservative fallback: true
+ACL omission Acl None: OwnershipNotPreserved (ACL owner or group identity is not preserved)
+ACL omission Acl None: UnsupportedEncoding (ACL encoding cannot represent this projection)
+ACL omission PosixAccess { index: 0 } None: UncopiedEntry { entry: PosixEntry { tag: 1, id: 4294967295, permissions: 6 } } (source ACL entry was not copied)
+ACL omission PosixAccess { index: 1 } None: UncopiedEntry { entry: PosixEntry { tag: 4, id: 4294967295, permissions: 0 } } (source ACL entry was not copied)
+ACL omission PosixAccess { index: 2 } Some("42422"): UncopiedEntry { entry: PosixEntry { tag: 8, id: 42422, permissions: 4 } } (source ACL entry was not copied)
+ACL omission PosixAccess { index: 3 } Some("42424"): UncopiedEntry { entry: PosixEntry { tag: 8, id: 42424, permissions: 2 } } (source ACL entry was not copied)
+ACL omission PosixAccess { index: 4 } None: UncopiedEntry { entry: PosixEntry { tag: 16, id: 4294967295, permissions: 6 } } (source ACL entry was not copied)
+ACL omission PosixAccess { index: 5 } None: UncopiedEntry { entry: PosixEntry { tag: 32, id: 4294967295, permissions: 0 } } (source ACL entry was not copied)
+ACL omission Acl None: NoSafeCandidate (no ACL candidate preserves current data authorization)
+applying ACL failed: the destination refused the write — Metadata failed at .data-mover-35ba5ebffe5fe4b5eb487061c5e2ff7d.stage (Protocol, Permanent): CIFS ACL SET readback mismatch: DACL protection differs
+Error: "the copy failed: transfer Metadata failed on Destination: staged metadata application failed: applying ACL failed: the destination refused the write — Metadata failed at .data-mover-35ba5ebffe5fe4b5eb487061c5e2ff7d.stage (Protocol, Permanent): CIFS ACL SET readback mismatch: DACL protection differs"
+EXIT 1
+CASE cleanup
+deleted Directory dm-meta-acl-auto-1793186881
+outcome=Completed(DeleteTreeCompletion { deleted_entries: 0, deleted_directories: 1, entry_failures: 0 })
+EXIT 0
+CLEANUP complete
+Traceback (most recent call last):
+  File "/tmp/dm-cifs-acl-real.py", line 19, in <module>
+    if code: raise RuntimeError('copy failed; readback not run')
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: copy failed; readback not run

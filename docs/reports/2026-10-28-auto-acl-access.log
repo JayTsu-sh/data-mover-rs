@@ -1,0 +1,5 @@
+{"subject": "named-user", "source": {"read": true, "write": 13, "read_write": 13, "execute": false}, "target": {"read": true, "write": 13, "read_write": 13, "execute": false}, "equal": true}
+{"subject": "named-group", "source": {"read": true, "write": 13, "read_write": 13, "execute": false}, "target": {"read": true, "write": 13, "read_write": 13, "execute": false}, "equal": true}
+{"subject": "other", "source": {"read": true, "write": 13, "read_write": 13, "execute": false}, "target": {"read": true, "write": 13, "read_write": 13, "execute": false}, "equal": true}
+{"subject": "owner", "source": {"read": true, "write": true, "read_write": true, "execute": false}, "target": {"read": true, "write": true, "read_write": true, "execute": false}, "equal": true}
+PASS: marked ACL source and mapped destination data access agree

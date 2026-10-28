@@ -325,7 +325,7 @@ the snapshot unchanged when reconstruction is required. Reconstruction never re-
 backend, but it needs the endpoint the scan ran on: `ObservedEntry::decode_snapshot(bytes,
 &identity)` takes it from `Storage::identity()` or `storage::endpoint_identity(&config)` offline.
 `SnapshotDecodeError::BackendMismatch` for a whole generation means the endpoint moved or is
-spelled differently; treat it as no previous generation. The only entry format is **DMES v9**,
+spelled differently; treat it as no previous generation. The only entry format is **DMES v10**,
 including entries without history. Other versions return `UnsupportedVersion` and require a fresh
 scan. Every format change increments the version byte and updates golden-byte fixtures. This is
 a development policy; before release, choose N-1 decoding or a documented migration/rescan path

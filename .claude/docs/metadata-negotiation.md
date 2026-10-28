@@ -57,9 +57,9 @@ ACL/xattr 的判定点是 `src/transfer/engine/negotiation.rs` 的 `optional_pol
 |---|---|---|
 | 两端都能，精确 | 不读不写 | 拷 |
 | 两端都能，有损（精度降低、只保留 mode 等） | 不读不写 | 拷，损失记进报告 |
-| 源端读不了（未提供 NFSACL 扩展的 NFSv3、未协商 named attributes 的 xattr） | 不读不写 | 跳过：outcome `Unsupported`，`skipped()` 记 `SourceCannotObserve` |
+| 源端读不了 | 不读不写 | 普通文件 ACL 目标可安全写入时使用保守 ACL 并报告 `SourceUnavailable`；其他族按能力跳过 |
 | 目的端存不了 | 不读不写 | 跳过：outcome `Unsupported`，`skipped()` 记 `DestinationCannotStore` |
-| 两端都存但编码不同（Posix ↔ NfsV4 ↔ WindowsSecurityDescriptor） | 不读不写 | 跳过：outcome `Unsupported`，`skipped()` 记 `EncodingsDiffer { source, destination }`；**不做任何转换** |
+| 两端都存但 ACL 编码不同 | 不读不写 | 普通文件自动映射受支持的 POSIX/NFSv4 权限并报告未复制项；不支持的映射使用目标模型的保守 ACL 并报告原因 |
 | 源端**读失败**（GETACL 报错） | — | **文件失败**（`SourceObservationFailed`，带 class） |
 | 目的端**写失败**（能力位为真但 SETACL 被拒） | — | 其余族照常应用，**文件最终失败**并列出所有失败的族 |
 | 应用期**取消** / **会话级失败** / **整批失败** | — | **立即停止**并失败 |
@@ -73,39 +73,24 @@ Display 如 `ACL skipped: the source cannot read it`。不变式：outcome 为 `
 —— 目的端什么都不存时例外：不读源端，记目的端。要了却没发观测（`NotRequested`，拷贝路径上不会
 发生：要的功能一定以 `BestEffort` 观测）记 `NotObserved`，不进 `skipped()`。
 
-`MetadataPolicy`（`RequireExact` / `RequireEquivalent` / `AllowKnownLoss` / `BestEffort` / `Omit`）在
+`MetadataPolicy`（`RequireExact` / `AllowKnownLoss` / `BestEffort` / `Omit`）在
 `metadata` 模块里，给基线族与直接调用 `compile_metadata_plan` 的代码用；**不再出现在拷贝请求里**。
 
-## 严格 ACL 复制与比对（2026-10-28）
+## ACL 自动复制与错误报告
 
-调用方可显式选择：
+`CopiedMetadataRequest::with_acl()` 选择 ACL 复制，后端自动处理本地 ACL 或普通文件的
+POSIX/NFSv4 映射。`TransferOutcome.metadata` 中的 `acl_copy_report()` 返回未复制项，
+包括源 ACE 序号、主体、权限或标志掩码与原因；应用失败时同一报告可从
+`MetadataApplicationFailure::report()` 取得。实际读取、写入或读回验证失败仍返回错误。
 
-| API | 契约 |
-| --- | --- |
-| `CopiedMetadataRequest::with_acl()` | 默认 BestEffort；编码不匹配或任一端不支持时报告跳过 |
-| `with_required_acl()` | 必须原生保留 ACL；观察缺失、不支持、编码不同或写入读回不符时失败 |
-| `with_acl_mapping()` | 严格 ACL + POSIX/NFSv4 双向受限映射；调用方确认数字身份和实际组解析一致 |
-| `IntegrityPlan::with_required_acl()` | 完整 typed 原生配置比对；缺失、畸形、不可比都不能返回匹配 |
-| `with_acl_equivalence()` | 显式比较普通文件当前 rwx；不承诺管理权限、未来 chmod/chown 或继承行为 |
+跨模型只映射受支持的当前普通文件 rwx，保持 DENY 顺序并使用独立求值器验证；
+不能证明时使用显式拒绝数据访问的 ACL，并通过 `AppliedConservativeAcl` 与报告提示。
+数字身份和组解析是否一致无法由本库验证，跨模型报告会明确提示。身份不保留时不会声称
+等效；目录只使用原生复制。NFS ACL 写入后读回最终候选并验证，owner/mode 先于 ACL。
 
-跨模型映射由 `model::acl` 规划并用独立 POSIX/NFSv4 求值器证明，覆盖全部七种非空 rwx 请求。
-普通文件类型在复制引擎和完整性比对入口检查。直接调用 `compile_metadata_plan` 选择
-`RequireEquivalent` 的调用方必须自行确认普通文件和共享数字身份条件。
-首期仅接受规范有序模板、成对 WRITE_DATA/APPEND_DATA、固定元数据权限 profile，组有效权限必须构成包含链。
-拒绝 r-only / w-only 的分拆组、非数字主体、继承/default、AUDIT/ALARM、部分写权限和额外管理权限。
-Linux 零 mask 且 other 非零的扩展 ACL 不进入跨模型证明；反向映射保留非零 mask 以使 Linux 执行 ACL 检查。
-同模型原生路径保留 raw mask/潜在权限/default 或完整有序 ACE，不套用跨模型子集限制。
-
-NFS 在 ACL SET 后完整 GET 读回再判定成功；已发布恢复路径只读核验最终文件。owner/mode 先于 ACL 应用。
-严格复制要求 owner/group 可以原样设置；身份缺失或只能复制 mode 会拒绝。
-`MetadataApplicationReport::mappings()` 区分 `Exact` 与 `Equivalent`；后者只表示上述限定访问契约。
-完整性报告的 `acl_scope()` 区分 `NativeConfiguration` 与 `CurrentRegularFileAccess`。
-仅在跨模型 ACL 证明成功时，基本 rwx mode 差异由 ACL 证明覆盖；owner/group 和特殊 mode 位仍独立检查。
-`AclUnverified` 是差异，必需 ACL 不会出现在 ignored 中。
-
-NFSv4 原生范围为 FATTR4_ACL 的 ACE 列表，不包括独立 dacl/sacl ACL 级控制标志。
-目录 access/default 可经 Metadata 角色原生复制；普通文件传输接口不等于整棵目录继承复制。
-实测与限制见 [四组合实现验收报告](../../docs/reports/2026-10-28-nfs-acl-four-way-validation.md)。
+完整性比对独立提供 `IntegrityPlan::with_required_acl()` 与 `with_acl_equivalence()`；
+其 `acl_scope()` 说明比较范围。NFSv3 POSIX ACL 需要 NFSACL 扩展。具体可表达范围与
+真机证据见 [四组合实现验收报告](../../docs/reports/2026-10-28-nfs-acl-four-way-validation.md)。
 
 ## 否决链（按发生顺序）
 
@@ -239,7 +224,9 @@ flush 失败经 `classify` 成 Entry 级，被当成那一条的拒绝 —— �
 诊断带服务端状态名，例如 chown 被拒是 `NFS role failed: NFS4ERR_PERM (permission denied)`；SETATTR 之前的
 LOOKUP 失败与 xattr 路径还没有（见 storage-nfs.md「Retry Taxonomy」的缺口）。
 
-## 真机证据（2026-09-23，`examples/nfs_metadata_copy.rs`）
+## 历史真机证据（2026-09-23，`examples/nfs_metadata_copy.rs`）
+
+下表记录当时的版本与结果；当前自动映射和回退行为以 2026-10-28 的[自动映射验收](../../docs/reports/2026-10-28-auto-acl-validation.md)为准。
 
 入口：`.claude/skills/e2e-nfs/scripts/metadata_matrix.sh`，9 档全过。环境：m1-source（NFSv3，只读源）、
 FAS2750 `ontap_lisaauto_nfs`（ONTAP 9.19.1，NFSv4.1）与同机 CIFS share。
