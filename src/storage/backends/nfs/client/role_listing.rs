@@ -244,7 +244,7 @@ async fn complete_v3_child(
         return Examined::Failed(unnamed_child(directory, &entry.file_name));
     }
     let child = Path::new(directory.as_str()).join(&entry.file_name);
-    if matches!(entry.file_name.as_str(), "" | "." | "..")
+    if entry.file_name.is_empty()
         || entry.file_name.contains('/')
         || child_path(directory, &entry.file_name).is_err()
     {
