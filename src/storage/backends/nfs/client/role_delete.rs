@@ -27,9 +27,6 @@ impl NFSStorage {
         loop {
             let page = self.cleanup_page(directory, &mut handle, cookie).await?;
             for entry in page.entries {
-                if entry.file_name == "." || entry.file_name == ".." {
-                    continue;
-                }
                 let path = child(directory, &entry.file_name)?;
                 if is_artifact_path(&path.to_string_lossy()) {
                     artifacts.push((path, entry));
@@ -74,9 +71,6 @@ impl NFSStorage {
             loop {
                 let page = self.cleanup_page(&path, &mut handle, cookie).await?;
                 for entry in page.entries {
-                    if entry.file_name == "." || entry.file_name == ".." {
-                        continue;
-                    }
                     pending.push((child(&path, &entry.file_name)?, entry));
                 }
                 if page.eof {
@@ -127,8 +121,28 @@ impl NFSStorage {
 }
 
 fn child(parent: &Path, name: &str) -> Result<PathBuf> {
-    if name.is_empty() || name.contains('/') || name.contains(char::REPLACEMENT_CHARACTER) {
+    if matches!(name, "" | "." | "..")
+        || name.contains('/')
+        || name.contains(char::REPLACEMENT_CHARACTER)
+    {
         return Err(NfsProtocolFailure::protocol());
     }
     Ok(parent.join(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::child;
+    use std::path::Path;
+
+    #[test]
+    fn cleanup_rejects_directory_navigation_names() {
+        for name in [".", ".."] {
+            assert!(child(Path::new("artifact"), name).is_err(), "{name}");
+        }
+        assert_eq!(
+            child(Path::new("artifact"), "file").ok().as_deref(),
+            Some(Path::new("artifact/file"))
+        );
+    }
 }
