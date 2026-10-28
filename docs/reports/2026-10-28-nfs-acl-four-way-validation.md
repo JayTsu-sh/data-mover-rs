@@ -165,9 +165,11 @@ cargo run --example integrity_input_probe -- \
 
 库中的 ignored 项为原有显式跳过测试，不计入通过数量；本文四组合真机测试另行执行并记录上述结果。
 
-## 合并最新 main 后的候选验证
+## 拆分协议补丁前的集成验证
 
-候选使用 vendored `nfs-rs` **0.8.8**，保留 main 的 URL 解码等上游修复。
+本节记录拆分前基于 `nfs-rs` **0.8.8** 加 NFSACL 补丁的验证，保留 main 的 URL 解码等上游修复。
+该协议补丁随后移到 nfs-rs 仓库；data-mover 等正式版本发布后更新 crates.io 依赖。
+下列结果是拆分前的历史证据，不代表当前发布依赖已经包含这些新接口。
 两路审查后统一模型 ACL codec，并修复观察时间精度误判和可选 NFSACL 探测的重试参数 panic。
 
 - 完整 `make ci` 通过：Clippy 全目标零警告，库测试 **2000 passed、0 failed、9 ignored**，
