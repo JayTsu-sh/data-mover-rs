@@ -265,7 +265,8 @@ that was current when it was observed.
 `IntegrityRequest.plan` independently selects native ACL and xattr comparisons.
 Its default omits both. Owner, group, and mode are selected automatically from
 the facts each backend can supply: each comparable fact is checked, and each
-unavailable or incompatible fact is reported as ignored. Numeric and named
+unavailable or incompatible fact is reported as ignored. Permission observation is owned by
+`Metadata::permissions` and remains bound to the selected version. Numeric and named
 principals are never mapped implicitly. Kind, size, and modification time are
 checked independently, while content depends on
 `IntegrityOptions.mode`. Requesting ACLs or xattrs on a backend that cannot

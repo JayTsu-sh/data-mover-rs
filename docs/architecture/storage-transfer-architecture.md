@@ -248,6 +248,9 @@ only actual descendants add a virtual Directory alongside a content object. Raw 
 semantics stay unchanged. Probes may relist a child directory and fail explicitly rather than
 treating failed inspection as absence; this is not a selectable scan mode. History records on a
 Directory use `ObservedEntry::history_source_path()` to read/replay the raw marker key.
+The backend projection also owns omission of a current-only root marker and the single child
+failure for an unrepresentable root object with content or history. Generic traversal does not
+reclassify backend objects; it observes, filters, counts, and schedules the projected children.
 
 S3 lends `stat` and `list` only: `list` of a path is one delimiter listing of the prefix `<path>/`,
 so a common prefix is a directory. `capabilities().histories` is fixed at connection: enabled or
@@ -264,6 +267,12 @@ A history is a property of each key returned by `list`; there is no separate tra
 Owns backend metadata observation and application plus protocol-to-model conversion. ACL,
 xattr, tags, ownership/mode, and timestamps are separate capabilities. It never performs an
 implicit source refetch to fill observations omitted during scanning.
+
+`Metadata::permissions(descriptor)` owns permission observation for the descriptor's selected
+version, including independent named-principal facts. Its default handles numeric ownership
+and version-bound mode-only facts; a backend without the selected version refuses it instead
+of reading the current entry. Integrity compares these facts through the role without repeating
+capability checks or protocol-to-permission conversion.
 
 ### NativeTransfer
 

@@ -168,8 +168,8 @@ cargo run --example integrity_input_probe -- \
 ## 拆分协议补丁前的集成验证
 
 本节记录拆分前基于 `nfs-rs` **0.8.8** 加 NFSACL 补丁的验证，保留 main 的 URL 解码等上游修复。
-该协议补丁随后移到 nfs-rs 仓库；data-mover 等正式版本发布后更新 crates.io 依赖。
-下列结果是拆分前的历史证据，不代表当前发布依赖已经包含这些新接口。
+该协议补丁随后移到 nfs-rs 仓库；当时 data-mover 等待正式版本后再更新 crates.io 依赖。
+下列结果是拆分前的历史证据，正式发布依赖的最终结果见下一节。
 两路审查后统一模型 ACL codec，并修复观察时间精度误判和可选 NFSACL 探测的重试参数 panic。
 
 - 完整 `make ci` 通过：Clippy 全目标零警告，库测试 **2000 passed、0 failed、9 ignored**，
@@ -183,3 +183,30 @@ cargo run --example integrity_input_probe -- \
 本轮复核复用了已保留的测试文件；上述四次复制与两次拒绝是原矩阵之后的额外检查。
 见 [本轮原始日志](2026-10-28-nfs-acl-main-integration.log) 和
 [本轮结构化结果](2026-10-28-nfs-acl-main-integration-results.json)。
+
+## 正式 crates.io 0.9.1 依赖与架构整改后的最终验收
+
+NFSACL 协议实现已在独立 nfs-rs 仓库合并。0.9.0 标签的真实 E2E 门禁发现旧的
+capability 默认值断言，未发布任何 registry 产物；修复后使用新标签 0.9.1 完整重走发布。
+[0.9.1 正式发布流程](https://github.com/JayTsu-sh/nfs-rs/actions/runs/40658200132)
+全部 8 个作业成功，包括真实性能基线、Linux/ONTAP 协议矩阵、最终 wheel/sdist/crate、
+产物审计及 crates.io/PyPI 发布。两个官方 registry 均确认 0.9.1 可用。
+
+- data-mover 最低依赖为 crates.io `nfs-rs = "0.9.1"`；没有 Git/path/patch 替代或 vendor 源码。
+- Cargo.lock 校验和与官方 sparse index 一致：
+  `a6f42f81b8aca4d68fb1df680178ce0013e37ff1983436e61e4466563632abe5`。
+  其他依赖版本与依赖图保持原样。
+- [架构复核](2026-10-28-storage-architecture-review.md) 的四项职责集中整改完成，公开路径和检查点格式保持兼容。
+- `RUSTUP_TOOLCHAIN=1.95.0 make ci` 完整通过：库测试 **2005 passed、0 failed、9 ignored**；
+  全目标 Clippy 零警告，架构守卫、测试工具契约、workspace 集成测试、doctests、examples 与本地 E2E 通过。
+- 使用本轮构建的工具，对保留根的 `named.bin` 重新完成四种方向的复制与严格比对；
+  两个跨模型比对使用观察输入，四次均为 `differences=[]`、`ignored=[]`。
+- 新建 73-byte `complex-registry-091.bin` 控制夹具，加入 mode 无法表示的 `EVERYONE@ WRITE_ACL`，
+  再完成原生 NFSv4 复制、原始有序 ACE 相等检查及严格完整性比对。
+- 原生跨模型请求与该额外管理权限 ACL 的跨模型映射，均在 **Metadata 规划阶段**按具体 ACL 原因拒绝。
+  验证脚本同时断言阶段、策略和原因，不能用源文件不存在或普通连接失败代替成功反例。
+
+共 12 条命令断言通过。规划拒绝后另经独立内核 NFS 客户端确认：两个控制文件仍为原始
+73 bytes，反例目的文件不存在。新控制文件保留在上文运行根的 `complex-src` 与 `complex-dst`；
+原四方向具名夹具继续保留。见 [原始日志](2026-10-28-nfs-acl-registry-0.9.1.log) 和
+[结构化结果](2026-10-28-nfs-acl-registry-0.9.1-results.json)。
