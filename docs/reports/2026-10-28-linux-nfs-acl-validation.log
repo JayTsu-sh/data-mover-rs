@@ -148,7 +148,7 @@ A::GROUP@:rtcy
 A:g:42422:rtcy
 A::EVERYONE@:tcy
 
-APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/named.bin: exit=0 
+APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/named.bin: exit=0
 $ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/named.bin
 # file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/named.bin
 A::OWNER@:rwatTcCy
@@ -179,7 +179,7 @@ A::GROUP@:tcy
 A:g:42422:rtcy
 A::EVERYONE@:tcy
 
-APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/masked.bin: exit=0 
+APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/masked.bin: exit=0
 $ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/masked.bin
 # file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/masked.bin
 A::OWNER@:rwatTcCy
@@ -213,7 +213,7 @@ D::GROUP@:r
 D:g:42422:r
 A::EVERYONE@:rtcy
 
-APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/precedence.bin: exit=0 
+APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/precedence.bin: exit=0
 $ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/precedence.bin
 # file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/precedence.bin
 A::OWNER@:rwatTcCy
@@ -247,7 +247,7 @@ A:g:42422:rtcy
 A:g:42424:watcy
 A::EVERYONE@:tcy
 
-APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/overlapping.bin: exit=0 
+APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/overlapping.bin: exit=0
 $ nfs4_getfacl /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/overlapping.bin
 # file: /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/overlapping.bin
 A::OWNER@:rwatTcCy
@@ -273,7 +273,7 @@ A:fdig:42422:rtcy
 D:fdig:42422:x
 A:fdi:EVERYONE@:rxtcy
 
-APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance: exit=0 
+APPLY NATIVE ACL /work/tmp/dm-acl-map-s8rl01b5/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/mapped/inheritance: exit=0
 $ getfacl -cpn /work/tmp/dm-acl-map-472yqmfn/data-mover-test/integrity-plan/linux3-to-ontap41-20261028/inheritance
 user::rwx
 group::r-x
@@ -436,4 +436,3 @@ ACCESS {"subject": "other", "uid": 42426, "gid": 42420, "groups": [], "source": 
 ACCESS {"subject": "overlapping_groups", "uid": 42425, "gid": 42422, "groups": [42424], "source": {"read": true, "write": 13, "read_write": 13, "execute_access": false}, "destination": {"read": true, "write": true, "read_write": true, "execute_access": false}, "equal": false}
 $ timeout 15 umount /work/tmp/dm-acl-map-__uzm7sy
 $ timeout 15 umount /work/tmp/dm-acl-map-w13n5vc6
-

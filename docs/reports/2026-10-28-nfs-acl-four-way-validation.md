@@ -151,7 +151,7 @@ cargo run --example integrity_input_probe -- \
   --key named.bin --input path --expected match --acl --acl-equivalent --expect-acl equal
 ```
 
-## 最终本地门禁
+## 实现阶段本地门禁
 
 最终 `make ci` 通过，见 [完整 CI 日志](2026-10-28-nfs-acl-four-way-ci.log)：
 
@@ -164,3 +164,20 @@ cargo run --example integrity_input_probe -- \
 - `git diff --check` 通过。未提交修改。
 
 库中的 ignored 项为原有显式跳过测试，不计入通过数量；本文四组合真机测试另行执行并记录上述结果。
+
+## 合并最新 main 后的候选验证
+
+候选使用 vendored `nfs-rs` **0.8.8**，保留 main 的 URL 解码等上游修复。
+两路审查后统一模型 ACL codec，并修复观察时间精度误判和可选 NFSACL 探测的重试参数 panic。
+
+- 完整 `make ci` 通过：Clippy 全目标零警告，库测试 **2000 passed、0 failed、9 ignored**，
+  workspace 集成测试、doctests、examples 和本地端到端检查通过。
+- vendor 独立库测试 **618 passed、0 failed、0 ignored**。
+- 使用本轮构建的工具，在上文保留根的 `named.bin` 上再次完成 POSIX→POSIX、
+  POSIX→NFSv4、NFSv4→POSIX、NFSv4→NFSv4 四次复制及四次严格比对；
+  其中两个跨模型比对使用观察输入，全部 `differences=[]`、`ignored=[]`。
+- 原生跨模型请求、带额外 NFSv4 管理权限的跨模型请求两次均按预期拒绝。
+
+本轮复核复用了已保留的测试文件；上述四次复制与两次拒绝是原矩阵之后的额外检查。
+见 [本轮原始日志](2026-10-28-nfs-acl-main-integration.log) 和
+[本轮结构化结果](2026-10-28-nfs-acl-main-integration-results.json)。
