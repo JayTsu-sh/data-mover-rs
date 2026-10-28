@@ -365,7 +365,9 @@ impl Endpoint {
                                 .inline_timestamps()
                                 .and_then(|times| times.modified),
                         )
-                        .is_some_and(|(before, now)| before != now);
+                        .is_some_and(|(before, now)| {
+                            !same_instant(Some(before), Some(now), Duration::ZERO)
+                        });
                     if observed.path() != &descriptor.path
                         || observed.kind() != descriptor.kind
                         || observed.size() != descriptor.size
@@ -433,7 +435,7 @@ impl Endpoint {
         if let (Some(before), ObservedMtime::Observed(Some(now))) = (
             self.input.observation().and_then(ObservedEntry::modified),
             modified,
-        ) && before != now
+        ) && !same_instant(Some(before), Some(now), Duration::ZERO)
         {
             return Err(self.observation_failure(
                 FailureClass::Conflict,

@@ -882,3 +882,6 @@ mod plan_tests;
 
 #[path = "strict_acl_tests.rs"]
 mod strict_acl_tests;
+
+#[path = "observed_time_tests.rs"]
+mod observed_time_tests;
