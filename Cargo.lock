@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "data-mover"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1348,6 +1348,18 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "data-mover-acl",
+ "data-mover-backend-cifs",
+ "data-mover-backend-hdfs",
+ "data-mover-backend-local",
+ "data-mover-backend-nfs",
+ "data-mover-backend-s3",
+ "data-mover-integrity",
+ "data-mover-metadata",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "data-mover-transfer",
+ "data-mover-traversal",
  "filetime",
  "futures",
  "glob",
@@ -1383,6 +1395,275 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "xattr",
+]
+
+[[package]]
+name = "data-mover-acl"
+version = "0.4.0"
+dependencies = [
+ "data-mover-model",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "data-mover-backend-cifs"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "binrw",
+ "blake3",
+ "bytes 1.11.1",
+ "data-mover-acl",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "futures",
+ "smb",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "data-mover-backend-hdfs"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.11.1",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "futures",
+ "hdfs-native",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "data-mover-backend-local"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.11.1",
+ "cap-primitives",
+ "cap-std",
+ "data-mover-acl",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "filetime",
+ "futures",
+ "libc",
+ "rustix",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "windows",
+ "windows-sys 0.61.2",
+ "xattr",
+]
+
+[[package]]
+name = "data-mover-backend-nfs"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.11.1",
+ "dashmap",
+ "data-mover-acl",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "futures",
+ "moka",
+ "nfs-rs",
+ "path-clean",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "xattr",
+]
+
+[[package]]
+name = "data-mover-backend-s3"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "base64",
+ "blake3",
+ "bytes 1.11.1",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "futures",
+ "http-body 1.0.1",
+ "hyper-rustls 0.27.9",
+ "hyper-util",
+ "md-5 0.10.6",
+ "percent-encoding",
+ "quick-xml",
+ "rustls 0.23.39",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "data-mover-integrity"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.11.1",
+ "data-mover-acl",
+ "data-mover-backend-cifs",
+ "data-mover-backend-hdfs",
+ "data-mover-backend-local",
+ "data-mover-backend-nfs",
+ "data-mover-backend-s3",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "filetime",
+ "futures",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "data-mover-metadata"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.11.1",
+ "data-mover-acl",
+ "data-mover-backend-cifs",
+ "data-mover-backend-hdfs",
+ "data-mover-backend-local",
+ "data-mover-backend-nfs",
+ "data-mover-backend-s3",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "data-mover-model"
+version = "0.4.0"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
+name = "data-mover-storage-core"
+version = "0.4.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "base64",
+ "blake3",
+ "bytes 1.11.1",
+ "cap-std",
+ "data-mover-model",
+ "filetime",
+ "futures",
+ "governor",
+ "num-traits",
+ "percent-encoding",
+ "quick-xml",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "data-mover-test-support"
+version = "0.4.0"
+dependencies = [
+ "data-mover-backend-cifs",
+ "data-mover-backend-hdfs",
+ "data-mover-backend-local",
+ "data-mover-backend-nfs",
+ "data-mover-backend-s3",
+ "data-mover-storage-core",
+]
+
+[[package]]
+name = "data-mover-transfer"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.11.1",
+ "data-mover-acl",
+ "data-mover-backend-cifs",
+ "data-mover-backend-hdfs",
+ "data-mover-backend-local",
+ "data-mover-backend-nfs",
+ "data-mover-backend-s3",
+ "data-mover-integrity",
+ "data-mover-metadata",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "data-mover-test-support",
+ "data-mover-traversal",
+ "filetime",
+ "futures",
+ "md-5 0.10.6",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "xattr",
+]
+
+[[package]]
+name = "data-mover-traversal"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes 1.11.1",
+ "data-mover-backend-cifs",
+ "data-mover-backend-hdfs",
+ "data-mover-backend-local",
+ "data-mover-backend-nfs",
+ "data-mover-backend-s3",
+ "data-mover-model",
+ "data-mover-storage-core",
+ "filetime",
+ "futures",
+ "glob",
+ "num-traits",
+ "parking_lot",
+ "smb",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

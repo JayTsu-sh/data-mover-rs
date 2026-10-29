@@ -1,0 +1,28 @@
+[package]
+name = "data-mover-metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+data-mover-model = { path = "../model" }
+data-mover-acl = { path = "../acl" }
+data-mover-storage-core = { path = "../storage-core" }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+data-mover-storage-core = { path = "../storage-core", features = ["test-support"] }
+data-mover-backend-local = { path = "../backend-local", features = ["test-support"] }
+data-mover-backend-nfs = { path = "../backend-nfs", features = ["test-support"] }
+data-mover-backend-cifs = { path = "../backend-cifs", features = ["test-support"] }
+data-mover-backend-s3 = { path = "../backend-s3", features = ["test-support"] }
+data-mover-backend-hdfs = { path = "../backend-hdfs", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }

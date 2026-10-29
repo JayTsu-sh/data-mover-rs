@@ -37,8 +37,10 @@ def resolved_commit(lock_data: bytes) -> str:
 
 
 def validate_manifest() -> None:
-    manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+    manifest = tomllib.loads((ROOT / "crates/backend-hdfs/Cargo.toml").read_text())
     dependency = manifest["dependencies"]["hdfs-native"]
+    if dependency.get("workspace"):
+        dependency = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["dependencies"]["hdfs-native"]
     if dependency != EXPECTED_DEPENDENCY:
         raise ValueError(
             "hdfs-native must pin the verified revision that provides durable FileWriter::hsync"

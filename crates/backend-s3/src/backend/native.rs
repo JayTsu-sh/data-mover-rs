@@ -1,0 +1,299 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use tokio_util::sync::CancellationToken;
+
+use crate::model::{BackendIdentity, FailureClass, Operation, Transience};
+use crate::storage::{
+    DestinationPrepareRequest, NativeAffinity, NativeEndpoint, NativeSourceBinding,
+    NativeStageEvidence, NativeStageFailure, PreparedStage, SourceDescriptor, StorageRoleFailure,
+};
+
+use super::source::{classified_entry, entry, object_identity, role_failure};
+use super::staged::S3StagedDestination;
+use super::{S3NativeCopySource, S3Protocol};
+
+#[derive(Clone)]
+pub struct S3NativeContext {
+    affinity: NativeAffinity,
+    bucket: String,
+    prefix: Option<String>,
+}
+
+impl S3NativeContext {
+    #[must_use]
+    pub fn new(
+        endpoint: &str,
+        compatibility: &str,
+        bucket: String,
+        prefix: Option<String>,
+    ) -> Self {
+        Self {
+            affinity: NativeAffinity::derive(&[endpoint.as_bytes(), compatibility.as_bytes()]),
+            bucket,
+            prefix,
+        }
+    }
+
+    /// A context that pairs only with storages of the same endpoint, label **and bucket**: a store
+    /// that copies only within one bucket (an ONTAP NAS bucket answers a `CopyObject` to or from
+    /// any other bucket with 501, P7 §14.2), so a copy between two buckets streams instead.
+    #[must_use]
+    pub fn within_bucket(
+        endpoint: &str,
+        compatibility: &str,
+        bucket: String,
+        prefix: Option<String>,
+    ) -> Self {
+        Self {
+            affinity: NativeAffinity::derive(&[
+                endpoint.as_bytes(),
+                compatibility.as_bytes(),
+                bucket.as_bytes(),
+            ]),
+            bucket,
+            prefix,
+        }
+    }
+
+    fn full_key(&self, path: &str) -> String {
+        self.prefix.as_ref().map_or_else(
+            || path.to_string(),
+            |prefix| format!("{}/{path}", prefix.trim_end_matches('/')),
+        )
+    }
+}
+
+pub struct S3NativeEndpoint<P> {
+    protocol: Arc<P>,
+    staged: Arc<S3StagedDestination<P>>,
+    identity: BackendIdentity,
+    context: S3NativeContext,
+}
+
+impl<P> S3NativeEndpoint<P> {
+    pub const fn new(
+        protocol: Arc<P>,
+        staged: Arc<S3StagedDestination<P>>,
+        identity: BackendIdentity,
+        context: S3NativeContext,
+    ) -> Self {
+        Self {
+            protocol,
+            staged,
+            identity,
+            context,
+        }
+    }
+}
+
+#[async_trait]
+impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
+    fn supports_hash_checkpoint(&self, source: &SourceDescriptor) -> bool {
+        self.staged.native_hash_checkpoint_eligible(source)
+    }
+
+    fn affinity(&self) -> NativeAffinity {
+        self.context.affinity
+    }
+
+    async fn bind_source(
+        &self,
+        source: &SourceDescriptor,
+    ) -> Result<NativeSourceBinding, StorageRoleFailure> {
+        // Bind the version the describe pinned, so a copy made after a newer version appeared
+        // still copies the described one.
+        let key = source.path.as_str();
+        let facts = match source.version().version_id() {
+            None => self.protocol.head(key).await,
+            Some(version) => self.protocol.head_version(key, version).await,
+        }
+        .map_err(|failure| role_failure(&source.path, Operation::Read, failure))?;
+        validate_identity(source, &self.identity, &facts)?;
+        let native = S3NativeCopySource {
+            bucket: self.context.bucket.clone(),
+            key: self.context.full_key(source.path.as_str()),
+            etag: facts.etag,
+            version_id: facts.version_id,
+            size: facts.size,
+        };
+        Ok(NativeSourceBinding {
+            affinity: self.context.affinity,
+            token: encode_source(&native).map_err(|()| {
+                entry(
+                    &source.path,
+                    Operation::Read,
+                    "native source binding is too large",
+                )
+            })?,
+            size: native.size,
+        })
+    }
+
+    /// One `CopyObject` or an upload on the final key (ADR-0006 C18).
+    async fn prepare_native(
+        &self,
+        request: DestinationPrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        self.staged.prepare_native_stage(request).await
+    }
+
+    async fn copy_into_stage(
+        &self,
+        source: NativeSourceBinding,
+        stage: &PreparedStage,
+        cancel: CancellationToken,
+    ) -> Result<NativeStageEvidence, NativeStageFailure> {
+        if source.affinity != self.context.affinity {
+            return Err(stage_failure(stage, "native pair affinity changed"));
+        }
+        let native = decode_source(source.token)
+            .map_err(|()| stage_failure(stage, "invalid native source binding"))?;
+        if native.size != source.size {
+            return Err(stage_failure(stage, "native source size changed"));
+        }
+        self.staged.fill_native(stage, native, cancel).await
+    }
+}
+
+/// Checks the object is still the one described, judging its identity exactly as `describe` did:
+/// a `"null"` or empty `versionId` (an unversioned bucket, or an object written before versioning)
+/// is no version at all, so the `ETag` identifies it.
+fn validate_identity(
+    source: &SourceDescriptor,
+    backend: &BackendIdentity,
+    facts: &super::S3ObjectFacts,
+) -> Result<(), StorageRoleFailure> {
+    let identity = object_identity(backend, &source.path, facts)
+        .map_err(|error| entry(&source.path, Operation::Read, error.to_string()))?;
+    if identity == source.source_identity {
+        Ok(())
+    } else {
+        // Same class as a changed object seen by `read` or by the metadata observation.
+        Err(classified_entry(
+            &source.path,
+            Operation::Read,
+            FailureClass::Conflict,
+            Transience::Permanent,
+            "S3 source identity changed",
+        ))
+    }
+}
+
+fn encode_source(source: &S3NativeCopySource) -> Result<Bytes, ()> {
+    let mut output = BytesMut::new();
+    for value in [&source.bucket, &source.key, &source.etag] {
+        put_string(&mut output, value)?;
+    }
+    let version = source.version_id.as_deref().unwrap_or("");
+    put_string(&mut output, version)?;
+    output.put_u64(source.size);
+    Ok(output.freeze())
+}
+
+fn put_string(output: &mut BytesMut, value: &str) -> Result<(), ()> {
+    let length = u32::try_from(value.len()).map_err(|_| ())?;
+    output.put_u32(length);
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn decode_source(mut token: Bytes) -> Result<S3NativeCopySource, ()> {
+    let bucket = take_string(&mut token)?;
+    let key = take_string(&mut token)?;
+    let etag = take_string(&mut token)?;
+    let version = take_string(&mut token)?;
+    if token.remaining() != 8 {
+        return Err(());
+    }
+    let size = token.get_u64();
+    Ok(S3NativeCopySource {
+        bucket,
+        key,
+        etag,
+        version_id: (!version.is_empty()).then_some(version),
+        size,
+    })
+}
+
+fn take_string(token: &mut Bytes) -> Result<String, ()> {
+    if token.remaining() < 4 {
+        return Err(());
+    }
+    let length = token.get_u32() as usize;
+    if length > 4096 || token.remaining() < length {
+        return Err(());
+    }
+    String::from_utf8(token.copy_to_bytes(length).to_vec()).map_err(|_| ())
+}
+
+fn stage_failure(stage: &PreparedStage, diagnostic: &str) -> NativeStageFailure {
+    NativeStageFailure {
+        error: entry(
+            stage.final_destination().path(),
+            Operation::Prepare,
+            diagnostic,
+        ),
+        native_bytes: 0,
+        native_requests: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{S3NativeContext, object_identity, validate_identity};
+    use crate::model::{EntryKind, FailureClass, StoragePath, Transience};
+    use crate::storage::backends::s3::S3ObjectFacts;
+    use crate::storage::backends::s3::tests::identity;
+    use crate::storage::{SourceDescriptor, StorageRoleFailure};
+
+    fn facts(etag: &str) -> S3ObjectFacts {
+        S3ObjectFacts {
+            size: 5,
+            etag: etag.to_string(),
+            version_id: None,
+            last_modified: None,
+        }
+    }
+
+    /// An object replaced between describe and the native bind is a conflict, as `read` and the
+    /// metadata observation report it — not an unknown protocol failure an engine might retry.
+    #[test]
+    fn a_changed_object_at_bind_is_a_permanent_conflict() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = StoragePath::new("source")?;
+        let described = SourceDescriptor::new(
+            path.clone(),
+            EntryKind::File,
+            Some(5),
+            object_identity(&identity(), &path, &facts("\"before\""))?,
+        );
+        assert!(validate_identity(&described, &identity(), &facts("\"before\"")).is_ok());
+        let Err(StorageRoleFailure::Entry(failure)) =
+            validate_identity(&described, &identity(), &facts("\"after\""))
+        else {
+            return Err("a changed object was bound".into());
+        };
+        assert_eq!(failure.class(), FailureClass::Conflict);
+        assert_eq!(failure.transience(), Transience::Permanent);
+        Ok(())
+    }
+
+    /// A context kept within its bucket pairs only with the same bucket of the same endpoint and
+    /// label; an ordinary one pairs across buckets.
+    #[test]
+    fn a_bucket_scoped_context_pairs_only_within_its_bucket() {
+        let scoped = |bucket: &str| {
+            S3NativeContext::within_bucket("http://ontap", "ontap-nas", bucket.into(), None)
+                .affinity
+        };
+        let open = |bucket: &str| {
+            S3NativeContext::new("http://ontap", "ontap-nas", bucket.into(), None).affinity
+        };
+        assert_eq!(scoped("nas"), scoped("nas"));
+        assert_ne!(scoped("nas"), scoped("other-nas"));
+        assert_eq!(open("nas"), open("other-nas"));
+        assert_ne!(scoped("nas"), open("nas"));
+    }
+}

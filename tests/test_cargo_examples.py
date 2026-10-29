@@ -22,7 +22,7 @@ class CargoExampleArtifacts(unittest.TestCase):
             (project / "src").mkdir()
             (project / "src/lib.rs").write_text("", encoding="utf-8")
             (project / "Cargo.toml").write_text(
-                '[package]\nname = "artifact-contract"\nversion = "0.0.0"\nedition = "2021"\n',
+                '[package]\nname = "data-mover"\nversion = "0.0.0"\nedition = "2021"\n',
                 encoding="utf-8",
             )
             (project / "examples/marker.rs").write_text(

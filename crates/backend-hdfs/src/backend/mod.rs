@@ -1,0 +1,125 @@
+//! HDFS adapter facade.
+
+mod at_destination;
+mod client;
+#[cfg(any(test, feature = "test-support"))]
+pub mod contract_tests;
+mod metadata;
+mod namespace;
+pub mod protocol;
+mod source;
+mod staged;
+#[cfg(test)]
+mod streaming_tests;
+mod writer;
+
+use std::sync::Arc;
+
+use crate::model::{BackendIdentity, BackendKind};
+use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
+
+pub use client::{
+    HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
+};
+pub use data_mover_storage_core::storage::config::hdfs::endpoint_identity;
+
+pub async fn connect_backend(
+    config: crate::storage::HdfsBackendConfig,
+) -> Result<Storage, crate::storage::BackendConnectError> {
+    let storage = client::create_hdfs_storage(
+        &config.location,
+        &config.client,
+        config.block_size,
+        config.ensure_dir,
+    )
+    .await
+    .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::Hdfs, error))?;
+    storage
+        .architecture_storage()
+        .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::Hdfs, error))
+}
+
+/// Connects an already validated HDFS client to the architecture-ready roles.
+pub fn connect<P>(
+    storage: Arc<P>,
+    identity: BackendIdentity,
+) -> Result<Storage, Box<dyn std::error::Error>>
+where
+    P: protocol::HdfsProtocol + 'static,
+{
+    if identity.kind() != BackendKind::Hdfs {
+        return Err(HdfsConnectError.into());
+    }
+    let source = Arc::new(source::HdfsReadSource::new(
+        Arc::clone(&storage),
+        identity.clone(),
+    ));
+    let metadata: Arc<dyn crate::storage::Metadata> = Arc::new(metadata::HdfsMetadata::new(
+        Arc::clone(&storage),
+        identity.clone(),
+    ));
+    let staged = Arc::new(
+        staged::HdfsStagedDestination::new(Arc::clone(&storage), identity.clone())
+            .with_metadata(Arc::clone(&metadata)),
+    );
+    let namespace = Arc::new(namespace::HdfsNamespace::new(
+        Arc::clone(&storage),
+        identity.clone(),
+    ));
+    drop(storage);
+    Ok(Storage::connected(
+        identity,
+        capabilities(),
+        Some(source),
+        Some(staged),
+        Some(namespace),
+        Some(metadata),
+        None,
+    )?)
+}
+
+fn capabilities() -> BackendCapabilities {
+    BackendCapabilities::new(
+        CapabilityAvailability::Supported,
+        CapabilityAvailability::Supported,
+        CapabilityAvailability::Supported,
+        CapabilityAvailability::Supported,
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HdfsConnectError;
+
+impl std::fmt::Display for HdfsConnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("HDFS roles require an HDFS backend identity")
+    }
+}
+
+impl std::error::Error for HdfsConnectError {}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_identity(name: &str) -> Result<BackendIdentity, crate::model::ModelValueError> {
+    BackendIdentity::new(BackendKind::Hdfs, name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hdfs_capabilities_are_truthful_for_connected_roles() {
+        let values = capabilities();
+        for capability in [
+            crate::storage::Capability::ReadSource,
+            crate::storage::Capability::StagedDestination,
+            crate::storage::Capability::Namespace,
+            crate::storage::Capability::Metadata,
+        ] {
+            assert_eq!(
+                values.availability(capability),
+                &CapabilityAvailability::Supported
+            );
+        }
+    }
+}

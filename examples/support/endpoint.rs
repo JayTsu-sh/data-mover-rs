@@ -27,6 +27,7 @@ use data_mover::storage::{
     HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, Storage,
     connect_backend, delete_tree,
 };
+#[cfg(any(feature = "backend-nfs", feature = "backend-cifs"))]
 use futures::TryStreamExt as _;
 use tokio_util::sync::CancellationToken;
 
@@ -226,10 +227,15 @@ pub async fn remove_run(endpoint: &str, dir: &str) -> Result<Vec<String>> {
     // SMB and HDFS need no separate pass: deleting a directory removes the artifacts in it (the
     // CIFS namespace sweeps them, HDFS deletes recursively).
     if endpoint.starts_with("nfs://") {
-        // The NFS namespace refuses `.data-mover-*` paths, so they go through a raw mount first.
-        let (mount, directory) = nfs_mount(endpoint, dir).await?;
-        for name in &removed {
-            mount.remove_path(&join(&directory, name)).await?;
+        #[cfg(not(feature = "backend-nfs"))]
+        return Err("NFS cleanup requires backend-nfs".into());
+        #[cfg(feature = "backend-nfs")]
+        {
+            // The NFS namespace refuses `.data-mover-*` paths, so they go through a raw mount first.
+            let (mount, directory) = nfs_mount(endpoint, dir).await?;
+            for name in &removed {
+                mount.remove_path(&join(&directory, name)).await?;
+            }
         }
     } else if !endpoint.starts_with("smb:") && !endpoint.starts_with("hdfs://") {
         fs::remove_dir_all(Path::new(endpoint).join(dir))?;
@@ -264,6 +270,7 @@ fn join(dir: &str, name: &str) -> String {
 }
 
 async fn names(endpoint: &str, dir: &str) -> Result<Vec<String>> {
+    #[cfg(feature = "backend-nfs")]
     if endpoint.starts_with("nfs://") {
         let (mount, directory) = nfs_mount(endpoint, dir).await?;
         let names = mount
@@ -274,9 +281,11 @@ async fn names(endpoint: &str, dir: &str) -> Result<Vec<String>> {
             .await?;
         return Ok(names);
     }
+    #[cfg(feature = "backend-cifs")]
     if endpoint.starts_with("smb:") {
         return smb_names(&cifs_config(endpoint, false)?, dir).await;
     }
+    #[cfg(feature = "backend-hdfs")]
     if endpoint.starts_with("hdfs://") {
         let (client, location) = data_mover::storage::build_hdfs_client(endpoint, &hdfs_client())?;
         let path = format!(
@@ -293,12 +302,16 @@ async fn names(endpoint: &str, dir: &str) -> Result<Vec<String>> {
     if endpoint.starts_with("s3:") || endpoint.starts_with("s3@") {
         return Err("list S3 artifacts with the bucket listing".into());
     }
+    if endpoint.contains("://") || endpoint.starts_with("smb:") {
+        return Err("artifact listing requires the corresponding backend feature".into());
+    }
     Ok(fs::read_dir(Path::new(endpoint).join(dir))?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<io::Result<Vec<_>>>()?)
 }
 
 /// The names in `dir` below the share sub-path `root`, read with a plain SMB directory query.
+#[cfg(feature = "backend-cifs")]
 async fn smb_names(config: &CifsBackendConfig, dir: &str) -> Result<Vec<String>> {
     let client = smb_domain::Client::with_policies(
         match config.signing_policy {
@@ -344,6 +357,7 @@ async fn smb_names(config: &CifsBackendConfig, dir: &str) -> Result<Vec<String>>
 /// A raw mount of the export behind an `nfs://host/export[:root]?…` endpoint, and `dir` as a path
 /// inside it (below the endpoint's root). Uses uid/gid 0 unless the URL says otherwise, as the
 /// NFS backend does, so it sees what the transfer wrote.
+#[cfg(feature = "backend-nfs")]
 async fn nfs_mount(endpoint: &str, dir: &str) -> Result<(Box<dyn nfs_rs::Mount>, String)> {
     let rest = endpoint
         .strip_prefix("nfs://")

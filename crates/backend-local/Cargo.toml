@@ -1,0 +1,42 @@
+[package]
+name = "data-mover-backend-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+data-mover-model = { path = "../model" }
+data-mover-acl = { path = "../acl" }
+data-mover-storage-core = { path = "../storage-core" }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+cap-std = { workspace = true }
+cap-primitives = { workspace = true }
+filetime = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+tempfile = { workspace = true, optional = true }
+
+[features]
+test-support = ["data-mover-storage-core/test-support", "dep:tempfile"]
+
+[dev-dependencies]
+data-mover-storage-core = { path = "../storage-core", features = ["test-support"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+rustix = { workspace = true, features = ["process", "thread"] }
+xattr = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32", "Win32_Security", "Win32_Security_Authorization"] }
+windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32", "Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_SystemServices", "Win32_System_Memory", "Win32_Storage_FileSystem"] }

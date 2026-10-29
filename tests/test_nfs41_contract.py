@@ -34,7 +34,7 @@ class Nfs41ContractTest(unittest.TestCase):
         self.assertIn('tests/lab/run-nfs41-contract.sh "$RUN_ID"', nightly)
 
     def test_source_lookup_keeps_the_native_session_failure_classification(self):
-        client = (ROOT / "src/storage/backends/nfs/client.rs").read_text()
+        client = (ROOT / "crates/backend-nfs/src/backend/client.rs").read_text()
         lookup = client.split("async fn role_lookup_with_attrs(", 1)[1].split(
             "/// Optimized role-only read primitive.", 1
         )[0]

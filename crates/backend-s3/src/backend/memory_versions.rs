@@ -1,0 +1,476 @@
+//! The versioned mode of [`MemoryS3`] (ADR-0006 C17): a bucket whose versioning is enabled or
+//! suspended keeps every key's versions and delete markers in order, as S3 does.
+//!
+//! - A write (`PutObject`, a completion) adds a new current version: a minted id when enabled,
+//!   the one `"null"` version (replacing the previous `"null"` entry) when suspended.
+//! - An unversioned `DeleteObject` adds a delete marker the same way and is logged, so a test can
+//!   prove none was sent to a final key.
+//! - `delete_version` removes one entry for good (none is fine); the newest remaining entry becomes
+//!   current. A key under a legal hold ([`MemoryS3::lock_versions`]) refuses it with
+//!   `PermissionDenied`, as Object Lock does — an unversioned delete (a marker) is still allowed,
+//!   as on AWS and `MinIO`, unless [`MemoryS3::lock_refuses_delete_markers`] (Ceph RGW / DXN
+//!   refuses it too while the current version is held).
+//! - `list_versions` reports a key's entries newest first.
+//! - `write_delete_marker` (P7 H1) answers as S3 does: a new marker and its id, or, with
+//!   [`MemoryS3::merge_delete_markers`], the existing marker when the newest record already is one
+//!   (`MinIO`, Ceph RGW / DXN); with [`MemoryS3::drop_null_versions_on_delete`] it removes the key's
+//!   `"null"` version instead of covering it (DXN). Unversioned, it removes the object.
+//!
+//! With versioning off (the default) the fake behaves as before, and lists an existing object as
+//! version `"null"`.
+//!
+//! What `GetBucketVersioning` answered at connection (P7 Q-A) follows the mode by default —
+//! enabled, suspended, never — or is what [`MemoryS3::answer_at_connect`] set: a refusal, a store
+//! without versioning, or no answer at all.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{MutexGuard, PoisonError};
+
+use bytes::Bytes;
+
+use super::{MemoryS3, not_found};
+use crate::model::{FailureClass, Transience};
+use crate::storage::artifacts::is_artifact_path;
+use crate::storage::backends::s3::{
+    S3BucketVersioning, S3DeleteReply, S3ObjectFacts, S3ProtocolFailure, S3Result, S3VersionFacts,
+    S3VersioningAtConnect,
+};
+
+/// What [`MemoryS3::forget_version`] did.
+enum Forgotten {
+    /// The key has versions, none of them this one.
+    Nothing,
+    /// The key has no recorded versions.
+    Unrecorded,
+    /// Removed; the id of the newest remaining entry, if any.
+    Removed(Option<String>),
+}
+
+/// A bucket's versioning state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Versioning {
+    #[default]
+    Off,
+    Enabled,
+    Suspended,
+}
+
+/// What the versioned mode keeps beside the fake's objects and version contents.
+#[derive(Default)]
+pub struct VersionedBucket {
+    mode: Versioning,
+    /// Version ids of each key, oldest first.
+    order: HashMap<String, Vec<String>>,
+    /// Keys whose versions refuse deletion (a legal hold on every version).
+    locked: HashSet<String>,
+    /// Single versions that refuse deletion (a legal hold on one version).
+    locked_versions: HashSet<(String, String)>,
+    /// A held current version also refuses an unversioned `DeleteObject` (Ceph RGW / DXN).
+    locks_refuse_markers: bool,
+    /// Keys an unversioned `DeleteObject` was sent to, whether it was accepted or not.
+    plain_deletes: Vec<String>,
+    /// (key, version) of every `delete_version` that removed an entry.
+    version_deletes: Vec<(String, String)>,
+    /// A delete-marker write adds none when the newest record already is a marker (`MinIO`, DXN).
+    merges_markers: bool,
+    /// A delete-marker write removes the key's `"null"` version instead of covering it (DXN).
+    drops_null_version: bool,
+    /// What `GetBucketVersioning` answered at connection, when not what the mode says.
+    answer_at_connect: Option<S3VersioningAtConnect>,
+    next: u64,
+}
+
+impl VersionedBucket {
+    /// The id the next write or marker gets, and the id it replaces (suspended: the `"null"` one).
+    fn mint(&mut self, key: &str) -> String {
+        if self.mode == Versioning::Suspended {
+            if let Some(ids) = self.order.get_mut(key) {
+                ids.retain(|id| id != "null");
+            }
+            return "null".to_string();
+        }
+        self.next += 1;
+        format!("v{:04}", self.next)
+    }
+
+    fn push(&mut self, key: &str, id: &str) {
+        self.order
+            .entry(key.to_string())
+            .or_default()
+            .push(id.to_string());
+    }
+
+    fn newest(&self, key: &str) -> Option<String> {
+        self.order.get(key)?.last().cloned()
+    }
+
+    fn held(&self, key: &str, id: &str) -> bool {
+        self.locked.contains(key)
+            || self
+                .locked_versions
+                .contains(&(key.to_string(), id.to_string()))
+    }
+}
+
+impl MemoryS3 {
+    fn bucket(&self) -> MutexGuard<'_, VersionedBucket> {
+        self.bucket.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn versioning(&self) -> Versioning {
+        self.bucket().mode
+    }
+
+    /// Whether versioning is enabled (not off, not suspended).
+    pub(super) fn versioning_is_enabled(&self) -> bool {
+        self.versioning() == Versioning::Enabled
+    }
+
+    /// Switches the bucket's versioning (enabling or suspending keeps what is stored).
+    pub fn set_versioning(&self, mode: Versioning) {
+        self.bucket().mode = mode;
+    }
+
+    /// Places a legal hold on every version of `key`: deleting one is refused.
+    pub fn lock_versions(&self, key: &str) {
+        self.bucket().locked.insert(key.to_string());
+    }
+
+    /// From now on a held current version refuses an unversioned `DeleteObject` too
+    /// (`PermissionDenied`), as Ceph RGW (DXN) does; AWS and `MinIO` add the delete marker.
+    pub fn lock_refuses_delete_markers(&self) {
+        self.bucket().locks_refuse_markers = true;
+    }
+
+    /// From now on a delete-marker write on a key whose newest record already is a marker adds
+    /// none and names that marker (`MinIO`, Ceph RGW / DXN).
+    pub fn merge_delete_markers(&self) {
+        self.bucket().merges_markers = true;
+    }
+
+    /// From now on a delete-marker write on a key holding a `"null"` version removes that version
+    /// (adding no marker when it was the newest record), as DXN does.
+    pub fn drop_null_versions_on_delete(&self) {
+        self.bucket().drops_null_version = true;
+    }
+
+    /// From now on the answer `GetBucketVersioning` gave at connection is `answer`, whatever the
+    /// mode (P7 Q-A): `Refused`, `NoVersioning`, `Unreachable`, or a state the mode is not. A
+    /// namespace takes the answer when it is connected: set it before connecting.
+    pub fn answer_at_connect(&self, answer: S3VersioningAtConnect) {
+        self.bucket().answer_at_connect = Some(answer);
+    }
+
+    /// What `GetBucketVersioning` answered at connection: what [`Self::answer_at_connect`] set, or
+    /// what the mode says.
+    pub(super) fn versioning_answer_at_connect(&self) -> S3VersioningAtConnect {
+        let bucket = self.bucket();
+        bucket.answer_at_connect.unwrap_or(match bucket.mode {
+            Versioning::Enabled => S3VersioningAtConnect::Enabled,
+            Versioning::Suspended => S3VersioningAtConnect::Suspended,
+            Versioning::Off => S3VersioningAtConnect::Never,
+        })
+    }
+
+    /// The bucket's versioning as `GetBucketVersioning` would answer now.
+    pub(super) fn bucket_versioning_now(&self) -> S3BucketVersioning {
+        match self.versioning() {
+            Versioning::Enabled => S3BucketVersioning::Enabled,
+            Versioning::Suspended => S3BucketVersioning::Suspended,
+            Versioning::Off => S3BucketVersioning::Off,
+        }
+    }
+
+    /// A `DeleteObject` without a version id sent to write a delete marker (P7 H1), with the
+    /// store behaviours the knobs select.
+    pub(super) async fn delete_marker_in_memory(&self, key: &str) -> S3Result<S3DeleteReply> {
+        if self.versioning() == Versioning::Off {
+            self.objects.lock().await.remove(key);
+            return Ok(S3DeleteReply::default());
+        }
+        let (merges, drops_null, newest, holds_null) = {
+            let bucket = self.bucket();
+            let holds_null = bucket
+                .order
+                .get(key)
+                .is_some_and(|ids| ids.iter().any(|id| id == "null"));
+            (
+                bucket.merges_markers,
+                bucket.drops_null_version,
+                bucket.newest(key),
+                holds_null,
+            )
+        };
+        let newest_is_marker = match &newest {
+            Some(id) => self
+                .versions
+                .lock()
+                .await
+                .get(&(key.to_string(), id.clone()))
+                .is_some_and(Option::is_none),
+            None => false,
+        };
+        if merges && newest_is_marker {
+            return Ok(S3DeleteReply {
+                delete_marker: true,
+                version_id: newest,
+            });
+        }
+        if drops_null && holds_null {
+            self.delete_one_version(key, "null").await?;
+            if newest.as_deref() == Some("null") {
+                return Ok(S3DeleteReply {
+                    delete_marker: false,
+                    version_id: Some("null".to_string()),
+                });
+            }
+        }
+        self.versioned_delete(key).await?;
+        Ok(S3DeleteReply {
+            delete_marker: true,
+            version_id: self.bucket().newest(key),
+        })
+    }
+
+    /// Places a legal hold on version `id` of `key` only.
+    pub fn lock_version(&self, key: &str, id: &str) {
+        self.bucket()
+            .locked_versions
+            .insert((key.to_string(), id.to_string()));
+    }
+
+    /// Keys an unversioned `DeleteObject` was sent to that are not transfer artifacts: final keys,
+    /// which ADR-0006 C17 never deletes so.
+    #[must_use]
+    pub fn plain_deletes_of_final_keys(&self) -> Vec<String> {
+        self.bucket()
+            .plain_deletes
+            .iter()
+            .filter(|key| !is_artifact_path(key))
+            .cloned()
+            .collect()
+    }
+
+    /// Every key that holds a version or a delete marker, sorted.
+    #[must_use]
+    pub fn keys_with_versions(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .bucket()
+            .order
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// (key, version) of every version deleted for good.
+    #[must_use]
+    pub fn version_deletes(&self) -> Vec<(String, String)> {
+        self.bucket().version_deletes.clone()
+    }
+
+    /// Logs an unversioned `DeleteObject` of `key` as it is sent, before anything may refuse it.
+    pub(super) fn record_plain_delete(&self, key: &str) {
+        self.bucket().plain_deletes.push(key.to_string());
+    }
+
+    /// Records `id` as the newest entry of `key` when the bucket is versioned.
+    pub(super) fn record_version(&self, key: &str, id: &str) {
+        let mut bucket = self.bucket();
+        if bucket.mode != Versioning::Off {
+            if let Some(ids) = bucket.order.get_mut(key) {
+                ids.retain(|existing| existing != id);
+            }
+            bucket.push(key, id);
+        }
+    }
+
+    /// A write in a versioned bucket: stores `bytes` as a new current version and returns its id;
+    /// `None` when versioning is off.
+    pub(super) async fn versioned_store(&self, key: &str, bytes: &Bytes) -> Option<String> {
+        let id = {
+            let mut bucket = self.bucket();
+            if bucket.mode == Versioning::Off {
+                return None;
+            }
+            let id = bucket.mint(key);
+            bucket.push(key, &id);
+            id
+        };
+        self.versions
+            .lock()
+            .await
+            .insert((key.to_string(), id.clone()), Some(bytes.clone()));
+        self.objects
+            .lock()
+            .await
+            .insert(key.to_string(), bytes.clone());
+        Some(id)
+    }
+
+    /// An unversioned `DeleteObject` in a versioned bucket: adds a delete marker. `false` when
+    /// versioning is off (the caller removes the object). Refused (`PermissionDenied`) when the
+    /// current version is held and [`Self::lock_refuses_delete_markers`] is set.
+    pub(super) async fn versioned_delete(&self, key: &str) -> S3Result<bool> {
+        let id = {
+            let mut bucket = self.bucket();
+            if bucket.mode == Versioning::Off {
+                return Ok(false);
+            }
+            let current = bucket.newest(key);
+            if bucket.locks_refuse_markers && current.is_some_and(|id| bucket.held(key, &id)) {
+                return Err(S3ProtocolFailure::entry(
+                    FailureClass::PermissionDenied,
+                    Transience::Permanent,
+                    "AccessDenied: the current S3 version is protected by Object Lock",
+                ));
+            }
+            let id = bucket.mint(key);
+            bucket.push(key, &id);
+            id
+        };
+        self.versions
+            .lock()
+            .await
+            .insert((key.to_string(), id), None);
+        self.objects.lock().await.remove(key);
+        Ok(true)
+    }
+
+    /// HEAD of the current object in a versioned bucket; `None` when versioning is off.
+    pub(super) async fn versioned_head(&self, key: &str) -> Option<S3Result<S3ObjectFacts>> {
+        if self.versioning() == Versioning::Off {
+            return None;
+        }
+        let newest = self.bucket().newest(key);
+        let Some(id) = newest else {
+            // An object written before versioning was enabled is version "null".
+            let object = self.objects.lock().await.get(key).cloned();
+            return Some(object.ok_or_else(not_found).map(|bytes| S3ObjectFacts {
+                size: bytes.len() as u64,
+                etag: self.etag_for(&bytes),
+                version_id: Some("null".to_string()),
+                last_modified: None,
+            }));
+        };
+        let stored = self
+            .versions
+            .lock()
+            .await
+            .get(&(key.to_string(), id.clone()))
+            .cloned()
+            .flatten();
+        let last_modified = *self.last_modified.lock().await;
+        Some(stored.ok_or_else(not_found).map(|bytes| S3ObjectFacts {
+            size: bytes.len() as u64,
+            etag: self.etag_for(&bytes),
+            version_id: Some(id),
+            last_modified,
+        }))
+    }
+
+    pub(super) async fn delete_one_version(&self, key: &str, version_id: &str) -> S3Result<()> {
+        let current = match self.forget_version(key, version_id)? {
+            Forgotten::Nothing => return Ok(()),
+            Forgotten::Unrecorded => return self.delete_unversioned_null(key, version_id).await,
+            Forgotten::Removed(current) => current,
+        };
+        let mut versions = self.versions.lock().await;
+        versions.remove(&(key.to_string(), version_id.to_string()));
+        let body = current.and_then(|id| versions.get(&(key.to_string(), id)).cloned().flatten());
+        drop(versions);
+        let mut objects = self.objects.lock().await;
+        match body {
+            Some(body) => objects.insert(key.to_string(), body),
+            None => objects.remove(key),
+        };
+        Ok(())
+    }
+
+    /// Removes `version_id` from the order of `key`, unless Object Lock holds the key.
+    fn forget_version(&self, key: &str, version_id: &str) -> S3Result<Forgotten> {
+        let mut bucket = self.bucket();
+        if bucket.held(key, version_id) {
+            return Err(S3ProtocolFailure::entry(
+                FailureClass::PermissionDenied,
+                Transience::Permanent,
+                "the S3 version is protected by Object Lock",
+            ));
+        }
+        let Some(ids) = bucket.order.get_mut(key) else {
+            return Ok(Forgotten::Unrecorded);
+        };
+        let before = ids.len();
+        ids.retain(|id| id != version_id);
+        if ids.len() == before {
+            return Ok(Forgotten::Nothing);
+        }
+        let newest = ids.last().cloned();
+        bucket
+            .version_deletes
+            .push((key.to_string(), version_id.to_string()));
+        Ok(Forgotten::Removed(newest))
+    }
+
+    /// A key with no recorded versions (versioning off): `?versionId=null` removes the object
+    /// (`MinIO` accepts it in an unversioned bucket too), and so does the id of a version the older
+    /// single-version model stored (`put_version`, or a write while its current version is real).
+    async fn delete_unversioned_null(&self, key: &str, version_id: &str) -> S3Result<()> {
+        let stored = self
+            .versions
+            .lock()
+            .await
+            .remove(&(key.to_string(), version_id.to_string()));
+        let mut objects = self.objects.lock().await;
+        let removed = match stored {
+            Some(body) if objects.get(key) == body.as_ref() => objects.remove(key).is_some(),
+            Some(_) => true,
+            None => version_id == "null" && objects.remove(key).is_some(),
+        };
+        drop(objects);
+        if removed {
+            self.bucket()
+                .version_deletes
+                .push((key.to_string(), version_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Every entry of `key`, newest first; an unversioned bucket lists its object as `"null"`.
+    pub(super) async fn versions_of(&self, key: &str) -> S3Result<Vec<S3VersionFacts>> {
+        let ids = self.bucket().order.get(key).cloned().unwrap_or_default();
+        if self.versioning() == Versioning::Off && ids.is_empty() {
+            let object = self.objects.lock().await.get(key).cloned();
+            return Ok(object
+                .map(|bytes| self.version_facts("null", Some(bytes), true))
+                .into_iter()
+                .collect());
+        }
+        let versions = self.versions.lock().await;
+        let count = ids.len();
+        Ok(ids
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, id)| {
+                let body = versions
+                    .get(&(key.to_string(), id.clone()))
+                    .cloned()
+                    .flatten();
+                self.version_facts(id, body, index + 1 == count)
+            })
+            .collect())
+    }
+
+    fn version_facts(&self, id: &str, body: Option<Bytes>, is_latest: bool) -> S3VersionFacts {
+        S3VersionFacts {
+            version_id: id.to_string(),
+            is_latest,
+            delete_marker: body.is_none(),
+            size: body.as_ref().map_or(0, |bytes| bytes.len() as u64),
+            etag: body.map(|bytes| self.etag_for(&bytes)).unwrap_or_default(),
+        }
+    }
+}

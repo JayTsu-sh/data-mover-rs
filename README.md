@@ -7,6 +7,14 @@ SMB/CIFS can be configured from an `smb://` URL or explicit config fields.
 For replacements for the removed legacy APIs, see the
 [migration inventory](docs/design/legacy-api-removal.md).
 
+## Workspace builds
+
+The default build includes all engines and backends. A minimal Local build uses
+`--no-default-features --features backend-local,traversal,transfer,integrity`.
+Use `cargo test --workspace` to run unit tests in the extracted crates.
+See [crate ownership, features and 0.4 migration](docs/architecture/crate-workspace.md)
+for dependency rules, recovery compatibility and extension points.
+
 ## Storage URL Formats
 
 | Backend | URL Format |

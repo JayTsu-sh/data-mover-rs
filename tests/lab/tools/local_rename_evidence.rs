@@ -431,7 +431,7 @@ async fn main() -> Result {
     let ctx = context(&args)?;
     let storage = local(&args.root, ctx).await?;
     match args.phase {
-        Phase::Before => before(&args, &ctx, &storage).await?,
+        Phase::Before => Box::pin(before(&args, &ctx, &storage)).await?,
         Phase::After => after(&args, &ctx, &storage).await?,
     }
     println!("RESULT phase={:?} PASS", args.phase);

@@ -17,7 +17,7 @@ from protocol_constants import PROJECT_ROOT  # noqa: E402
 
 
 def main() -> int:
-    cmd = ["cargo", "test", "--lib", "filter::"]
+    cmd = [sys.executable, "tests/run_cargo_test.py", "filter::"]
     print(f"[skill op-filter-dsl] $ {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=PROJECT_ROOT)
     assert_exit_code("cargo test filter::", result.returncode)

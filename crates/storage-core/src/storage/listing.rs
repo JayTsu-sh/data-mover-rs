@@ -1,0 +1,782 @@
+//! Streaming directory listings: the one listing entry of the [`Namespace`](super::Namespace)
+//! role (P7 §5.1, §5.4.2–§5.4.4).
+//!
+//! A listing is a [`ListingStream`] of [`ListingPage`]s. The stream ending normally means the
+//! directory was listed to its end; an `Err` item ends it early, and nothing follows it.
+//!
+//! **Dropping the stream at any point leaks nothing on the server.** A backend produces its pages
+//! from one producer per listing ([`ListingStream::from_producer`]) and hands them over a
+//! channel of capacity one, so a full channel stops the producer from reading further (one page
+//! read ahead). The producer runs in the consumer's own task until it hands over its first item
+//! with more still to do — most directories are one page, and a listing that small costs no task
+//! and no hand-off between tasks — and from then on as a detached task of its own, which reads
+//! ahead while the consumer works. When the consumer drops the stream, the producer is moved to
+//! a detached task if it was not in one yet, its next [`PageSink::send`] fails, and it leaves
+//! through its own clean-up path — a CIFS directory handle is closed there, never abandoned. A
+//! producer is never dropped or aborted part way, which is what makes that hold.
+//!
+//! **Pages carry names, not paths.** A child's full path is, by contract, the requested path, a
+//! `/`, and the child's name ([`child_path`]). A backend whose own spelling of a child differs
+//! reports that child as a [`ChildFailure`] rather than hand out a name that does not join back
+//! to what it listed; the page constructor enforces that contract.
+//!
+//! **One child may have an empty name: the directory's own object** (P7 F5, §5.4.4). An object
+//! store can hold content under the key `p/d/` itself; the listing of `p/d` hands it over as a
+//! file whose name is empty, so by the same rule its path is `p/d/` — exactly the key. Only
+//! [`ListedChild::directory_object`] and [`ListingPage::push_directory_object`] make such a child;
+//! [`ListedChild::new`] still refuses an empty name. The storage root has no own object (its path
+//! would be the root itself), and a directory object is always a file: an empty name at the root,
+//! or on anything but a file, is a `Protocol` failure, never a child. Paths are compared byte for
+//! byte and a trailing `/` is never normalised away, so `p/d/` and the file or directory `p/d` are
+//! different entries.
+//!
+//! A logical traversal may instead classify that object in its parent's block. The dedicated
+//! `push_child_object` constructor permits one File name ending in `/` (`d/`), not arbitrary
+//! multi-segment names. Raw listings keep the empty-named own-object representation.
+//!
+//! Single-directory callers (recursive delete, the NDX walk) collect a whole listing with
+//! [`collect_listing`].
+//!
+//! **Where each backend stands.** Local (P7 C5), S3's current objects (C6), NFS (C7), HDFS (C8)
+//! and CIFS (C9) read their directories page by page: a dropped or cancelled listing stops within
+//! a page (S3 and HDFS abandon their stateless request in flight at once; NFS lets the
+//! READDIRPLUS in flight finish and sends no other; CIFS lets the record in flight arrive, then
+//! closes its directory handle). S3's listing of a versioned bucket gathers each directory's
+//! records whole before it hands over any child (§5.3, Q9; it too abandons its requests at once),
+//! then builds its children a page at a time. A CIFS listing waiting for its
+//! consumer holds an open directory handle, so a consumer keeps no more of them parked than
+//! [`Namespace::parked_listing_limit`](super::Namespace::parked_listing_limit) says. A
+//! producer detached from a runtime that shuts down mid-listing is dropped with the runtime, as
+//! every other detached task is.
+
+use std::fmt;
+use std::future::Future;
+use std::mem;
+use std::num::NonZeroUsize;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
+
+use futures::future::BoxFuture;
+use futures::{FutureExt as _, Stream, StreamExt as _, future, stream};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use super::{SourceDescriptor, StorageRoleFailure};
+pub use child::ListedChild;
+pub use collect::{CollectLimits, collect_listing};
+pub use failure::{ChildFailure, is_vanished};
+pub use hint::DescentHint;
+pub use names::child_path;
+pub use names::respelled;
+use names::{child_name, child_path_owned, valid_object_suffix};
+
+use crate::model::{
+    BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
+    Transience,
+};
+
+/// Children per page when the caller has no reason to choose: about one native page of the
+/// larger protocols (S3 returns up to 1000 keys, HDFS 1000 statuses).
+pub const DEFAULT_PAGE_HINT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1023);
+
+/// One listing of a directory's direct children.
+#[derive(Clone, Debug)]
+pub struct ListRequest {
+    /// The directory to list, relative to the storage root; the empty path is the root.
+    pub path: StoragePath,
+    /// Stops paging as soon as possible. A stateless listing (S3) abandons the request in flight;
+    /// one that holds a handle (CIFS) finishes the request in flight and closes the handle first.
+    /// A cancelled listing ends with a `Cancelled` entry failure.
+    pub cancel: CancellationToken,
+    /// Most children one page may hold. A backend may return fewer, never more.
+    pub page_hint: NonZeroUsize,
+    /// What the listing that returned this directory handed back with it ([`DescentHint`]), for
+    /// the backend to use instead of resolving `path` again. `None` for a root, or when that
+    /// listing gave none; a backend lists `path` either way.
+    pub descent_hint: Option<DescentHint>,
+}
+
+impl ListRequest {
+    /// A request for `path` with [`DEFAULT_PAGE_HINT`] and no descent hint.
+    #[must_use]
+    pub const fn new(path: StoragePath, cancel: CancellationToken) -> Self {
+        Self {
+            path,
+            cancel,
+            page_hint: DEFAULT_PAGE_HINT,
+            descent_hint: None,
+        }
+    }
+
+    /// The same request carrying `hint`, from the listing that returned this directory.
+    #[must_use]
+    pub fn with_descent_hint(mut self, hint: Option<DescentHint>) -> Self {
+        self.descent_hint = hint;
+        self
+    }
+
+    /// The same request with another page size bound.
+    #[must_use]
+    pub const fn with_page_hint(mut self, page_hint: NonZeroUsize) -> Self {
+        self.page_hint = page_hint;
+        self
+    }
+}
+
+/// One page of a listing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ListingPage {
+    /// Children this page describes.
+    pub children: Vec<ListedChild>,
+    /// Children the listing returned but could not describe; each concerns that child alone. One
+    /// whose class is `NotFound` vanished before it could be described ([`ChildFailure`]).
+    pub failures: Vec<ChildFailure>,
+    /// Entries this page hid. They are not children: transfer artifacts (`.data-mover-*`), and
+    /// ONTAP's snapshot directory where `NFSv3` lists it without attributes (P7 C7b).
+    pub internal_hidden: u32,
+}
+
+impl ListingPage {
+    /// A page of `children` and `failures`, with `internal_hidden` entries hidden.
+    #[must_use]
+    pub const fn new(
+        children: Vec<ListedChild>,
+        failures: Vec<ChildFailure>,
+        internal_hidden: u32,
+    ) -> Self {
+        Self {
+            children,
+            failures,
+            internal_hidden,
+        }
+    }
+
+    /// Whether the page holds neither a child nor a failure.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.children.is_empty() && self.failures.is_empty()
+    }
+
+    /// A page of `directory`'s children from descriptors a backend spelled with full paths.
+    ///
+    /// A descriptor whose path is not `directory`, `/` and one name becomes a [`ChildFailure`]
+    /// at the path it carried: its name would not join back to what the backend listed.
+    #[must_use]
+    pub fn from_descriptors(
+        directory: &StoragePath,
+        descriptors: Vec<SourceDescriptor>,
+        failures: Vec<EntryOperationFailure>,
+        internal_hidden: u32,
+    ) -> Self {
+        let mut page = Self {
+            children: Vec::with_capacity(descriptors.len()),
+            failures: failures
+                .into_iter()
+                .map(|failure| ChildFailure::from_failure(directory, failure))
+                .collect(),
+            internal_hidden,
+        };
+        for descriptor in descriptors {
+            page.push_descriptor(directory, descriptor, None);
+        }
+        page
+    }
+
+    /// Adds `directory`'s own object (P7 F5): `descriptor` is the file stored under the key
+    /// `directory` + `/`, handed over as the child with the empty name. A descriptor at any other
+    /// path, one that is not a file, or any at the storage root (which has no own object) becomes
+    /// a `Protocol` failure at the path it carried instead.
+    pub fn push_directory_object(&mut self, directory: &StoragePath, descriptor: SourceDescriptor) {
+        let own = !directory.as_str().is_empty()
+            && descriptor.kind == EntryKind::File
+            && descriptor.path.as_str().strip_suffix('/') == Some(directory.as_str());
+        if !own {
+            self.failures.push(ChildFailure {
+                name: None,
+                raw_name: None,
+                failure: listing_failure(
+                    &descriptor.path,
+                    FailureClass::Protocol,
+                    Transience::Permanent,
+                    "the listing handed over a directory object that is not the listed \
+                     directory's own file",
+                ),
+            });
+            return;
+        }
+        self.children
+            .push(ListedChild::from_descriptor(String::new(), descriptor));
+    }
+
+    /// A content object named `<child>/`, classified in its parent's traversal listing rather
+    /// than as the child's own empty-named file. Only one segment plus the final slash is valid;
+    /// this does not permit arbitrary descendant paths or normalise away the object's slash.
+    pub fn push_child_object(&mut self, directory: &StoragePath, descriptor: SourceDescriptor) {
+        let valid = descriptor
+            .path
+            .as_str()
+            .strip_suffix('/')
+            .and_then(|path| StoragePath::new(path).ok())
+            .and_then(|path| child_name(directory, &path).map(str::to_owned))
+            .filter(|_| descriptor.kind == EntryKind::File);
+        if let Some(name) = valid {
+            self.children
+                .push(ListedChild::from_descriptor(format!("{name}/"), descriptor));
+        } else {
+            self.failures.push(ChildFailure::from_failure(
+                directory,
+                listing_failure(
+                    &descriptor.path,
+                    FailureClass::Protocol,
+                    Transience::Permanent,
+                    "the traversal directory object is not one child key ending in '/'",
+                ),
+            ));
+        }
+    }
+
+    /// Adds the listed child of `directory` that `descriptor` describes, carrying `hint` for the
+    /// listing of it ([`DescentHint`]), or a failure at the path it carried when that path is not
+    /// `directory`, `/` and one name.
+    pub fn push_descriptor(
+        &mut self,
+        directory: &StoragePath,
+        mut descriptor: SourceDescriptor,
+        hint: Option<DescentHint>,
+    ) {
+        let Some(name_len) = child_name(directory, &descriptor.path).map(str::len) else {
+            self.failures.push(ChildFailure {
+                name: None,
+                raw_name: None,
+                failure: EntryOperationFailure::new(
+                    descriptor.path,
+                    Operation::Traverse,
+                    FailureClass::Protocol,
+                    Transience::Permanent,
+                    "the listing spelled a child that is not the listed directory's path and one name",
+                )
+                .unwrap_or_else(|_| unreachable!("the static listing diagnostic is valid")),
+            });
+            return;
+        };
+        // The name is the path's tail: keep the path's own allocation for it rather than copy.
+        let mut name = mem::replace(&mut descriptor.path, StoragePath::root()).into_string();
+        name.drain(..name.len() - name_len);
+        let mut child = ListedChild::from_descriptor(name, descriptor);
+        child.descent_hint = hint;
+        self.children.push(child);
+    }
+
+    /// The children of `directory` with their full paths, and every failure of the page.
+    ///
+    /// A child whose joined path exceeds the storage path limit becomes an entry failure at
+    /// `directory`, beside its siblings.
+    #[must_use]
+    pub fn into_descriptors(
+        self,
+        directory: &StoragePath,
+    ) -> (Vec<SourceDescriptor>, Vec<EntryOperationFailure>) {
+        self.into_parts(directory, |descriptor, _| descriptor)
+    }
+
+    /// [`Self::into_descriptors`], keeping each child's [`DescentHint`] beside its descriptor.
+    #[must_use]
+    pub fn into_hinted_descriptors(self, directory: &StoragePath) -> HintedDescriptors {
+        self.into_parts(directory, |descriptor, hint| (descriptor, hint))
+    }
+
+    /// Every child of `directory` as `keep` makes it of its descriptor and descent hint, and every
+    /// failure of the page.
+    fn into_parts<T>(
+        self,
+        directory: &StoragePath,
+        keep: impl Fn(SourceDescriptor, Option<DescentHint>) -> T,
+    ) -> (Vec<T>, Vec<EntryOperationFailure>) {
+        let mut failures: Vec<EntryOperationFailure> = self
+            .failures
+            .into_iter()
+            .map(|failure| failure.failure)
+            .collect();
+        let mut children = Vec::with_capacity(self.children.len());
+        for mut child in self.children {
+            let hint = child.descent_hint.take();
+            if let Some(failure) = misplaced_object(directory, &child) {
+                failures.push(failure);
+                continue;
+            }
+            match child_path_owned(directory, mem::take(&mut child.name)) {
+                Ok(path) => children.push(keep(child.at(path), hint)),
+                Err(name) => failures.push(too_long(directory, &name)),
+            }
+        }
+        (children, failures)
+    }
+
+    /// Adds a child `self` could not describe.
+    pub fn push_failure(&mut self, failure: ChildFailure) {
+        self.failures.push(failure);
+    }
+
+    /// Appends `page` to this one.
+    fn absorb(&mut self, page: Self) {
+        if self.children.is_empty() {
+            self.children = page.children;
+        } else {
+            self.children.extend(page.children);
+        }
+        self.failures.extend(page.failures);
+        self.internal_hidden = self.internal_hidden.saturating_add(page.internal_hidden);
+    }
+}
+
+/// A page's children as descriptors, each with the descent hint its listing gave it, and every
+/// failure of the page.
+pub type HintedDescriptors = (
+    Vec<(SourceDescriptor, Option<DescentHint>)>,
+    Vec<EntryOperationFailure>,
+);
+
+type Item = Result<ListingPage, StorageRoleFailure>;
+
+/// A directory listing, page by page. See the [module docs](self) for its contract.
+pub struct ListingStream {
+    path: StoragePath,
+    inner: Pin<Box<dyn Stream<Item = Item> + Send>>,
+}
+
+impl ListingStream {
+    /// A listing of `path` whose pages `producer` sends through the [`PageSink`] it is given.
+    ///
+    /// The producer starts when the stream is first polled (a stream dropped unpolled never
+    /// touches the server), inside the consumer's task; once it hands over an item and is not
+    /// finished, or the stream is dropped while it runs, it continues as a detached task of its
+    /// own (see the [module docs](self)). It returns once the listing is finished, has failed, or
+    /// [`PageSink::send`] reports the stream dropped; on every one of those exits it releases
+    /// whatever it holds. A producer that stops without returning (a panic) ends the stream with
+    /// an `Internal` entry failure, never with a normal end that would read as a complete
+    /// listing.
+    pub fn from_producer<F, Fut>(path: StoragePath, producer: F) -> Self
+    where
+        F: FnOnce(PageSink) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let start: Start = Box::new(move |sink| producer(sink).boxed());
+        let inner = Produced {
+            path: path.clone(),
+            state: ProducerState::Idle(Some(start)),
+        };
+        Self {
+            path,
+            inner: Box::pin(inner),
+        }
+    }
+
+    /// A listing of `path` made of `pages`, as they are; for listings already in memory.
+    pub fn from_pages(path: StoragePath, pages: impl IntoIterator<Item = Item>) -> Self {
+        let pages: Vec<Item> = pages.into_iter().collect();
+        Self {
+            path,
+            inner: Box::pin(ended_by_failure(stream::iter(pages))),
+        }
+    }
+
+    /// A listing of `path` that fails at once with `failure`.
+    #[must_use]
+    pub fn failed(path: StoragePath, failure: StorageRoleFailure) -> Self {
+        Self::from_pages(path, [Err(failure)])
+    }
+
+    /// The directory this stream lists.
+    #[must_use]
+    pub const fn path(&self) -> &StoragePath {
+        &self.path
+    }
+}
+
+impl Stream for ListingStream {
+    type Item = Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Item>> {
+        self.inner.as_mut().poll_next(context)
+    }
+}
+
+impl fmt::Debug for ListingStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ListingStream")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Ends `stream` after its first `Err` item, as the listing contract says.
+fn ended_by_failure(
+    stream: impl Stream<Item = Item> + Send + 'static,
+) -> impl Stream<Item = Item> + Send + 'static {
+    stream.scan(false, |failed, item| {
+        let next = if *failed {
+            None
+        } else {
+            *failed = item.is_err();
+            Some(item)
+        };
+        future::ready(next)
+    })
+}
+
+type Start = Box<dyn FnOnce(PageSink) -> BoxFuture<'static, ()> + Send>;
+
+/// A started producer, wrapped so that its clean return marks the listing finished.
+type Producer = BoxFuture<'static, ()>;
+
+enum ProducerState {
+    /// Not polled yet: nothing has been started.
+    Idle(Option<Start>),
+    /// Items arrive on `receiver`. The producer's clean return is `finished`, set before the
+    /// channel's last sender goes, so a closed channel reads as the listing's end when it is set
+    /// and as an abandoned producer (a panic) when it is not. An end that needs no channel slot
+    /// is visible the moment the last page has been received, not only once the producer is
+    /// scheduled again to send one — so a one-page listing's page and end arrive together.
+    ///
+    /// `producer` is the producer while it still runs in the consumer's task; `None` once it has
+    /// returned or moved to a task of its own on `runtime`.
+    Running {
+        receiver: mpsc::Receiver<Item>,
+        finished: Arc<AtomicBool>,
+        producer: Option<Producer>,
+        runtime: Handle,
+    },
+    Finished,
+}
+
+/// The consumer side of [`ListingStream::from_producer`].
+struct Produced {
+    path: StoragePath,
+    state: ProducerState,
+}
+
+impl Produced {
+    fn start(&mut self, start: Start) -> Option<Item> {
+        let Ok(runtime) = Handle::try_current() else {
+            self.state = ProducerState::Finished;
+            return Some(Err(no_runtime()));
+        };
+        let (sender, receiver) = mpsc::channel(1);
+        let finished = Arc::new(AtomicBool::new(false));
+        let (done, last) = (Arc::clone(&finished), sender.clone());
+        let producer = start(PageSink { sender });
+        // `finished` marks a listing the producer finished rather than abandoned; it is set
+        // while `last` still keeps the channel open, so the consumer cannot see it closed first.
+        // A panic is caught here so that, polled in the consumer's task, it ends the listing as
+        // an abandoned one instead of unwinding through the consumer; `last` is dropped with it.
+        let producer = AssertUnwindSafe(async move {
+            producer.await;
+            done.store(true, Ordering::SeqCst);
+            drop(last);
+        })
+        .catch_unwind()
+        .map(drop)
+        .boxed();
+        self.state = ProducerState::Running {
+            receiver,
+            finished,
+            producer: Some(producer),
+            runtime,
+        };
+        None
+    }
+}
+
+impl Drop for Produced {
+    /// A producer still running in the consumer's task moves to a detached task of its own: it
+    /// finds the stream gone at its next send and leaves through its own clean-up path.
+    fn drop(&mut self) {
+        if let ProducerState::Running {
+            producer, runtime, ..
+        } = &mut self.state
+            && let Some(producer) = producer.take()
+        {
+            drop(runtime.spawn(producer));
+        }
+    }
+}
+
+impl Stream for Produced {
+    type Item = Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Item>> {
+        loop {
+            match &mut self.state {
+                ProducerState::Idle(start) => {
+                    let Some(start) = start.take() else {
+                        self.state = ProducerState::Finished;
+                        continue;
+                    };
+                    if let Some(failure) = self.start(start) {
+                        return Poll::Ready(Some(failure));
+                    }
+                }
+                ProducerState::Running {
+                    receiver,
+                    finished,
+                    producer,
+                    runtime,
+                } => {
+                    if let Some(running) = producer.as_mut()
+                        && running.as_mut().poll(context).is_ready()
+                    {
+                        *producer = None;
+                    }
+                    let message = match receiver.poll_recv(context) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(message) => message,
+                    };
+                    // The listing goes on past this item: let the producer read ahead in a task
+                    // of its own while the consumer works on it.
+                    if let Some(running) = producer.take() {
+                        drop(runtime.spawn(running));
+                    }
+                    let item = match message {
+                        Some(item) => item,
+                        None if finished.load(Ordering::SeqCst) => {
+                            self.state = ProducerState::Finished;
+                            return Poll::Ready(None);
+                        }
+                        None => Err(abandoned(&self.path)),
+                    };
+                    if item.is_err() {
+                        // Nothing follows a failure; dropping the receiver tells the producer.
+                        self.state = ProducerState::Finished;
+                    }
+                    return Poll::Ready(Some(item));
+                }
+                ProducerState::Finished => return Poll::Ready(None),
+            }
+        }
+    }
+}
+
+/// The consumer dropped the listing; the producer should release what it holds and return.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListingClosed;
+
+impl fmt::Display for ListingClosed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the listing's consumer is gone")
+    }
+}
+
+impl std::error::Error for ListingClosed {}
+
+/// The producer side of [`ListingStream::from_producer`].
+pub struct PageSink {
+    sender: mpsc::Sender<Item>,
+}
+
+impl PageSink {
+    /// Sends one page, waiting while the consumer still holds the previous one.
+    ///
+    /// # Errors
+    /// Returns [`ListingClosed`] when the consumer dropped the stream (or took a failure and
+    /// stopped); the producer must release what it holds and return.
+    pub async fn send(&self, page: ListingPage) -> Result<(), ListingClosed> {
+        self.sender.send(Ok(page)).await.map_err(|_| ListingClosed)
+    }
+
+    /// Ends the listing with `failure`. Nothing the producer sends afterwards is delivered.
+    pub async fn fail(&self, failure: StorageRoleFailure) {
+        let _ = self.sender.send(Err(failure)).await;
+    }
+
+    /// Resolves once the consumer has dropped the stream, so a stateless producer can abandon
+    /// the request in flight at once.
+    pub async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
+    /// Whether the consumer has dropped the stream.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    /// Hands over a listing read whole, in pages of at most `request.page_hint` children; the
+    /// first page carries the failures and the hidden-artifact count. Stops at cancellation with a
+    /// `Cancelled` failure, and as soon as the consumer is gone. For test producers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn deliver(&self, listing: Item, request: &ListRequest) {
+        match listing {
+            Ok(page) => {
+                let _ = self.send_split(page, request).await;
+            }
+            Err(failure) => self.fail(failure).await,
+        }
+    }
+
+    /// Hands over `page` — one piece of a listing a backend read, however many children it
+    /// holds — in pages of at most `request.page_hint` children (at least one page, even an empty
+    /// one); the first carries the failures and the hidden-artifact count. A cancelled request
+    /// ends the listing before the next page, or while a page waits for the consumer to make
+    /// room (that page is dropped).
+    ///
+    /// # Errors
+    /// Returns [`ListingClosed`] when the listing is over: the consumer is gone, or the request
+    /// was cancelled and the listing has been ended with a `Cancelled` failure. The producer must
+    /// release what it holds and return.
+    pub async fn send_split(
+        &self,
+        page: ListingPage,
+        request: &ListRequest,
+    ) -> Result<(), ListingClosed> {
+        let ListingPage {
+            children,
+            failures,
+            internal_hidden,
+        } = page;
+        let hint = request.page_hint.get();
+        let mut children = children.into_iter();
+        let mut page = ListingPage::new(
+            children.by_ref().take(hint).collect(),
+            failures,
+            internal_hidden,
+        );
+        loop {
+            let sent = tokio::select! {
+                biased;
+                () = request.cancel.cancelled() => None,
+                sent = self.send(page) => Some(sent),
+            };
+            let Some(sent) = sent else {
+                self.fail(cancelled(&request.path)).await;
+                return Err(ListingClosed);
+            };
+            sent?;
+            let next: Vec<ListedChild> = children.by_ref().take(hint).collect();
+            if next.is_empty() {
+                return Ok(());
+            }
+            page = ListingPage::new(next, Vec::new(), 0);
+        }
+    }
+}
+
+impl fmt::Debug for PageSink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PageSink")
+            .field("closed", &self.is_closed())
+            .finish()
+    }
+}
+
+/// The failure a listing ends with when its request was cancelled.
+#[must_use]
+pub fn cancelled(path: &StoragePath) -> StorageRoleFailure {
+    StorageRoleFailure::Entry(listing_failure(
+        path,
+        FailureClass::Cancelled,
+        Transience::Transient,
+        "the listing was cancelled",
+    ))
+}
+
+/// A child of `directory` whose joined path exceeds the storage path limit, named in the
+/// diagnostic when the name itself fits.
+fn too_long(directory: &StoragePath, name: &str) -> EntryOperationFailure {
+    EntryOperationFailure::new(
+        directory.clone(),
+        Operation::Traverse,
+        FailureClass::Unsupported,
+        Transience::Permanent,
+        format!("the path of listed child {name:?} exceeds the storage path limit"),
+    )
+    .unwrap_or_else(|_| {
+        listing_failure(
+            directory,
+            FailureClass::Unsupported,
+            Transience::Permanent,
+            "a listed child's path exceeds the storage path limit",
+        )
+    })
+}
+
+/// Why an empty-named child cannot be handed over: at the storage root its path would be the root
+/// itself, and a directory object is always a file (P7 F5). `None` for any other child.
+fn misplaced_object(directory: &StoragePath, child: &ListedChild) -> Option<EntryOperationFailure> {
+    if !valid_object_suffix(&child.name, child.kind) {
+        return Some(listing_failure(
+            directory,
+            FailureClass::Protocol,
+            Transience::Permanent,
+            "a trailing slash is only valid on one file key segment",
+        ));
+    }
+    if !child.is_directory_object() {
+        return None;
+    }
+    let diagnostic = if directory.as_str().is_empty() {
+        "the listing handed over an own object of the storage root, which has no path"
+    } else if child.kind == EntryKind::File {
+        return None;
+    } else {
+        "the listing handed over a directory object that is not a file"
+    };
+    Some(listing_failure(
+        directory,
+        FailureClass::Protocol,
+        Transience::Permanent,
+        diagnostic,
+    ))
+}
+
+fn abandoned(path: &StoragePath) -> StorageRoleFailure {
+    StorageRoleFailure::Entry(listing_failure(
+        path,
+        FailureClass::Internal,
+        Transience::Unknown,
+        "the listing's producer stopped before the listing ended",
+    ))
+}
+
+fn no_runtime() -> StorageRoleFailure {
+    StorageRoleFailure::Session(
+        BackendSessionFailure::new(
+            Operation::Traverse,
+            FailureClass::Internal,
+            Transience::Permanent,
+            "a listing needs a Tokio runtime to run its producer",
+        )
+        .unwrap_or_else(|_| unreachable!("the static listing diagnostic is valid")),
+    )
+}
+
+fn listing_failure(
+    path: &StoragePath,
+    class: FailureClass,
+    transience: Transience,
+    diagnostic: &'static str,
+) -> EntryOperationFailure {
+    EntryOperationFailure::new(
+        path.clone(),
+        Operation::Traverse,
+        class,
+        transience,
+        diagnostic,
+    )
+    .unwrap_or_else(|_| unreachable!("the static listing diagnostic is valid"))
+}
+
+mod child;
+mod collect;
+mod failure;
+mod hint;
+mod names;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
+#[cfg(test)]
+mod tests;

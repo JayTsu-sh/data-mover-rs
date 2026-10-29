@@ -30,7 +30,7 @@ def run_clippy(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 def main() -> int:
     cmd = [
-        "cargo", "clippy", "--all-targets", "--",
+        "cargo", "clippy", "--workspace", "--all-targets", "--",
         "-D", "warnings",
         "-D", "clippy::unwrap_used",
         "-D", "clippy::expect_used",

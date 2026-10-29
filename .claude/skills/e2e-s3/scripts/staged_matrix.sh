@@ -32,7 +32,7 @@ case "$PREFIX" in
   staged-*|data-mover-*) ;;
   *) echo "S3_MATRIX_PREFIX must start with staged- or data-mover-: $PREFIX" >&2; exit 1 ;;
 esac
-WORK=/tmp/data-mover-s3-staged-$RUN
+WORK=${TMPDIR:-/tmp}/data-mover-s3-staged-$RUN
 mkdir -p "$WORK/src"
 cargo_build_examples transfer_resume || exit $?
 BIN=$(cargo_example_binary transfer_resume) || exit 1

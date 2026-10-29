@@ -42,7 +42,7 @@ SIZE=${SIZE:-209715200}; BW=${BW:-20971520}; CUT_MS=${CUT_MS:-6000}
 UNLIMITED=10737418240
 RUN=${RUN:-$(date +%s)}
 DIR=resume-$RUN
-WORK=/tmp/data-mover-resume-$RUN
+WORK=${TMPDIR:-/tmp}/data-mover-resume-$RUN
 if [[ "$DEST" == s3:* ]]; then
   [ -n "${S3_BUCKET_OVERRIDE:-}" ] && S3_BUCKET=$S3_BUCKET_OVERRIDE
   PREFIX=${DEST#s3:}; PREFIX=${PREFIX#/}; PREFIX=${PREFIX%/}

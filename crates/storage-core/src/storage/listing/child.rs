@@ -1,0 +1,211 @@
+//! One child of a listed directory ([`ListedChild`]): a [`SourceDescriptor`] with its full path
+//! replaced by its name, the path being the listing contract's [`child_path`].
+
+use bytes::Bytes;
+
+use super::DescentHint;
+use super::names::{child_path, is_segment, valid_object_suffix};
+use crate::model::{
+    EntryKind, ModelValueError, RenameEvidence, SourceIdentity, SourceVersion, StoragePath,
+    TimestampMetadata,
+};
+use crate::storage::{InlineOwnership, ListingFacts, SourceDescriptor};
+
+/// One child of a listed directory: [`SourceDescriptor`] with its full path replaced by its name.
+///
+/// The name is empty for the directory's own object ([`Self::directory_object`], P7 F5), whose
+/// path is the directory's and a `/`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListedChild {
+    pub(super) name: String,
+    /// File, directory, symlink or special; a CIFS reparse point is a file.
+    pub kind: EntryKind,
+    /// A file's size; `None` where a size means nothing (a directory, an S3 prefix).
+    pub size: Option<u64>,
+    /// The stable identity the listing reported for the child.
+    pub source_identity: SourceIdentity,
+    pub rename_evidence: Option<RenameEvidence>,
+    pub backend_fact: Option<Bytes>,
+    pub content_version: Option<Bytes>,
+    pub inline_timestamps: Option<TimestampMetadata>,
+    pub inline_mode: Option<u32>,
+    pub inline_ownership: Option<InlineOwnership>,
+    pub version: SourceVersion,
+    pub listing: ListingFacts,
+    /// See [`DescentHint`]; meaningful only on a directory.
+    pub(super) descent_hint: Option<DescentHint>,
+}
+
+impl ListedChild {
+    /// A child named `name`, without backend-private facts.
+    ///
+    /// # Errors
+    /// Returns an error when `name` is not one path segment: empty, `.`, `..`, or containing `/`
+    /// or NUL.
+    pub fn new(
+        name: impl Into<String>,
+        kind: EntryKind,
+        size: Option<u64>,
+        source_identity: SourceIdentity,
+    ) -> Result<Self, ModelValueError> {
+        let name = name.into();
+        if !is_segment(&name) {
+            return Err(ModelValueError::new(
+                "listed_child_name",
+                "must be one non-empty path segment other than '.' and '..'",
+            ));
+        }
+        Ok(Self {
+            name,
+            kind,
+            size,
+            source_identity,
+            rename_evidence: None,
+            backend_fact: None,
+            content_version: None,
+            inline_timestamps: None,
+            inline_mode: None,
+            inline_ownership: None,
+            version: SourceVersion::Current,
+            listing: ListingFacts::default(),
+            descent_hint: None,
+        })
+    }
+
+    /// The listed directory's own object (P7 F5): the file an object store keeps under the key
+    /// `<directory>/`, a child with the empty name, so its path is exactly that key. Only a
+    /// listing of a directory other than the storage root can hand one over.
+    #[must_use]
+    pub fn directory_object(size: Option<u64>, source_identity: SourceIdentity) -> Self {
+        Self {
+            name: String::new(),
+            kind: EntryKind::File,
+            size,
+            source_identity,
+            rename_evidence: None,
+            backend_fact: None,
+            content_version: None,
+            inline_timestamps: None,
+            inline_mode: None,
+            inline_ownership: None,
+            version: SourceVersion::Current,
+            listing: ListingFacts::default(),
+            descent_hint: None,
+        }
+    }
+
+    /// `descriptor` with its path replaced by `name`.
+    pub(super) fn from_descriptor(name: String, descriptor: SourceDescriptor) -> Self {
+        let SourceDescriptor {
+            path: _,
+            kind,
+            size,
+            source_identity,
+            rename_evidence,
+            backend_fact,
+            content_version,
+            inline_timestamps,
+            inline_mode,
+            inline_ownership,
+            version,
+            listing,
+        } = descriptor;
+        Self {
+            name,
+            kind,
+            size,
+            source_identity,
+            rename_evidence,
+            backend_fact,
+            content_version,
+            inline_timestamps,
+            inline_mode,
+            inline_ownership,
+            version,
+            listing,
+            descent_hint: None,
+        }
+    }
+
+    /// Whether this child is the listed directory's own object (the empty name).
+    #[must_use]
+    pub fn is_directory_object(&self) -> bool {
+        self.name.is_empty()
+    }
+
+    /// The same child carrying `hint` for the listing of it, when it is a directory a traversal
+    /// descends into ([`DescentHint`]).
+    #[must_use]
+    pub fn with_descent_hint(mut self, hint: DescentHint) -> Self {
+        self.descent_hint = Some(hint);
+        self
+    }
+
+    /// The hint for listing this child, if its listing gave one.
+    #[must_use]
+    pub const fn descent_hint(&self) -> Option<&DescentHint> {
+        self.descent_hint.as_ref()
+    }
+
+    /// The child's name: the last segment of its path; empty for the directory's own object.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Timestamps the listing already returned, if any.
+    #[must_use]
+    pub const fn inline_timestamps(&self) -> Option<TimestampMetadata> {
+        self.inline_timestamps
+    }
+
+    /// Permission bits the listing could already derive, if any (display-grade, see
+    /// [`SourceDescriptor::inline_mode`]).
+    #[must_use]
+    pub const fn inline_mode(&self) -> Option<u32> {
+        self.inline_mode
+    }
+
+    /// The descriptor of this child of `directory`, its path being [`child_path`].
+    ///
+    /// # Errors
+    /// Returns an error when the joined path exceeds the storage path limit, or for a directory
+    /// object of the storage root, which has no path of its own.
+    pub fn into_descriptor(
+        self,
+        directory: &StoragePath,
+    ) -> Result<SourceDescriptor, ModelValueError> {
+        if !valid_object_suffix(&self.name, self.kind) {
+            return Err(ModelValueError::new(
+                "listed_child_name",
+                "a trailing slash is only valid on one file key segment",
+            ));
+        }
+        if self.is_directory_object() && directory.as_str().is_empty() {
+            return Err(ModelValueError::new(
+                "listed_child_name",
+                "the storage root has no own object",
+            ));
+        }
+        let path = child_path(directory, &self.name)?;
+        Ok(self.at(path))
+    }
+
+    /// The descriptor of this child at `path`.
+    pub(super) fn at(self, path: StoragePath) -> SourceDescriptor {
+        SourceDescriptor {
+            rename_evidence: self.rename_evidence,
+            path,
+            kind: self.kind,
+            size: self.size,
+            source_identity: self.source_identity,
+            backend_fact: self.backend_fact,
+            content_version: self.content_version,
+            inline_timestamps: self.inline_timestamps,
+            inline_mode: self.inline_mode,
+            inline_ownership: self.inline_ownership,
+            version: self.version,
+            listing: self.listing,
+        }
+    }
+}

@@ -1,6 +1,6 @@
 .PHONY: help build test clippy clippy-strict fmt fmt-fix check ci doc clean examples \
         e2e-local e2e-cifs e2e-nfs e2e-s3 e2e-network e2e-all \
-        coverage audit-large arch-guard arch-guard-selftest harness-contract verify
+        coverage audit-large arch-guard arch-guard-selftest harness-contract feature-matrix verify
 
 help:
 	@echo "data-mover-rs Makefile (Claude harness 稳定命令面)"
@@ -56,7 +56,7 @@ clippy:
 	python3 .claude/skills/quality-clippy/scripts/run.py
 
 clippy-strict:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 test:
 	cargo test --workspace --no-fail-fast
@@ -95,7 +95,10 @@ harness-contract:
 	python3 -m unittest discover -s tests -p 'test_hdfs_memory*.py'
 	python3 -m unittest discover -s tests/lab -p 'test_nfs_read_audit.py'
 
-ci: fmt arch-guard harness-contract clippy test examples e2e-local
+feature-matrix:
+	python3 tests/feature_matrix.py
+
+ci: fmt arch-guard harness-contract feature-matrix clippy test examples e2e-local
 
 verify: ci audit-large arch-guard-selftest
 
