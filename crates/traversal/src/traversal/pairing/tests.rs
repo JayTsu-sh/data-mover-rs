@@ -240,6 +240,7 @@ fn history_entry(value: &str) -> ObservedEntry {
     ObservedEntry::new(path(value), EntryKind::File, None, None, identity(value))
         .unwrap()
         .with_history(Some(Box::new(history)))
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn segmented_block(value: &str) -> Vec<TraversalItem> {

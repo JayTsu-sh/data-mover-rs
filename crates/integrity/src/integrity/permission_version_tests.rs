@@ -122,7 +122,8 @@ fn observed(descriptor: &SourceDescriptor) -> TestResult<ObservedEntry> {
     .with_history(Some(Box::new(ObjectHistory::whole(
         vec![record],
         HistoryOrder::Server,
-    )?))))
+    )?)))
+    .unwrap_or_else(|error| panic!("{error}")))
 }
 
 fn storage(name: &str, owner: &'static str, support: ObservationSupport) -> TestResult<Storage> {

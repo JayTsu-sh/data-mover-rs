@@ -223,7 +223,8 @@ fn observation(descriptor: &SourceDescriptor) -> TestResult<ObservedEntry> {
         None,
         descriptor.source_identity.clone(),
     )?
-    .with_history(descriptor.listing.history.clone()))
+    .with_history(descriptor.listing.history.clone())
+    .unwrap_or_else(|error| panic!("{error}")))
 }
 
 /// Every listed child of `directory` as the traversal observes it.
@@ -528,7 +529,8 @@ fn directory_with_history(sizes: &[Option<u64>]) -> TestResult<ObservedEntry> {
         None,
         SourceIdentity::new(identity(), IdentityStrength::PathScoped, b"d")?,
     )?
-    .with_history(raw.history().cloned().map(Box::new)))
+    .with_history(raw.history().cloned().map(Box::new))
+    .unwrap_or_else(|error| panic!("{error}")))
 }
 
 /// `path` with a history of one record per size, oldest first: a version of that size, or a
@@ -555,7 +557,9 @@ fn with_history(path: &str, sizes: &[Option<u64>]) -> TestResult<ObservedEntry> 
     }
     let history = ObjectHistory::whole(records, HistoryOrder::Server)?;
     let size = history.current().and_then(VersionRecord::size);
-    Ok(observed(path, size)?.with_history(Some(Box::new(history))))
+    Ok(observed(path, size)?
+        .with_history(Some(Box::new(history)))
+        .unwrap_or_else(|error| panic!("{error}")))
 }
 
 /// A store that completes a multipart upload to `x/` as `x` (`RustFS` 1.0.0), holding the real

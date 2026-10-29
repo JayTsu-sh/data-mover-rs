@@ -70,7 +70,7 @@ impl VersionRecord {
     /// A record as the listing spelled it: `"null"` (or an empty id) names no real version.
     ///
     /// # Errors
-    /// Returns an error for a real id that is longer than 1024 bytes or contains NUL.
+    /// Returns an error for a malformed version id or an ETag exceeding the model field limit.
     #[doc(hidden)]
     pub fn from_listing(
         reported_id: impl Into<String>,
@@ -84,7 +84,7 @@ impl VersionRecord {
     }
 
     /// # Errors
-    /// Returns an error for a malformed id, or the spelled-out `"null"` id.
+    /// Returns an error for a malformed id, the spelled-out `"null"` id, or an oversized ETag.
     #[doc(hidden)]
     pub fn new(
         version_id: Option<String>,
@@ -101,6 +101,10 @@ impl VersionRecord {
                     "the null version carries no version id",
                 ));
             }
+        }
+        if matches!(&kind, RecordKind::Object { etag, .. } if etag.len() > super::MAX_MODEL_FIELD_BYTES)
+        {
+            return Err(ModelValueError::new("etag", "exceeds model field limit"));
         }
         Ok(Self {
             version_id,

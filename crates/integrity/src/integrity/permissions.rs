@@ -4,9 +4,11 @@ use super::{
     Endpoint, IntegrityDifference, IntegrityFailure, IntegrityIgnored, IntegrityPlan, reconcile,
 };
 use crate::model::{
-    EntryKind, FailureClass, MetadataObservation, ObservationMode, ObservationPlan, SourceVersion,
+    EntryKind, FailureClass, MetadataObservation, ObservationMode, ObservationPlan,
 };
-use crate::storage::{PermissionFacts, PrincipalIdentity, SourceDescriptor, StorageRoleFailure};
+#[cfg(test)]
+use crate::storage::PrincipalIdentity;
+use crate::storage::{PermissionFacts, SourceDescriptor, StorageRoleFailure};
 
 pub(super) async fn compare_permissions(
     source: &Endpoint,
@@ -82,57 +84,11 @@ async fn permission_facts(
     endpoint: &Endpoint,
     entry: &SourceDescriptor,
 ) -> Result<PermissionFacts, IntegrityFailure> {
-    if matches!(entry.version(), SourceVersion::Current) {
-        return match endpoint.metadata.permissions(entry).await {
-            Ok(facts) => Ok(facts),
-            Err(failure) if is_unsupported(&failure) => Ok(PermissionFacts::default()),
-            Err(failure) => Err(endpoint.attribute(failure)),
-        };
+    match endpoint.metadata.permissions(entry).await {
+        Ok(facts) => Ok(facts),
+        Err(failure) if is_unsupported(&failure) => Ok(PermissionFacts::default()),
+        Err(failure) => Err(endpoint.attribute(failure)),
     }
-    if matches!(
-        endpoint
-            .metadata
-            .observation_capabilities()
-            .support(crate::model::MetadataFamily::OwnershipMode),
-        crate::model::ObservationSupport::NotApplicable
-            | crate::model::ObservationSupport::Unsupported
-    ) {
-        return Ok(PermissionFacts::default());
-    }
-    let plan = ObservationPlan::default().with_ownership_mode(ObservationMode::BestEffort);
-    let bound = match endpoint
-        .metadata
-        .observe_copy_bound_version(
-            &endpoint.path,
-            &entry.source_identity,
-            entry.version(),
-            plan,
-        )
-        .await
-    {
-        Ok(bound) => bound,
-        Err(failure) if is_unsupported(&failure) => {
-            return Ok(PermissionFacts::default());
-        }
-        Err(failure) => return Err(endpoint.attribute(failure)),
-    };
-    let ownership = optional_value(
-        endpoint,
-        bound.observations.ownership_mode(),
-        "permission observation failed",
-    )?;
-    let mut facts = match ownership {
-        Some(value) => PermissionFacts {
-            owner: Some(PrincipalIdentity::Numeric(value.uid)),
-            group: Some(PrincipalIdentity::Numeric(value.gid)),
-            mode: Some(value.mode & 0o7777),
-        },
-        None => PermissionFacts::default(),
-    };
-    if facts.mode.is_none() {
-        facts.mode = bound.mode_without_ownership;
-    }
-    Ok(facts)
 }
 
 fn is_unsupported(failure: &StorageRoleFailure) -> bool {

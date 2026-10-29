@@ -295,7 +295,8 @@ fn assemble_entry(
     .map_err(|_| internal())?
     .with_metadata(metadata)
     .with_rename_evidence(rename_evidence)
-    .with_history(listing.history);
+    .with_history(listing.history)
+    .map_err(|_| internal())?;
     match backend_fact {
         Some(fact) => entry
             .with_backend_fact_bytes(fact.to_vec())

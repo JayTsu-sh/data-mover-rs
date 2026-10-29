@@ -51,7 +51,8 @@ fn observation(descriptor: &SourceDescriptor) -> TestResult<ObservedEntry> {
         None,
         descriptor.source_identity.clone(),
     )?
-    .with_history(descriptor.listing.history.clone()))
+    .with_history(descriptor.listing.history.clone())
+    .unwrap_or_else(|error| panic!("{error}")))
 }
 
 /// Every listed `source` entry: of the current objects, or with its history (`histories`) — what

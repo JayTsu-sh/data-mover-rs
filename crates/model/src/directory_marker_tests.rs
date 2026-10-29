@@ -133,7 +133,9 @@ fn invalid_markers() -> Vec<ObservedEntry> {
         entry("data/", EntryKind::Directory, Some(0)),
         entry("data/", EntryKind::File, None),
         entry("data/", EntryKind::File, Some(1)),
-        marker().with_history(Some(Box::new(history()))),
+        marker()
+            .with_history(Some(Box::new(history())))
+            .unwrap_or_else(|error| panic!("{error}")),
     ];
     for path in ["data", "data//", "other/", "data/x/", "data2/"] {
         cases.push(entry(path, EntryKind::File, Some(0)));
@@ -159,7 +161,9 @@ fn marker_constraints_are_enforced_by_builder_and_decoder() {
     }
     for outer in [
         entry("data", EntryKind::File, None),
-        directory().with_history(Some(Box::new(history()))),
+        directory()
+            .with_history(Some(Box::new(history())))
+            .unwrap_or_else(|error| panic!("{error}")),
     ] {
         assert!(
             outer
@@ -178,20 +182,29 @@ fn marker_constraints_are_enforced_by_builder_and_decoder() {
 }
 
 #[test]
-fn attaching_history_after_a_marker_still_cannot_decode_as_a_valid_snapshot() {
-    // with_history is an internal, infallible builder used by history segmentation. Even if
-    // callers compose the builders in the wrong order, the decoder enforces exclusivity.
-    let invalid = directory()
+fn attaching_history_after_a_marker_is_rejected() {
+    let marked = directory()
         .with_directory_marker_object(Some(Box::new(marker())))
-        .unwrap_or_else(|error| panic!("{error}"))
-        .with_history(Some(Box::new(history())));
-    assert_eq!(
-        ObservedEntry::decode_snapshot(
-            invalid.encode_snapshot().as_bytes(),
-            &backend("s3://bucket")
-        ),
-        Err(SnapshotDecodeError::Malformed),
-    );
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(marked.with_history(Some(Box::new(history()))).is_err());
+}
+
+#[test]
+fn history_from_another_endpoint_is_rejected() {
+    let other = ObservedEntry::new(
+        StoragePath::new("data").unwrap_or_else(|e| panic!("{e}")),
+        EntryKind::File,
+        Some(0),
+        None,
+        SourceIdentity::new(
+            backend("s3://elsewhere"),
+            IdentityStrength::PathScoped,
+            b"data",
+        )
+        .unwrap_or_else(|e| panic!("{e}")),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(other.with_history(Some(Box::new(history()))).is_err());
 }
 
 #[test]

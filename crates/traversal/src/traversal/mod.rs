@@ -184,8 +184,8 @@ pub trait TraversalFilter: fmt::Debug + Send + Sync {
 ///
 /// ```
 /// # use std::num::NonZeroUsize;
-/// # use data_mover::model::StoragePath;
-/// # use data_mover::traversal::{TraversalOrder, TraversalRequest};
+/// # use data_mover_model::StoragePath;
+/// # use data_mover_traversal::{TraversalOrder, TraversalRequest};
 /// let request = TraversalRequest::new(StoragePath::root())
 ///     .order(TraversalOrder::Blocks)
 ///     .max_depth(NonZeroUsize::new(3))

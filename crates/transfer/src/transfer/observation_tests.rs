@@ -26,7 +26,8 @@ fn observation(descriptor: SourceDescriptor) -> TestResult<ObservedEntry> {
             .and_then(|times| times.modified),
         descriptor.source_identity,
     )?
-    .with_history(descriptor.listing.history))
+    .with_history(descriptor.listing.history)
+    .unwrap_or_else(|error| panic!("{error}")))
 }
 
 fn request(

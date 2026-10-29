@@ -151,7 +151,8 @@ async fn observed_versions_are_compared_even_after_newer_versions_become_current
             None,
             described.source_identity,
         )?
-        .with_history(Some(Box::new(history))))
+        .with_history(Some(Box::new(history)))
+        .unwrap_or_else(|error| panic!("{error}")))
     };
     let source_observed = versioned(source.read_source()?.describe(&path).await?)?;
     let destination_observed = versioned(destination.read_source()?.describe(&path).await?)?;

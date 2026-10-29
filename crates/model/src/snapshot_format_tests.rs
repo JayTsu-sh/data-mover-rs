@@ -111,6 +111,7 @@ fn s3_history() -> ObservedEntry {
     )
     .unwrap_or_else(|error| panic!("{error}"))
     .with_history(Some(Box::new(history)))
+    .unwrap_or_else(|error| panic!("{error}"))
 }
 
 /// Segment 1 of a longer history (whose largest version is 9 bytes), not complete, server-ordered;
@@ -143,7 +144,9 @@ fn s3_segment() -> ObservedEntry {
     records[0].set_metadata(observed("three"));
     let history = ObjectHistory::segment_of(records, HistoryOrder::Server, 1, false, Some(9))
         .unwrap_or_else(|error| panic!("{error}"));
-    s3_history().with_history(Some(Box::new(history)))
+    s3_history()
+        .with_history(Some(Box::new(history)))
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn fixtures() -> [(&'static str, ObservedEntry, &'static str); 4] {
@@ -205,7 +208,11 @@ fn another_version_byte_is_unsupported_never_misread() {
 /// Where the history section of `entry`'s snapshot starts: right after what the same entry
 /// without a history encodes before its rename evidence, marker tag and identity key.
 fn history_at(entry: &ObservedEntry) -> usize {
-    let bare = entry.clone().with_history(None).encode_snapshot();
+    let bare = entry
+        .clone()
+        .with_history(None)
+        .unwrap_or_else(|error| panic!("{error}"))
+        .encode_snapshot();
     bare.as_bytes().len() - 32 - 1 - 1 - 1
 }
 

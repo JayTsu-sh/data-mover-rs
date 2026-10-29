@@ -154,3 +154,67 @@ fn a_split_history_numbers_its_segments_and_completes_only_the_last() {
     // Short enough: one segment, unchanged.
     assert_eq!(whole(records.clone()).split(7), [whole(records)]);
 }
+
+#[test]
+fn an_oversized_etag_is_rejected_before_snapshot_assembly() {
+    let kind = RecordKind::Object {
+        size: 1,
+        etag: "e".repeat(crate::MAX_MODEL_FIELD_BYTES + 1),
+        modified: None,
+    };
+    assert!(VersionRecord::from_listing("v1", true, kind, identity("v1")).is_err());
+}
+
+#[test]
+fn whole_history_requires_segmentation_before_snapshot_serialization() {
+    let history = whole(vec![object("v1", true); MAX_HISTORY_RECORDS + 1]);
+    let entry = crate::ObservedEntry::new(
+        crate::StoragePath::new("file").unwrap_or_else(|e| panic!("{e}")),
+        crate::EntryKind::File,
+        Some(1),
+        None,
+        identity("file"),
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
+    .with_history(Some(Box::new(history)))
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(entry.try_encode_snapshot().is_err());
+    for segment in entry.into_segments(usize::MAX) {
+        let snapshot = segment
+            .try_encode_snapshot()
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            crate::ObservedEntry::decode_snapshot(
+                snapshot.as_bytes(),
+                segment.source_identity().backend()
+            )
+            .unwrap_or_else(|e| panic!("{e}")),
+            segment
+        );
+    }
+}
+
+#[test]
+fn a_mutated_history_cannot_understate_its_largest_version() {
+    let mut history = whole(vec![object("v1", true)]);
+    history.records_mut()[0] = VersionRecord::from_listing(
+        "v2",
+        true,
+        RecordKind::Object {
+            size: 2,
+            etag: String::new(),
+            modified: None,
+        },
+        identity("v2"),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let entry = crate::ObservedEntry::new(
+        crate::StoragePath::new("file").unwrap_or_else(|e| panic!("{e}")),
+        crate::EntryKind::File,
+        Some(1),
+        None,
+        identity("file"),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(entry.with_history(Some(Box::new(history))).is_err());
+}

@@ -420,11 +420,40 @@ impl ObservedEntry {
         self
     }
 
+    /// Attaches a listing's history on this entry's backend. A whole listing can exceed
+    /// the snapshot record limit: call [`Self::into_segments`] before snapshot serialization.
+    ///
+    /// # Errors
+    /// Rejects history alongside a directory marker, records from another backend, or a largest-version bound smaller than a record.
     #[doc(hidden)]
-    #[must_use]
-    pub fn with_history(mut self, history: Option<Box<ObjectHistory>>) -> Self {
+    pub fn with_history(
+        mut self,
+        history: Option<Box<ObjectHistory>>,
+    ) -> Result<Self, ModelValueError> {
+        if let Some(history) = history.as_deref()
+            && (self.marker.is_some()
+                || history
+                    .records()
+                    .iter()
+                    .filter_map(VersionRecord::size)
+                    .max()
+                    .is_some_and(|own| {
+                        history
+                            .largest_version()
+                            .is_none_or(|largest| own > largest)
+                    })
+                || history
+                    .records()
+                    .iter()
+                    .any(|record| record.identity().backend() != self.source_identity.backend()))
+        {
+            return Err(ModelValueError::new(
+                "history",
+                "must share the entry backend, respect the largest-version bound and cannot coexist with a marker",
+            ));
+        }
         self.history = history;
-        self
+        Ok(self)
     }
 
     /// Attaches the current marker object without replacing the directory's structural identity.
@@ -467,10 +496,12 @@ impl ObservedEntry {
     /// This entry once per segment of its history, each of at most `cap` records (P7 Q8): the
     /// same entry — path, identity key, every entry-level field — with segments numbered from 0,
     /// only the last complete. An entry without a history, or with one of at most `cap` records,
-    /// is itself.
+    /// is itself. The cap is clamped to 1 through [`super::MAX_HISTORY_RECORDS`], so every
+    /// returned entry can be serialized as one snapshot.
     #[doc(hidden)]
     #[must_use]
     pub fn into_segments(mut self, cap: usize) -> Vec<Self> {
+        let cap = cap.clamp(1, super::MAX_HISTORY_RECORDS);
         let Some(history) = self.history.take() else {
             return vec![self];
         };
@@ -607,8 +638,32 @@ impl ObservedEntry {
     /// Rename evidence is included; its [`super::RenameContext`] belongs to the whole scan and
     /// must be persisted separately. Without that context candidates cannot authorize matching.
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics if a whole listing exceeds the history segment limit. Call [`Self::into_segments`]
+    /// first, or use [`Self::try_encode_snapshot`] for typed rejection.
     pub fn encode_snapshot(&self) -> EntrySnapshot {
-        self.encode()
+        self.try_encode_snapshot()
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Encodes a snapshot, rejecting a whole history that has not been segmented yet.
+    ///
+    /// # Errors
+    /// Returns an error if history exceeds [`super::MAX_HISTORY_RECORDS`]. Use
+    /// [`Self::into_segments`] before serializing a whole listing.
+    pub fn try_encode_snapshot(&self) -> Result<EntrySnapshot, ModelValueError> {
+        if self
+            .history
+            .as_ref()
+            .is_some_and(|history| history.records().len() > super::MAX_HISTORY_RECORDS)
+        {
+            return Err(ModelValueError::new(
+                "history",
+                "split whole history before snapshot serialization",
+            ));
+        }
+        Ok(self.encode())
     }
 
     /// Reconstructs an observation from an unchanged snapshot taken on `backend`.
