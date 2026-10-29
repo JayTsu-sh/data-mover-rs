@@ -37,8 +37,9 @@ attempt=1
 while (( attempt <= HDFS_SMOKE_ATTEMPTS )); do
   if run_hdfs_contract; then
     exit 0
+  else
+    status=$?
   fi
-  status=$?
   if (( attempt == HDFS_SMOKE_ATTEMPTS )); then
     exit "$status"
   fi

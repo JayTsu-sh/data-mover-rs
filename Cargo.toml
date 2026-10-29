@@ -1,95 +1,115 @@
 [package]
 name = "data-mover"
-version = "0.3.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[workspace]
+members = ["crates/*"]
+default-members = ["."]
+resolver = "3"
+
+[workspace.package]
+version = "0.4.0"
 edition = "2024"
+rust-version = "1.95"
+
+[features]
+default = ["full"]
+full = ["traversal", "transfer", "integrity", "metadata", "acl", "backend-local", "backend-nfs", "backend-cifs", "backend-s3", "backend-hdfs"]
+acl = ["dep:data-mover-acl"]
+metadata = ["dep:data-mover-metadata", "acl"]
+transfer = ["dep:data-mover-transfer", "metadata"]
+integrity = ["dep:data-mover-integrity", "acl"]
+traversal = ["dep:data-mover-traversal"]
+backend-local = ["dep:data-mover-backend-local"]
+backend-nfs = ["dep:data-mover-backend-nfs", "acl", "dep:nfs-rs"]
+backend-cifs = ["dep:data-mover-backend-cifs", "dep:smb-domain"]
+backend-s3 = ["dep:data-mover-backend-s3", "dep:aws-config", "dep:aws-credential-types", "dep:aws-sdk-s3", "dep:aws-smithy-runtime-api", "dep:aws-smithy-types", "dep:aws-types"]
+backend-hdfs = ["dep:data-mover-backend-hdfs", "dep:hdfs-native"]
 
 [dependencies]
-arc-swap = "1.9.1"
-async-trait = "0.1"
-aws-config = "1.8.15"
-aws-credential-types = "1.2.14"
-aws-sdk-s3 = "1.129.0"
-aws-smithy-runtime-api = "1.11"
-aws-smithy-types = { version = "1.4", features = ["http-body-1-x"] }
-aws-types = "1.3.14"
-base64 = "0.22"
-binrw = "0.15"
-blake3 = "1.8.4"
-bytes = { version = "1", features = ["serde"] }
-cap-std = "4.0.3"
-# Same version cap-std already builds; used directly only for `open_dir_nofollow`.
-cap-primitives = "4.0.3"
-chrono = "0.4.44"
-filetime = "0.2.27"
-futures = "0.3.32"
-glob = "0.3.3"
-governor = "0.10.4"
-hdfs-native = { git = "https://github.com/kimahriman/hdfs-native", rev = "695fc47e9f88804e39bba1d30bf128e66da9b8d6" }
-http-body = "1.0.1"
-dashmap = "6.1.0"
-parking_lot = "0.12"
-percent-encoding = "2"
-tracing = "0.1.44"
-moka = { version = "0.12.15", features = ["sync"] }
-md-5 = "0.10"
-nfs-rs = "0.9.1"
-num-traits = "0.2.19"
-path-clean = "1.0.1"
-quick-xml = { version = "0.39.2", features = ["serialize"] }
-hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-serde = { version = "1", features = ["derive", "rc"] }
-smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "2649a0bbd615c23d64faca0053e969288694e034" }
-thiserror = "2.0.18"
-tokio = { version = "1.51.1", features = ["full"] }
-tokio-util = "0.7"
-url = "2.5.8"
-uuid = { version = "1.18.1", features = ["v4"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-rustix = { version = "1.1", features = ["process", "thread"] }
-xattr = "1.6"
-
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
-    "Win32",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-] }
-windows-sys = { version = "0.61.2", features = [
-    "Wdk_System_SystemServices",
-    "Win32",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_Foundation",
-    "Win32_System_SystemServices",
-    "Win32_System_Memory",
-    "Win32_Storage_FileSystem",
-] }
+data-mover-model = { path = "crates/model" }
+data-mover-storage-core = { path = "crates/storage-core" }
+data-mover-acl = { path = "crates/acl", optional = true }
+data-mover-metadata = { path = "crates/metadata", optional = true }
+data-mover-integrity = { path = "crates/integrity", optional = true }
+data-mover-traversal = { path = "crates/traversal", optional = true }
+data-mover-transfer = { path = "crates/transfer", optional = true }
+data-mover-backend-local = { path = "crates/backend-local", optional = true }
+data-mover-backend-nfs = { path = "crates/backend-nfs", optional = true }
+data-mover-backend-cifs = { path = "crates/backend-cifs", optional = true }
+data-mover-backend-s3 = { path = "crates/backend-s3", optional = true }
+data-mover-backend-hdfs = { path = "crates/backend-hdfs", optional = true }
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-smithy-runtime-api = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, features = ["http-body-1-x"], optional = true }
+aws-types = { workspace = true, optional = true }
+hdfs-native = { workspace = true, optional = true }
+nfs-rs = { workspace = true, optional = true }
+smb-domain = { workspace = true, optional = true }
 
 [dev-dependencies]
-clap = { version = "4.6.0", features = ["derive"] }
-indicatif = "0.18.4"
-serde_json = "1"
-tempfile = "3"
-# Local TLS endpoint for the certificate-verification tests (tests/s3_tls_verify.rs).
-tokio-rustls = { version = "0.26.4", default-features = false }
-tokio = { version = "1.51.1", features = ["test-util"] }
-# Real-server tests turn protocol tracing on through RUST_LOG; see tests/common/mod.rs.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+binrw = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+cap-std = { workspace = true }
+cap-primitives = { workspace = true }
+chrono = { workspace = true }
+filetime = { workspace = true }
+futures = { workspace = true }
+glob = { workspace = true }
+governor = { workspace = true }
+http-body = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+percent-encoding = { workspace = true }
+tracing = { workspace = true }
+moka = { workspace = true, features = ["sync"] }
+md-5 = { workspace = true }
+num-traits = { workspace = true }
+path-clean = { workspace = true }
+quick-xml = { workspace = true, features = ["serialize"] }
+hyper-rustls = { workspace = true, features = ["http1", "http2"] }
+hyper-util = { workspace = true, features = ["client-legacy", "tokio"] }
+rustls = { workspace = true, features = ["ring", "std"] }
+serde = { workspace = true, features = ["derive", "rc"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-util = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+clap = { workspace = true, features = ["derive"] }
+indicatif = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
-# 546 个依赖里几乎不会去单步调试，本 crate 自己的代码不受影响。
-# 这是 dev 产物体积的大头，且完全可移植。
-# 调试信息不再复制进每个产物，见 .cargo/config.toml (只对 unix 生效)。
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+rustix = { workspace = true, features = ["process", "thread"] }
+xattr = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = ["Win32", "Win32_Security", "Win32_Security_Authorization"] }
+windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32", "Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_SystemServices", "Win32_System_Memory", "Win32_Storage_FileSystem"] }
+
 [profile.dev.package."*"]
 debug = 0
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 unsafe_code = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
@@ -97,89 +117,402 @@ dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
 
-# Lab executables retain their cargo target names; source lives with the harnesses.
-
 [[example]]
 name = "backend_pipeline_benchmark"
 path = "tests/lab/tools/backend_pipeline_benchmark.rs"
+required-features = ["full"]
 
 [[example]]
 name = "storage_small_benchmark"
 path = "tests/lab/tools/storage_small_benchmark.rs"
+required-features = ["full"]
 
 [[example]]
 name = "local_write_benchmark"
 path = "tests/lab/tools/local_write_benchmark.rs"
+required-features = ["full"]
 
 [[example]]
 name = "local_rename_evidence"
 path = "tests/lab/tools/local_rename_evidence.rs"
+required-features = ["full"]
 
 [[example]]
 name = "storage_resume"
 path = "tests/lab/tools/storage_resume.rs"
+required-features = ["full"]
 
 [[example]]
 name = "nfs_metadata_copy"
 path = "tests/lab/tools/nfs_metadata_copy.rs"
+required-features = ["full"]
 
 [[example]]
 name = "hdfs_fault_mutation"
 path = "tests/lab/tools/hdfs_fault_mutation.rs"
+required-features = ["full"]
 
 [[example]]
 name = "nfs_copy_comparison"
 path = "tests/lab/tools/nfs_copy_comparison.rs"
+required-features = ["full"]
 
 [[example]]
 name = "local_copy_comparison"
 path = "tests/lab/tools/local_copy_comparison.rs"
+required-features = ["full"]
 
 [[example]]
 name = "storage_delete_contract"
 path = "tests/lab/tools/storage_delete_contract.rs"
+required-features = ["full"]
 
 [[example]]
 name = "nfs_opt_dir"
 path = "tests/lab/tools/nfs_opt_dir.rs"
+required-features = ["full"]
 
 [[example]]
 name = "cifs_mount_comparison"
 path = "tests/lab/tools/cifs_mount_comparison.rs"
+required-features = ["full"]
 
 [[example]]
 name = "nfs_mount_comparison"
 path = "tests/lab/tools/nfs_mount_comparison.rs"
+required-features = ["full"]
 
 [[example]]
 name = "s3_history_replay"
 path = "tests/lab/tools/s3_history_replay.rs"
+required-features = ["full"]
 
 [[example]]
 name = "integrity_input_probe"
 path = "tests/lab/tools/integrity_input_probe.rs"
+required-features = ["full"]
 
 [[example]]
 name = "transfer_resume"
 path = "tests/lab/tools/transfer_resume.rs"
+required-features = ["full"]
 
 [[example]]
 name = "nfs3_contract"
 path = "tests/lab/tools/nfs3_contract.rs"
 test = true
+required-features = ["full"]
 
 [[example]]
 name = "hdfs_kerberos_copy"
 path = "tests/lab/tools/hdfs_kerberos_copy.rs"
+required-features = ["full"]
 
 [[example]]
 name = "hdfs_ha_probe"
 path = "tests/lab/tools/hdfs_ha_probe.rs"
+required-features = ["full"]
 
 [[example]]
 name = "storage_inspect"
 path = "tests/lab/tools/storage_inspect.rs"
+required-features = ["full"]
 
 [[example]]
 name = "storage_role_operations"
 path = "tests/lab/tools/storage_role_operations/main.rs"
+required-features = ["full"]
+
+[[example]]
+name = "storage_namespace"
+path = "examples/storage_namespace.rs"
+required-features = []
+
+[[example]]
+name = "storage_traverse"
+path = "examples/storage_traverse.rs"
+required-features = ["traversal"]
+
+[[example]]
+name = "nfs_export"
+path = "examples/nfs_export.rs"
+required-features = ["backend-nfs"]
+
+[[example]]
+name = "storage_read"
+path = "examples/storage_read.rs"
+required-features = []
+
+[[example]]
+name = "storage_copy"
+path = "examples/storage_copy.rs"
+required-features = ["transfer", "integrity"]
+
+[[example]]
+name = "storage_rename"
+path = "examples/storage_rename.rs"
+required-features = []
+
+[[example]]
+name = "storage_integrity_check"
+path = "examples/storage_integrity_check.rs"
+required-features = ["integrity"]
+
+[[test]]
+name = "backend_factory"
+path = "tests/backend_factory.rs"
+required-features = ["full"]
+
+[[test]]
+name = "cifs_capability_probe"
+path = "tests/cifs_capability_probe.rs"
+required-features = ["full"]
+
+[[test]]
+name = "cifs_namespace_contract"
+path = "tests/cifs_namespace_contract.rs"
+required-features = ["full"]
+
+[[test]]
+name = "cifs_policy_contract"
+path = "tests/cifs_policy_contract.rs"
+required-features = ["full"]
+
+[[test]]
+name = "cifs_readonly_contract"
+path = "tests/cifs_readonly_contract.rs"
+required-features = ["full"]
+
+[[test]]
+name = "copy_error_attribution"
+path = "tests/copy_error_attribution.rs"
+required-features = ["full"]
+
+[[test]]
+name = "creation_modes_real"
+path = "tests/creation_modes_real.rs"
+required-features = ["full"]
+
+[[test]]
+name = "expert_transfer"
+path = "tests/expert_transfer.rs"
+required-features = ["full"]
+
+[[test]]
+name = "hdfs_architecture_contract"
+path = "tests/hdfs_architecture_contract.rs"
+required-features = ["full"]
+
+[[test]]
+name = "hdfs_native_contract"
+path = "tests/hdfs_native_contract.rs"
+required-features = ["full"]
+
+[[test]]
+name = "local_artifact_listing"
+path = "tests/local_artifact_listing.rs"
+required-features = ["traversal", "backend-local"]
+
+[[test]]
+name = "local_creation_modes"
+path = "tests/local_creation_modes.rs"
+required-features = ["transfer", "traversal", "backend-local"]
+
+[[test]]
+name = "local_metadata"
+path = "tests/local_metadata.rs"
+required-features = ["metadata", "transfer", "traversal", "backend-local"]
+
+[[test]]
+name = "local_namespace_contract"
+path = "tests/local_namespace_contract.rs"
+required-features = ["backend-local"]
+
+[[test]]
+name = "local_transfer_runtime"
+path = "tests/local_transfer_runtime.rs"
+required-features = ["transfer", "backend-local"]
+
+[[test]]
+name = "nfs_listing_contract"
+path = "tests/nfs_listing_contract.rs"
+required-features = ["full"]
+
+[[test]]
+name = "nfs_mkdir_contract"
+path = "tests/nfs_mkdir_contract.rs"
+required-features = ["full"]
+
+[[test]]
+name = "observed_entry_snapshot"
+path = "tests/observed_entry_snapshot.rs"
+required-features = []
+
+[[test]]
+name = "role_symlink"
+path = "tests/role_symlink.rs"
+required-features = ["full"]
+
+[[test]]
+name = "role_tar"
+path = "tests/role_tar.rs"
+required-features = ["full"]
+
+[[test]]
+name = "s3_architecture_contract"
+path = "tests/s3_architecture_contract.rs"
+required-features = ["full"]
+
+[[test]]
+name = "s3_tls_verify"
+path = "tests/s3_tls_verify.rs"
+required-features = ["full"]
+
+[[test]]
+name = "source_versions"
+path = "tests/source_versions.rs"
+required-features = ["full"]
+
+[[test]]
+name = "storage_capability_contract"
+path = "tests/storage_capability_contract.rs"
+required-features = ["full"]
+
+[[test]]
+name = "storage_model_contract"
+path = "tests/storage_model_contract.rs"
+required-features = []
+
+[[test]]
+name = "storage_options_public_api"
+path = "tests/storage_options_public_api.rs"
+required-features = ["transfer"]
+
+[[test]]
+name = "test_copy_file_cancel"
+path = "tests/test_copy_file_cancel.rs"
+required-features = ["full"]
+
+[[test]]
+name = "test_copy_file_qos"
+path = "tests/test_copy_file_qos.rs"
+required-features = ["full"]
+
+[[test]]
+name = "test_copy_file_resume"
+path = "tests/test_copy_file_resume.rs"
+required-features = ["full"]
+
+[[test]]
+name = "test_copy_size_guard"
+path = "tests/test_copy_size_guard.rs"
+required-features = ["full"]
+
+[[test]]
+name = "test_local_overwrite_truncate"
+path = "tests/test_local_overwrite_truncate.rs"
+required-features = ["full"]
+
+[[test]]
+name = "test_local_positional_io"
+path = "tests/test_local_positional_io.rs"
+required-features = ["full"]
+
+[[test]]
+name = "test_local_write_flush"
+path = "tests/test_local_write_flush.rs"
+required-features = ["full"]
+
+[[test]]
+name = "test_storage_type"
+path = "tests/test_storage_type.rs"
+required-features = ["full"]
+
+[[test]]
+name = "test_transfer_concurrency"
+path = "tests/test_transfer_concurrency.rs"
+required-features = []
+
+[[test]]
+name = "test_write_chunk_stream"
+path = "tests/test_write_chunk_stream.rs"
+required-features = ["full"]
+
+[[test]]
+name = "transfer_identity"
+path = "tests/transfer_identity.rs"
+required-features = ["full"]
+
+[[test]]
+name = "transfer_public_api"
+path = "tests/transfer_public_api.rs"
+required-features = ["full"]
+
+[[test]]
+name = "transfer_relative_paths"
+path = "tests/transfer_relative_paths.rs"
+required-features = ["full"]
+
+[[test]]
+name = "cifs_acl_fallback_probe"
+path = "tests/cifs_acl_fallback_probe.rs"
+required-features = ["full"]
+
+[[test]]
+name = "private_creation_modes"
+path = "tests/private_creation_modes.rs"
+required-features = ["full"]
+
+[workspace.dependencies]
+arc-swap = "1.9.1"
+async-trait = "0.1"
+aws-config = "1.8.15"
+aws-credential-types = "1.2.14"
+aws-sdk-s3 = "1.129.0"
+aws-smithy-runtime-api = "1.11"
+aws-smithy-types = { version = "1.4" }
+aws-types = "1.3.14"
+base64 = "0.22"
+binrw = "0.15"
+blake3 = "1.8.4"
+bytes = { version = "1" }
+cap-primitives = "4.0.3"
+cap-std = "4.0.3"
+chrono = "0.4.44"
+clap = { version = "4.6.0" }
+dashmap = "6.1.0"
+filetime = "0.2.27"
+futures = "0.3.32"
+glob = "0.3.3"
+governor = "0.10.4"
+hdfs-native = { git = "https://github.com/kimahriman/hdfs-native", rev = "695fc47e9f88804e39bba1d30bf128e66da9b8d6" }
+http-body = "1.0.1"
+hyper-rustls = { version = "0.27" }
+hyper-util = { version = "0.1" }
+indicatif = "0.18.4"
+libc = "0.2"
+md-5 = "0.10"
+moka = { version = "0.12.15" }
+nfs-rs = "0.9.1"
+num-traits = "0.2.19"
+parking_lot = "0.12"
+path-clean = "1.0.1"
+percent-encoding = "2"
+quick-xml = { version = "0.39.2" }
+rustix = { version = "1.1" }
+rustls = { version = "0.23", default-features = false }
+serde = { version = "1" }
+serde_json = "1"
+smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "2649a0bbd615c23d64faca0053e969288694e034" }
+tempfile = "3"
+thiserror = "2.0.18"
+tokio = { version = "1.51.1", default-features = false }
+tokio-rustls = { version = "0.26.4", default-features = false }
+tokio-util = "0.7"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3" }
+url = "2.5.8"
+uuid = { version = "1.18.1" }
+windows = { version = "0.62.2" }
+windows-sys = { version = "0.61.2" }
+xattr = "1.6"

@@ -144,28 +144,43 @@ validate_run_id() {
 hdfs_run_root() {
   local run_id="$1"
   validate_run_id "$run_id"
-  python3 - "$LAB_HDFS_LOCATION" "$LAB_HDFS_ADMIN_USER" "$run_id" <<'PY'
+  python3 - "$LAB_HDFS_LOCATION" "$LAB_HDFS_ADMIN_USER" "$run_id" "$LAB_HDFS_CONFIG_DIR" <<'PY'
+import pathlib
 import re
 import sys
 import urllib.parse
+import xml.etree.ElementTree as ET
 
-location, admin_user, run_id = sys.argv[1:]
+location, admin_user, run_id, config_dir = sys.argv[1:]
 parsed = urllib.parse.urlsplit(location)
 if (
     parsed.scheme != "hdfs"
     or parsed.password is not None
     or parsed.hostname is None
-    or parsed.port is None
     or parsed.query
     or parsed.fragment
 ):
-    raise SystemExit("LAB_HDFS_LOCATION must be an explicit password-free direct HDFS URL")
+    raise SystemExit("LAB_HDFS_LOCATION must be an explicit password-free HDFS URL")
+if parsed.port is None:
+    # A configured HA nameservice has no port. Preserve it so the client uses
+    # its failover addresses and the cluster's Kerberos service principal.
+    site = pathlib.Path(config_dir) / "hdfs-site.xml"
+    nameservices = set()
+    if config_dir and site.is_file():
+        for prop in ET.parse(site).getroot().findall("property"):
+            if prop.findtext("name") == "dfs.nameservices":
+                nameservices.update(
+                    name.strip() for name in (prop.findtext("value") or "").split(",")
+                )
+    if parsed.hostname not in nameservices:
+        raise SystemExit("port-free HDFS URL must name a configured HA nameservice")
 kind = run_id.split("-", 1)[0]
 if kind not in {"nightly", "release"}:
     raise SystemExit("invalid HDFS lab run kind")
 user = urllib.parse.quote(admin_user, safe="")
 host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
 root = f"/tmp/data-mover-{kind}/{run_id}/hdfs"
-print(f"hdfs://{user}@{host}:{parsed.port}{root}")
+authority = f"{host}:{parsed.port}" if parsed.port is not None else host
+print(f"hdfs://{user}@{authority}{root}")
 PY
 }

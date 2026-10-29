@@ -1,0 +1,15 @@
+[package]
+name = "data-mover-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+[lints]
+workspace = true
+[dependencies]
+data-mover-storage-core = { path = "../storage-core" }
+data-mover-backend-local = { path = "../backend-local" }
+data-mover-backend-nfs = { path = "../backend-nfs" }
+data-mover-backend-cifs = { path = "../backend-cifs" }
+data-mover-backend-s3 = { path = "../backend-s3" }
+data-mover-backend-hdfs = { path = "../backend-hdfs" }

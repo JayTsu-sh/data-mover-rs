@@ -1,0 +1,46 @@
+[package]
+name = "data-mover-backend-s3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+data-mover-model = { path = "../model" }
+data-mover-storage-core = { path = "../storage-core" }
+async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true, features = ["http-body-1-x"] }
+aws-types = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+futures = { workspace = true }
+http-body = { workspace = true }
+percent-encoding = { workspace = true }
+tracing = { workspace = true }
+md-5 = { workspace = true }
+quick-xml = { workspace = true, features = ["serialize"] }
+hyper-rustls = { workspace = true, features = ["http1", "http2"] }
+hyper-util = { workspace = true, features = ["client-legacy", "tokio"] }
+rustls = { workspace = true, features = ["ring", "std"] }
+serde = { workspace = true, features = ["derive", "rc"] }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"], optional = true }
+
+[features]
+test-support = ["data-mover-storage-core/test-support", "dep:tracing-subscriber"]
+
+[dev-dependencies]
+data-mover-storage-core = { path = "../storage-core", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

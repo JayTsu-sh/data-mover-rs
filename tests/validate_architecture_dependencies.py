@@ -3,6 +3,7 @@
 
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 
@@ -207,7 +208,56 @@ def backend_roots(code: str, backend_depth: int) -> set[str]:
     return roots
 
 
+def validate_workspace(root: Path) -> list[str]:
+    errors = []
+    allowed = {
+        "model": set(), "acl": {"model"}, "storage-core": {"model"},
+        "metadata": {"model", "storage-core", "acl"},
+        "integrity": {"model", "storage-core", "acl"},
+        "traversal": {"model", "storage-core", "acl"},
+        "transfer": {"model", "storage-core", "acl", "metadata"},
+        **{"backend-" + name: {"model", "storage-core", "acl"} for name in BACKENDS},
+    }
+    sdk_owners = {"nfs-rs": "backend-nfs", "hdfs-native": "backend-hdfs", "smb-domain": "backend-cifs", "smb": "backend-cifs"}
+    workspace = tomllib.loads((root / "Cargo.toml").read_text()).get("workspace", {}).get("dependencies", {})
+    for manifest in (root / "crates").glob("*/Cargo.toml"):
+        if manifest.parent.name not in allowed and manifest.parent.name != "test-support":
+            errors.append(f"{manifest.parent.name}: missing architecture dependency rule")
+    for name, permitted in allowed.items():
+        manifest = root / "crates" / name / "Cargo.toml"
+        if not manifest.exists():
+            errors.append(f"workspace crate {name} is missing")
+            continue
+        data = tomllib.loads(manifest.read_text())
+        tables = [data.get("dependencies", {}), data.get("build-dependencies", {})]
+        for target in data.get("target", {}).values():
+            tables.extend([target.get("dependencies", {}), target.get("build-dependencies", {})])
+        for table in tables:
+            for alias, specification in table.items():
+                if isinstance(specification, dict) and specification.get("workspace"):
+                    specification = workspace.get(alias, specification)
+                dependency = specification.get("package", alias) if isinstance(specification, dict) else alias
+                if dependency == "data-mover":
+                    errors.append(f"{name}: must not depend on the facade")
+                elif dependency.startswith("data-mover-") and dependency.removeprefix("data-mover-") not in permitted:
+                    errors.append(f"{name}: must not depend on {dependency}")
+                owner = "backend-s3" if dependency.startswith("aws-") else sdk_owners.get(dependency)
+                if owner and owner != name:
+                    errors.append(f"{name}: protocol SDK {dependency} belongs to {owner}")
+        if data.get("lints", {}).get("workspace") is not True:
+            errors.append(f"{name}: must inherit workspace lints")
+    # Keep protocol dispatch out of functional engines, including after a file move.
+    for name in ["transfer", "traversal"]:
+        for path in rust_files(root / "crates" / name / "src" / name):
+            code = code_only(path.read_text())
+            if BACKEND_KIND_BRANCH.search(code):
+                errors.append(f"{relative(path, root)}: {name} must not branch on BackendKind")
+    return errors
+
+
 def validate(root: Path) -> list[str]:
+    if (root / "crates" / "storage-core" / "Cargo.toml").exists():
+        return validate_workspace(root)
     source = root / "src"
     errors = []
     lib_text = code_only((source / "lib.rs").read_text())

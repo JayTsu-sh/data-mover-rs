@@ -1,0 +1,32 @@
+[package]
+name = "data-mover-backend-cifs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+data-mover-model = { path = "../model" }
+data-mover-acl = { path = "../acl" }
+data-mover-storage-core = { path = "../storage-core" }
+async-trait = { workspace = true }
+binrw = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+smb-domain = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[features]
+test-support = ["data-mover-storage-core/test-support"]
+
+[dev-dependencies]
+data-mover-storage-core = { path = "../storage-core", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }

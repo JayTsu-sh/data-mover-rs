@@ -13,27 +13,17 @@ sys.path.insert(0, str(SHARED))
 
 from protocol_constants import PROJECT_ROOT  # noqa: E402
 
-# Baseline 截至 2026-08-03 (所有现有 src/*.rs，含 <1000 行的)
-# 增长 / 缩减按 % 计算。新文件 (不在表内) 必须 ≤1000 行。
+# Existing large files carried into the 0.4 workspace (pre-extraction line counts).
+# Use full relative paths: identical leaf names belong to different crates.
 BASELINE = {
-    "filter.rs": 5303,
-    "s3.rs": 4329,
-    "nfs.rs": 3853,
-    "cifs.rs": 36,  # #150 后只剩 factory bridge
-    "storage_enum.rs": 2246,
-    "local.rs": 1423,
-    # Integrity tests intentionally stay next to the implementation so private
-    # stream/retry helpers can be exercised without widening the public API.
-    "integrity_check.rs": 1372,
-    "acl.rs": 985,
-    "qos.rs": 672,
-    "lib.rs": 565,
-    "tar_pack.rs": 286,
-    "error.rs": 166,
-    "time_util.rs": 130,
-    "checksum.rs": 71,
-    "url_redact.rs": 66,
-    "write_pipeline.rs": 226,
+    'crates/backend-cifs/src/backend/source_tests.rs': 1023,
+    'crates/backend-local/src/backend/staged.rs': 1569,
+    'crates/backend-local/src/backend/staged/tests.rs': 1311,
+    'crates/backend-nfs/src/backend/client.rs': 2477,
+    'crates/backend-nfs/src/backend/staged_tests.rs': 1466,
+    'crates/storage-core/src/qos.rs': 1286,
+    'crates/transfer/src/transfer/tests.rs': 1382,
+    'crates/traversal/src/filter.rs': 5414,
 }
 NEW_FILE_LIMIT = 1000
 GROWTH_WARN_PCT = 5
@@ -50,29 +40,32 @@ def main() -> int:
     warns = []
     print(f"{'file':<20} {'loc':>6} {'baseline':>9} {'status':<10}")
     print("-" * 50)
-    for rs in sorted(src.glob("*.rs")):
+    root = Path(PROJECT_ROOT)
+    sources = [*src.rglob("*.rs"), *(root / "crates").glob("*/src/**/*.rs")]
+    for rs in sorted(sources):
+        relative = rs.relative_to(root).as_posix()
         loc = sum(1 for _ in rs.open(encoding="utf-8"))
-        baseline = BASELINE.get(rs.name)
+        baseline = BASELINE.get(relative)
         if baseline is None:
             status = "NEW"
             if loc > NEW_FILE_LIMIT:
                 status = f"NEW>{NEW_FILE_LIMIT} FAIL"
-                fails.append(f"{rs.name}: NEW file {loc} > {NEW_FILE_LIMIT}")
+                fails.append(f"{relative}: NEW file {loc} > {NEW_FILE_LIMIT}")
         else:
             growth = (loc - baseline) / baseline * 100
             if growth > HIGH_GROWTH_PCT:
                 status = f"GROW +{growth:.1f}% WARN"
                 warns.append(
-                    f"{rs.name}: grew {growth:.1f}% (baseline {baseline}, now {loc})"
+                    f"{relative}: grew {growth:.1f}% (baseline {baseline}, now {loc})"
                 )
             elif growth > GROWTH_WARN_PCT:
                 status = f"GROW +{growth:.1f}% WARN"
-                warns.append(f"{rs.name}: grew {growth:.1f}%")
+                warns.append(f"{relative}: grew {growth:.1f}%")
             elif growth < -GROWTH_WARN_PCT:
                 status = f"SHRINK {growth:.1f}%"
             else:
                 status = "SAME"
-        print(f"{rs.name:<20} {loc:>6} {str(baseline or '-'):>9} {status:<10}")
+        print(f"{relative:<20} {loc:>6} {str(baseline or '-'):>9} {status:<10}")
 
     if fails:
         print(f"\n[skill audit-large] FAIL ({len(fails)}):")

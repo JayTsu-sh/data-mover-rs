@@ -1,0 +1,39 @@
+[package]
+name = "data-mover-storage-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+data-mover-model = { path = "../model" }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
+cap-std = { workspace = true }
+filetime = { workspace = true }
+futures = { workspace = true }
+governor = { workspace = true }
+percent-encoding = { workspace = true }
+tracing = { workspace = true }
+num-traits = { workspace = true }
+quick-xml = { workspace = true, features = ["serialize"] }
+serde = { workspace = true, features = ["derive", "rc"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32", "Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_SystemServices", "Win32_System_Memory", "Win32_Storage_FileSystem"] }
+
+[features]
+test-support = []

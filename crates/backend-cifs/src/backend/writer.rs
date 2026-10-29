@@ -1,0 +1,140 @@
+//! Concurrent positioned writes with a contiguous FLUSH barrier at each checkpoint.
+
+use super::{
+    at_destination::write_pointer,
+    source::{classify, entry_failure},
+    staged::{CifsStageFile, CifsStagedDestination},
+};
+use crate::model::{FailureClass, Operation};
+use crate::storage::{ByteStream, PreparedStage, StorageRoleFailure};
+use bytes::Bytes;
+use futures::{StreamExt as _, stream::FuturesUnordered};
+
+// Keep draining and persistence in the same loop so issued writes cannot escape a barrier.
+#[allow(clippy::too_many_lines)]
+pub(super) async fn write(
+    adapter: &CifsStagedDestination,
+    stage: &PreparedStage,
+    file: &dyn CifsStageFile,
+    mut input: ByteStream,
+) -> Result<u64, StorageRoleFailure> {
+    let path = stage.final_destination().path();
+    let maximum = file.maximum_write_chunk() as usize;
+    if maximum == 0 {
+        return Err(entry_failure(
+            path,
+            Operation::Write,
+            FailureClass::Protocol,
+        ));
+    }
+    let depth = adapter.write_inflight;
+    let mut writes = FuturesUnordered::new();
+    let mut offset = stage.write_offset();
+    let mut pending = Bytes::new();
+    let mut done = false;
+    let mut failure = None;
+    let interval = stage
+        .deferred_checkpoint()
+        .as_ref()
+        .map(|v| v.interval_bytes);
+    let mut next = interval.map(|step| offset.saturating_add(step));
+    loop {
+        if failure.is_some() || (done && pending.is_empty()) {
+            break;
+        }
+        if next == Some(offset)
+            && stage
+                .deferred_checkpoint()
+                .as_ref()
+                .is_some_and(|v| offset < v.source_size)
+        {
+            while let Some(result) = writes.next().await {
+                if let Err(error) = result {
+                    failure.get_or_insert_with(|| classify(path, Operation::Write, &error));
+                }
+            }
+            if failure.is_some() {
+                break;
+            }
+            if let Err(error) = save(adapter, stage, file, offset).await {
+                failure = Some(error);
+                break;
+            }
+            next = interval.map(|step| offset.saturating_add(step));
+        }
+        if !pending.is_empty() && writes.len() < depth {
+            let count = pending.len().min(maximum).min(
+                usize::try_from(
+                    next.filter(|v| *v > offset)
+                        .map_or(u64::MAX, |v| v - offset),
+                )
+                .unwrap_or(usize::MAX),
+            );
+            let chunk = pending.split_to(count);
+            let start = offset;
+            let Some(end) = offset.checked_add(count as u64) else {
+                failure = Some(entry_failure(
+                    path,
+                    Operation::Write,
+                    FailureClass::InvalidInput,
+                ));
+                break;
+            };
+            offset = end;
+            writes.push(async move {
+                let result = file.write_all_at(start, chunk).await;
+                if result.is_ok() {
+                    stage.confirmed_write(start, count as u64);
+                }
+                result
+            });
+            continue;
+        }
+        tokio::select! {
+            result = writes.next(), if !writes.is_empty() => {
+                if let Some(Err(error)) = result { failure = Some(classify(path, Operation::Write, &error)); }
+            }
+            item = input.next(), if pending.is_empty() && !done && writes.len() < depth => {
+                match item { Some(Ok(bytes)) => pending = bytes, Some(Err(error)) => failure = Some(error), None => done = true }
+            }
+        }
+    }
+    // Never close while already-issued writes may still be completing.
+    while let Some(result) = writes.next().await {
+        if let Err(error) = result {
+            failure.get_or_insert_with(|| classify(path, Operation::Write, &error));
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    // A recorded prefix must be flushed data, whether or not publication asks for durability.
+    if stage.durable_publication() || stage.recovery_enabled() {
+        file.flush()
+            .await
+            .map_err(|e| classify(path, Operation::Write, &e))?;
+        super::at_destination::checkpoint_barrier(stage, offset).await?;
+    }
+    if stage.recovery_enabled() {
+        write_pointer(adapter, stage, offset, false).await?;
+        stage.checkpoint_recorded(offset);
+    }
+    Ok(offset)
+}
+
+pub(super) async fn save(
+    adapter: &CifsStagedDestination,
+    stage: &PreparedStage,
+    file: &dyn CifsStageFile,
+    offset: u64,
+) -> Result<(), StorageRoleFailure> {
+    file.flush()
+        .await
+        .map_err(|e| classify(stage.final_destination().path(), Operation::Write, &e))?;
+    super::at_destination::checkpoint_barrier(stage, offset).await?;
+    // The pointer is the whole recovery record: nothing registers where data-mover runs.
+    write_pointer(adapter, stage, offset, false).await?;
+    stage.set_recovery_enabled(true);
+    stage.checkpoint_recorded(offset);
+    Ok(())
+}

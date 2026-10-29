@@ -33,8 +33,11 @@ jobs:
       - name: Compile library, HDFS contracts, and examples
         run: cargo check --locked --lib --test hdfs_native_contract --examples
 
+      - name: Compile minimal Local consumer on Windows
+        run: cargo check --locked --no-default-features --features backend-local,traversal,transfer,integrity --all-targets
+
       - name: Windows Local ACL runtime contracts
-        run: cargo test --locked --lib windows_acl
+        run: python tests/run_cargo_test.py backend::windows_acl --package data-mover-backend-local
 
   ci:
     name: fmt + clippy + test + examples + e2e-local
@@ -89,6 +92,9 @@ jobs:
             docs/architecture/current-real-environment-evidence.yaml
           python3 -m unittest tests/test_architecture_matrix.py
           python3 -m unittest tests/test_current_evidence_baseline.py
+
+      - name: Feature isolation and minimal consumer contracts
+        run: python3 tests/feature_matrix.py
 
       - name: cargo clippy (all targets, deny warnings)
         run: python3 .claude/skills/quality-clippy/scripts/run.py

@@ -12,7 +12,7 @@ cargo_build_examples() {
   CARGO_EXAMPLE_BINARIES=()
   for example in "$@"; do arguments+=(--example "$example"); done
   artifacts=$(mktemp) || return 1
-  if cargo build --quiet --message-format=json-render-diagnostics "${arguments[@]}" >"$artifacts"; then
+  if cargo build -p data-mover --quiet --message-format=json-render-diagnostics "${arguments[@]}" >"$artifacts"; then
     :
   else
     status=$?

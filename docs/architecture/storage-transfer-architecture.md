@@ -985,3 +985,8 @@ mode to Local (Unix), NFS, and HDFS destinations while reporting owner/group los
 the destination principals. CIFS does not advertise POSIX mode conversion and reports that loss.
 Compatible mtime is copied; atime and creation time remain excluded. Local mode application
 uses permissions only; NFS uses a mode-only SETATTR, without reading or rewriting ownership.
+
+
+The implementation is distributed across the [crate workspace](crate-workspace.md).
+That document defines package ownership, feature selection and the 0.4 build migration;
+the operation and persistence contracts in this architecture remain authoritative.
