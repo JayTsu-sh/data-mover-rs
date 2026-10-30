@@ -4,15 +4,12 @@ use crate::{
         AclTarget, MetadataPlanRequest, MetadataPolicies, MetadataTarget, OwnershipTarget,
         TimestampTargetCapability, ValueTarget, compile_metadata_plan,
     },
-    model::{
-        BackendIdentity, BackendKind, EntryKind, IdentityStrength, MetadataObservations,
-        SourceIdentity,
-    },
+    model::{EntryKind, IdentityStrength, MetadataObservations, SourceIdentity},
     storage::{LocalBackendConfig, backends::local::connect_backend},
 };
 use std::{
     error::Error,
-    fs::{metadata, read, write},
+    fs::{File, metadata, read, write},
     num::NonZeroUsize,
     os::unix::fs::MetadataExt,
 };
@@ -45,22 +42,23 @@ fn storage(root: &TempDir) -> TestResult<Storage> {
     })?)
 }
 
-fn source(size: usize) -> TestResult<SourceDescriptor> {
-    Ok(SourceDescriptor::new(
+async fn new_session(root: &TempDir, size: usize) -> TestResult<DirectPatchSession> {
+    let storage = storage(root)?;
+    let source = SourceDescriptor::new(
         StoragePath::new("file")?,
         EntryKind::File,
         Some(size as u64),
         SourceIdentity::new(
-            BackendIdentity::new(BackendKind::Local, "remote-test")?,
+            storage.identity().clone(),
             IdentityStrength::PathScoped,
             b"remote-file",
         )?,
-    ))
+    );
+    Ok(DirectPatchSession::prepare(storage, source, plan()?).await?)
 }
 
 async fn prepare(root: &TempDir, payload: &[u8]) -> TestResult<DirectPatchSession> {
-    let mut session =
-        DirectPatchSession::prepare(storage(root)?, source(payload.len())?, plan()?).await?;
+    let mut session = new_session(root, payload.len()).await?;
     let chunks = payload
         .chunks(4)
         .enumerate()
@@ -116,12 +114,12 @@ async fn aborted_or_stale_sessions_leave_basis_untouched() -> TestResult {
 async fn incomplete_input_cannot_truncate_or_publish() -> TestResult {
     let root = tempfile::tempdir()?;
     write(root.path().join("file"), b"AAAABBBB")?;
-    let session = DirectPatchSession::prepare(storage(&root)?, source(8)?, plan()?).await?;
+    let session = new_session(&root, 8).await?;
     assert!(matches!(
         session.complete().await,
         Err(DirectPatchError::InvalidInput(_))
     ));
-    let mut session = DirectPatchSession::prepare(storage(&root)?, source(8)?, plan()?).await?;
+    let mut session = new_session(&root, 8).await?;
     let mut input: DirectPatchInput = Box::pin(stream::iter([DirectPatchChunk {
         offset: 0,
         data: Bytes::from_static(b"XXXX"),
@@ -140,7 +138,7 @@ async fn incomplete_input_cannot_truncate_or_publish() -> TestResult {
 async fn invalid_input_cannot_be_cleared_by_a_later_empty_receive() -> TestResult {
     let root = tempfile::tempdir()?;
     write(root.path().join("file"), b"AAAABBBB")?;
-    let mut session = DirectPatchSession::prepare(storage(&root)?, source(8)?, plan()?).await?;
+    let mut session = new_session(&root, 8).await?;
     let mut bad: DirectPatchInput = Box::pin(stream::iter([DirectPatchChunk {
         offset: 1,
         data: Bytes::from_static(b"XXXXXXXX"),
@@ -155,4 +153,51 @@ async fn invalid_input_cannot_be_cleared_by_a_later_empty_receive() -> TestResul
     ));
     assert_eq!(read(root.path().join("file"))?, b"AAAABBBB");
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "uses a 20 GiB sparse fixture; explicit native large-file acceptance"]
+async fn twenty_gib_basis_with_ten_mib_changes_writes_only_ten_mib() -> TestResult {
+    const SIZE: u64 = 20 * 1024 * 1024 * 1024;
+    const CHANGED: u64 = 10 * 1024 * 1024;
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("file");
+    File::create(&path)?.set_len(SIZE)?;
+    let inode = metadata(&path)?.ino();
+    let mut session = new_session(&root, usize::try_from(SIZE)?).await?;
+    let mut input = large_input(SIZE, CHANGED)?;
+    session.receive(&mut input).await?;
+    assert_eq!(metadata(&path)?.blocks(), 0);
+    assert_eq!(session.progress().bytes, SIZE);
+    assert_eq!(session.complete().await?, CHANGED);
+    let after = metadata(&path)?;
+    assert_eq!(after.ino(), inode);
+    assert_eq!(after.len(), SIZE);
+    assert!(after.blocks() * 512 < CHANGED * 4);
+    Ok(())
+}
+
+fn large_input(size: u64, changed_size: u64) -> TestResult<DirectPatchInput> {
+    const CHUNK: u64 = 1024 * 1024;
+    let zeros = Bytes::from(vec![0; usize::try_from(CHUNK)?]);
+    let changed = Bytes::from(vec![0x47; usize::try_from(CHUNK)?]);
+    let input: DirectPatchInput = Box::pin(stream::unfold(0u64, move |offset| {
+        let zeros = zeros.clone();
+        let changed = changed.clone();
+        async move {
+            if offset == size {
+                return None;
+            }
+            let different = (size / 2..size / 2 + changed_size).contains(&offset);
+            Some((
+                DirectPatchChunk {
+                    offset,
+                    data: if different { changed } else { zeros },
+                    unchanged_basis: !different,
+                },
+                offset + CHUNK,
+            ))
+        }
+    }));
+    Ok(input)
 }
