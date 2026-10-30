@@ -76,9 +76,45 @@ def verify_isolated_destination(endpoint, run_id):
     if (len(run_id) > 88 or ".." in run_id or
             not re.fullmatch(r"(?:nightly|release)-[A-Za-z0-9_.-]+", run_id)):
         raise ValueError("a valid isolated lab run identifier is required")
-    path = urlsplit(endpoint).path if "://" in endpoint or endpoint.startswith(("smb:", "s3:", "s3@")) else endpoint
-    if run_id not in path.split("/"):
+    remote = "://" in endpoint or endpoint.startswith(("smb:", "s3:", "s3@"))
+    if "://" in endpoint:
+        if endpoint.split("://", 1)[0] not in ("nfs", "smb", "hdfs", "s3", "s3+https"):
+            raise ValueError("unsupported isolated destination scheme")
+        # S3 credentials may contain slashes; its parser separates at the last @.
+        authority_path = endpoint.split("://", 1)[1].rsplit("@", 1)[-1]
+        authority_path = authority_path.split("?", 1)[0].split("#", 1)[0]
+        path = authority_path[authority_path.find("/"):] if "/" in authority_path else ""
+        path = unquote(path.split("?", 1)[0].split("#", 1)[0])
+    elif remote:
+        path = unquote(endpoint.split(":", 1)[1])
+    else:
+        path = endpoint
+    parts = re.split(r"[/\\]", path)
+    if run_id not in parts or any(part in (".", "..") or "\0" in part for part in parts):
         raise ValueError("destination must contain the exact isolated run path component")
+    if not remote:
+        absolute = Path(path).absolute()
+        index = absolute.parts.index(run_id)
+        expected = Path(*absolute.parts[:index]).resolve().joinpath(*absolute.parts[index:])
+        if absolute.resolve() != expected:
+            raise ValueError("destination cannot follow a symlink at or below the isolated run root")
+
+
+def select_profiles(profiles, requested):
+    """Fail before fixture creation if the requested workload is empty or ambiguous."""
+    names = [profile["name"] for profile in profiles]
+    if len(names) != len(set(names)):
+        raise ValueError("profile names must be unique")
+    if requested is not None and (not requested or len(requested) != len(set(requested))):
+        raise ValueError("requested profiles must be nonempty and unique")
+    if requested is not None and set(requested) - set(names):
+        raise ValueError("unknown requested profile")
+    selected = [profile for profile in profiles if requested is None or profile["name"] in requested]
+    if not selected:
+        raise ValueError("at least one profile is required")
+    if any(not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in (".", "..") for name in names):
+        raise ValueError("profile names must be safe path components")
+    return selected
 
 
 def strict_timing(result, resource, rate):

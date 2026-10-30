@@ -141,6 +141,72 @@ class CrossQosMatrix(unittest.TestCase):
             with self.assertRaises(ValueError):
                 EVIDENCE.verify_isolated_destination(endpoint, run_id)
 
+    def test_isolation_rejects_parent_paths_and_credentials_disguised_as_paths(self):
+        for endpoint in ["/tmp/nightly-test/../shared", "/tmp/nightly-test/../../",
+                         "s3://user:pass@bucket.host/ci/nightly-test/%2e%2e/shared",
+                         "nfs://host/export:/ci/nightly-test/%2E%2E%2fshared",
+                         "smb:nightly-test/../shared", "s3@bucket:nightly-test/../shared",
+                         "s3://user:pass/nightly-test/x@bucket.host/shared",
+                         "s3://user:pass@bucket.host?prefix=/nightly-test/",
+                         "file://host/nightly-test/link", "NFS://host/nightly-test/link",
+                         "/tmp/x://host/nightly-test"]:
+            with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
+                EVIDENCE.verify_isolated_destination(endpoint, "nightly-test")
+        EVIDENCE.verify_isolated_destination(
+            "s3://user:pass/word@bucket.host/ci/nightly-test/destination", "nightly-test")
+
+    def test_isolation_checks_the_actual_local_root_and_preserves_a_sibling(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shared = root / "shared"
+            shared.mkdir()
+            sentinel = shared / "sentinel"
+            sentinel.write_bytes(b"keep")
+            run = root / "nightly-test"
+            run.symlink_to(shared, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                EVIDENCE.verify_isolated_destination(str(run), "nightly-test")
+            run.unlink()
+            run.mkdir()
+            (run / "destination").symlink_to(shared, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                EVIDENCE.verify_isolated_destination(str(run / "destination"), "nightly-test")
+            EVIDENCE.verify_isolated_destination(str(run / "fresh-destination"), "nightly-test")
+            self.assertEqual(sentinel.read_bytes(), b"keep")
+
+    def test_invalid_profile_selection_fails_before_creating_any_fixture(self):
+        lab = Path(__file__).parent / "lab"
+        with patch.object(sys, "path", [str(lab), *sys.path]):
+            spec = importlib.util.spec_from_file_location("profile_validation_runner", lab / "run-backend-qos.py")
+            runner = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(runner)
+        local = {"name": "local", "env": {}}
+        invalid = [([], None), ([local], ["typo"]), ([local, local], None),
+                   ([local], []), ([local], ["local", "local"]),
+                   ([{"name": "../outside", "env": {}}], None)]
+        for profiles, requested in invalid:
+            with self.subTest(profiles=profiles, requested=requested), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                config_file = root / "config.json"
+                config_file.write_text(json.dumps({"profiles": profiles}))
+                argv = ["runner", "--config", str(config_file), "--root", str(root / "work"),
+                        "--binary", str(root / "binary"), "--phase", "final"]
+                if requested is not None:
+                    argv += ["--profiles", *requested]
+                with patch.object(sys, "argv", argv), patch.object(runner.VALIDATOR, "fixture") as fixture, \
+                        patch.object(runner.subprocess, "run") as invoke, contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as result:
+                        runner.main()
+                self.assertEqual(result.exception.code, 2)
+                fixture.assert_not_called()
+                invoke.assert_not_called()
+                self.assertFalse((root / "work").exists())
+
+    def test_profile_selection_preserves_only_the_requested_configured_workloads(self):
+        profiles = [{"name": "local"}, {"name": "nfs4.1"}]
+        self.assertEqual(EVIDENCE.select_profiles(profiles, None), profiles)
+        self.assertEqual(EVIDENCE.select_profiles(profiles, ["nfs4.1"]), profiles[1:])
+
     def test_runner_defers_exact_sample_cleanup_and_keeps_aa_arms_unshaped(self):
         self.check_runner_workload(128, 16)
 

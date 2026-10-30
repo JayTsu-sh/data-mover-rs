@@ -14,7 +14,7 @@ import subprocess
 import time
 import uuid
 from qos_evidence import (compare_performance, concurrency_environment, redact as redact_secrets, sample_destination,
-                          secret_values, strict_timing, verify_baseline_identity, verify_isolated_destination)
+                          secret_values, select_profiles, strict_timing, verify_baseline_identity, verify_isolated_destination)
 
 SPEC = importlib.util.spec_from_file_location("qos_validator", Path(__file__).with_name("run-local-qos.py"))
 VALIDATOR = importlib.util.module_from_spec(SPEC)
@@ -44,6 +44,10 @@ def main():
     parser.add_argument("--measure-only", action="store_true", help="seed and measure small-read baselines before qualification")
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
+    try:
+        selected_profiles = select_profiles(config["profiles"], args.profiles)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not math.isfinite(args.limit_duration_seconds) or args.limit_duration_seconds <= 0:
         parser.error("finite workload duration must be positive and finite")
     if args.repeats < 1 or (args.performance_control and args.repeats < 3):
@@ -54,9 +58,7 @@ def main():
                                         or not config.get("run_id")):
         parser.error("isolated destinations require --cleanup-binary and config.run_id")
     if args.isolated_destinations:
-        for profile in config["profiles"]:
-            if args.profiles and profile["name"] not in args.profiles:
-                continue
+        for profile in selected_profiles:
             target = profile["env"].get("QOS_DESTINATION", str(args.root / "destination" / profile["name"]))
             verify_isolated_destination(target, config["run_id"])
     configuration_sha256 = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
@@ -76,10 +78,9 @@ def main():
     fixtures = args.root / "fixtures"
     fixtures.mkdir(exist_ok=True)
     fixture_sizes = {64, 128, *([args.performance_size_mib] if args.performance_size_mib else [])}
-    for profile in config["profiles"]:
-        if not args.profiles or profile["name"] in args.profiles:
-            fixture_sizes.add(profile.get("size_mib", 64))
-            fixture_sizes.add(profile.get("performance_size_mib", args.performance_size_mib or profile.get("size_mib", 64)))
+    for profile in selected_profiles:
+        fixture_sizes.add(profile.get("size_mib", 64))
+        fixture_sizes.add(profile.get("performance_size_mib", args.performance_size_mib or profile.get("size_mib", 64)))
     for size in sorted(fixture_sizes):
         path = fixtures / f"{size}.bin"
         if not path.exists():
@@ -112,11 +113,9 @@ def main():
     sample_session = uuid.uuid4().hex
     pending_cleanup = []
     try:
-        for profile in config["profiles"]:
+        for profile in selected_profiles:
             name = profile["name"]
             source_kind = profile.get("source_kind", name)
-            if args.profiles and name not in args.profiles:
-                continue
             folder = output / name
             folder.mkdir()
             destination = args.root / "destination" / name
@@ -324,7 +323,7 @@ def main():
             except Exception as exc:
                 gate(name, case, "isolated_destination_removed", False, error=redact(str(exc)))
     print(f"FINISHED {sum(c['passed'] for c in checks)}/{len(checks)} checks passed", flush=True)
-    return 0 if all(c["passed"] for c in checks) else 1
+    return 0 if checks and all(c["passed"] for c in checks) else 1
 
 
 if __name__ == "__main__":

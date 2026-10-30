@@ -1,15 +1,18 @@
 //! Remove artifacts and payloads only within an explicitly isolated `QoS` run root.
+use std::env;
+use std::num::NonZeroUsize;
+
 use clap::Parser;
 use data_mover::model::{FailureClass, StoragePath};
 use data_mover::storage::{
     DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, StorageRoleFailure, delete_tree,
 };
-use std::num::NonZeroUsize;
 use tokio_util::sync::CancellationToken;
 
 #[allow(dead_code)]
 #[path = "../../../examples/support/endpoint.rs"]
 mod endpoint_support;
+mod qos_run_scope;
 
 #[derive(Parser)]
 struct Args {
@@ -26,22 +29,7 @@ struct Args {
 #[tokio::main(worker_threads = 4)]
 async fn main() -> endpoint_support::Result {
     let args = Args::parse();
-    let endpoint = std::env::var("QOS_SOURCE")?;
-    let endpoint_path =
-        url::Url::parse(&endpoint).map_or_else(|_| endpoint.clone(), |url| url.path().to_owned());
-    if !args.run_id.starts_with("nightly-") && !args.run_id.starts_with("release-") {
-        return Err("an isolated lab run identifier is required".into());
-    }
-    if args.run_id.len() > 88
-        || args.run_id.contains("..")
-        || !args
-            .run_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-        || !endpoint_path.split('/').any(|part| part == args.run_id)
-    {
-        return Err("the source endpoint must be scoped to the isolated run".into());
-    }
+    let endpoint = qos_run_scope::validated_endpoint(&env::var("QOS_SOURCE")?, &args.run_id)?;
     let storage = endpoint_support::connect_with_options(&endpoint, false, None).await?;
     let namespace = storage.namespace()?;
     namespace

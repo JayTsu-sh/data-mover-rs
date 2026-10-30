@@ -675,3 +675,9 @@ a larger fixture rather than hiding the failed duration check. S3 retains its
 8 MiB GETs. Strict summaries include admission timing and the remaining tail;
 these diagnostics never replace the end-to-end verdict. High-QoS raw ratios and
 A/A precision remain separate gates.
+
+The runner rejects unknown, duplicate or empty profile selections before creating
+fixtures; an empty run cannot qualify. Isolated cleanup rejects parent path
+components (including URL-encoded forms) and unsupported URL schemes. For Local,
+it resolves the actual root and refuses symlinks at or below the run directory;
+cleanup only starts after that validation succeeds.
