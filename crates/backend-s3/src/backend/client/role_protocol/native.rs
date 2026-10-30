@@ -169,6 +169,8 @@ pub(super) mod tests {
             bucket_name: "destination".into(),
             prefix: None,
             client: aws_sdk_s3::Client::from_conf(config),
+            single_attempt_client: std::sync::OnceLock::new(),
+            http_client_capture: crate::backend::client::qos_client::HttpClientCapture::default(),
             is_bucket_versioned: false,
             versioning_suspended: false,
             versioning_at_connect: super::super::super::S3VersioningAtConnect::Never,

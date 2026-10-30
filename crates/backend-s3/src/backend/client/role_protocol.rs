@@ -40,6 +40,8 @@ mod listing;
 mod multipart;
 mod native;
 #[cfg(test)]
+mod qos_pool_tests;
+#[cfg(test)]
 mod qos_wire_tests;
 pub(super) mod rename;
 mod streaming_put;
@@ -111,24 +113,28 @@ impl S3Storage {
         key: &str,
         range: std::ops::Range<u64>,
         observed: &crate::storage::backends::s3::S3ObjectFacts,
-        retry: Option<aws_sdk_s3::config::retry::RetryConfig>,
+        single_attempt: bool,
     ) -> crate::storage::backends::s3::S3Result<Bytes> {
         if range.start == range.end {
             return Ok(Bytes::new());
         }
         let pinned = self.bucket_capabilities().conditional_reads;
-        let mut config = aws_sdk_s3::config::Builder::default();
-        config.set_retry_config(retry);
-        let response = self
-            .client
+        // Build this immutable SDK configuration once per connection, rather
+        // than rebuilding operation runtime plugins for every small Range GET.
+        let client = if single_attempt {
+            self.single_attempt_client.get_or_init(|| {
+                super::qos_client::single_attempt_client(&self.client, &self.http_client_capture)
+            })
+        } else {
+            &self.client
+        };
+        let response = client
             .get_object()
             .bucket(&self.bucket_name)
             .key(self.build_full_key(key))
             .range(format!("bytes={}-{}", range.start, range.end - 1))
             .set_version_id(observed.version_id.clone())
             .set_if_match(pinned.then(|| observed.etag.clone()))
-            .customize()
-            .config_override(config)
             .send()
             .await
             .map_err(|error| {
@@ -279,7 +285,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         range: std::ops::Range<u64>,
         observed: &crate::storage::backends::s3::S3ObjectFacts,
     ) -> S3Result<Bytes> {
-        self.get_range_request(key, range, observed, None).await
+        self.get_range_request(key, range, observed, false).await
     }
 
     async fn get_range_once(
@@ -288,13 +294,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         range: std::ops::Range<u64>,
         observed: &crate::storage::backends::s3::S3ObjectFacts,
     ) -> S3Result<Bytes> {
-        self.get_range_request(
-            key,
-            range,
-            observed,
-            Some(aws_sdk_s3::config::retry::RetryConfig::disabled()),
-        )
-        .await
+        self.get_range_request(key, range, observed, true).await
     }
 
     async fn put_object(

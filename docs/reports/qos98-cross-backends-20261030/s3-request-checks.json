@@ -1,0 +1,266 @@
+[
+  {
+    "route": "s3-to-local",
+    "case": "baseline",
+    "name": "payload_request_count_no_inflation",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "baseline",
+    "name": "payload_requests_remain_8MiB",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "baseline",
+    "name": "payload_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "high",
+    "name": "payload_request_count_no_inflation",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "high",
+    "name": "payload_requests_remain_8MiB",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "high",
+    "name": "payload_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "payload_request_count_no_inflation",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "payload_requests_remain_8MiB",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "payload_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "wire_requests_match_qos_accounting",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "payload_request_count_no_inflation",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "payload_requests_remain_8MiB",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "payload_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "wire_requests_match_qos_accounting",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-low",
+    "name": "payload_request_count_no_inflation",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-low",
+    "name": "payload_requests_remain_8MiB",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-low",
+    "name": "payload_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-low",
+    "name": "wire_requests_match_qos_accounting",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-low",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-low",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "iops-strict",
+    "name": "payload_request_count_no_inflation",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "iops-strict",
+    "name": "payload_requests_remain_8MiB",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "iops-strict",
+    "name": "payload_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "iops-strict",
+    "name": "wire_requests_match_qos_accounting",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "route": "s3-to-local",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "baseline",
+    "name": "payload_request_count_no_inflation",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "baseline",
+    "name": "payload_requests_remain_8MiB",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "baseline",
+    "name": "payload_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "baseline",
+    "name": "independent_readback_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "high",
+    "name": "payload_request_count_no_inflation",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "high",
+    "name": "payload_requests_remain_8MiB",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "high",
+    "name": "payload_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "high",
+    "name": "independent_readback_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "payload_request_count_no_inflation",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "payload_requests_remain_8MiB",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "payload_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "independent_readback_wire_bytes_match",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "route": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  }
+]

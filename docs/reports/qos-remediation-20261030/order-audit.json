@@ -1,0 +1,158 @@
+{
+  "executed_candidate_comparison": {
+    "orders": [
+      [
+        "old-baseline",
+        "old-high",
+        "new-baseline",
+        "new-control",
+        "new-high"
+      ],
+      [
+        "old-baseline",
+        "new-high",
+        "new-control",
+        "new-baseline",
+        "old-high"
+      ],
+      [
+        "new-baseline",
+        "new-control",
+        "new-high",
+        "old-baseline",
+        "old-high"
+      ],
+      [
+        "new-baseline",
+        "old-high",
+        "old-baseline",
+        "new-high",
+        "new-control"
+      ],
+      [
+        "new-high",
+        "old-baseline",
+        "old-high",
+        "new-baseline",
+        "new-control"
+      ]
+    ],
+    "position_counts": {
+      "old-baseline": [
+        2,
+        1,
+        1,
+        1,
+        0
+      ],
+      "old-high": [
+        0,
+        2,
+        1,
+        0,
+        2
+      ],
+      "new-baseline": [
+        2,
+        0,
+        1,
+        2,
+        0
+      ],
+      "new-control": [
+        0,
+        1,
+        1,
+        1,
+        2
+      ],
+      "new-high": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "balanced": false
+  },
+  "corrected_future_comparison": {
+    "orders": [
+      [
+        "old-baseline",
+        "old-high",
+        "new-baseline",
+        "new-control",
+        "new-high"
+      ],
+      [
+        "old-high",
+        "new-baseline",
+        "new-control",
+        "new-high",
+        "old-baseline"
+      ],
+      [
+        "new-baseline",
+        "new-control",
+        "new-high",
+        "old-baseline",
+        "old-high"
+      ],
+      [
+        "new-control",
+        "new-high",
+        "old-baseline",
+        "old-high",
+        "new-baseline"
+      ],
+      [
+        "new-high",
+        "old-baseline",
+        "old-high",
+        "new-baseline",
+        "new-control"
+      ]
+    ],
+    "position_counts": {
+      "old-baseline": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "old-high": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "new-baseline": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "new-control": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "new-high": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "balanced": true
+  },
+  "retained_primary": "six three-arm blocks; rotate all three positions and reverse only a whole three-block cycle; position balanced",
+  "scope": "does not rewrite any recorded sample or verdict; candidate remains rejected; corrected script not executed"
+}

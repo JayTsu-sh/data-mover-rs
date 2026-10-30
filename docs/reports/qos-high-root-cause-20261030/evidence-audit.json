@@ -1,0 +1,244 @@
+{
+  "all_archive_checksums_verified": true,
+  "all_955_regression_verdicts_reproduced": true,
+  "regression_passed": 944,
+  "regression_failed": 11,
+  "accepted_performance_samples": 270,
+  "finite_samples": 115,
+  "matched_experiments": [
+    {
+      "experiment": "matched",
+      "checks_reproduced": true
+    },
+    {
+      "experiment": "matched-shared",
+      "checks_reproduced": true
+    },
+    {
+      "experiment": "matched-capture",
+      "checks_reproduced": true
+    }
+  ],
+  "actual_tcp_connect_counts_reproduced": true,
+  "all_same_size_digests_match": true,
+  "all_full_fixture_hashes_reconstructed": true,
+  "measurements_including_imported_copies": 1123,
+  "baseline_bindings": [
+    {
+      "profile": "local-to-local",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "local-to-nfs41",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "local-to-cifs",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "local-to-s3",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "local-to-hdfs",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "nfs3-to-local",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "nfs40-to-local",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "nfs41-to-local",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "nfs41-to-cifs",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "nfs41-to-s3",
+      "binary_and_configuration_verified": true,
+      "repetitions": 15,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "nfs41-to-hdfs",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "cifs-to-local",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "cifs-to-nfs41",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "cifs-to-s3",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "cifs-to-hdfs",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "s3-to-local",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "s3-to-nfs41",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "s3-to-cifs",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "s3-to-hdfs",
+      "binary_and_configuration_verified": true,
+      "repetitions": 15,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "hdfs-to-local",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "hdfs-to-nfs41",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "hdfs-to-cifs",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    },
+    {
+      "profile": "hdfs-to-s3",
+      "binary_and_configuration_verified": true,
+      "repetitions": 5,
+      "performance_idle_ms": 1000
+    }
+  ],
+  "all_304_original_fixed_limit_verdicts_reproduced": true,
+  "all_original_fixed_limit_commands_bound": true,
+  "fixed_limit_samples": 40,
+  "fixed_limit_passed": 300,
+  "fixed_limit_new_failures": 0,
+  "independent_30_pair_confirmation": {
+    "baseline_mibps": 282.5493387128903,
+    "high_mibps": 282.34524681320266,
+    "ratio": 0.999277676951511,
+    "passed": true,
+    "samples_per_arm": 30
+  },
+  "pooled_57_pair_posthoc": {
+    "ratio": 0.9919931994721647,
+    "passed": true,
+    "samples_per_arm": 57,
+    "cohorts": [
+      "matched-capture final arms,12",
+      "regression/focused s3-to-hdfs,15",
+      "confirmation-30,30"
+    ],
+    "status": "post-hoc pooled sensitivity analysis; independent 30-pair verdict is separate; initial 15-pair failure retained"
+  },
+  "source_only_diagnostic": {
+    "medians": {
+      "old-baseline": 764.2073488709067,
+      "old-high": 767.26054505539,
+      "fixed-baseline": 762.7040418929271,
+      "fixed-high": 766.4926983546835
+    },
+    "old_ratio": 1.0039952457785106,
+    "fixed_ratio": 1.0049674005297697,
+    "diagnostic_only": true
+  },
+  "absolute_controls": {
+    "cifs-absolute": {
+      "medians": {
+        "old-high": 34.38267528318009,
+        "fixed-high": 34.96714778302313,
+        "fixed-baseline": 38.15845984315038
+      },
+      "ratio": 1.016999040796833,
+      "passed": true,
+      "fixed_high_to_fixed_baseline": 0.916366853556326,
+      "relative_passed": false,
+      "blocks": 12,
+      "target_readiness_controlled": true,
+      "readiness_preconditions_independently_verified": 36
+    },
+    "hdfs-nfs-absolute": {
+      "medians": {
+        "old-high": 295.3302681745183,
+        "fixed-high": 302.49625767121904,
+        "fixed-baseline": 288.22076223529257
+      },
+      "ratio": 1.0242643246186542,
+      "passed": true,
+      "fixed_high_to_fixed_baseline": 1.0495297261904835,
+      "relative_passed": true,
+      "blocks": 12,
+      "target_readiness_controlled": true,
+      "readiness_preconditions_independently_verified": 36
+    }
+  },
+  "local_nfs_cold_control": {
+    "end_to_end_ratio_medians": {
+      "old": 0.9904686428079917,
+      "fixed": 0.9905130360753628
+    },
+    "fixed_to_old_ratio": 1.0000448204672538,
+    "absolute_non_regression_passed": true,
+    "cold_end_to_end_98_percent": {
+      "old": true,
+      "fixed": true
+    },
+    "pairs": 5
+  },
+  "cifs_attribution_operations_and_zero_wait_verified": true
+}

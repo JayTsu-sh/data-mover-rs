@@ -1,0 +1,236 @@
+{
+  "run_id": "nightly-qos-cross-20261029192047",
+  "profiles": [
+    {
+      "name": "local-to-local",
+      "source_kind": "local",
+      "destination_kind": "local",
+      "transfer_profile": "default",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 512,
+      "soft_mibps": 4
+    },
+    {
+      "name": "local-to-nfs41",
+      "source_kind": "local",
+      "destination_kind": "nfs41",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "local-to-cifs",
+      "source_kind": "local",
+      "destination_kind": "cifs",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "local-to-s3",
+      "source_kind": "local",
+      "destination_kind": "s3",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "local-to-hdfs",
+      "source_kind": "local",
+      "destination_kind": "hdfs",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "nfs3-to-local",
+      "source_kind": "nfs3",
+      "destination_kind": "local",
+      "transfer_profile": "default",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 512,
+      "soft_mibps": 4
+    },
+    {
+      "name": "nfs40-to-local",
+      "source_kind": "nfs40",
+      "destination_kind": "local",
+      "transfer_profile": "default",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 4
+    },
+    {
+      "name": "nfs41-to-local",
+      "source_kind": "nfs41",
+      "destination_kind": "local",
+      "transfer_profile": "default",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 512,
+      "soft_mibps": 4
+    },
+    {
+      "name": "nfs41-to-cifs",
+      "source_kind": "nfs41",
+      "destination_kind": "cifs",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "nfs41-to-s3",
+      "source_kind": "nfs41",
+      "destination_kind": "s3",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "nfs41-to-hdfs",
+      "source_kind": "nfs41",
+      "destination_kind": "hdfs",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "cifs-to-local",
+      "source_kind": "cifs",
+      "destination_kind": "local",
+      "transfer_profile": "default",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 512,
+      "soft_mibps": 4
+    },
+    {
+      "name": "cifs-to-nfs41",
+      "source_kind": "cifs",
+      "destination_kind": "nfs41",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "cifs-to-s3",
+      "source_kind": "cifs",
+      "destination_kind": "s3",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "cifs-to-hdfs",
+      "source_kind": "cifs",
+      "destination_kind": "hdfs",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "s3-to-local",
+      "source_kind": "s3",
+      "destination_kind": "local",
+      "transfer_profile": "default",
+      "size_mib": 128,
+      "chunk_bytes": 8388608,
+      "performance_size_mib": 128,
+      "soft_mibps": 4
+    },
+    {
+      "name": "s3-to-nfs41",
+      "source_kind": "s3",
+      "destination_kind": "nfs41",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 8388608,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "s3-to-cifs",
+      "source_kind": "s3",
+      "destination_kind": "cifs",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 8388608,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "s3-to-hdfs",
+      "source_kind": "s3",
+      "destination_kind": "hdfs",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 8388608,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "hdfs-to-local",
+      "source_kind": "hdfs",
+      "destination_kind": "local",
+      "transfer_profile": "default",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 512,
+      "soft_mibps": 4
+    },
+    {
+      "name": "hdfs-to-nfs41",
+      "source_kind": "hdfs",
+      "destination_kind": "nfs41",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "hdfs-to-cifs",
+      "source_kind": "hdfs",
+      "destination_kind": "cifs",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    },
+    {
+      "name": "hdfs-to-s3",
+      "source_kind": "hdfs",
+      "destination_kind": "s3",
+      "transfer_profile": "cross",
+      "size_mib": 128,
+      "chunk_bytes": 2097152,
+      "performance_size_mib": 128,
+      "soft_mibps": 8
+    }
+  ],
+  "configuration_sha256": "daa10594f265eae09db0a66b11a0853d4ed9873423799a599229cd0441389a3e"
+}

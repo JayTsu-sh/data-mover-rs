@@ -1,0 +1,92 @@
+{
+  "matched": {
+    "medians": {
+      "old-baseline": 249.58795692386354,
+      "old-high": 261.52605219722193,
+      "fixed-baseline": 267.70442042124347,
+      "fixed-high": 252.67019278016014
+    },
+    "checks": [
+      {
+        "name": "old_high_to_old_baseline",
+        "ratio": 1.047831215177582,
+        "passed": true
+      },
+      {
+        "name": "fixed_high_to_fixed_baseline",
+        "ratio": 0.9438401965218715,
+        "passed": false
+      },
+      {
+        "name": "fixed_high_to_old_high",
+        "ratio": 0.9661377543741477,
+        "passed": false
+      },
+      {
+        "name": "fixed_baseline_to_old_baseline",
+        "ratio": 1.0725854873795306,
+        "passed": true
+      }
+    ]
+  },
+  "matched-shared": {
+    "medians": {
+      "old-baseline": 260.98313971993923,
+      "old-high": 259.91014274972804,
+      "fixed-baseline": 235.6864398959903,
+      "fixed-high": 246.97615991807282
+    },
+    "checks": [
+      {
+        "name": "old_high_to_old_baseline",
+        "ratio": 0.99588863490813,
+        "passed": true
+      },
+      {
+        "name": "fixed_high_to_fixed_baseline",
+        "ratio": 1.0479014406898621,
+        "passed": true
+      },
+      {
+        "name": "fixed_high_to_old_high",
+        "ratio": 0.9502367137549166,
+        "passed": false
+      },
+      {
+        "name": "fixed_baseline_to_old_baseline",
+        "ratio": 0.9030715169911175,
+        "passed": false
+      }
+    ]
+  },
+  "matched-capture": {
+    "medians": {
+      "old-baseline": 243.91671853916847,
+      "old-high": 233.86354753629848,
+      "fixed-baseline": 249.60759377450438,
+      "fixed-high": 249.54047378949173
+    },
+    "checks": [
+      {
+        "name": "old_high_to_old_baseline",
+        "ratio": 0.9587844118964907,
+        "passed": false
+      },
+      {
+        "name": "fixed_high_to_fixed_baseline",
+        "ratio": 0.9997310979846499,
+        "passed": true
+      },
+      {
+        "name": "fixed_high_to_old_high",
+        "ratio": 1.0670345011796247,
+        "passed": true
+      },
+      {
+        "name": "fixed_baseline_to_old_baseline",
+        "ratio": 1.0233312225148767,
+        "passed": true
+      }
+    ]
+  }
+}

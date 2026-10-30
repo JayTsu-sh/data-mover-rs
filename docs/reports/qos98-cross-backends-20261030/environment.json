@@ -1,0 +1,14 @@
+{
+  "run_id": "nightly-qos-cross-20261029192047",
+  "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+  "cpu_count": 24,
+  "binary_sha256": "d7c04f29a868a388e9b3dd9ca8fc470f684ca3f8eab7100b637ead4e5ffa9156",
+  "admission_probe_sha256": "45ca4327edcaf0a2ae430498e3ac6c103c265fe8a0db687583ba5d10d1da1eb1",
+  "tail_probe_sha256": "8db95eaa5cffa211c23e72376325278872b22a5c31c1f33a1f1ef86625a088d5",
+  "filesystem": "Filesystem     Type 1K-blocks      Used Available Use% Mounted on\n/dev/sda1      ext4 305147016 143142852 161987780  47% /\n",
+  "memory": "               total        used        free      shared  buff/cache   available\nMem:     33648082944  4460646400   594616320    73019392 29608136704 29187436544\nSwap:              0           0           0\n",
+  "performance_workers": 1,
+  "finite_workers": 4,
+  "runtime_workers_per_process": 4,
+  "source_warming": "local golden hash before every timer; remote source caching inherited from preparation and repeated copies, no cache flush"
+}

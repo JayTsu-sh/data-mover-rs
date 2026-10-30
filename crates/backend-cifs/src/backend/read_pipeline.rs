@@ -93,26 +93,33 @@ async fn run(
                 None
             };
             let offset = next;
-            // QoS can reduce a read; obtain the grant before assigning the next offset.
+            // Plan the immutable grant before assigning offsets, but reserve its
+            // time only when the future is polled at actual read dispatch.
             let count = if let Some(qos) = &request.source_qos {
-                usize::try_from(
-                    tokio::select! {
-                        () = tx.closed() => return Ok(()),
-                        result = qos.admit_read(count as u64, &request.cancel) => result,
-                    }
-                    .map_err(|_| failed(FailureClass::Cancelled))?,
-                )
-                .map_err(|_| failed(FailureClass::InvalidInput))?
+                usize::try_from(qos.read_size(count as u64))
+                    .map_err(|_| failed(FailureClass::InvalidInput))?
             } else {
                 count
             };
             let wire_count =
                 u32::try_from(count).map_err(|_| failed(FailureClass::InvalidInput))?;
             let future = async move {
+                let read = async {
+                    if let Some(qos) = &request.source_qos {
+                        qos.admit_read(count as u64, &request.cancel)
+                            .await
+                            .map_err(|_| failed(FailureClass::Cancelled))?;
+                    }
+                    state
+                        .cursor
+                        .read_at(offset, wire_count)
+                        .await
+                        .map_err(|e| classify(&request.path, Operation::Read, &e))
+                };
                 let result = tokio::select! {
                     biased;
                     () = request.cancel.cancelled() => Err(failed(FailureClass::Cancelled)),
-                    result = state.cursor.read_at(offset, wire_count) => result.map_err(|e| classify(&request.path, Operation::Read, &e)),
+                    result = read => result,
                 };
                 (offset, count, result, admission)
             };

@@ -1,0 +1,10 @@
+{
+  "sustained_cases": 50,
+  "sustained_checks_passed": 415,
+  "remaining_high_raw_failures": 5,
+  "source_manifest_files_verified": 613,
+  "initial_dirty_rust_and_cargo_files_unchanged": 21,
+  "archive_verified": true,
+  "private_files_removed": true,
+  "all_four_scenarios_qualified": false
+}

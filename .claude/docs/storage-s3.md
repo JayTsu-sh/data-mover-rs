@@ -90,6 +90,14 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
 
 ## 关键行为
 
+### Source QoS 的 HTTP transport 复用
+
+`crates/backend-s3/src/backend/client/qos_client.rs` 保留 SDK 实际解析出的 `SharedHttpClient`：
+显式配置的 transport 直接复用；默认 runtime plugin 提供、未出现在 `Client::config().http_client()`
+中的 transport，通过连接期元数据请求的 interceptor 捕获。用于受 Source QoS 限制的 GET 的
+single-attempt 客户端沿用这个 transport 与连接池，仅为这些 GET 禁用 SDK 重试，避免一次 admission
+产生额外 GET。普通 GET、元数据和写请求继续使用原客户端及其既有重试配置。
+
 ### 404 → FileNotFound
 
 commit `7eb3046`：S3 GetObject / HeadObject 返回 404 时，**必须映射为 `StorageError::FileNotFound`**，不是 `S3Error` 也不是 retry。

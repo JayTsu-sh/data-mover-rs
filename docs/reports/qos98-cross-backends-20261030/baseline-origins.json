@@ -1,0 +1,54 @@
+{
+  "local-to-s3": {
+    "baseline": "/tmp/nightly-qos-cross-20261029192047/calibration/local-to-s3/survey",
+    "reason": "complete failed-route long-sample requalification; original and unlimited A/A evidence retained",
+    "unlimited_control_ratio": 0.9845273471749183,
+    "exit": 0,
+    "configuration_sha256": "d5f1ad855dd7561a618b19b17ab602cd5e4d776b9eb0b4af7638d8beafedd0ff",
+    "only_performance_size_changed": true
+  },
+  "local-to-hdfs": {
+    "baseline": "/tmp/nightly-qos-cross-20261029192047/calibration/local-to-hdfs/survey",
+    "reason": "complete failed-route long-sample requalification; original and unlimited A/A evidence retained",
+    "unlimited_control_ratio": 1.0392475209332048,
+    "exit": 0,
+    "configuration_sha256": "1f857c8d70f3812466a9e1ca9eb209bf9be6a39939e29de23f434d779252ce7e",
+    "only_performance_size_changed": true
+  },
+  "nfs41-to-s3": {
+    "baseline": "/tmp/nightly-qos-cross-20261029192047/calibration/nfs41-to-s3/extended/survey",
+    "reason": "first long sample failed amid >2% identical-control variation; fixed 15-pair requalification with equal idle",
+    "unlimited_control_ratio": 1.0741240788175201,
+    "exit": 1,
+    "repetitions": 15,
+    "performance_idle_ms": 1000,
+    "configuration_sha256": "efe7a5491bbd71e3e7987753fc12459a7fe974af3120de605c64655695236b51",
+    "only_performance_size_changed": true
+  },
+  "cifs-to-s3": {
+    "baseline": "/tmp/nightly-qos-cross-20261029192047/calibration/cifs-to-s3/survey",
+    "reason": "complete failed-route long-sample requalification; original and unlimited A/A evidence retained",
+    "unlimited_control_ratio": 1.0944245051478194,
+    "exit": 0,
+    "configuration_sha256": "cb8ba113d2363152e4412ad9b3aea6298ecddd92bb8b1b71019a2d8c81b346ad",
+    "only_performance_size_changed": true
+  },
+  "s3-to-nfs41": {
+    "baseline": "/tmp/nightly-qos-cross-20261029192047/calibration/s3-to-nfs41/survey",
+    "reason": "complete failed-route long-sample requalification; original and unlimited A/A evidence retained",
+    "unlimited_control_ratio": 1.077844153508246,
+    "exit": 0,
+    "configuration_sha256": "868c77b431ffb886012d0019ad1e85d9073f2cd235ebd2aa97f7d232752f0c49",
+    "only_performance_size_changed": true
+  },
+  "s3-to-hdfs": {
+    "baseline": "/tmp/nightly-qos-cross-20261029192047/calibration/s3-to-hdfs/extended/survey",
+    "reason": "first long sample failed amid >2% identical-control variation; fixed 15-pair requalification with equal idle",
+    "unlimited_control_ratio": 0.9437772844225507,
+    "exit": 1,
+    "repetitions": 15,
+    "performance_idle_ms": 1000,
+    "configuration_sha256": "14c21c372f7f9d27880763858b7adf1067eecbc9f399307cfcdfdfa29c50e43b",
+    "only_performance_size_changed": true
+  }
+}

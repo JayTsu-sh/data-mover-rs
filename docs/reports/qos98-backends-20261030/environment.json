@@ -1,0 +1,98 @@
+{
+  "run_id": "nightly-qos98-20261029230541",
+  "runner": "10.131.9.11",
+  "platform": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+  "logical_cpus": 24,
+  "memory_kib": "MemTotal:       32859456 kB",
+  "filesystem": "Filesystem     Type 1K-blocks      Used Available Use% Mounted on\n/dev/sda1      ext4 305147016 126773492 178357140  42% /\n",
+  "runtime_workers_per_process": 4,
+  "finite_limit_max_processes": 4,
+  "minimum_ratio": 0.98,
+  "high_bandwidth_bytes_per_second": 1099511627776,
+  "high_iops": 1000000000,
+  "performance_repetitions": 5,
+  "high_admission_trace": false,
+  "final_binary": "validated-bin",
+  "binary_sha256": {
+    "before": "6a7d9268c195fb15364ecfec0e089a20a03b540cb412d60ff54dd4e157d7be14",
+    "after": "a78e9a9827c4af7b52d0a82d329a55bb226ceea15121d98ffab5cdbe9f13f8e6",
+    "candidate": "e7446aa9153b344f6c7773a4700888321e7deb6ab01f933e4c748aa234e37545",
+    "final-bin": "e2c942dbc132b8ce28adbb26c5b9e6c99dd56fb983c405530f4fe33a72204914",
+    "release-bin": "ab1a3fbc2b3a33219a72e9b23e0f85576d66e650cfafd8cf9af39c531398e97b",
+    "release-bin-v2": "4c791bd8e650d34f8daf651ea0f27d3e57bab6cd9e1ee72dfb90b4fabe392f01",
+    "validated-bin": "7a73775588e2c7d2c468d443b533741aea81d665ca1825f67930a0cbd98caf59",
+    "backend-qos-cleanup": "22b3d214b65bca9ff1ca3a04fb6c6dec06ea34b0742cfe1a2a763273630f0f9c",
+    "hdfs-cleanup": "d0aeab1c951396b1e9acf0d319155959e542db354566c9dcb0d4815946377139"
+  },
+  "profiles": [
+    {
+      "name": "local",
+      "source": "/tmp/nightly-qos98-20261029230541/local-source",
+      "credential_environment_names": [],
+      "limited_size_mib": 64,
+      "requested_chunk_bytes": 2097152
+    },
+    {
+      "name": "nfs3",
+      "source": "nfs://10.10.1.12/srv/nfs/v3:/ci/nightly-qos98-20261029230541?version=3&noresvport=true",
+      "credential_environment_names": [],
+      "limited_size_mib": 64,
+      "requested_chunk_bytes": 2097152
+    },
+    {
+      "name": "nfs40",
+      "source": "nfs://10.131.7.201/jay_nfs:/nightly-qos98-20261029230541?version=4.0&noresvport=true&uid=0&gid=0",
+      "credential_environment_names": [],
+      "limited_size_mib": 128,
+      "requested_chunk_bytes": 2097152
+    },
+    {
+      "name": "nfs41",
+      "source": "nfs://10.10.1.12/srv/nfs/v4:/ci/nightly-qos98-20261029230541?version=4.1&noresvport=true",
+      "credential_environment_names": [],
+      "limited_size_mib": 64,
+      "requested_chunk_bytes": 2097152
+    },
+    {
+      "name": "cifs",
+      "source": "smb:nightly-qos98-20261029230541",
+      "credential_environment_names": [
+        "CIFS_REAL_SERVER",
+        "CIFS_REAL_SHARE",
+        "CIFS_REAL_USER",
+        "CIFS_REAL_PASS"
+      ],
+      "limited_size_mib": 64,
+      "requested_chunk_bytes": 2097152
+    },
+    {
+      "name": "s3",
+      "source": "s3:ci/nightly-qos98-20261029230541/qos",
+      "credential_environment_names": [
+        "S3_HOST",
+        "S3_BUCKET",
+        "S3_AK",
+        "S3_SK"
+      ],
+      "limited_size_mib": 128,
+      "requested_chunk_bytes": 8388608
+    },
+    {
+      "name": "hdfs",
+      "source": "hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@hdfs-ha/tmp/data-mover-nightly/nightly-qos98-20261029230541/hdfs/qos",
+      "credential_environment_names": [
+        "LAB_HDFS_CONFIG_DIR",
+        "LAB_HDFS_KEYTAB",
+        "KRB5CCNAME"
+      ],
+      "limited_size_mib": 64,
+      "requested_chunk_bytes": 2097152
+    }
+  ],
+  "s3_service": "RustFS 10.10.1.12:9000, terrasync-ci",
+  "cifs_service": "ONTAP 10.128.61.200, ontap_lisaauto_cifs",
+  "hdfs_service": "hdfs-ha, Kerberos keytab authentication",
+  "evidence_sha256": "c0de8c44c92ed2a3d82f05c2b6d6dabcca147e90e93796616cd3a3092deb0aa4",
+  "remote_archive_sha256": "25cf9a88cd39580853a75c7fc1febeb3842e42acc1790f57861ed807bd3d1b3a",
+  "private_configs_removed": true
+}

@@ -1,0 +1,8 @@
+{
+  "archive_files": 2662,
+  "archive_bytes": 14248805,
+  "archive_sha256": "1a53580a2e8274db2789c66a3f807d2b42e6cca7a7f97b88db304c6484100ccd",
+  "credential_scan_passed": true,
+  "retained_source_files": 613,
+  "rejected_candidate_source_files": 614
+}

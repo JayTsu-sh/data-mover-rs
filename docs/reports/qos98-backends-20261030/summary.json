@@ -1,0 +1,1196 @@
+{
+  "full": {
+    "local": {
+      "baseline_mibps": 609.7193922618624,
+      "baseline_iops": 304.8596961309312,
+      "high_mibps": 611.318089977462,
+      "high_ratio": 1.002622022090636,
+      "request_cap_bytes": 2097152,
+      "soft_bytes": 4194304,
+      "soft_iops": 2,
+      "size_mib": 64,
+      "performance_size_mib": 512,
+      "cases": {
+        "bandwidth-strict": {
+          "actual": 4171022.1015030546,
+          "ratio": 0.9944491628415715,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 41944.0,
+            "soft_max_excess": 41944.0,
+            "packet_allowance": 41944,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 4192894.475239161,
+            "first_half_second_rate": 4194400.0
+          }
+        },
+        "bandwidth-dual": {
+          "actual": 4445488.683189981,
+          "ratio": 1.0598870952582313,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 83887.0,
+            "soft_max_excess": 4194307.7070837775,
+            "packet_allowance": 83887,
+            "soft_credit_capacity": 4194304.0,
+            "steady_rate": 4194303.275373822,
+            "first_half_second_rate": 8304813.0
+          }
+        },
+        "iops-strict": {
+          "actual": 1.988436030295083,
+          "ratio": 0.9942180151475415,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 1.9999628118026047,
+            "first_half_second_rate": 2.0
+          }
+        },
+        "iops-dual": {
+          "actual": 2.2694639070954428,
+          "ratio": 1.1347319535477214,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 4.000000606,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 4.0,
+            "steady_rate": 1.9999668845483252,
+            "first_half_second_rate": 3.5
+          }
+        },
+        "combined": {
+          "bandwidth": {
+            "ratio": 1.1351448715449797,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 83887.0,
+              "soft_max_excess": 8388612.210631682,
+              "packet_allowance": 83887,
+              "soft_credit_capacity": 8388608,
+              "steady_rate": 4194303.780380095,
+              "first_half_second_rate": 8346756.5
+            }
+          },
+          "iops": {
+            "ratio": 1.1351448715449797,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 1.0,
+              "soft_max_excess": 100.00000654999997,
+              "packet_allowance": 1,
+              "soft_credit_capacity": 100,
+              "steady_rate": 50.001203808982424,
+              "first_half_second_rate": 99.5
+            }
+          }
+        }
+      }
+    },
+    "nfs3": {
+      "baseline_mibps": 592.8610934806663,
+      "baseline_iops": 592.8610934806663,
+      "high_mibps": 604.6779792263777,
+      "high_ratio": 1.019931963617877,
+      "request_cap_bytes": 1048576,
+      "soft_bytes": 4194304,
+      "soft_iops": 4,
+      "size_mib": 64,
+      "performance_size_mib": 512,
+      "cases": {
+        "bandwidth-strict": {
+          "actual": 4171538.9026955753,
+          "ratio": 0.9945723778475702,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 41944.0,
+            "soft_max_excess": 41944.0,
+            "packet_allowance": 41944,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 4192920.400920075,
+            "first_half_second_rate": 4194400.0
+          }
+        },
+        "bandwidth-dual": {
+          "actual": 4303832.681474603,
+          "ratio": 1.0261136726080424,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 83887.0,
+            "soft_max_excess": 2097155.4505937924,
+            "packet_allowance": 83887,
+            "soft_credit_capacity": 2097152.0,
+            "steady_rate": 4194310.818603097,
+            "first_half_second_rate": 8220926.0
+          }
+        },
+        "iops-strict": {
+          "actual": 3.977636792451205,
+          "ratio": 0.9944091981128013,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 3.9998954225236565,
+            "first_half_second_rate": 4.0
+          }
+        },
+        "iops-dual": {
+          "actual": 4.5397976116643015,
+          "ratio": 1.1349494029160754,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 8.000000488,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 8.0,
+            "steady_rate": 4.00000019360001,
+            "first_half_second_rate": 7.5
+          }
+        },
+        "combined": {
+          "bandwidth": {
+            "ratio": 1.1354285085724656,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 83887.0,
+              "soft_max_excess": 8388612.853783038,
+              "packet_allowance": 83887,
+              "soft_credit_capacity": 8388608,
+              "steady_rate": 4194302.1504350384,
+              "first_half_second_rate": 8346756.5
+            }
+          },
+          "iops": {
+            "ratio": 1.1354285085724656,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 1.0,
+              "soft_max_excess": 99.99978815000006,
+              "packet_allowance": 1,
+              "soft_credit_capacity": 100,
+              "steady_rate": 50.001184378054376,
+              "first_half_second_rate": 99.5
+            }
+          }
+        }
+      }
+    },
+    "nfs40": {
+      "baseline_mibps": 97.44531426060558,
+      "baseline_iops": 97.44531426060558,
+      "high_mibps": 98.06017349470866,
+      "high_ratio": 1.0063097875846416,
+      "request_cap_bytes": 1048576,
+      "soft_bytes": 4194304,
+      "soft_iops": 8,
+      "size_mib": 128,
+      "performance_size_mib": 128,
+      "cases": {
+        "bandwidth-strict": {
+          "actual": 4181197.7046960373,
+          "ratio": 0.9968752156963437,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 41944.0,
+            "soft_max_excess": 41944.0,
+            "packet_allowance": 41944,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 4193467.6671388727,
+            "first_half_second_rate": 4194400.0
+          }
+        },
+        "bandwidth-dual": {
+          "actual": 4247465.700677855,
+          "ratio": 1.0126747371382367,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 83887.0,
+            "soft_max_excess": 2097157.012225531,
+            "packet_allowance": 83887,
+            "soft_credit_capacity": 2097152.0,
+            "steady_rate": 4194304.671088746,
+            "first_half_second_rate": 8220926.0
+          }
+        },
+        "iops-strict": {
+          "actual": 7.946952830759343,
+          "ratio": 0.9933691038449178,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 7.999825267406263,
+            "first_half_second_rate": 8.0
+          }
+        },
+        "iops-dual": {
+          "actual": 9.074218131330397,
+          "ratio": 1.1342772664162997,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 16.000003360000004,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 16.0,
+            "steady_rate": 8.000000347200015,
+            "first_half_second_rate": 15.5
+          }
+        },
+        "combined": {
+          "bandwidth": {
+            "ratio": 1.0632888010919865,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 83887.0,
+              "soft_max_excess": 8388610.885713408,
+              "packet_allowance": 83887,
+              "soft_credit_capacity": 8388608,
+              "steady_rate": 4194303.775676252,
+              "first_half_second_rate": 8346687.5
+            }
+          },
+          "iops": {
+            "ratio": 1.0632888010919865,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 1.0,
+              "soft_max_excess": 100.00002765000004,
+              "packet_allowance": 1,
+              "soft_credit_capacity": 100,
+              "steady_rate": 49.99999952811248,
+              "first_half_second_rate": 99.5
+            }
+          }
+        }
+      }
+    },
+    "nfs41": {
+      "baseline_mibps": 567.9108322226231,
+      "baseline_iops": 571.2384347551775,
+      "high_mibps": 570.4404952757349,
+      "high_ratio": 1.0044543314013072,
+      "request_cap_bytes": 1044480,
+      "soft_bytes": 4194304,
+      "soft_iops": 4,
+      "size_mib": 64,
+      "performance_size_mib": 512,
+      "cases": {
+        "bandwidth-strict": {
+          "actual": 4179596.2122598905,
+          "ratio": 0.9964933901452757,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 41944.0,
+            "soft_max_excess": 41944.0,
+            "packet_allowance": 41944,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 4193077.846066222,
+            "first_half_second_rate": 4194400.0
+          }
+        },
+        "bandwidth-dual": {
+          "actual": 4312035.817658555,
+          "ratio": 1.0280694526811969,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 83887.0,
+            "soft_max_excess": 2097156.171454464,
+            "packet_allowance": 83887,
+            "soft_credit_capacity": 2097152.0,
+            "steady_rate": 4194296.4225681676,
+            "first_half_second_rate": 8220926.0
+          }
+        },
+        "iops-strict": {
+          "actual": 3.98546390163551,
+          "ratio": 0.9963659754088775,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 3.999811848008603,
+            "first_half_second_rate": 4.0
+          }
+        },
+        "iops-dual": {
+          "actual": 4.539775771371354,
+          "ratio": 1.1349439428428385,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 7.999999915999999,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 8.0,
+            "steady_rate": 3.9999995090526914,
+            "first_half_second_rate": 7.5
+          }
+        },
+        "combined": {
+          "bandwidth": {
+            "ratio": 1.1376016415302737,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 83887.0,
+              "soft_max_excess": 8388610.446683135,
+              "packet_allowance": 83887,
+              "soft_credit_capacity": 8388608,
+              "steady_rate": 4194333.172458,
+              "first_half_second_rate": 8346756.5
+            }
+          },
+          "iops": {
+            "ratio": 1.1376016415302737,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 1.0,
+              "soft_max_excess": 99.99848770000001,
+              "packet_allowance": 1,
+              "soft_credit_capacity": 100,
+              "steady_rate": 50.001554198309144,
+              "first_half_second_rate": 99.5
+            }
+          }
+        }
+      }
+    },
+    "cifs": {
+      "baseline_mibps": 100.6807469713845,
+      "baseline_iops": 100.6807469713845,
+      "high_mibps": 100.72094195173894,
+      "high_ratio": 1.0003992320434996,
+      "request_cap_bytes": 1048576,
+      "soft_bytes": 4194304,
+      "soft_iops": 4,
+      "size_mib": 64,
+      "performance_size_mib": 512,
+      "cases": {
+        "bandwidth-strict": {
+          "actual": 4175187.17226454,
+          "ratio": 0.9954421930943823,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 41944.0,
+            "soft_max_excess": 41944.0,
+            "packet_allowance": 41944,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 4192674.271502818,
+            "first_half_second_rate": 4194400.0
+          }
+        },
+        "bandwidth-dual": {
+          "actual": 4310072.088590811,
+          "ratio": 1.027601263187125,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 83887.0,
+            "soft_max_excess": 2097154.9796367357,
+            "packet_allowance": 83887,
+            "soft_credit_capacity": 2097152.0,
+            "steady_rate": 4194303.3584230174,
+            "first_half_second_rate": 8220926.0
+          }
+        },
+        "iops-strict": {
+          "actual": 3.981351309904391,
+          "ratio": 0.9953378274760978,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 3.9997016811975548,
+            "first_half_second_rate": 4.0
+          }
+        },
+        "iops-dual": {
+          "actual": 4.546307827053033,
+          "ratio": 1.1365769567632582,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 8.000001456000001,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 8.0,
+            "steady_rate": 4.000054654346765,
+            "first_half_second_rate": 7.5
+          }
+        },
+        "combined": {
+          "bandwidth": {
+            "ratio": 1.1372065919614405,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 83887.0,
+              "soft_max_excess": 8388612.244766718,
+              "packet_allowance": 83887,
+              "soft_credit_capacity": 8388608,
+              "steady_rate": 4194311.238883908,
+              "first_half_second_rate": 8346756.5
+            }
+          },
+          "iops": {
+            "ratio": 1.1372065919614405,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 1.0,
+              "soft_max_excess": 99.99999800000002,
+              "packet_allowance": 1,
+              "soft_credit_capacity": 100,
+              "steady_rate": 50.00129272342181,
+              "first_half_second_rate": 99.5
+            }
+          }
+        }
+      }
+    },
+    "s3": {
+      "baseline_mibps": 354.7238601396316,
+      "baseline_iops": 44.34048251745395,
+      "high_mibps": 357.49694769524996,
+      "high_ratio": 1.0078175952261197,
+      "request_cap_bytes": 8388608,
+      "soft_bytes": 4194304,
+      "soft_iops": 1,
+      "size_mib": 128,
+      "performance_size_mib": 128,
+      "cases": {
+        "bandwidth-strict": {
+          "actual": 4182841.6429719087,
+          "ratio": 0.9972671611242077,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 8388608.0,
+            "soft_max_excess": 8388608.0,
+            "packet_allowance": 8388608,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 4194300.8899258897,
+            "first_half_second_rate": 4194304.0
+          }
+        },
+        "bandwidth-dual": {
+          "actual": 4772314.597290041,
+          "ratio": 1.137808465311537,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 8388608.0,
+            "soft_max_excess": 16777216.864026625,
+            "packet_allowance": 8388608,
+            "soft_credit_capacity": 16777216.0,
+            "steady_rate": 4194304.226492428,
+            "first_half_second_rate": 6291456.0
+          }
+        },
+        "iops-strict": {
+          "actual": 0.9925295942505694,
+          "ratio": 0.9925295942505694,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 0.9999976002557588,
+            "first_half_second_rate": 1.0
+          }
+        },
+        "iops-dual": {
+          "actual": 1.1329924792825257,
+          "ratio": 1.1329924792825257,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.999999855,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 2.0,
+            "steady_rate": 0.9999999320000048,
+            "first_half_second_rate": 1.5
+          }
+        },
+        "combined": {
+          "bandwidth": {
+            "ratio": 1.1331077121928086,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 8388608.0,
+              "soft_max_excess": 16777218.608857088,
+              "packet_allowance": 8388608,
+              "soft_credit_capacity": 16777216,
+              "steady_rate": 8388609.419352716,
+              "first_half_second_rate": 12582912.0
+            }
+          },
+          "iops": {
+            "ratio": 1.1331077121928086,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 1.0,
+              "soft_max_excess": 2.000000311,
+              "packet_allowance": 1,
+              "soft_credit_capacity": 2,
+              "steady_rate": 1.0000001692000289,
+              "first_half_second_rate": 1.5
+            }
+          }
+        }
+      }
+    },
+    "hdfs": {
+      "baseline_mibps": 314.83608683891595,
+      "baseline_iops": 157.41804341945797,
+      "high_mibps": 323.198910300534,
+      "high_ratio": 1.026562467935567,
+      "request_cap_bytes": 2097152,
+      "soft_bytes": 4194304,
+      "soft_iops": 2,
+      "size_mib": 64,
+      "performance_size_mib": 512,
+      "cases": {
+        "bandwidth-strict": {
+          "actual": 4176508.5701834233,
+          "ratio": 0.9957572389086302,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 41944.0,
+            "soft_max_excess": 41944.0,
+            "packet_allowance": 41944,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 4192920.8100146535,
+            "first_half_second_rate": 4194400.0
+          }
+        },
+        "bandwidth-dual": {
+          "actual": 4454331.32522649,
+          "ratio": 1.0619953454080797,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 83887.0,
+            "soft_max_excess": 4194306.828294659,
+            "packet_allowance": 83887,
+            "soft_credit_capacity": 4194304.0,
+            "steady_rate": 4194304.897769822,
+            "first_half_second_rate": 8304813.0
+          }
+        },
+        "iops-strict": {
+          "actual": 1.9901895219568648,
+          "ratio": 0.9950947609784324,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 1.9999835668016925,
+            "first_half_second_rate": 2.0
+          }
+        },
+        "iops-dual": {
+          "actual": 2.273134043445136,
+          "ratio": 1.136567021722568,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 4.000000707999998,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 4.0,
+            "steady_rate": 2.000000054800002,
+            "first_half_second_rate": 3.5
+          }
+        },
+        "combined": {
+          "bandwidth": {
+            "ratio": 1.137160443313274,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 83887.0,
+              "soft_max_excess": 8388614.625619458,
+              "packet_allowance": 83887,
+              "soft_credit_capacity": 8388608,
+              "steady_rate": 4194302.440687641,
+              "first_half_second_rate": 8346756.5
+            }
+          },
+          "iops": {
+            "ratio": 1.137160443313274,
+            "trace": {
+              "hard_envelope": true,
+              "soft_envelope": true,
+              "steady_ceiling": true,
+              "steady_window_after_peak": true,
+              "steady_at_least_98_percent": true,
+              "burst_observed": true,
+              "hard_max_excess": 1.0,
+              "soft_max_excess": 99.99997379999999,
+              "packet_allowance": 1,
+              "soft_credit_capacity": 100,
+              "steady_rate": 50.00118783821851,
+              "first_half_second_rate": 99.5
+            }
+          }
+        }
+      }
+    }
+  },
+  "small": {
+    "local": {
+      "baseline_mibps": 1359.2731968340393,
+      "baseline_iops": 21748.371149344628,
+      "high_mibps": 1334.294723954475,
+      "high_ratio": 0.9816236552462426,
+      "request_cap_bytes": 65536,
+      "soft_bytes": 4194304,
+      "soft_iops": 128,
+      "size_mib": 128,
+      "performance_size_mib": 512,
+      "cases": {
+        "iops-strict": {
+          "actual": 127.9746406092042,
+          "ratio": 0.9998018797594078,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 127.92984654267546,
+            "first_half_second_rate": 128.0
+          }
+        },
+        "iops-dual": {
+          "actual": 146.2817230829382,
+          "ratio": 1.1428259615854548,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 256.0000622080001,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 256.0,
+            "steady_rate": 127.99996946269276,
+            "first_half_second_rate": 255.5
+          }
+        }
+      }
+    },
+    "nfs3": {
+      "baseline_mibps": 370.8524415234909,
+      "baseline_iops": 5933.639064375854,
+      "high_mibps": 372.98392164586306,
+      "high_ratio": 1.0057475154096758,
+      "request_cap_bytes": 65536,
+      "soft_bytes": 4194304,
+      "soft_iops": 128,
+      "size_mib": 128,
+      "performance_size_mib": 512,
+      "cases": {
+        "iops-strict": {
+          "actual": 127.96550130063375,
+          "ratio": 0.9997304789112011,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 127.93505197657,
+            "first_half_second_rate": 128.0
+          }
+        },
+        "iops-dual": {
+          "actual": 146.27598495798878,
+          "ratio": 1.1427811324842874,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 256.0001733119999,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 256.0,
+            "steady_rate": 127.9999997435994,
+            "first_half_second_rate": 255.5
+          }
+        }
+      }
+    },
+    "nfs40": {
+      "baseline_mibps": 63.89932163461757,
+      "baseline_iops": 1022.3891461538811,
+      "high_mibps": 67.57441447091895,
+      "high_ratio": 1.0575138004956597,
+      "request_cap_bytes": 65536,
+      "soft_bytes": 4194304,
+      "soft_iops": 128,
+      "size_mib": 128,
+      "performance_size_mib": 128,
+      "cases": {
+        "iops-strict": {
+          "actual": 127.98369858032913,
+          "ratio": 0.9998726451588213,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 127.98446026543431,
+            "first_half_second_rate": 128.0
+          }
+        },
+        "iops-dual": {
+          "actual": 146.26315619226634,
+          "ratio": 1.1426809077520808,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 256.00007552000005,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 256.0,
+            "steady_rate": 128.00000882018213,
+            "first_half_second_rate": 255.5
+          }
+        }
+      }
+    },
+    "nfs41": {
+      "baseline_mibps": 222.72059890571288,
+      "baseline_iops": 3563.529582491406,
+      "high_mibps": 233.91256083496916,
+      "high_ratio": 1.0502511307182427,
+      "request_cap_bytes": 65536,
+      "soft_bytes": 4194304,
+      "soft_iops": 128,
+      "size_mib": 128,
+      "performance_size_mib": 512,
+      "cases": {
+        "iops-strict": {
+          "actual": 127.96486252828855,
+          "ratio": 0.9997254885022543,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 127.9360477048735,
+            "first_half_second_rate": 128.0
+          }
+        },
+        "iops-dual": {
+          "actual": 146.2768085043338,
+          "ratio": 1.1427875664401077,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 256.000084992,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 256.0,
+            "steady_rate": 128.00000885760062,
+            "first_half_second_rate": 255.5
+          }
+        }
+      }
+    },
+    "cifs": {
+      "baseline_mibps": 53.8380542797299,
+      "baseline_iops": 861.4088684756784,
+      "high_mibps": 52.857426407149276,
+      "high_ratio": 0.9817855996896635,
+      "request_cap_bytes": 1048576,
+      "soft_bytes": 4194304,
+      "soft_iops": 128,
+      "size_mib": 128,
+      "performance_size_mib": 128,
+      "cases": {
+        "iops-strict": {
+          "actual": 127.8095457556781,
+          "ratio": 0.9985120762162352,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 127.86848037384334,
+            "first_half_second_rate": 128.0
+          }
+        },
+        "iops-dual": {
+          "actual": 146.260483641878,
+          "ratio": 1.142660028452172,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 256.0000856319999,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 256.0,
+            "steady_rate": 128.00007790084746,
+            "first_half_second_rate": 255.5
+          }
+        }
+      }
+    },
+    "s3": {
+      "baseline_mibps": 48.73390545306257,
+      "baseline_iops": 779.7424872490011,
+      "high_mibps": 48.09984023713222,
+      "high_ratio": 0.9869892386001972,
+      "request_cap_bytes": 65536,
+      "soft_bytes": 4194304,
+      "soft_iops": 128,
+      "size_mib": 128,
+      "performance_size_mib": 128,
+      "cases": {
+        "iops-strict": {
+          "actual": 127.97907191031688,
+          "ratio": 0.9998364992993506,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 127.98501142094483,
+            "first_half_second_rate": 128.0
+          }
+        },
+        "iops-dual": {
+          "actual": 146.2475266016494,
+          "ratio": 1.142558801575386,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 256.00019123199996,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 256.0,
+            "steady_rate": 128.00003961390897,
+            "first_half_second_rate": 255.5
+          }
+        }
+      }
+    },
+    "hdfs": {
+      "baseline_mibps": 116.66088325654499,
+      "baseline_iops": 1866.5741321047199,
+      "high_mibps": 119.51383253774726,
+      "high_ratio": 1.0244550632702518,
+      "request_cap_bytes": 2097152,
+      "soft_bytes": 4194304,
+      "soft_iops": 128,
+      "size_mib": 128,
+      "performance_size_mib": 512,
+      "cases": {
+        "iops-strict": {
+          "actual": 127.96881384010614,
+          "ratio": 0.9997563581258292,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 1.0,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 0.0,
+            "steady_rate": 127.97523072454577,
+            "first_half_second_rate": 128.0
+          }
+        },
+        "iops-dual": {
+          "actual": 146.2607501038931,
+          "ratio": 1.1426621101866647,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 256.00009036800003,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 256.0,
+            "steady_rate": 128.00000130560002,
+            "first_half_second_rate": 255.5
+          }
+        }
+      }
+    }
+  }
+}

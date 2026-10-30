@@ -64,6 +64,7 @@ pub struct MemoryS3State {
     pub version: Mutex<Option<String>>,
     pub last_modified: Mutex<Option<crate::model::StorageTimestamp>>,
     pub range_observations: Mutex<Vec<S3ObjectFacts>>,
+    pub range_dispatches: Mutex<Vec<(tokio::time::Instant, Range<u64>)>>,
     pub objects: Mutex<HashMap<String, Bytes>>,
     pub(super) uploads: Mutex<UploadParts>,
     tags: Mutex<HashMap<String, Vec<ObjectTag>>>,
@@ -476,6 +477,10 @@ impl S3Protocol for MemoryS3 {
         let full_key = self.full_key(key);
         let key = full_key.as_str();
         self.range_observations.lock().await.push(observed.clone());
+        self.range_dispatches
+            .lock()
+            .await
+            .push((tokio::time::Instant::now(), range.clone()));
         let gate = self
             .range_gate
             .lock()

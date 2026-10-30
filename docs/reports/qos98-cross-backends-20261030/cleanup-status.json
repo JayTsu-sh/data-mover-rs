@@ -1,0 +1,27 @@
+[
+  [
+    "nfs40",
+    "tree",
+    0
+  ],
+  [
+    "nfs40",
+    "run-root",
+    0
+  ],
+  [
+    "cifs",
+    "tree",
+    0
+  ],
+  [
+    "cifs",
+    "run-root",
+    0
+  ],
+  [
+    "standard",
+    "lifecycle",
+    0
+  ]
+]

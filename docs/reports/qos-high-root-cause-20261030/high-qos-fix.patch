@@ -1,0 +1,333 @@
+--- a/crates/backend-s3/src/backend/client.rs
++++ b/crates/backend-s3/src/backend/client.rs
+@@ -26,6 +26,7 @@
+ #[cfg(test)]
+ mod directory_object_write_tests;
+ mod dxn;
++mod qos_client;
+ mod storagegrid;
+ mod tls;
+ mod url_options;
+@@ -108,6 +109,7 @@
+     prefix: Option<String>,
+     client: Client,
+     single_attempt_client: std::sync::OnceLock<Client>,
++    http_client_capture: qos_client::HttpClientCapture,
+     pub is_bucket_versioned: bool,
+     /// `GetBucketVersioning` answered `Suspended` when the bucket was connected: a write there
+     /// creates the `"null"` version, whether or not its reply says so (`RustFS` names none). A
+@@ -368,7 +370,8 @@
+         // 创建 S3 客户端，强制使用路径样式以支持 FQDN 和自定义域名
+         // 禁用自动 checksum 计算（WhenRequired），避免 SDK 对 UploadPart 等操作
+         // 自动附加 trailing CRC32 + aws-chunked 编码，某些 S3 兼容存储不支持该编码
+-        let client = Client::from_conf(build_s3_config(&sdk_config, options.compat));
++        let (client, http_client_capture) =
++            qos_client::capturing_client(build_s3_config(&sdk_config, options.compat));
+ 
+         // 只有当prefix不为空时才设置
+         let prefix_option = if prefix.is_empty() {
+@@ -405,13 +408,11 @@
+             endpoint,
+             bucket_name,
+             prefix: prefix_option,
+-            single_attempt_client: std::sync::OnceLock::from(Client::from_conf(
+-                client
+-                    .config()
+-                    .to_builder()
+-                    .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+-                    .build(),
++            single_attempt_client: std::sync::OnceLock::from(qos_client::single_attempt_client(
++                &client,
++                &http_client_capture,
+             )),
++            http_client_capture,
+             client,
+             is_bucket_versioned,
+             versioning_suspended,
+@@ -478,6 +479,7 @@
+             prefix: prefix.map(std::string::ToString::to_string),
+             client,
+             single_attempt_client: std::sync::OnceLock::new(),
++            http_client_capture: qos_client::HttpClientCapture::default(),
+             is_bucket_versioned: false,
+             versioning_suspended: false,
+             versioning_at_connect: S3VersioningAtConnect::Never,
+--- a/crates/backend-s3/src/backend/client/copy_request.rs
++++ b/crates/backend-s3/src/backend/client/copy_request.rs
+@@ -103,6 +103,7 @@
+             prefix: None,
+             client: aws_sdk_s3::Client::from_conf(config),
+             single_attempt_client: std::sync::OnceLock::new(),
++            http_client_capture: crate::backend::client::qos_client::HttpClientCapture::default(),
+             is_bucket_versioned: false,
+             versioning_suspended: false,
+             versioning_at_connect: S3VersioningAtConnect::Never,
+--- a/crates/backend-s3/src/backend/client/directory_object_write_tests.rs
++++ b/crates/backend-s3/src/backend/client/directory_object_write_tests.rs
+@@ -65,6 +65,7 @@
+         prefix: None,
+         client: aws_sdk_s3::Client::from_conf(config),
+         single_attempt_client: std::sync::OnceLock::new(),
++        http_client_capture: crate::backend::client::qos_client::HttpClientCapture::default(),
+         is_bucket_versioned: false,
+         versioning_suspended: false,
+         versioning_at_connect: S3VersioningAtConnect::Never,
+--- a/crates/backend-s3/src/backend/client/qos_client.rs
++++ b/crates/backend-s3/src/backend/client/qos_client.rs
+@@ -0,0 +1,57 @@
++//! Preserve the SDK's resolved transport when disabling retries for shaped GETs.
++use std::sync::{Arc, OnceLock};
++
++use aws_sdk_s3::{Client, Config};
++use aws_smithy_runtime_api::box_error::BoxError;
++use aws_smithy_runtime_api::client::http::SharedHttpClient;
++use aws_smithy_runtime_api::client::interceptors::Intercept;
++use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextRef;
++use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
++use aws_smithy_types::config_bag::ConfigBag;
++
++/// `Client::config()` omits a transport supplied by the SDK's default runtime plugin.
++/// Observe that exact transport during metadata preflight instead of constructing another one.
++#[derive(Clone, Debug, Default)]
++pub(super) struct HttpClientCapture(Arc<OnceLock<SharedHttpClient>>);
++
++impl Intercept for HttpClientCapture {
++    fn name(&self) -> &'static str {
++        "SourceQosHttpClientCapture"
++    }
++
++    fn read_before_transmit(
++        &self,
++        _: &BeforeTransmitInterceptorContextRef<'_>,
++        components: &RuntimeComponents,
++        _: &mut ConfigBag,
++    ) -> Result<(), BoxError> {
++        if self.0.get().is_none()
++            && let Some(client) = components.http_client()
++        {
++            let _ = self.0.set(client);
++        }
++        Ok(())
++    }
++}
++
++pub(super) fn capturing_client(config: Config) -> (Client, HttpClientCapture) {
++    let capture = HttpClientCapture::default();
++    let config = if let Some(client) = config.http_client() {
++        let _ = capture.0.set(client);
++        config
++    } else {
++        config.to_builder().interceptor(capture.clone()).build()
++    };
++    (Client::from_conf(config), capture)
++}
++
++pub(super) fn single_attempt_client(client: &Client, capture: &HttpClientCapture) -> Client {
++    let mut config = client
++        .config()
++        .to_builder()
++        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled());
++    if let Some(http) = capture.0.get() {
++        config.set_http_client(Some(http.clone()));
++    }
++    Client::from_conf(config.build())
++}
+--- a/crates/backend-s3/src/backend/client/role_protocol.rs
++++ b/crates/backend-s3/src/backend/client/role_protocol.rs
+@@ -39,6 +39,8 @@
+ mod listing;
+ mod multipart;
+ mod native;
++#[cfg(test)]
++mod qos_pool_tests;
+ #[cfg(test)]
+ mod qos_wire_tests;
+ pub(super) mod rename;
+@@ -121,13 +123,7 @@
+         // than rebuilding operation runtime plugins for every small Range GET.
+         let client = if single_attempt {
+             self.single_attempt_client.get_or_init(|| {
+-                aws_sdk_s3::Client::from_conf(
+-                    self.client
+-                        .config()
+-                        .to_builder()
+-                        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+-                        .build(),
+-                )
++                super::qos_client::single_attempt_client(&self.client, &self.http_client_capture)
+             })
+         } else {
+             &self.client
+--- a/crates/backend-s3/src/backend/client/role_protocol/native.rs
++++ b/crates/backend-s3/src/backend/client/role_protocol/native.rs
+@@ -170,6 +170,7 @@
+             prefix: None,
+             client: aws_sdk_s3::Client::from_conf(config),
+             single_attempt_client: std::sync::OnceLock::new(),
++            http_client_capture: crate::backend::client::qos_client::HttpClientCapture::default(),
+             is_bucket_versioned: false,
+             versioning_suspended: false,
+             versioning_at_connect: super::super::super::S3VersioningAtConnect::Never,
+--- a/crates/backend-s3/src/backend/client/role_protocol/qos_pool_tests.rs
++++ b/crates/backend-s3/src/backend/client/role_protocol/qos_pool_tests.rs
+@@ -0,0 +1,160 @@
++//! Source `QoS` must retain the connection pool already used by metadata and ordinary reads.
++use std::sync::Arc;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::time::Duration;
++
++use futures::StreamExt as _;
++use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
++use tokio::net::TcpListener;
++use tokio_util::sync::CancellationToken;
++
++use super::super::{S3Compatibility, S3UrlOptions};
++use super::S3Storage;
++use crate::model::SourceVersion;
++use crate::storage::backends::s3::source::S3ReadSource;
++use crate::storage::backends::s3::tests::identity;
++use crate::storage::{ReadRequest, ReadSource, SourceQosGroup, SourceQosPolicy};
++
++fn serve(
++    listener: TcpListener,
++    accepted: Arc<AtomicUsize>,
++    server_stop: CancellationToken,
++) -> tokio::task::JoinHandle<()> {
++    tokio::spawn(async move {
++        loop {
++            let connection = tokio::select! {
++                () = server_stop.cancelled() => break,
++                result = listener.accept() => result,
++            };
++            let Ok((mut socket, _)) = connection else {
++                break;
++            };
++            accepted.fetch_add(1, Ordering::Relaxed);
++            let connection_stop = server_stop.clone();
++            tokio::spawn(async move {
++                loop {
++                    let mut request = Vec::new();
++                    let mut buffer = [0; 4096];
++                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
++                        let read = tokio::select! {
++                            () = connection_stop.cancelled() => return,
++                            result = socket.read(&mut buffer) => result,
++                        };
++                        let Ok(count) = read else { return };
++                        if count == 0 {
++                            return;
++                        }
++                        request.extend_from_slice(&buffer[..count]);
++                    }
++                    let (status, body, length) = if request.starts_with(b"HEAD ") {
++                        ("200 OK", "", 1)
++                    } else if request.windows(10).any(|part| part == b"versioning") {
++                        let body = "<VersioningConfiguration/>";
++                        ("200 OK", body, body.len())
++                    } else {
++                        ("206 Partial Content", "x", 1)
++                    };
++                    let response = format!(
++                        "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nETag: \"source\"\r\n\
++                         Content-Type: application/xml\r\nConnection: keep-alive\r\n\r\n{body}"
++                    );
++                    if socket.write_all(response.as_bytes()).await.is_err() {
++                        return;
++                    }
++                }
++            });
++        }
++    })
++}
++
++#[tokio::test]
++async fn source_qos_reuses_the_metadata_and_payload_connection_pool()
++-> Result<(), Box<dyn std::error::Error>> {
++    let listener = TcpListener::bind("127.0.0.1:0").await?;
++    let address = listener.local_addr()?;
++    let connections = Arc::new(AtomicUsize::new(0));
++    let accepted = Arc::clone(&connections);
++    let stop = CancellationToken::new();
++    let server_stop = stop.clone();
++    let server = serve(listener, accepted, server_stop);
++    let result = tokio::time::timeout(Duration::from_secs(10), async {
++        // Use the default connector (the regression needs independently created pools),
++        // but disable environment proxy discovery for this loopback-only fixture.
++        // Production clients continue to use the latest behavior version.
++        #[allow(deprecated)]
++        let sdk_config = aws_config::SdkConfig::builder()
++            .behavior_version(aws_sdk_s3::config::BehaviorVersion::v2025_01_17())
++            .credentials_provider(
++                aws_credential_types::provider::SharedCredentialsProvider::new(
++                    aws_credential_types::Credentials::new(
++                        "test-key",
++                        "test-secret",
++                        None,
++                        None,
++                        "pool-test",
++                    ),
++                ),
++            )
++            .region(aws_types::region::Region::new("us-east-1"))
++            .endpoint_url(format!("http://{address}"))
++            .build();
++        let config = super::super::build_s3_config(&sdk_config, S3Compatibility::default());
++        let (client, http_client_capture) = super::super::qos_client::capturing_client(config);
++        let storage = S3Storage {
++            client,
++            http_client_capture,
++            single_attempt_client: std::sync::OnceLock::new(),
++            transfer_concurrency: crate::transfer_concurrency::TransferConcurrency::defaults(4, 4),
++            read_chunk_bytes: 8 * 1024 * 1024,
++            options: S3UrlOptions::default(),
++            endpoint: format!("http://{address}"),
++            bucket_name: "bucket".into(),
++            prefix: None,
++            is_bucket_versioned: false,
++            versioning_suspended: false,
++            versioning_at_connect: crate::storage::backends::s3::S3VersioningAtConnect::Never,
++        };
++        let source = S3ReadSource::new(Arc::new(storage), identity());
++        let path = crate::model::StoragePath::new("source")?;
++        let described = source.describe(&path).await?;
++        let budget = SourceQosGroup::new(SourceQosPolicy::new(
++            Some((1 << 40, 1 << 40, Duration::ZERO)),
++            8 * 1024 * 1024,
++            Some((1_000_000_000, 1_000_000_000, Duration::ZERO)),
++        )?)
++        .transfer_budget();
++        // Exercise the actual caller's HEAD -> regular GET -> HEAD -> shaped GET sequence.
++        for qos in [None, Some(budget.clone()), None, Some(budget.clone())] {
++            let mut stream = source
++                .read(ReadRequest {
++                    path: path.clone(),
++                    range: Some(0..1),
++                    expected_source: Some(described.source_identity.clone()),
++                    maximum_chunk_bytes: 8 * 1024 * 1024,
++                    read_inflight: 1,
++                    read_budget: None,
++                    cancel: CancellationToken::new(),
++                    source_qos: qos,
++                    version: SourceVersion::Current,
++                })
++                .await?;
++            assert_eq!(
++                stream.next().await.ok_or("missing payload")??.as_ref(),
++                b"x"
++            );
++            assert!(stream.next().await.is_none());
++        }
++        assert_eq!(budget.stats().source_read_operations, 2);
++        Ok::<_, Box<dyn std::error::Error>>(())
++    })
++    .await;
++    stop.cancel();
++    server.await?;
++    result??;
++    assert_eq!(
++        connections.load(Ordering::Relaxed),
++        1,
++        "enabling source QoS must not create a second cold HTTP connection pool"
++    );
++    Ok(())
++}

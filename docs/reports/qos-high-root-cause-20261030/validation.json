@@ -1,0 +1,20 @@
+{
+  "rust_library": {
+    "passed": 2076,
+    "failed": 0,
+    "ignored": 9,
+    "suites": 14,
+    "log": "validation-logs/qos-high-capture-rust-tests.log"
+  },
+  "python_qos": {
+    "passed": 16
+  },
+  "clippy_release_acceptance_and_cleanup": "passed, -D warnings",
+  "clippy_s3_library_and_tests": "passed, -D warnings",
+  "cargo_fmt": "passed",
+  "architecture": "passed",
+  "cargo_lock_and_s3_dependencies_unchanged": true,
+  "normal_binary_sha256": "9b56c318e8547d358eadc4bbc05914cce34fc9a4683d784a869216905376e4dd",
+  "normal_binary_and_production_sources_have_no_diagnostic_probe_tags": true,
+  "source_manifest_verified": true
+}

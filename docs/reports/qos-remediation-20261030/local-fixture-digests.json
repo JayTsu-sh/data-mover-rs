@@ -1,0 +1,24 @@
+{
+  "tool": "Python blake3 1.0.11",
+  "families": {
+    "nightly-qos-remediation-local-final": {
+      "size_mib": 512,
+      "payload_blake3": "b69728dd1278f43f8cae7e1a5c4e33be141a4f66cc68e28051d215b6667c79af",
+      "block_sha256": "7e947e0178d21754362cb45645b752710f5edce3c66b79723fce68dc5eee2dd9",
+      "block_file": "nightly-qos-remediation-local-final.block.bin"
+    },
+    "nightly-qos-remediation-local-retained": {
+      "size_mib": 512,
+      "payload_blake3": "ea797f3f861bf7669a1a34b55eaa9ef003072aec3a5b795dae99e63c6756c6f9",
+      "block_sha256": "962ccaedbd6c4e4dbf63c2a8222d7eea78c7b49ad2c75d08098ae91a5fbf9b76",
+      "block_file": "nightly-qos-remediation-local-retained.block.bin"
+    },
+    "nightly-qos-remediation-local-sustained": {
+      "size_mib": 1024,
+      "payload_blake3": "ba2e20073ff8b36b4f013c82591ddf71133525050eecfb7fd3697669e500fe3b",
+      "block_sha256": "1dd0eaece35200168492e28b87452be277ba7d9ecaf2d305547cb682c5767faf",
+      "block_file": "nightly-qos-remediation-local-sustained.block.bin"
+    }
+  },
+  "early_self_source_local_diagnostic": "512 MiB golden deleted by that successful source-cleanup; original hashes/output retained, not used for final qualification"
+}

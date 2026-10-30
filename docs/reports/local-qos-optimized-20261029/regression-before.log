@@ -1,0 +1,87 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling smallvec v1.15.1
+   Compiling rustix v1.1.4
+   Compiling cc v1.2.61
+   Compiling futures-channel v0.3.32
+   Compiling slab v0.4.12
+   Compiling tracing-core v0.1.36
+   Compiling parking_lot_core v0.9.12
+   Compiling parking_lot v0.12.5
+   Compiling dashmap v6.1.0
+   Compiling quote v1.0.45
+   Compiling syn v2.0.117
+   Compiling blake3 v1.8.5
+   Compiling data-mover-model v0.4.0 (/root/jay/rust/github/data-mover-rs/crates/model)
+   Compiling fs-set-times v0.20.3
+   Compiling rustix-linux-procfs v0.1.1
+   Compiling tempfile v3.27.0
+   Compiling cap-primitives v4.0.3
+   Compiling cap-std v4.0.3
+   Compiling synstructure v0.13.2
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.5
+   Compiling serde_derive v1.0.228
+   Compiling futures-macro v0.3.32
+   Compiling tokio-macros v2.7.0
+   Compiling tracing-attributes v0.1.31
+   Compiling thiserror-impl v2.0.18
+   Compiling async-trait v0.1.89
+   Compiling futures-util v0.3.32
+   Compiling zerofrom v0.1.7
+   Compiling yoke v0.8.2
+   Compiling tracing v0.1.44
+   Compiling thiserror v2.0.18
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_collections v2.2.0
+   Compiling icu_locale_core v2.2.0
+   Compiling serde v1.0.228
+   Compiling icu_provider v2.2.0
+   Compiling bytes v1.11.1
+   Compiling quick-xml v0.39.2
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling tokio v1.52.1
+   Compiling futures-executor v0.3.32
+   Compiling governor v0.10.4
+   Compiling futures v0.3.32
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling tokio-util v0.7.19
+   Compiling data-mover-storage-core v0.4.0 (/root/jay/rust/github/data-mover-rs/crates/storage-core)
+    Finished `release` profile [optimized] target(s) in 20.85s
+     Running unittests src/lib.rs (/work/cargo-target/release/deps/data_mover_storage_core-24c88a33e3a54496)
+
+running 8 tests
+
+thread 'runtime::qos::tests::completed_io_time_satisfies_strict_bandwidth_and_iops_slots' (2908697) panicked at crates/storage-core/src/runtime/qos.rs:463:9:
+assertion `left == right` failed
+  left: 8ms
+ right: 0ns
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'runtime::qos::tests::hard_wait_refills_soft_credit_for_the_full_peak_duration' (2908698) panicked at crates/storage-core/src/runtime/qos.rs:485:9:
+700ms
+test runtime::qos::tests::policy_rejects_zero_and_inverted_limits ... ok
+test runtime::qos::tests::hard_wait_refills_soft_credit_for_the_full_peak_duration ... FAILED
+test runtime::qos::tests::completed_io_time_satisfies_strict_bandwidth_and_iops_slots ... FAILED
+test runtime::qos::tests::soft_average_hard_ceiling_and_peak_credit_are_bounded ... ok
+test runtime::qos::tests::cloned_group_shares_admission_but_keeps_per_transfer_counters ... ok
+test runtime::qos::tests::repeated_source_attempts_charge_each_operation_but_only_returned_payload ... ok
+test runtime::qos::tests::cancellation_while_waiting_is_immediate_and_uncharged ... ok
+test runtime::qos::tests::queued_transfers_share_one_fair_budget_without_starvation ... ok
+
+failures:
+
+failures:
+    runtime::qos::tests::completed_io_time_satisfies_strict_bandwidth_and_iops_slots
+    runtime::qos::tests::hard_wait_refills_soft_credit_for_the_full_peak_duration
+
+test result: FAILED. 6 passed; 2 failed; 0 ignored; 0 measured; 190 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p data-mover-storage-core --lib`

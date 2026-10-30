@@ -1,0 +1,102 @@
+{
+  "review_base": "4149575e91fe392ee853725e110d6c1be9c6b562",
+  "reviewed_code_head": "baac11505b0f0825afdb903d3bcf6f42ebc4d7c1",
+  "toolchain": "Rust 1.95.0",
+  "make_verify": "passed",
+  "all_features_clippy": "passed: workspace/all-targets/all-features/locked -D warnings",
+  "all_features_workspace_tests": {
+    "passed": 2196,
+    "failed": 0,
+    "ignored": 45
+  },
+  "default_workspace_tests": {
+    "passed": 2196,
+    "failed": 0,
+    "ignored": 45
+  },
+  "python_all": {
+    "passed": 146,
+    "failed": 0
+  },
+  "python_qos": {
+    "passed": 34,
+    "failed": 0
+  },
+  "cleanup_scope_rust": {
+    "passed": 3,
+    "failed": 0
+  },
+  "cleanup_executable_e2e": {
+    "binary_sha256": "c8e61a0b558f35ad51b383cafd41fba949d8a71bad5d73b6f554e776a83c1aee",
+    "checks": [
+      {
+        "case": "parent",
+        "rejected": true,
+        "sibling_sentinel_preserved": true
+      },
+      {
+        "case": "multiple-parents",
+        "rejected": true,
+        "sibling_sentinel_preserved": true
+      },
+      {
+        "case": "run-symlink",
+        "rejected": true,
+        "sibling_sentinel_preserved": true
+      },
+      {
+        "case": "child-symlink",
+        "rejected": true,
+        "sibling_sentinel_preserved": true
+      },
+      {
+        "case": "encoded-parent",
+        "rejected": true,
+        "sibling_sentinel_preserved": true
+      },
+      {
+        "case": "credential-slash",
+        "rejected": true,
+        "sibling_sentinel_preserved": true
+      },
+      {
+        "case": "query-is-not-root",
+        "rejected": true,
+        "sibling_sentinel_preserved": true
+      },
+      {
+        "case": "unknown-file-scheme",
+        "rejected": true,
+        "sibling_sentinel_preserved": true
+      },
+      {
+        "case": "unknown-uppercase-scheme",
+        "rejected": true,
+        "sibling_sentinel_preserved": true
+      },
+      {
+        "case": "unknown-local-scheme-symlink",
+        "rejected": true,
+        "sibling_sentinel_preserved": true
+      },
+      {
+        "case": "valid-local-tree",
+        "deleted_owned_children_only": true,
+        "root_retained": true,
+        "sibling_sentinel_preserved": true
+      }
+    ],
+    "passed": 11,
+    "failed": 0,
+    "scope": "actual cleanup executable; only disposable local trees; no external backend contacted"
+  },
+  "standards": {
+    "safety_correctness_blockers": 0,
+    "unresolved_p3": 1,
+    "unresolved_p3_scope": "CLI/scheduler function length; disclosed nonblocking maintenance debt, not a preexisting exemption"
+  },
+  "spec": {
+    "code_blockers": 0,
+    "performance_acceptance": "high-QoS qualification remains incomplete; preserved 5 raw failures and 8 precision insufficiencies"
+  }
+}

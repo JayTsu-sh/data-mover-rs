@@ -1,0 +1,9 @@
+{
+  "scope": "imports and aliases only; ignores whitespace and top-level use declarations",
+  "files": {
+    "crates/storage-core/src/runtime/qos/wait.rs": true,
+    "crates/backend-s3/src/backend/client/qos_client.rs": true,
+    "crates/backend-s3/src/backend/client.rs": true,
+    "tests/lab/tools/backend_qos_acceptance.rs": true
+  }
+}
