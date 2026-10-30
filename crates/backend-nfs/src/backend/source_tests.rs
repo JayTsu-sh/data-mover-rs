@@ -12,17 +12,23 @@ struct FakeProtocol {
     opened: Mutex<usize>,
     active_reads: Arc<AtomicUsize>,
     maximum_active_reads: Arc<AtomicUsize>,
+    read_started: Arc<Mutex<Vec<tokio::time::Instant>>>,
 }
 
 struct FakeCursor {
     payload: Bytes,
     active_reads: Arc<AtomicUsize>,
     maximum_active_reads: Arc<AtomicUsize>,
+    read_started: Arc<Mutex<Vec<tokio::time::Instant>>>,
 }
 
 #[async_trait]
 impl NfsReadCursor for FakeCursor {
     async fn read_at(&self, offset: u64, count: usize) -> Result<Bytes, NfsProtocolFailure> {
+        self.read_started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(tokio::time::Instant::now());
         let active = self.active_reads.fetch_add(1, Ordering::SeqCst) + 1;
         self.maximum_active_reads
             .fetch_max(active, Ordering::SeqCst);
@@ -69,6 +75,7 @@ impl NfsSourceProtocol for FakeProtocol {
                 payload: self.payload.clone(),
                 active_reads: Arc::clone(&self.active_reads),
                 maximum_active_reads: Arc::clone(&self.maximum_active_reads),
+                read_started: Arc::clone(&self.read_started),
             }),
             self.handle.clone(),
         ))
@@ -94,6 +101,7 @@ async fn one_stream_uses_one_open_cursor_and_exact_ranges() -> Result<(), Box<dy
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
         maximum_active_reads: Arc::new(AtomicUsize::new(0)),
+        read_started: Arc::new(Mutex::new(Vec::new())),
     });
     let source = adapter(Arc::clone(&protocol));
     let path = StoragePath::new("large.bin")?;
@@ -143,6 +151,7 @@ async fn shared_budget_bounds_nfs_prefetch_without_serializing_reads()
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
         maximum_active_reads: Arc::new(AtomicUsize::new(0)),
+        read_started: Arc::new(Mutex::new(Vec::new())),
     });
     let source = adapter(Arc::clone(&protocol));
     let path = StoragePath::new("large.bin")?;
@@ -197,6 +206,7 @@ async fn opened_identity_detects_change_and_precancel_avoids_another_open()
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
         maximum_active_reads: Arc::new(AtomicUsize::new(0)),
+        read_started: Arc::new(Mutex::new(Vec::new())),
     });
     let source = adapter(Arc::clone(&protocol));
     let path = StoragePath::new("file")?;
@@ -261,6 +271,7 @@ async fn negotiated_protocol_limit_prevents_internal_read_resplitting()
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
         maximum_active_reads: Arc::new(AtomicUsize::new(0)),
+        read_started: Arc::new(Mutex::new(Vec::new())),
     });
     let source = adapter(protocol);
     assert_eq!(source.maximum_read_chunk_bytes(), 3);
@@ -391,5 +402,52 @@ async fn positioned_nfs_read_does_not_wait_for_delayed_first_range()
             .collect::<Vec<_>>(),
         b"abcdefghijkl"
     );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn qos_paces_actual_cursor_calls_instead_of_queued_futures()
+-> Result<(), Box<dyn std::error::Error>> {
+    let protocol = Arc::new(FakeProtocol {
+        payload: Bytes::from_static(b"abcdefghijklmnop"),
+        handle: Bytes::from_static(b"handle"),
+        maximum_read_chunk_bytes: 4,
+        described: AtomicUsize::new(0),
+        opened: Mutex::new(0),
+        active_reads: Arc::new(AtomicUsize::new(0)),
+        maximum_active_reads: Arc::new(AtomicUsize::new(0)),
+        read_started: Arc::new(Mutex::new(Vec::new())),
+    });
+    let source = adapter(protocol.clone());
+    let budget = crate::storage::SourceQosGroup::new(crate::storage::SourceQosPolicy::new(
+        None,
+        4,
+        Some((2, 2, std::time::Duration::ZERO)),
+    )?)
+    .transfer_budget();
+    let mut stream = source
+        .read(ReadRequest {
+            path: StoragePath::new("file")?,
+            range: None,
+            expected_source: None,
+            maximum_chunk_bytes: 4,
+            read_inflight: 4,
+            read_budget: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            source_qos: Some(budget.clone()),
+            version: SourceVersion::Current,
+        })
+        .await?;
+    while stream.next().await.transpose()?.is_some() {}
+    let calls = protocol
+        .read_started
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(calls.len(), 4);
+    for pair in calls.windows(2) {
+        assert!(pair[1].duration_since(pair[0]) >= std::time::Duration::from_millis(500));
+    }
+    assert_eq!(budget.stats().source_read_operations, 4);
+    assert_eq!(budget.stats().client_streamed_shaped_bytes, 16);
     Ok(())
 }

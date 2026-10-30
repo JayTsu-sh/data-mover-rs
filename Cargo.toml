@@ -23,6 +23,7 @@ transfer = ["dep:data-mover-transfer", "metadata"]
 integrity = ["dep:data-mover-integrity", "acl"]
 traversal = ["dep:data-mover-traversal"]
 backend-local = ["dep:data-mover-backend-local"]
+qos-diagnostics = ["data-mover-storage-core/test-support"]
 backend-nfs = ["dep:data-mover-backend-nfs", "acl", "dep:nfs-rs"]
 backend-cifs = ["dep:data-mover-backend-cifs", "dep:smb-domain"]
 backend-s3 = ["dep:data-mover-backend-s3", "dep:aws-config", "dep:aws-credential-types", "dep:aws-sdk-s3", "dep:aws-smithy-runtime-api", "dep:aws-smithy-types", "dep:aws-types"]
@@ -126,6 +127,21 @@ required-features = ["full"]
 name = "storage_small_benchmark"
 path = "tests/lab/tools/storage_small_benchmark.rs"
 required-features = ["full"]
+
+[[example]]
+name = "backend_qos_acceptance"
+path = "tests/lab/tools/backend_qos_acceptance.rs"
+required-features = ["full", "qos-diagnostics"]
+
+[[example]]
+name = "backend_qos_cleanup"
+path = "tests/lab/tools/backend_qos_cleanup.rs"
+required-features = ["full"]
+
+[[example]]
+name = "local_qos_acceptance"
+path = "tests/lab/tools/local_qos_acceptance.rs"
+required-features = ["transfer", "backend-local", "qos-diagnostics"]
 
 [[example]]
 name = "local_write_benchmark"

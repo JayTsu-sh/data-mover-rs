@@ -339,13 +339,10 @@ async fn fill_read_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFail
         } else {
             None
         };
-        let granted = if let Some(qos) = &state.qos {
-            qos.admit_read(requested, &state.cancel)
-                .await
-                .map_err(|_| cancelled(&state.path))?
-        } else {
-            requested
-        };
+        let granted = state
+            .qos
+            .as_ref()
+            .map_or(requested, |qos| qos.read_size(requested));
         let count = usize::try_from(granted).map_err(|_| {
             entry_failure(
                 &state.path,
@@ -357,14 +354,23 @@ async fn fill_read_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFail
         let offset = state.next_issue;
         let cursor = Arc::clone(&state.cursor);
         let cancel = state.cancel.clone();
+        let qos = state.qos.clone();
         let future: NfsReadFuture = Box::pin(async move {
+            let read = async {
+                if let Some(qos) = &qos {
+                    qos.admit_read(granted, &cancel).await.map_err(|_| {
+                        NfsProtocolFailure::new(FailureClass::Cancelled, Transience::Transient)
+                    })?;
+                }
+                cursor.read_at(offset, count).await
+            };
             let result = tokio::select! {
                 biased;
                 () = cancel.cancelled() => Err(NfsProtocolFailure::new(
                     FailureClass::Cancelled,
                     Transience::Transient,
                 )),
-                result = cursor.read_at(offset, count) => result,
+                result = read => result,
             };
             (offset, count, result, admission)
         });

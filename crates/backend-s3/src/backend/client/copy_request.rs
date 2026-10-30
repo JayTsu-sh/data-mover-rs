@@ -102,6 +102,8 @@ mod tests {
             bucket_name: "bucket".into(),
             prefix: None,
             client: aws_sdk_s3::Client::from_conf(config),
+            single_attempt_client: std::sync::OnceLock::new(),
+            http_client_capture: crate::backend::client::qos_client::HttpClientCapture::default(),
             is_bucket_versioned: false,
             versioning_suspended: false,
             versioning_at_connect: S3VersioningAtConnect::Never,
