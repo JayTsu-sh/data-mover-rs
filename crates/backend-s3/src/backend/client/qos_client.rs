@@ -1,6 +1,7 @@
 //! Preserve the SDK's resolved transport when disabling retries for shaped GETs.
 use std::sync::{Arc, OnceLock};
 
+use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::{Client, Config};
 use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
@@ -49,7 +50,7 @@ pub(super) fn single_attempt_client(client: &Client, capture: &HttpClientCapture
     let mut config = client
         .config()
         .to_builder()
-        .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled());
+        .retry_config(RetryConfig::disabled());
     if let Some(http) = capture.0.get() {
         config.set_http_client(Some(http.clone()));
     }

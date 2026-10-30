@@ -52,7 +52,8 @@ types rather than duplicate wrappers or codec implementations.
 | `traversal` | Traversal engine and filter interfaces |
 | `transfer` | Transfer engine, metadata, ACL, probes and tar helpers |
 | `backend-local`, `backend-nfs`, `backend-cifs`, `backend-s3`, `backend-hdfs` | Compile the selected connector; NFS also exposes native ACL support |
-| `full` | All of the above |
+| `qos-diagnostics` | Opt-in QoS admission diagnostics via storage-core `test-support`; disabled by default and does not change the default scheduling policy |
+| `full` | All engines, ACL and backends above; excludes `qos-diagnostics` |
 
 For a local-only application:
 

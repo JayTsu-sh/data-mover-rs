@@ -196,7 +196,7 @@ async fn prepare_source(args: &Args, path: &StoragePath) -> Result<Storage> {
                 source.clone(),
                 CancellationToken::new(),
             )
-            .with_transfer_policy(data_mover::transfer::TransferPolicy::AtomicReplace),
+            .with_transfer_policy(TransferPolicy::AtomicReplace),
         )
         .await?;
         println!("{{\"seeded\":true}}");

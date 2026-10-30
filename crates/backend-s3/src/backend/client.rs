@@ -1,6 +1,6 @@
-use crate::Result;
-use crate::error::StorageError;
-use crate::storage::backends::s3::S3VersioningAtConnect;
+use std::sync::OnceLock;
+use std::time::Duration;
+
 use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_credential_types::Credentials;
@@ -13,9 +13,12 @@ use data_mover_storage_core::storage::config::s3::{
     ParsedS3Url, parse_s3_endpoint_url, parse_s3_url,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use tls::{build_skip_verify_http_client, untrusted_certificate, warn_unverified};
 use tracing::{debug, error, info, warn};
+
+use crate::Result;
+use crate::error::StorageError;
+use crate::storage::backends::s3::S3VersioningAtConnect;
+use tls::{build_skip_verify_http_client, untrusted_certificate, warn_unverified};
 use url_options::{S3BucketType, S3Compatibility, S3UrlOptions};
 
 mod architecture;
@@ -108,7 +111,7 @@ pub struct S3Storage {
     bucket_name: String,
     prefix: Option<String>,
     client: Client,
-    single_attempt_client: std::sync::OnceLock<Client>,
+    single_attempt_client: OnceLock<Client>,
     http_client_capture: qos_client::HttpClientCapture,
     pub is_bucket_versioned: bool,
     /// `GetBucketVersioning` answered `Suspended` when the bucket was connected: a write there
@@ -408,7 +411,7 @@ impl S3Storage {
             endpoint,
             bucket_name,
             prefix: prefix_option,
-            single_attempt_client: std::sync::OnceLock::from(qos_client::single_attempt_client(
+            single_attempt_client: OnceLock::from(qos_client::single_attempt_client(
                 &client,
                 &http_client_capture,
             )),
@@ -478,7 +481,7 @@ mod tests {
             bucket_name: "test-bucket".to_string(),
             prefix: prefix.map(std::string::ToString::to_string),
             client,
-            single_attempt_client: std::sync::OnceLock::new(),
+            single_attempt_client: OnceLock::new(),
             http_client_capture: qos_client::HttpClientCapture::default(),
             is_bucket_versioned: false,
             versioning_suspended: false,
