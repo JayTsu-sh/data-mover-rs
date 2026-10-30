@@ -18,9 +18,11 @@ bytes = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
 md-5 = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 data-mover-acl = { path = "../acl" }
