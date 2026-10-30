@@ -14,8 +14,9 @@ pub use crate::storage::{
 };
 pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
 pub use engine::{
-    DIRECTORY_OBJECT_SKIP_REASON, DIRECTORY_OBJECT_TOO_LARGE_REASON, DirectoryObjectAction,
-    DirectoryObjectDestination, EffectiveRecovery, ExpertDestinationRequest,
+    DIRECTORY_OBJECT_SKIP_REASON, DIRECTORY_OBJECT_TOO_LARGE_REASON, DirectPatchChunk,
+    DirectPatchError, DirectPatchInput, DirectPatchProgress, DirectPatchSession,
+    DirectoryObjectAction, DirectoryObjectDestination, EffectiveRecovery, ExpertDestinationRequest,
     ExpertDestinationSession, ExpertDestinationTransferred, ExpertSourceEvidence,
     ExpertSourceOffer, ExpertSourcePayload, ExpertSourceRequest, ExpertSourceSession,
     TransferFailure, TransferOutcome, TransferPhase, TransferRoute, TransferSide,

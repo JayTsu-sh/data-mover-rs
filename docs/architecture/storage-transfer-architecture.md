@@ -1000,3 +1000,10 @@ the operation and persistence contracts in this architecture remain authoritativ
 
 调用方必须先消费所有旧 basis 引用，验证完整输入及原 basis 的版本，再开始补丁写入。
 该接口不承担事务回滚或网络恢复；最终内容校验、元数据和 publication 仍使用现有角色接口。
+
+`transfer::DirectPatchSession` 拥有完整的补丁输入生命周期：固定 basis 描述、仅暂存差异、
+拒绝未完成输入、复核 basis 版本、应用补丁、读回校验、元数据及发布。
+产品层只传递有界 `DirectPatchChunk`、读取 `DirectPatchProgress` 并在验证源端证据后完成会话。
+同位置未变化提示必须来自已读取的可信 basis 字节；不能直接接受未验证的 wire 跳过指令。
+Unix 输入文件创建后立即 unlink，保留的 fd 在异常或进程结束时自动回收；其他平台依能力拒绝。
+接收中断不会修改原目标，应用补丁期间失败可能留下部分更新，重试必须重新生成 basis 签名。

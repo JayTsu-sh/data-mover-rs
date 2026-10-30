@@ -6,6 +6,7 @@ use crate::storage::{
 };
 use futures::StreamExt;
 use std::{fs::File, os::unix::fs::FileExt, sync::Arc};
+use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 
 pub(super) async fn apply(
@@ -39,7 +40,7 @@ pub(super) async fn apply(
     if cancel.is_cancelled() {
         return Err(failure(path, Operation::Write, FailureClass::Cancelled));
     }
-    let result = tokio::task::spawn_blocking(move || file.set_len(final_size))
+    let result = spawn_blocking(move || file.set_len(final_size))
         .await
         .map_err(|_| failure(path, Operation::Write, FailureClass::Internal))?;
     result.map_err(|error| io_failure(path, Operation::Write, &error))?;
@@ -53,7 +54,7 @@ async fn write_piece(
     chunk: PositionedChunk,
     path: &StoragePath,
 ) -> Result<u64, StorageRoleFailure> {
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking(move || {
         write_all_at(&chunk.data, chunk.offset, |bytes, offset| {
             file.write_at(bytes, offset)
         })
@@ -64,40 +65,50 @@ async fn write_piece(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::storage::{BackendConnectError, Storage};
     use crate::storage::{FinalDestination, LocalBackendConfig, PrepareRequest, SourceDescriptor};
     use crate::{
         backend::connect_backend,
         model::{BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity},
     };
     use bytes::Bytes;
+    use futures::stream;
+    use std::error::Error;
     use std::os::unix::fs::MetadataExt;
+    use std::{
+        fs::{metadata, read, write},
+        num::NonZeroUsize,
+    };
+    use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn sparse_patch_preserves_untouched_bytes_inode_and_exact_write_count() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("file"), b"AAAABBBBCCCC").unwrap();
-        let inode = std::fs::metadata(root.path().join("file")).unwrap().ino();
-        let storage = connect_backend(LocalBackendConfig {
+    fn storage(root: &TempDir) -> Result<Storage, BackendConnectError> {
+        connect_backend(LocalBackendConfig {
             root: root.path().to_path_buf(),
             rename_context: None,
             read_chunk_bytes: None,
             write_chunk_bytes: None,
-            read_concurrency: std::num::NonZeroUsize::MIN,
-            write_concurrency: std::num::NonZeroUsize::MIN,
+            read_concurrency: NonZeroUsize::MIN,
+            write_concurrency: NonZeroUsize::MIN,
         })
-        .unwrap();
-        let destination = storage.staged_destination().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sparse_patch_preserves_untouched_bytes_inode_and_exact_write_count()
+    -> Result<(), Box<dyn Error>> {
+        let root = tempfile::tempdir()?;
+        write(root.path().join("file"), b"AAAABBBBCCCC")?;
+        let inode = metadata(root.path().join("file"))?.ino();
+        let storage = storage(&root)?;
+        let destination = storage.staged_destination()?;
         assert!(destination.supports_sparse_patch());
-        let path = StoragePath::new("file").unwrap();
+        let path = StoragePath::new("file")?;
         let identity = SourceIdentity::new(
-            BackendIdentity::new(BackendKind::Local, "remote-source").unwrap(),
+            BackendIdentity::new(BackendKind::Local, "remote-source")?,
             IdentityStrength::PathScoped,
             b"remote-file",
-        )
-        .unwrap();
+        )?;
         let stage = destination
             .prepare_direct(
                 PrepareRequest {
@@ -107,35 +118,27 @@ mod tests {
                 },
                 CancellationToken::new(),
             )
-            .await
-            .unwrap();
-        let input = futures::stream::iter([Ok(PositionedChunk {
+            .await?;
+        let input = stream::iter([Ok(PositionedChunk {
             offset: 4,
             data: Bytes::from_static(b"XXXX"),
         })]);
         let written = destination
             .patch_direct(&stage, Box::pin(input), 12, CancellationToken::new())
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(written.persisted_bytes, 4);
-        assert_eq!(
-            std::fs::read(root.path().join("file")).unwrap(),
-            b"AAAAXXXXCCCC"
-        );
-        assert_eq!(
-            std::fs::metadata(root.path().join("file")).unwrap().ino(),
-            inode
-        );
+        assert_eq!(read(root.path().join("file"))?, b"AAAAXXXXCCCC");
+        assert_eq!(metadata(root.path().join("file"))?.ino(), inode);
         let written = destination
             .patch_direct(
                 &stage,
-                Box::pin(futures::stream::empty()),
+                Box::pin(stream::empty()),
                 4,
                 CancellationToken::new(),
             )
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(written.persisted_bytes, 0);
-        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"AAAA");
+        assert_eq!(read(root.path().join("file"))?, b"AAAA");
+        Ok(())
     }
 }
