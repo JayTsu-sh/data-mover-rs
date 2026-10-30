@@ -35,6 +35,8 @@ use crate::storage::{
 mod at_destination;
 mod checkpoint;
 mod direct;
+#[cfg(unix)]
+mod direct_patch;
 mod directory_sync;
 mod hash_checkpoint;
 #[cfg(unix)]
@@ -857,6 +859,32 @@ impl StagedDestination for LocalStagedDestination {
     ) -> Result<PreparedStage, StorageRoleFailure> {
         self.open_direct(request, cancel).await
     }
+    fn supports_sparse_patch(&self) -> bool {
+        cfg!(unix)
+    }
+
+    async fn patch_direct(
+        &self,
+        stage: &PreparedStage,
+        input: crate::storage::PositionedByteStream,
+        final_size: u64,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        #[cfg(unix)]
+        {
+            direct_patch::apply(self, stage, input, final_size, cancel).await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (input, final_size, cancel);
+            Err(failure(
+                stage.final_destination().path(),
+                Operation::Write,
+                FailureClass::Unsupported,
+            ))
+        }
+    }
+
     fn copied_metadata_target(&self) -> Option<crate::storage::CopiedMetadataTarget> {
         #[cfg(unix)]
         {

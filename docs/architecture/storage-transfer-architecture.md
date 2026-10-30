@@ -990,3 +990,13 @@ uses permissions only; NFS uses a mode-only SETATTR, without reading or rewritin
 The implementation is distributed across the [crate workspace](crate-workspace.md).
 That document defines package ownership, feature selection and the 0.4 build migration;
 the operation and persistence contracts in this architecture remain authoritative.
+
+### Direct 稀疏补丁
+
+`StagedDestination::supports_sparse_patch()` 默认 false；仅 Unix Local 实现。
+`patch_direct(stage, input, final_size, cancel)` 只接受 Direct stage 和有序、非重叠、有界补丁，
+保留未触及区间，最后调整长度，返回实际写入字节数。失败允许留下部分更新。
+它不同于 `write_positioned`：后者的 Direct 生命周期从零重建文件，不能用于跳过旧区间。
+
+调用方必须先消费所有旧 basis 引用，验证完整输入及原 basis 的版本，再开始补丁写入。
+该接口不承担事务回滚或网络恢复；最终内容校验、元数据和 publication 仍使用现有角色接口。
