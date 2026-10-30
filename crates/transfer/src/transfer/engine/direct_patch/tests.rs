@@ -135,3 +135,24 @@ async fn incomplete_input_cannot_truncate_or_publish() -> TestResult {
     assert_eq!(read(root.path().join("file"))?, b"AAAABBBB");
     Ok(())
 }
+
+#[tokio::test]
+async fn invalid_input_cannot_be_cleared_by_a_later_empty_receive() -> TestResult {
+    let root = tempfile::tempdir()?;
+    write(root.path().join("file"), b"AAAABBBB")?;
+    let mut session = DirectPatchSession::prepare(storage(&root)?, source(8)?, plan()?).await?;
+    let mut bad: DirectPatchInput = Box::pin(stream::iter([DirectPatchChunk {
+        offset: 1,
+        data: Bytes::from_static(b"XXXXXXXX"),
+        unchanged_basis: false,
+    }]));
+    assert!(session.receive(&mut bad).await.is_err());
+    let mut empty: DirectPatchInput = Box::pin(stream::empty());
+    assert!(session.receive(&mut empty).await.is_err());
+    assert!(matches!(
+        session.complete().await,
+        Err(DirectPatchError::InvalidInput(_))
+    ));
+    assert_eq!(read(root.path().join("file"))?, b"AAAABBBB");
+    Ok(())
+}

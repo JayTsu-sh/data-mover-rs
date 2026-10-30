@@ -44,7 +44,7 @@ fn role_failure(message: &'static str) -> StorageRoleFailure {
 }
 pub type DirectPatchInput = Pin<Box<dyn Stream<Item = DirectPatchChunk> + Send>>;
 
-/// unchanged_basis 只可用于已从同位置旧 basis 读取的字节，不能接受外部未验证的跳过提示。
+/// `unchanged_basis` 只可用于已从同位置旧 basis 读取的字节，不能接受外部未验证的跳过提示。
 pub struct DirectPatchChunk {
     pub offset: u64,
     pub data: Bytes,
@@ -70,6 +70,7 @@ pub struct DirectPatchSession {
     bytes: u64,
     hash: Hasher,
     ended: bool,
+    failed: bool,
     changed_bytes: u64,
 }
 
@@ -106,6 +107,7 @@ impl DirectPatchSession {
             bytes: 0,
             hash: Hasher::new(),
             ended: false,
+            failed: false,
             changed_bytes: 0,
         })
     }
@@ -113,8 +115,19 @@ impl DirectPatchSession {
     /// 消费完整重建输入，只写入临时补丁，不改目标。
     ///
     /// # Errors
-    /// 输入长度、顺序、basis 读取或临时文件 IO 失败时返回原始类型。
+    /// 输入长度、顺序、basis 读取或临时文件 IO 失败时返回原始类型；失败后须丢弃会话。
     pub async fn receive(&mut self, input: &mut DirectPatchInput) -> PatchResult<()> {
+        if self.failed {
+            return Err(operation(
+                "Direct input previously failed; discard this session",
+            ));
+        }
+        let result = self.receive_inner(input).await;
+        self.failed = result.is_err();
+        result
+    }
+
+    async fn receive_inner(&mut self, input: &mut DirectPatchInput) -> PatchResult<()> {
         if self.ended {
             return Err(operation("Direct input was already completed"));
         }
@@ -172,9 +185,9 @@ impl DirectPatchSession {
         let Some(basis) = &self.basis else {
             return Ok(false);
         };
-        if !basis
+        if basis
             .size
-            .is_some_and(|size| offset + expected.len() as u64 <= size)
+            .is_none_or(|size| offset + expected.len() as u64 > size)
         {
             return Ok(false);
         }
@@ -215,7 +228,7 @@ impl DirectPatchSession {
     /// basis 变化、输入未完成或后端写入/校验/元数据/发布失败时返回错误。
     /// 写入开始后的失败可能留下部分更新；调用方须重新生成 basis 签名后重试。
     pub async fn complete(mut self) -> PatchResult<u64> {
-        if !self.ended || Some(self.bytes) != self.source.size {
+        if self.failed || !self.ended || Some(self.bytes) != self.source.size {
             return Err(operation(
                 "Direct patch requires a complete verified payload",
             ));
