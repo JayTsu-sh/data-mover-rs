@@ -4,7 +4,7 @@ import argparse
 import subprocess
 
 PROTOCOLS = ("local", "nfs", "cifs", "s3", "hdfs")
-MATRIX = ("", "acl", "metadata", "traversal", "transfer", "integrity", *(f"backend-{name}" for name in PROTOCOLS), "backend-local,traversal,transfer,integrity", "full")
+MATRIX = ("", "acl", "metadata", "traversal", "transfer", "integrity", "qos-diagnostics", *(f"backend-{name}" for name in PROTOCOLS), "backend-local,traversal,transfer,integrity", "full")
 SDK_PREFIXES = {"s3": ("aws-",), "nfs": ("nfs-rs ",), "cifs": ("smb ",), "hdfs": ("hdfs-native ",)}
 
 
