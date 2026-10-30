@@ -1,0 +1,45 @@
+{
+  "controls": {
+    "cifs-absolute": {
+      "medians": {
+        "old-high": 34.38267528318009,
+        "fixed-high": 34.96714778302313,
+        "fixed-baseline": 38.15845984315038
+      },
+      "ratio": 1.016999040796833,
+      "passed": true,
+      "fixed_high_to_fixed_baseline": 0.916366853556326,
+      "relative_passed": false,
+      "blocks": 12,
+      "target_readiness_controlled": true,
+      "readiness_preconditions_independently_verified": 36
+    },
+    "hdfs-nfs-absolute": {
+      "medians": {
+        "old-high": 295.3302681745183,
+        "fixed-high": 302.49625767121904,
+        "fixed-baseline": 288.22076223529257
+      },
+      "ratio": 1.0242643246186542,
+      "passed": true,
+      "fixed_high_to_fixed_baseline": 1.0495297261904835,
+      "relative_passed": true,
+      "blocks": 12,
+      "target_readiness_controlled": true,
+      "readiness_preconditions_independently_verified": 36
+    }
+  },
+  "local_nfs": {
+    "end_to_end_ratio_medians": {
+      "old": 0.9904686428079917,
+      "fixed": 0.9905130360753628
+    },
+    "fixed_to_old_ratio": 1.0000448204672538,
+    "absolute_non_regression_passed": true,
+    "cold_end_to_end_98_percent": {
+      "old": true,
+      "fixed": true
+    },
+    "pairs": 5
+  }
+}

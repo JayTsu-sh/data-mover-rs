@@ -1,0 +1,90 @@
+{
+  "rust_lib_tests": {
+    "passed": 2075,
+    "failed": 0,
+    "ignored": 9,
+    "suites": 14,
+    "command": "cargo test --workspace --lib --locked --features qos-diagnostics"
+  },
+  "python_qos_tests": {
+    "passed": 10,
+    "command": "python3 -m unittest discover -s tests -p 'test_*qos*.py'"
+  },
+  "clippy": {
+    "passed": true,
+    "command": "cargo clippy --release --locked --features qos-diagnostics --example backend_qos_acceptance --example backend_qos_cleanup -- -D warnings"
+  },
+  "format": {
+    "passed": true,
+    "command": "cargo fmt --all -- --check"
+  },
+  "architecture": {
+    "passed": true,
+    "command": "python3 tests/validate_architecture_dependencies.py ."
+  },
+  "red_green_regressions": [
+    "qos98-coop-red.log",
+    "qos98-coop-green.log",
+    "qos98-nfs-dispatch-red.log",
+    "qos98-nfs-dispatch-green.log",
+    "qos98-s3-regression-red.log",
+    "qos98-s3-regression-green.log",
+    "qos98-micro-wait-red.log",
+    "qos98-micro-wait-green.log"
+  ],
+  "existing_warning": "binrw v0.15.1 future-incompatibility warning, unrelated to these changes",
+  "cleanup": {
+    "passed": true,
+    "operations": 9
+  },
+  "local_full_copy_supplements": [
+    {
+      "case": "bandwidth-16mib-full-copy",
+      "ratio": 0.9838442069613148,
+      "actual": 16506166.770538682,
+      "passed": true,
+      "trace": {
+        "hard_envelope": true,
+        "soft_envelope": true,
+        "steady_ceiling": true,
+        "steady_window_after_peak": true,
+        "steady_at_least_98_percent": true,
+        "burst_observed": true,
+        "hard_max_excess": 167773.0,
+        "soft_max_excess": 167773.0,
+        "packet_allowance": 167773,
+        "soft_credit_capacity": 0.0,
+        "steady_rate": 16768131.248824602,
+        "first_half_second_rate": 16777300.0
+      }
+    },
+    {
+      "case": "iops128-full-copy",
+      "ratio": 0.9920933134239586,
+      "actual": 126.9879441182667,
+      "passed": true,
+      "trace": {
+        "hard_envelope": true,
+        "soft_envelope": true,
+        "steady_ceiling": true,
+        "steady_window_after_peak": true,
+        "steady_at_least_98_percent": true,
+        "burst_observed": true,
+        "hard_max_excess": 1.0,
+        "soft_max_excess": 1.0,
+        "packet_allowance": 1,
+        "soft_credit_capacity": 0.0,
+        "steady_rate": 127.94812454579129,
+        "first_half_second_rate": 128.0
+      }
+    }
+  ],
+  "real_backend_final_checks": {
+    "passed": 406,
+    "failed": 0,
+    "protocol_profiles": 7,
+    "performance_samples": 140,
+    "finite_limit_samples": 49
+  },
+  "independent_audit": "evidence-audit.json"
+}

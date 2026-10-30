@@ -1,0 +1,928 @@
+{
+  "generated_utc": "2026-10-30T14:31:41.715940+00:00",
+  "status": "strict_high_qos_not_fully_qualified",
+  "retained_binary_sha256": "9b56c318e8547d358eadc4bbc05914cce34fc9a4683d784a869216905376e4dd",
+  "rejected_candidate_sha256": "eab6995bd1d81f859788084fd8c3d4535acb99188c2880bd451ea4392d1faeaf",
+  "user_scope": "98% sustained transfer; retain short-file failures and tails",
+  "production_changes_this_turn": false,
+  "retained_high": {
+    "cifs-to-s3": {
+      "baseline_mibps": 35.70832328215084,
+      "high_mibps": 38.27641940699486,
+      "ratio": 1.071918698185633,
+      "passed": true,
+      "control_mibps": 36.107055976841444,
+      "control_ratio": 1.011166379657202,
+      "control_ratio_interval_95": [
+        0.9321433401057578,
+        1.1505689143292703
+      ],
+      "high_ratio_interval_95": [
+        0.982760635092468,
+        1.2683188824092853
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable"
+    },
+    "local-to-s3": {
+      "baseline_mibps": 43.07827259135308,
+      "high_mibps": 42.002913921411235,
+      "ratio": 0.9750370986287483,
+      "passed": false,
+      "control_mibps": 43.575069626317145,
+      "control_ratio": 1.0115324270236357,
+      "control_ratio_interval_95": [
+        0.7908548372861186,
+        1.0746455699389843
+      ],
+      "high_ratio_interval_95": [
+        0.7364239730491685,
+        1.0908189226727256
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable"
+    },
+    "nfs41-to-s3": {
+      "baseline_mibps": 37.73853886166542,
+      "high_mibps": 36.33845632277464,
+      "ratio": 0.9629004571686538,
+      "passed": false,
+      "control_mibps": 40.97131589210039,
+      "control_ratio": 1.0856624852987833,
+      "control_ratio_interval_95": [
+        1.005907281690706,
+        1.2000943415860454
+      ],
+      "high_ratio_interval_95": [
+        0.9031329425162856,
+        1.0540572753376667
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable"
+    },
+    "hdfs-to-s3": {
+      "baseline_mibps": 35.61662962522986,
+      "high_mibps": 36.31828893567236,
+      "ratio": 1.0197003286898731,
+      "passed": true,
+      "control_mibps": 34.58959154741121,
+      "control_ratio": 0.9711640857479921,
+      "control_ratio_interval_95": [
+        0.8868540697407097,
+        1.0203884797064133
+      ],
+      "high_ratio_interval_95": [
+        0.9205417645434855,
+        1.1566254983833366
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable"
+    },
+    "s3-to-s3": {
+      "baseline_mibps": 35.1098936573827,
+      "high_mibps": 35.48139942901118,
+      "ratio": 1.0105812274811707,
+      "passed": true,
+      "control_mibps": 33.23397144679274,
+      "control_ratio": 0.9465699831250983,
+      "control_ratio_interval_95": [
+        0.8849002438064698,
+        1.0504837627218797
+      ],
+      "high_ratio_interval_95": [
+        0.8816273023073576,
+        1.2090056117394699
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable"
+    },
+    "s3-to-hdfs": {
+      "baseline_mibps": 264.3092808054634,
+      "high_mibps": 252.20505594504874,
+      "ratio": 0.9542043138873977,
+      "passed": false,
+      "control_mibps": 212.54483592985673,
+      "control_ratio": 0.8041519967900549,
+      "control_ratio_interval_95": [
+        0.7299120544398146,
+        1.2032263732413822
+      ],
+      "high_ratio_interval_95": [
+        0.7709068081289431,
+        1.3235104517953569
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable"
+    },
+    "s3-to-local": {
+      "baseline_mibps": 321.7376313528283,
+      "high_mibps": 300.05493253476675,
+      "ratio": 0.9326075139955152,
+      "passed": false,
+      "control_mibps": 314.61225084347245,
+      "control_ratio": 0.9778534438778722,
+      "control_ratio_interval_95": [
+        0.8803284193135883,
+        1.120037452927284
+      ],
+      "high_ratio_interval_95": [
+        0.8433024555628252,
+        1.0207555432140945
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable"
+    },
+    "s3-to-cifs": {
+      "baseline_mibps": 104.60515801648663,
+      "high_mibps": 104.56189469615059,
+      "ratio": 0.9995864131257349,
+      "passed": true,
+      "control_mibps": 104.34376219469831,
+      "control_ratio": 0.9975011191919703,
+      "control_ratio_interval_95": [
+        0.9878840980188857,
+        1.0017665670928877
+      ],
+      "high_ratio_interval_95": [
+        0.9962840024325852,
+        1.0017861608413372
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": true,
+      "qualified": true,
+      "classification": "passed"
+    },
+    "s3-to-nfs41": {
+      "baseline_mibps": 285.91302038157056,
+      "high_mibps": 277.09721821071696,
+      "ratio": 0.9691661395515031,
+      "passed": false,
+      "control_mibps": 261.3965114373196,
+      "control_ratio": 0.9142518626415403,
+      "control_ratio_interval_95": [
+        0.5925802247902315,
+        1.5796328821920385
+      ],
+      "high_ratio_interval_95": [
+        0.8614179213287492,
+        1.7007679366749
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable"
+    }
+  },
+  "retained_high_raw_failures": [
+    {
+      "profile": "local-to-s3",
+      "ratio": 0.9750370986287483
+    },
+    {
+      "profile": "nfs41-to-s3",
+      "ratio": 0.9629004571686538
+    },
+    {
+      "profile": "s3-to-hdfs",
+      "ratio": 0.9542043138873977
+    },
+    {
+      "profile": "s3-to-local",
+      "ratio": 0.9326075139955152
+    },
+    {
+      "profile": "s3-to-nfs41",
+      "ratio": 0.9691661395515031
+    }
+  ],
+  "rejected_candidate": {
+    "cifs-to-s3": {
+      "baseline_mibps": 35.04468725382795,
+      "high_mibps": 34.26231426077812,
+      "ratio": 0.9776749900096662,
+      "passed": false,
+      "control_mibps": 32.24230522407639,
+      "control_ratio": 0.9200340408389447,
+      "control_ratio_interval_95": [
+        0.876202517843223,
+        1.252614726061373
+      ],
+      "high_ratio_interval_95": [
+        0.8460438755271108,
+        1.2003632242265059
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable",
+      "new_high_to_old_high": 1.0071663732385527,
+      "new_baseline_to_old_baseline": 1.2296607463930416,
+      "absolute_raw_gates_passed": true,
+      "samples": {
+        "old-baseline": [
+          33.979367964830935,
+          28.002524629082227,
+          32.935983604808044,
+          28.499476263371324,
+          26.76821069866028
+        ],
+        "old-high": [
+          27.66421601793442,
+          35.63843500811716,
+          30.61793129389153,
+          36.445226255416216,
+          34.018524814929364
+        ],
+        "new-baseline": [
+          35.747058256233785,
+          32.87442722465688,
+          30.548550272619572,
+          35.04468725382795,
+          35.83038880813508
+        ],
+        "new-control": [
+          31.321662449600414,
+          32.24230522407639,
+          38.265563931309444,
+          34.56888289014944,
+          32.0247440385742
+        ],
+        "new-high": [
+          30.243579705797437,
+          31.517624013361356,
+          36.669356300687134,
+          34.26231426077812,
+          34.495007412633825
+        ]
+      }
+    },
+    "local-to-s3": {
+      "baseline_mibps": 33.49023823919379,
+      "high_mibps": 34.462851862693604,
+      "ratio": 1.0290417051247356,
+      "passed": true,
+      "control_mibps": 33.5959950796946,
+      "control_ratio": 1.0031578407936508,
+      "control_ratio_interval_95": [
+        0.9213407123429026,
+        1.2120251486016664
+      ],
+      "high_ratio_interval_95": [
+        0.7822757880923238,
+        1.3501392715037355
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable",
+      "new_high_to_old_high": 1.2139530998691832,
+      "new_baseline_to_old_baseline": 0.9526189484696276,
+      "absolute_raw_gates_passed": false,
+      "samples": {
+        "old-baseline": [
+          36.826470000063175,
+          36.80444494423954,
+          35.1559648199267,
+          32.57102322355414,
+          32.61468245643403
+        ],
+        "old-high": [
+          26.081412582174995,
+          40.36300595222188,
+          28.388948359213675,
+          26.887593957133454,
+          36.113577129821095
+        ],
+        "new-baseline": [
+          29.751794658238016,
+          38.111825949884235,
+          33.9042755280006,
+          24.51768480868255,
+          33.49023823919379
+        ],
+        "new-control": [
+          28.860758221793937,
+          35.113976869355064,
+          33.5959950796946,
+          29.716050573612286,
+          37.95136634041978
+        ],
+        "new-high": [
+          40.1690663658022,
+          34.462851862693604,
+          34.9365242541891,
+          29.190091131140118,
+          26.198602511965003
+        ]
+      }
+    },
+    "nfs41-to-s3": {
+      "baseline_mibps": 31.066360572615157,
+      "high_mibps": 34.60369207592173,
+      "ratio": 1.1138637239157236,
+      "passed": true,
+      "control_mibps": 32.59875747001339,
+      "control_ratio": 1.0493265663937807,
+      "control_ratio_interval_95": [
+        0.8137916580600433,
+        1.3344267968550099
+      ],
+      "high_ratio_interval_95": [
+        0.9307241825682366,
+        1.2459770612552088
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable",
+      "new_high_to_old_high": 1.155930759965913,
+      "new_baseline_to_old_baseline": 0.9435278443728736,
+      "absolute_raw_gates_passed": false,
+      "samples": {
+        "old-baseline": [
+          35.03322940742707,
+          32.92574856999982,
+          33.72500555106181,
+          30.808938688412454,
+          31.93027682799773
+        ],
+        "old-high": [
+          26.24475068944531,
+          28.41027469050391,
+          33.76040113953547,
+          30.582372256038305,
+          29.93578272537894
+        ],
+        "new-baseline": [
+          29.111088083381254,
+          35.678964427991836,
+          31.066360572615157,
+          35.263473627705196,
+          25.529290860618246
+        ],
+        "new-control": [
+          32.983434342214956,
+          30.53160734078999,
+          32.59875747001339,
+          28.69712067244682,
+          34.06696982911468
+        ],
+        "new-high": [
+          36.2717479800729,
+          33.20727500212389,
+          34.60369207592173,
+          34.672917770984,
+          30.48298128787208
+        ]
+      }
+    },
+    "hdfs-to-s3": {
+      "baseline_mibps": 32.24890829685522,
+      "high_mibps": 34.95421516119355,
+      "ratio": 1.0838883238910182,
+      "passed": true,
+      "control_mibps": 33.853574543183406,
+      "control_ratio": 1.049758777306724,
+      "control_ratio_interval_95": [
+        0.6595291459732099,
+        1.7449074097928103
+      ],
+      "high_ratio_interval_95": [
+        0.8289947873033141,
+        1.6524946182472677
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable",
+      "new_high_to_old_high": 1.0762253186743846,
+      "new_baseline_to_old_baseline": 1.059761677423418,
+      "absolute_raw_gates_passed": true,
+      "samples": {
+        "old-baseline": [
+          28.815261714494085,
+          35.162514361607045,
+          28.561457365016953,
+          30.43034012634,
+          32.30598475351204
+        ],
+        "old-high": [
+          32.47852894247794,
+          34.39941887427723,
+          29.683303157047714,
+          26.944589265355084,
+          38.03416935754676
+        ],
+        "new-baseline": [
+          30.915882315576294,
+          32.24890829685522,
+          36.22716236500482,
+          23.03128026562694,
+          42.256583929344956
+        ],
+        "new-control": [
+          33.853574543183406,
+          33.78812626430615,
+          36.74311973220441,
+          40.18745159250737,
+          27.869448710666145
+        ],
+        "new-high": [
+          31.990090325752,
+          34.32626659537752,
+          34.95421516119355,
+          38.05906669029302,
+          35.030487806671964
+        ]
+      }
+    },
+    "s3-to-s3": {
+      "baseline_mibps": 34.34366891960963,
+      "high_mibps": 28.092182708216654,
+      "ratio": 0.8179726742059441,
+      "passed": false,
+      "control_mibps": 31.61448783942578,
+      "control_ratio": 0.9205332113300937,
+      "control_ratio_interval_95": [
+        0.8311098524653032,
+        1.1801573901853988
+      ],
+      "high_ratio_interval_95": [
+        0.7427842373269768,
+        1.1462791789798055
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable",
+      "new_high_to_old_high": 0.8230128615330592,
+      "new_baseline_to_old_baseline": 0.9884376927949059,
+      "absolute_raw_gates_passed": false,
+      "samples": {
+        "old-baseline": [
+          27.930356091316057,
+          25.22379528227008,
+          39.379406270695526,
+          35.57204510799025,
+          34.745405977487046
+        ],
+        "old-high": [
+          37.85028532694634,
+          32.10786895639527,
+          37.15491150984245,
+          28.46855761957601,
+          34.13334593081354
+        ],
+        "new-baseline": [
+          37.8201115431726,
+          34.57289161839356,
+          23.798613214443314,
+          34.34366891960963,
+          32.87822370735419
+        ],
+        "new-control": [
+          37.415311550332504,
+          28.73387085226199,
+          28.08610926118917,
+          34.59156203181836,
+          31.61448783942578
+        ],
+        "new-high": [
+          28.092182708216654,
+          25.837811357845574,
+          27.27985481631003,
+          32.44408337542342,
+          35.10985866994684
+        ]
+      }
+    },
+    "s3-to-hdfs": {
+      "baseline_mibps": 279.641895351464,
+      "high_mibps": 285.5486327697781,
+      "ratio": 1.0211225053059032,
+      "passed": true,
+      "control_mibps": 283.30477371293756,
+      "control_ratio": 1.0130984606468567,
+      "control_ratio_interval_95": [
+        0.9670952834173144,
+        1.0627862693165397
+      ],
+      "high_ratio_interval_95": [
+        0.9668196379090017,
+        1.0936951490696232
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable",
+      "new_high_to_old_high": 1.0830050790992634,
+      "new_baseline_to_old_baseline": 0.9698058678882135,
+      "absolute_raw_gates_passed": false,
+      "samples": {
+        "old-baseline": [
+          234.85011483351852,
+          291.9252262269409,
+          288.34832270131966,
+          299.617473105373,
+          231.07101910184866
+        ],
+        "old-high": [
+          263.66324431947197,
+          217.23548916786206,
+          289.1873876711393,
+          292.4541895359274,
+          243.89252357105605
+        ],
+        "new-baseline": [
+          283.1643477822042,
+          270.450100456841,
+          267.2449235768487,
+          279.641895351464,
+          282.7626179490829
+        ],
+        "new-control": [
+          284.278178666088,
+          283.30477371293756,
+          284.0242353220228,
+          270.440358040279,
+          279.5847223711202
+        ],
+        "new-high": [
+          290.87009299717363,
+          295.7899629350393,
+          283.5659004142444,
+          270.36327600788934,
+          285.5486327697781
+        ]
+      }
+    },
+    "s3-to-local": {
+      "baseline_mibps": 313.0767100775164,
+      "high_mibps": 310.3856937258837,
+      "ratio": 0.9914046102280607,
+      "passed": true,
+      "control_mibps": 305.8906989777164,
+      "control_ratio": 0.9770471233774599,
+      "control_ratio_interval_95": [
+        0.8830042176014059,
+        1.0122534527805427
+      ],
+      "high_ratio_interval_95": [
+        0.9637297851763617,
+        0.9979437387135393
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable",
+      "new_high_to_old_high": 0.9526749016048858,
+      "new_baseline_to_old_baseline": 1.0019000136352245,
+      "absolute_raw_gates_passed": false,
+      "samples": {
+        "old-baseline": [
+          294.3557566519474,
+          315.2387854867225,
+          340.11826129833605,
+          312.4829881392761,
+          287.09027479675524
+        ],
+        "old-high": [
+          328.20970294344926,
+          314.11351816654553,
+          306.64356826075687,
+          337.2095607467164,
+          325.8044199579571
+        ],
+        "new-baseline": [
+          312.72950192002236,
+          310.7390057911822,
+          321.33861472760844,
+          328.00173180814375,
+          313.0767100775164
+        ],
+        "new-control": [
+          305.6125321308601,
+          305.8906989777164,
+          307.7340337642031,
+          289.6269125671561,
+          316.9129807611389
+        ],
+        "new-high": [
+          301.3867357036937,
+          310.1000452033805,
+          315.5533795520424,
+          323.8155583919381,
+          310.3856937258837
+        ]
+      }
+    },
+    "s3-to-cifs": {
+      "baseline_mibps": 104.43722971935618,
+      "high_mibps": 104.64659350480487,
+      "ratio": 1.0020046853599172,
+      "passed": true,
+      "control_mibps": 104.3422791890163,
+      "control_ratio": 0.99909083637516,
+      "control_ratio_interval_95": [
+        0.9902951096657343,
+        1.0007018081426753
+      ],
+      "high_ratio_interval_95": [
+        0.9900910553149609,
+        1.0053817860613918
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": true,
+      "qualified": true,
+      "classification": "passed",
+      "new_high_to_old_high": 1.0000373555636748,
+      "new_baseline_to_old_baseline": 1.0013226240819684,
+      "absolute_raw_gates_passed": true,
+      "samples": {
+        "old-baseline": [
+          104.11166879647148,
+          104.52062719967131,
+          105.19258024792674,
+          104.2992809786019,
+          104.15141392603104
+        ],
+        "old-high": [
+          104.75230528091339,
+          104.69393096528978,
+          104.58421822169738,
+          104.64268451834023,
+          104.59437321494994
+        ],
+        "new-baseline": [
+          104.89691351297094,
+          104.43722971935618,
+          104.28211378977808,
+          105.23868020855201,
+          104.39208714047265
+        ],
+        "new-control": [
+          103.8789004709246,
+          104.3422791890163,
+          104.35529982637114,
+          104.70210683346218,
+          104.19880311067942
+        ],
+        "new-high": [
+          103.85749579933957,
+          104.38912160083015,
+          104.64659350480487,
+          105.05052707530307,
+          104.95390301996484
+        ]
+      }
+    },
+    "s3-to-nfs41": {
+      "baseline_mibps": 339.9339422304467,
+      "high_mibps": 325.23579709630195,
+      "ratio": 0.9567617607182615,
+      "passed": false,
+      "control_mibps": 314.4824973562218,
+      "control_ratio": 0.9251282625464599,
+      "control_ratio_interval_95": [
+        0.8082199577902773,
+        1.3280877409203966
+      ],
+      "high_ratio_interval_95": [
+        0.9234463413278432,
+        1.320760222366841
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": false,
+      "qualified": false,
+      "classification": "environment_not_repeatable",
+      "new_high_to_old_high": 0.9792864740270988,
+      "new_baseline_to_old_baseline": 1.0282149872700315,
+      "absolute_raw_gates_passed": false,
+      "samples": {
+        "old-baseline": [
+          260.1113797741041,
+          331.8892168003328,
+          330.60590094391677,
+          350.4333079105832,
+          312.039188358085
+        ],
+        "old-high": [
+          367.0479081453663,
+          293.16681653598636,
+          351.9474538052126,
+          221.46194720230218,
+          332.1150712506441
+        ],
+        "new-baseline": [
+          358.2028507389178,
+          300.4156259573108,
+          236.96367264516445,
+          354.30950806726764,
+          339.9339422304467
+        ],
+        "new-control": [
+          314.4824973562218,
+          296.2469903735929,
+          314.7085486835168,
+          334.81633164905287,
+          274.7413964409742
+        ],
+        "new-high": [
+          356.1527098790181,
+          325.23579709630195,
+          312.97219297569075,
+          337.0113896316582,
+          313.9107552458564
+        ]
+      }
+    }
+  },
+  "sustained": {
+    "samples": 45,
+    "checks": 375,
+    "passed": 375,
+    "failed": [],
+    "complete": true
+  },
+  "local_sustained": {
+    "checks": 87,
+    "passed": 86,
+    "failed": [
+      {
+        "profile": "local-to-local",
+        "case": "high",
+        "name": "baseline_repeatable_98_percent",
+        "passed": false,
+        "control_ratio": 0.9863037954736734,
+        "interval_95": [
+          0.975410856319353,
+          1.0008896398380716
+        ],
+        "classification": "environment_not_repeatable"
+      }
+    ],
+    "finite_checks": 40,
+    "finite_passed": 40,
+    "high_ratio": 0.9927069439347916,
+    "high_qualified": false
+  },
+  "cleanup_complete": true,
+  "all_four_scenarios_qualified": false,
+  "sustained_total": {
+    "samples": 50,
+    "checks": 415,
+    "passed": 415,
+    "failed": []
+  },
+  "high_qos_remaining_action": "exclusive host/storage performance window with original balanced controls; current topology does not identify each low score cause",
+  "evidence_audit": {
+    "measurement_records": 556,
+    "arithmetic_and_available_full_hashes_recomputed": true,
+    "sustained_samples": 45,
+    "sustained_gates": 375,
+    "sustained_passed": 375,
+    "local_sustained_gates": 40,
+    "local_sustained_passed": 40,
+    "total_sustained_samples": 50,
+    "total_sustained_gates": 415,
+    "performance_intervals_recomputed_with_frozen_evaluator": true,
+    "all_recorded_finite_verdicts_reproduced": true,
+    "raw_high_ratios": {
+      "high-control": {
+        "cifs-to-s3": {
+          "ratio": 1.071918698185633,
+          "raw_passed": true,
+          "recorded_qualified": false
+        },
+        "local-to-s3": {
+          "ratio": 0.9750370986287483,
+          "raw_passed": false,
+          "recorded_qualified": false
+        },
+        "nfs41-to-s3": {
+          "ratio": 0.9629004571686538,
+          "raw_passed": false,
+          "recorded_qualified": false
+        },
+        "hdfs-to-s3": {
+          "ratio": 1.0197003286898731,
+          "raw_passed": true,
+          "recorded_qualified": false
+        },
+        "s3-to-s3": {
+          "ratio": 1.0105812274811707,
+          "raw_passed": true,
+          "recorded_qualified": false
+        },
+        "s3-to-hdfs": {
+          "ratio": 0.9542043138873977,
+          "raw_passed": false,
+          "recorded_qualified": false
+        },
+        "s3-to-local": {
+          "ratio": 0.9326075139955152,
+          "raw_passed": false,
+          "recorded_qualified": false
+        },
+        "s3-to-cifs": {
+          "ratio": 0.9995864131257349,
+          "raw_passed": true,
+          "recorded_qualified": true
+        },
+        "s3-to-nfs41": {
+          "ratio": 0.9691661395515031,
+          "raw_passed": false,
+          "recorded_qualified": false
+        }
+      },
+      "candidate-comparison": {
+        "cifs-to-s3": {
+          "ratio": 0.9776749900096662,
+          "raw_passed": false,
+          "recorded_qualified": false
+        },
+        "local-to-s3": {
+          "ratio": 1.0290417051247356,
+          "raw_passed": true,
+          "recorded_qualified": false
+        },
+        "nfs41-to-s3": {
+          "ratio": 1.1138637239157236,
+          "raw_passed": true,
+          "recorded_qualified": false
+        },
+        "hdfs-to-s3": {
+          "ratio": 1.0838883238910182,
+          "raw_passed": true,
+          "recorded_qualified": false
+        },
+        "s3-to-s3": {
+          "ratio": 0.8179726742059441,
+          "raw_passed": false,
+          "recorded_qualified": false
+        },
+        "s3-to-hdfs": {
+          "ratio": 1.0211225053059032,
+          "raw_passed": true,
+          "recorded_qualified": false
+        },
+        "s3-to-local": {
+          "ratio": 0.9914046102280607,
+          "raw_passed": true,
+          "recorded_qualified": false
+        },
+        "s3-to-cifs": {
+          "ratio": 1.0020046853599172,
+          "raw_passed": true,
+          "recorded_qualified": true
+        },
+        "s3-to-nfs41": {
+          "ratio": 0.9567617607182615,
+          "raw_passed": false,
+          "recorded_qualified": false
+        }
+      }
+    },
+    "unreconstructable_early_diagnostic_records": [
+      "nightly-qos-remediation-local/final/local-to-local/baseline-0.json",
+      "nightly-qos-remediation-local/final/local-to-local/control-0.json",
+      "nightly-qos-remediation-local/final/local-to-local/high-0.json",
+      "nightly-qos-remediation-local/final/local-to-local/control-1.json",
+      "nightly-qos-remediation-local/final/local-to-local/high-1.json",
+      "nightly-qos-remediation-local/final/local-to-local/baseline-1.json",
+      "nightly-qos-remediation-local/final/local-to-local/high-2.json",
+      "nightly-qos-remediation-local/final/local-to-local/baseline-2.json",
+      "nightly-qos-remediation-local/final/local-to-local/control-2.json",
+      "nightly-qos-remediation-local/final/local-to-local/baseline-3.json",
+      "nightly-qos-remediation-local/final/local-to-local/control-3.json",
+      "nightly-qos-remediation-local/final/local-to-local/high-3.json",
+      "nightly-qos-remediation-local/final/local-to-local/control-4.json",
+      "nightly-qos-remediation-local/final/local-to-local/high-4.json",
+      "nightly-qos-remediation-local/final/local-to-local/baseline-4.json",
+      "nightly-qos-remediation-local/final/local-to-local/high-5.json",
+      "nightly-qos-remediation-local/final/local-to-local/baseline-5.json",
+      "nightly-qos-remediation-local/final/local-to-local/control-5.json",
+      "nightly-qos-remediation-local/final/local-to-local/bandwidth-strict.json",
+      "nightly-qos-remediation-local/final/local-to-local/bandwidth-dual.json",
+      "nightly-qos-remediation-local/final/local-to-local/iops-strict.json",
+      "nightly-qos-remediation-local/final/local-to-local/iops-dual.json",
+      "nightly-qos-remediation-local/final/local-to-local/combined.json"
+    ],
+    "candidate_ordering": "not position balanced; rejected diagnostic only; original failures retained",
+    "errors": []
+  }
+}

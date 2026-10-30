@@ -231,20 +231,23 @@ async fn fill_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFailure> 
         } else {
             None
         };
-        let count = if let Some(qos) = &state.qos {
-            qos.admit_read(requested, &state.cancel)
-                .await
-                .map_err(|_| cancelled(&state.path, Operation::Read))?
-        } else {
-            requested
-        };
+        let count = state
+            .qos
+            .as_ref()
+            .map_or(requested, |qos| qos.read_size(requested));
         let offset = state.next_issue;
         let protocol = Arc::clone(&state.protocol);
         let cursor = state.cursor.clone();
         let path = state.path.clone();
         let cancel = state.cancel.clone();
+        let qos = state.qos.clone();
         state.inflight.push_back(Box::pin(async move {
             let read = async {
+                if let Some(qos) = &qos {
+                    qos.admit_read(count, &cancel)
+                        .await
+                        .map_err(|_| cancelled(&path, Operation::Read))?;
+                }
                 match cursor {
                     Some(cursor) => cursor.read_range(offset..offset + count).await,
                     None => protocol.read_range(&path, offset..offset + count).await,

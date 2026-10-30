@@ -1,0 +1,136 @@
+{
+  "measurement_records": 556,
+  "arithmetic_and_available_full_hashes_recomputed": true,
+  "sustained_samples": 45,
+  "sustained_gates": 375,
+  "sustained_passed": 375,
+  "local_sustained_gates": 40,
+  "local_sustained_passed": 40,
+  "total_sustained_samples": 50,
+  "total_sustained_gates": 415,
+  "performance_intervals_recomputed_with_frozen_evaluator": true,
+  "all_recorded_finite_verdicts_reproduced": true,
+  "raw_high_ratios": {
+    "high-control": {
+      "cifs-to-s3": {
+        "ratio": 1.071918698185633,
+        "raw_passed": true,
+        "recorded_qualified": false
+      },
+      "local-to-s3": {
+        "ratio": 0.9750370986287483,
+        "raw_passed": false,
+        "recorded_qualified": false
+      },
+      "nfs41-to-s3": {
+        "ratio": 0.9629004571686538,
+        "raw_passed": false,
+        "recorded_qualified": false
+      },
+      "hdfs-to-s3": {
+        "ratio": 1.0197003286898731,
+        "raw_passed": true,
+        "recorded_qualified": false
+      },
+      "s3-to-s3": {
+        "ratio": 1.0105812274811707,
+        "raw_passed": true,
+        "recorded_qualified": false
+      },
+      "s3-to-hdfs": {
+        "ratio": 0.9542043138873977,
+        "raw_passed": false,
+        "recorded_qualified": false
+      },
+      "s3-to-local": {
+        "ratio": 0.9326075139955152,
+        "raw_passed": false,
+        "recorded_qualified": false
+      },
+      "s3-to-cifs": {
+        "ratio": 0.9995864131257349,
+        "raw_passed": true,
+        "recorded_qualified": true
+      },
+      "s3-to-nfs41": {
+        "ratio": 0.9691661395515031,
+        "raw_passed": false,
+        "recorded_qualified": false
+      }
+    },
+    "candidate-comparison": {
+      "cifs-to-s3": {
+        "ratio": 0.9776749900096662,
+        "raw_passed": false,
+        "recorded_qualified": false
+      },
+      "local-to-s3": {
+        "ratio": 1.0290417051247356,
+        "raw_passed": true,
+        "recorded_qualified": false
+      },
+      "nfs41-to-s3": {
+        "ratio": 1.1138637239157236,
+        "raw_passed": true,
+        "recorded_qualified": false
+      },
+      "hdfs-to-s3": {
+        "ratio": 1.0838883238910182,
+        "raw_passed": true,
+        "recorded_qualified": false
+      },
+      "s3-to-s3": {
+        "ratio": 0.8179726742059441,
+        "raw_passed": false,
+        "recorded_qualified": false
+      },
+      "s3-to-hdfs": {
+        "ratio": 1.0211225053059032,
+        "raw_passed": true,
+        "recorded_qualified": false
+      },
+      "s3-to-local": {
+        "ratio": 0.9914046102280607,
+        "raw_passed": true,
+        "recorded_qualified": false
+      },
+      "s3-to-cifs": {
+        "ratio": 1.0020046853599172,
+        "raw_passed": true,
+        "recorded_qualified": true
+      },
+      "s3-to-nfs41": {
+        "ratio": 0.9567617607182615,
+        "raw_passed": false,
+        "recorded_qualified": false
+      }
+    }
+  },
+  "unreconstructable_early_diagnostic_records": [
+    "nightly-qos-remediation-local/final/local-to-local/baseline-0.json",
+    "nightly-qos-remediation-local/final/local-to-local/control-0.json",
+    "nightly-qos-remediation-local/final/local-to-local/high-0.json",
+    "nightly-qos-remediation-local/final/local-to-local/control-1.json",
+    "nightly-qos-remediation-local/final/local-to-local/high-1.json",
+    "nightly-qos-remediation-local/final/local-to-local/baseline-1.json",
+    "nightly-qos-remediation-local/final/local-to-local/high-2.json",
+    "nightly-qos-remediation-local/final/local-to-local/baseline-2.json",
+    "nightly-qos-remediation-local/final/local-to-local/control-2.json",
+    "nightly-qos-remediation-local/final/local-to-local/baseline-3.json",
+    "nightly-qos-remediation-local/final/local-to-local/control-3.json",
+    "nightly-qos-remediation-local/final/local-to-local/high-3.json",
+    "nightly-qos-remediation-local/final/local-to-local/control-4.json",
+    "nightly-qos-remediation-local/final/local-to-local/high-4.json",
+    "nightly-qos-remediation-local/final/local-to-local/baseline-4.json",
+    "nightly-qos-remediation-local/final/local-to-local/high-5.json",
+    "nightly-qos-remediation-local/final/local-to-local/baseline-5.json",
+    "nightly-qos-remediation-local/final/local-to-local/control-5.json",
+    "nightly-qos-remediation-local/final/local-to-local/bandwidth-strict.json",
+    "nightly-qos-remediation-local/final/local-to-local/bandwidth-dual.json",
+    "nightly-qos-remediation-local/final/local-to-local/iops-strict.json",
+    "nightly-qos-remediation-local/final/local-to-local/iops-dual.json",
+    "nightly-qos-remediation-local/final/local-to-local/combined.json"
+  ],
+  "candidate_ordering": "not position balanced; rejected diagnostic only; original failures retained",
+  "errors": []
+}

@@ -1,0 +1,70 @@
+{
+  "all_succeeded": true,
+  "first_attempt": "backend cleanup completed; worker root SSH rejected; resumed as documented ci-runner user; original script/driver log retained; S3 counts are resume-attempt counts",
+  "operations": [
+    {
+      "operation": "cifs-tree",
+      "exit_code": 0,
+      "completed_in_first_attempt": true
+    },
+    {
+      "operation": "cifs-root",
+      "exit_code": 0,
+      "completed_in_first_attempt": true
+    },
+    {
+      "operation": "hdfs-tree",
+      "exit_code": 0,
+      "completed_in_first_attempt": true
+    },
+    {
+      "operation": "hdfs-root",
+      "exit_code": 0,
+      "completed_in_first_attempt": true
+    },
+    {
+      "operation": "nfs-bookkeeping-10.131.9.12",
+      "exit_code": 0
+    },
+    {
+      "operation": "nfs-bookkeeping-10.131.9.13",
+      "exit_code": 0
+    },
+    {
+      "operation": "nfs-bookkeeping-10.131.9.14",
+      "exit_code": 0
+    }
+  ],
+  "s3": [
+    {
+      "endpoint": "source",
+      "prefix": "ci/nightly-qos-remediation-20261030/",
+      "empty": true,
+      "versions_and_markers_deleted": 0,
+      "multipart_aborted": 0
+    },
+    {
+      "endpoint": "source",
+      "prefix": "nightly-qos-remediation-20261030/",
+      "empty": true,
+      "versions_and_markers_deleted": 0,
+      "multipart_aborted": 0
+    },
+    {
+      "endpoint": "destination",
+      "prefix": "ci/nightly-qos-remediation-20261030/",
+      "empty": true,
+      "versions_and_markers_deleted": 0,
+      "multipart_aborted": 0
+    },
+    {
+      "endpoint": "destination",
+      "prefix": "nightly-qos-remediation-20261030/",
+      "empty": true,
+      "versions_and_markers_deleted": 0,
+      "multipart_aborted": 0
+    }
+  ],
+  "source_and_destination_data_removed": true,
+  "shared_services": "no service configuration, process or keytab changed"
+}

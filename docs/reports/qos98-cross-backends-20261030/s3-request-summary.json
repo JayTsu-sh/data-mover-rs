@@ -1,0 +1,262 @@
+[
+  {
+    "route": "s3-to-local",
+    "case": "baseline",
+    "counts": {
+      "bucket-versioning": 1,
+      "head-object": 4,
+      "range-get": 8
+    },
+    "payload_requests": 8,
+    "payload_request_bytes": [
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608
+    ],
+    "seconds": 0.127614544,
+    "mibps": 501.51023538508275,
+    "iops": 62.688779423135344,
+    "digest": "8c2623be4facc2220b4cc6053acf2340f8abb86cceb920bd3b66d70e42007595",
+    "expected_payload_requests": 8
+  },
+  {
+    "route": "s3-to-local",
+    "case": "high",
+    "counts": {
+      "bucket-versioning": 1,
+      "head-object": 4,
+      "range-get": 8
+    },
+    "payload_requests": 8,
+    "payload_request_bytes": [
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608
+    ],
+    "seconds": 0.132311251,
+    "mibps": 483.70791989564066,
+    "iops": 60.46348998695508,
+    "digest": "8c2623be4facc2220b4cc6053acf2340f8abb86cceb920bd3b66d70e42007595",
+    "expected_payload_requests": 8
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-strict",
+    "counts": {
+      "bucket-versioning": 1,
+      "head-object": 4,
+      "range-get": 8
+    },
+    "payload_requests": 8,
+    "payload_request_bytes": [
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608
+    ],
+    "seconds": 16.024141142,
+    "mibps": 3.993973806948885,
+    "iops": 0.49924672586861063,
+    "digest": "8c2623be4facc2220b4cc6053acf2340f8abb86cceb920bd3b66d70e42007595",
+    "expected_payload_requests": 8,
+    "steady_window_seconds": 5,
+    "steady_rate": 4194217.009842107,
+    "soft": 4194304,
+    "end_to_end_ratio": 0.9984934517372213
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-dual",
+    "counts": {
+      "bucket-versioning": 1,
+      "head-object": 4,
+      "range-get": 8
+    },
+    "payload_requests": 8,
+    "payload_request_bytes": [
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608
+    ],
+    "seconds": 12.033174543,
+    "mibps": 5.318629740747043,
+    "iops": 0.6648287175933804,
+    "digest": "8c2623be4facc2220b4cc6053acf2340f8abb86cceb920bd3b66d70e42007595",
+    "expected_payload_requests": 8,
+    "steady_window_seconds": 5,
+    "steady_rate": 4194408.228947285,
+    "soft": 4194304,
+    "end_to_end_ratio": 1.3296574351867607
+  },
+  {
+    "route": "s3-to-local",
+    "case": "bandwidth-low",
+    "counts": {
+      "bucket-versioning": 1,
+      "head-object": 4,
+      "range-get": 8
+    },
+    "payload_requests": 8,
+    "payload_request_bytes": [
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608
+    ],
+    "seconds": 64.028826447,
+    "mibps": 0.9995497895463715,
+    "iops": 0.12494372369329644,
+    "digest": "8c2623be4facc2220b4cc6053acf2340f8abb86cceb920bd3b66d70e42007595",
+    "expected_payload_requests": 8,
+    "steady_window_seconds": 16.0,
+    "steady_rate": 1048575.7335306916,
+    "soft": 1048576,
+    "end_to_end_ratio": 0.9995497895463715
+  },
+  {
+    "route": "s3-to-local",
+    "case": "iops-strict",
+    "counts": {
+      "bucket-versioning": 1,
+      "head-object": 4,
+      "range-get": 8
+    },
+    "payload_requests": 8,
+    "payload_request_bytes": [
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608
+    ],
+    "seconds": 8.027415409,
+    "mibps": 7.9726782207191995,
+    "iops": 0.9965847775898999,
+    "digest": "8c2623be4facc2220b4cc6053acf2340f8abb86cceb920bd3b66d70e42007595",
+    "expected_payload_requests": 8,
+    "steady_window_seconds": 5,
+    "steady_rate": 0.9999955285199942,
+    "soft": 1,
+    "end_to_end_ratio": 0.9965847775898999
+  },
+  {
+    "route": "local-to-s3",
+    "case": "baseline",
+    "counts": {
+      "bucket-versioning": 1,
+      "head-object": 4,
+      "list-multipart": 1,
+      "create-multipart": 1,
+      "upload-part": 8,
+      "complete-multipart": 1,
+      "range-get": 32,
+      "delete": 1
+    },
+    "payload_requests": 8,
+    "payload_request_bytes": [
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608
+    ],
+    "seconds": 1.8874752849999998,
+    "mibps": 33.9077287573596,
+    "iops": 16.9538643786798,
+    "digest": "8c2623be4facc2220b4cc6053acf2340f8abb86cceb920bd3b66d70e42007595",
+    "expected_payload_requests": 8
+  },
+  {
+    "route": "local-to-s3",
+    "case": "high",
+    "counts": {
+      "bucket-versioning": 1,
+      "head-object": 4,
+      "list-multipart": 1,
+      "create-multipart": 1,
+      "upload-part": 8,
+      "complete-multipart": 1,
+      "range-get": 32,
+      "delete": 1
+    },
+    "payload_requests": 8,
+    "payload_request_bytes": [
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608
+    ],
+    "seconds": 1.7984359049999998,
+    "mibps": 35.586478129171915,
+    "iops": 17.793239064585958,
+    "digest": "8c2623be4facc2220b4cc6053acf2340f8abb86cceb920bd3b66d70e42007595",
+    "expected_payload_requests": 8
+  },
+  {
+    "route": "local-to-s3",
+    "case": "bandwidth-strict",
+    "counts": {
+      "bucket-versioning": 1,
+      "head-object": 4,
+      "list-multipart": 1,
+      "create-multipart": 1,
+      "upload-part": 8,
+      "complete-multipart": 1,
+      "range-get": 32,
+      "delete": 1
+    },
+    "payload_requests": 8,
+    "payload_request_bytes": [
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608,
+      8388608
+    ],
+    "seconds": 16.570936561,
+    "mibps": 3.8621836348480847,
+    "iops": 96.55459087120212,
+    "digest": "8c2623be4facc2220b4cc6053acf2340f8abb86cceb920bd3b66d70e42007595",
+    "expected_payload_requests": 8,
+    "steady_window_seconds": 5,
+    "steady_rate": 4191251.8351548887,
+    "soft": 4194304,
+    "end_to_end_ratio": 0.9655459087120212
+  }
+]

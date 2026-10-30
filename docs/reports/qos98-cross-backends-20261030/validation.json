@@ -1,0 +1,41 @@
+{
+  "rust_lib_tests": {
+    "passed": 2075,
+    "failed": 0,
+    "ignored": 9,
+    "suites": 14,
+    "command": "cargo test --workspace --lib --locked --features qos-diagnostics"
+  },
+  "python_qos_tests": {
+    "passed": 16,
+    "failed": 0,
+    "command": "python3 -m unittest discover -s tests -p 'test_*qos*.py'"
+  },
+  "clippy": {
+    "passed": true,
+    "command": "cargo clippy --release --locked --features qos-diagnostics --example backend_qos_acceptance --example backend_qos_cleanup -- -D warnings"
+  },
+  "format": {
+    "passed": true,
+    "command": "cargo fmt --all -- --check"
+  },
+  "architecture": {
+    "passed": true,
+    "command": "python3 tests/validate_architecture_dependencies.py ."
+  },
+  "normal_binary_sha256": "d7c04f29a868a388e9b3dd9ca8fc470f684ca3f8eab7100b637ead4e5ffa9156",
+  "normal_binary_matches_remote_acceptance_binary": true,
+  "debug_probe_tags_absent_from_normal_binary": true,
+  "existing_warning": "binrw v0.15.1 future-incompatibility warning",
+  "rejected_experiments": {
+    "tail_1m_rejected": true,
+    "tail_2m_rejected": true,
+    "production_changes_reverted": true
+  },
+  "cleanup": {
+    "passed": true,
+    "operations": 5,
+    "s3_exact_prefix_version_and_multipart_scopes": 4,
+    "s3_empty": true
+  }
+}

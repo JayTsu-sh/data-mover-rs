@@ -1,0 +1,4 @@
+{"case": "unlimited", "median_iops": 9329.833673847967, "cpu_seconds": 0.072646}
+{"case": "high", "median_iops": 10311.126148170077, "cpu_seconds": 0.070663}
+{"case": "strict", "median_iops": 125.69390091311169, "cpu_seconds": 0.148933}
+high/unlimited = 1.1051779172733514 strict/128 = 0.9819836008836851

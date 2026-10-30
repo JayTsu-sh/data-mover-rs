@@ -1,0 +1,34 @@
+[
+  {
+    "endpoint": "source",
+    "prefix": "ci/nightly-qos-cross-20261029192047-pressure/",
+    "versioning": "Unversioned",
+    "versions_and_markers_deleted": 0,
+    "multipart_aborted": 0,
+    "empty": true
+  },
+  {
+    "endpoint": "source",
+    "prefix": "ci/nightly-qos-cross-20261029192047/",
+    "versioning": "Unversioned",
+    "versions_and_markers_deleted": 0,
+    "multipart_aborted": 0,
+    "empty": true
+  },
+  {
+    "endpoint": "destination",
+    "prefix": "ci/nightly-qos-cross-20261029192047-pressure/",
+    "versioning": "Unversioned",
+    "versions_and_markers_deleted": 0,
+    "multipart_aborted": 0,
+    "empty": true
+  },
+  {
+    "endpoint": "destination",
+    "prefix": "ci/nightly-qos-cross-20261029192047/",
+    "versioning": "Unversioned",
+    "versions_and_markers_deleted": 0,
+    "multipart_aborted": 0,
+    "empty": true
+  }
+]

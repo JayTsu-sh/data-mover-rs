@@ -1,0 +1,20 @@
+{
+  "independent_30_pair": {
+    "baseline_mibps": 282.5493387128903,
+    "high_mibps": 282.34524681320266,
+    "ratio": 0.999277676951511,
+    "passed": true,
+    "samples_per_arm": 30
+  },
+  "posthoc_57_pair": {
+    "ratio": 0.9919931994721647,
+    "passed": true,
+    "samples_per_arm": 57,
+    "cohorts": [
+      "matched-capture final arms,12",
+      "regression/focused s3-to-hdfs,15",
+      "confirmation-30,30"
+    ],
+    "status": "post-hoc pooled sensitivity analysis; independent 30-pair verdict is separate; initial 15-pair failure retained"
+  }
+}

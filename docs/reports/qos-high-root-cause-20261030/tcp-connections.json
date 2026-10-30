@@ -1,0 +1,26 @@
+[
+  {
+    "binary": "qos-bin",
+    "arm": "baseline",
+    "s3_tcp_connection_attempts": 2,
+    "diagnostic_only": true
+  },
+  {
+    "binary": "qos-bin",
+    "arm": "high",
+    "s3_tcp_connection_attempts": 3,
+    "diagnostic_only": true
+  },
+  {
+    "binary": "capture-bin",
+    "arm": "baseline",
+    "s3_tcp_connection_attempts": 2,
+    "diagnostic_only": true
+  },
+  {
+    "binary": "capture-bin",
+    "arm": "high",
+    "s3_tcp_connection_attempts": 2,
+    "diagnostic_only": true
+  }
+]

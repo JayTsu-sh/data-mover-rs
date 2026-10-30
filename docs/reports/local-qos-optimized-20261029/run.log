@@ -1,0 +1,151 @@
+RUN baseline-0 read bandwidth
+  852.268 MiB/s, 426.134 IOPS, 0.300s
+RUN high-0 read bandwidth
+  955.055 MiB/s, 477.527 IOPS, 0.268s
+RUN high-1 read bandwidth
+  939.388 MiB/s, 469.694 IOPS, 0.273s
+RUN baseline-1 read bandwidth
+  859.754 MiB/s, 429.877 IOPS, 0.298s
+RUN baseline-2 read bandwidth
+  970.852 MiB/s, 485.426 IOPS, 0.264s
+RUN high-2 read bandwidth
+  853.207 MiB/s, 426.603 IOPS, 0.300s
+PASS bandwidth/read/baseline_has_headroom {'baseline': 859.7537103846815, 'hard': 32.0}
+PASS bandwidth/read/high_qos_matches_baseline {'ratio': 1.0926242849025174, 'baseline': 859.7537103846815, 'high': 939.3877830013488}
+RUN strict read bandwidth
+  15.790 MiB/s, 98.687 IOPS, 8.106s
+PASS bandwidth/read/strict/average_95_percent {'actual': 15.789986738017276, 'soft': 16.0}
+PASS bandwidth/read/strict/hard_total {'actual': 15.789986738017276}
+PASS bandwidth/read/strict/hard_envelope {'hard_max_excess': 167773.0, 'soft_max_excess': 167773.0, 'packet_allowance': 167773, 'soft_credit_capacity': 0.0, 'steady_rate': 16575838.0, 'first_half_second_rate': 16441754.0}
+PASS bandwidth/read/strict/soft_envelope {'hard_max_excess': 167773.0, 'soft_max_excess': 167773.0, 'packet_allowance': 167773, 'soft_credit_capacity': 0.0, 'steady_rate': 16575838.0, 'first_half_second_rate': 16441754.0}
+PASS bandwidth/read/strict/steady_ceiling {'hard_max_excess': 167773.0, 'soft_max_excess': 167773.0, 'packet_allowance': 167773, 'soft_credit_capacity': 0.0, 'steady_rate': 16575838.0, 'first_half_second_rate': 16441754.0}
+PASS bandwidth/read/strict/steady_at_least_95_percent {'hard_max_excess': 167773.0, 'soft_max_excess': 167773.0, 'packet_allowance': 167773, 'soft_credit_capacity': 0.0, 'steady_rate': 16575838.0, 'first_half_second_rate': 16441754.0}
+RUN dual read bandwidth
+  17.064 MiB/s, 53.326 IOPS, 7.501s
+PASS bandwidth/read/dual/average_95_percent {'actual': 17.064271252525323, 'soft': 16.0}
+PASS bandwidth/read/dual/hard_total {'actual': 17.064271252525323}
+PASS bandwidth/read/dual/hard_envelope {'hard_max_excess': 335545.0, 'soft_max_excess': 8386805.488575993, 'packet_allowance': 335545, 'soft_credit_capacity': 8388608.0, 'steady_rate': 16777195.6, 'first_half_second_rate': 32883410.0}
+PASS bandwidth/read/dual/soft_envelope {'hard_max_excess': 335545.0, 'soft_max_excess': 8386805.488575993, 'packet_allowance': 335545, 'soft_credit_capacity': 8388608.0, 'steady_rate': 16777195.6, 'first_half_second_rate': 32883410.0}
+PASS bandwidth/read/dual/steady_ceiling {'hard_max_excess': 335545.0, 'soft_max_excess': 8386805.488575993, 'packet_allowance': 335545, 'soft_credit_capacity': 8388608.0, 'steady_rate': 16777195.6, 'first_half_second_rate': 32883410.0}
+PASS bandwidth/read/dual/steady_at_least_95_percent {'hard_max_excess': 335545.0, 'soft_max_excess': 8386805.488575993, 'packet_allowance': 335545, 'soft_credit_capacity': 8388608.0, 'steady_rate': 16777195.6, 'first_half_second_rate': 32883410.0}
+PASS bandwidth/read/dual/burst_observed {'hard_max_excess': 335545.0, 'soft_max_excess': 8386805.488575993, 'packet_allowance': 335545, 'soft_credit_capacity': 8388608.0, 'steady_rate': 16777195.6, 'first_half_second_rate': 32883410.0}
+RUN baseline-0 copy bandwidth
+  401.684 MiB/s, 200.842 IOPS, 0.637s
+RUN high-0 copy bandwidth
+  401.712 MiB/s, 200.856 IOPS, 0.637s
+RUN high-1 copy bandwidth
+  412.000 MiB/s, 206.000 IOPS, 0.621s
+RUN baseline-1 copy bandwidth
+  405.419 MiB/s, 202.710 IOPS, 0.631s
+RUN baseline-2 copy bandwidth
+  407.867 MiB/s, 203.933 IOPS, 0.628s
+RUN high-2 copy bandwidth
+  411.661 MiB/s, 205.831 IOPS, 0.622s
+PASS bandwidth/copy/baseline_has_headroom {'baseline': 405.41947524175475, 'hard': 32.0}
+PASS bandwidth/copy/high_qos_matches_baseline {'ratio': 1.0153960486349243, 'baseline': 405.41947524175475, 'high': 411.6613332001223}
+RUN strict copy bandwidth
+  15.446 MiB/s, 96.540 IOPS, 8.287s
+PASS bandwidth/copy/strict/average_95_percent {'actual': 15.446351613375631, 'soft': 16.0}
+PASS bandwidth/copy/strict/hard_total {'actual': 15.446351613375631}
+PASS bandwidth/copy/strict/hard_envelope {'hard_max_excess': 167773.0, 'soft_max_excess': 167773.0, 'packet_allowance': 167773, 'soft_credit_capacity': 0.0, 'steady_rate': 16542333.8, 'first_half_second_rate': 16441754.0}
+PASS bandwidth/copy/strict/soft_envelope {'hard_max_excess': 167773.0, 'soft_max_excess': 167773.0, 'packet_allowance': 167773, 'soft_credit_capacity': 0.0, 'steady_rate': 16542333.8, 'first_half_second_rate': 16441754.0}
+PASS bandwidth/copy/strict/steady_ceiling {'hard_max_excess': 167773.0, 'soft_max_excess': 167773.0, 'packet_allowance': 167773, 'soft_credit_capacity': 0.0, 'steady_rate': 16542333.8, 'first_half_second_rate': 16441754.0}
+PASS bandwidth/copy/strict/steady_at_least_95_percent {'hard_max_excess': 167773.0, 'soft_max_excess': 167773.0, 'packet_allowance': 167773, 'soft_credit_capacity': 0.0, 'steady_rate': 16542333.8, 'first_half_second_rate': 16441754.0}
+RUN dual copy bandwidth
+  16.679 MiB/s, 52.123 IOPS, 7.674s
+PASS bandwidth/copy/dual/average_95_percent {'actual': 16.679371452491687, 'soft': 16.0}
+PASS bandwidth/copy/dual/hard_total {'actual': 16.679371452491687}
+PASS bandwidth/copy/dual/hard_envelope {'hard_max_excess': 335545.0, 'soft_max_excess': 8386668.889325569, 'packet_allowance': 335545, 'soft_credit_capacity': 8388608.0, 'steady_rate': 16777216.0, 'first_half_second_rate': 32883410.0}
+PASS bandwidth/copy/dual/soft_envelope {'hard_max_excess': 335545.0, 'soft_max_excess': 8386668.889325569, 'packet_allowance': 335545, 'soft_credit_capacity': 8388608.0, 'steady_rate': 16777216.0, 'first_half_second_rate': 32883410.0}
+PASS bandwidth/copy/dual/steady_ceiling {'hard_max_excess': 335545.0, 'soft_max_excess': 8386668.889325569, 'packet_allowance': 335545, 'soft_credit_capacity': 8388608.0, 'steady_rate': 16777216.0, 'first_half_second_rate': 32883410.0}
+PASS bandwidth/copy/dual/steady_at_least_95_percent {'hard_max_excess': 335545.0, 'soft_max_excess': 8386668.889325569, 'packet_allowance': 335545, 'soft_credit_capacity': 8388608.0, 'steady_rate': 16777216.0, 'first_half_second_rate': 32883410.0}
+PASS bandwidth/copy/dual/burst_observed {'hard_max_excess': 335545.0, 'soft_max_excess': 8386668.889325569, 'packet_allowance': 335545, 'soft_credit_capacity': 8388608.0, 'steady_rate': 16777216.0, 'first_half_second_rate': 32883410.0}
+RUN baseline-0 read iops
+  649.699 MiB/s, 10395.187 IOPS, 0.394s
+RUN high-0 read iops
+  662.957 MiB/s, 10607.318 IOPS, 0.386s
+RUN high-1 read iops
+  687.020 MiB/s, 10992.315 IOPS, 0.373s
+RUN baseline-1 read iops
+  690.002 MiB/s, 11040.025 IOPS, 0.371s
+RUN baseline-2 read iops
+  687.543 MiB/s, 11000.693 IOPS, 0.372s
+RUN high-2 read iops
+  618.164 MiB/s, 9890.619 IOPS, 0.414s
+PASS iops/read/baseline_has_headroom {'baseline': 11000.692643464858, 'hard': 256.0}
+PASS iops/read/high_qos_matches_baseline {'ratio': 0.964240900846766, 'baseline': 11000.692643464858, 'high': 10607.317784472945}
+RUN strict read iops
+  7.875 MiB/s, 126.002 IOPS, 8.127s
+PASS iops/read/strict/average_95_percent {'actual': 126.00227568870989, 'soft': 128.0}
+PASS iops/read/strict/hard_total {'actual': 126.00227568870989}
+PASS iops/read/strict/hard_envelope {'hard_max_excess': 1.0, 'soft_max_excess': 1.0, 'packet_allowance': 1, 'soft_credit_capacity': 0.0, 'steady_rate': 126.2, 'first_half_second_rate': 126.0}
+PASS iops/read/strict/soft_envelope {'hard_max_excess': 1.0, 'soft_max_excess': 1.0, 'packet_allowance': 1, 'soft_credit_capacity': 0.0, 'steady_rate': 126.2, 'first_half_second_rate': 126.0}
+PASS iops/read/strict/steady_ceiling {'hard_max_excess': 1.0, 'soft_max_excess': 1.0, 'packet_allowance': 1, 'soft_credit_capacity': 0.0, 'steady_rate': 126.2, 'first_half_second_rate': 126.0}
+PASS iops/read/strict/steady_at_least_95_percent {'hard_max_excess': 1.0, 'soft_max_excess': 1.0, 'packet_allowance': 1, 'soft_credit_capacity': 0.0, 'steady_rate': 126.2, 'first_half_second_rate': 126.0}
+RUN dual read iops
+  8.533 MiB/s, 136.522 IOPS, 7.501s
+PASS iops/read/dual/average_95_percent {'actual': 136.52209791053127, 'soft': 128.0}
+PASS iops/read/dual/hard_total {'actual': 136.52209791053127}
+PASS iops/read/dual/hard_envelope {'hard_max_excess': 1.0, 'soft_max_excess': 63.991951232, 'packet_allowance': 1, 'soft_credit_capacity': 64.0, 'steady_rate': 128.2, 'first_half_second_rate': 250.0}
+PASS iops/read/dual/soft_envelope {'hard_max_excess': 1.0, 'soft_max_excess': 63.991951232, 'packet_allowance': 1, 'soft_credit_capacity': 64.0, 'steady_rate': 128.2, 'first_half_second_rate': 250.0}
+PASS iops/read/dual/steady_ceiling {'hard_max_excess': 1.0, 'soft_max_excess': 63.991951232, 'packet_allowance': 1, 'soft_credit_capacity': 64.0, 'steady_rate': 128.2, 'first_half_second_rate': 250.0}
+PASS iops/read/dual/steady_at_least_95_percent {'hard_max_excess': 1.0, 'soft_max_excess': 63.991951232, 'packet_allowance': 1, 'soft_credit_capacity': 64.0, 'steady_rate': 128.2, 'first_half_second_rate': 250.0}
+PASS iops/read/dual/burst_observed {'hard_max_excess': 1.0, 'soft_max_excess': 63.991951232, 'packet_allowance': 1, 'soft_credit_capacity': 64.0, 'steady_rate': 128.2, 'first_half_second_rate': 250.0}
+RUN baseline-0 copy iops
+  376.317 MiB/s, 6021.074 IOPS, 0.680s
+RUN high-0 copy iops
+  343.718 MiB/s, 5499.487 IOPS, 0.745s
+RUN high-1 copy iops
+  369.687 MiB/s, 5914.998 IOPS, 0.692s
+RUN baseline-1 copy iops
+  380.329 MiB/s, 6085.271 IOPS, 0.673s
+RUN baseline-2 copy iops
+  340.866 MiB/s, 5453.856 IOPS, 0.751s
+RUN high-2 copy iops
+  365.405 MiB/s, 5846.476 IOPS, 0.701s
+PASS iops/copy/baseline_has_headroom {'baseline': 6021.07404433299, 'hard': 256.0}
+PASS iops/copy/high_qos_matches_baseline {'ratio': 0.9710021437325358, 'baseline': 6021.07404433299, 'high': 5846.475804619662}
+RUN strict copy iops
+  7.750 MiB/s, 124.001 IOPS, 8.258s
+PASS iops/copy/strict/average_95_percent {'actual': 124.00119830543937, 'soft': 128.0}
+PASS iops/copy/strict/hard_total {'actual': 124.00119830543937}
+PASS iops/copy/strict/hard_envelope {'hard_max_excess': 1.0, 'soft_max_excess': 1.0, 'packet_allowance': 1, 'soft_credit_capacity': 0.0, 'steady_rate': 125.6, 'first_half_second_rate': 124.0}
+PASS iops/copy/strict/soft_envelope {'hard_max_excess': 1.0, 'soft_max_excess': 1.0, 'packet_allowance': 1, 'soft_credit_capacity': 0.0, 'steady_rate': 125.6, 'first_half_second_rate': 124.0}
+PASS iops/copy/strict/steady_ceiling {'hard_max_excess': 1.0, 'soft_max_excess': 1.0, 'packet_allowance': 1, 'soft_credit_capacity': 0.0, 'steady_rate': 125.6, 'first_half_second_rate': 124.0}
+PASS iops/copy/strict/steady_at_least_95_percent {'hard_max_excess': 1.0, 'soft_max_excess': 1.0, 'packet_allowance': 1, 'soft_credit_capacity': 0.0, 'steady_rate': 125.6, 'first_half_second_rate': 124.0}
+RUN dual copy iops
+  8.423 MiB/s, 134.776 IOPS, 7.598s
+PASS iops/copy/dual/average_95_percent {'actual': 134.77599309482886, 'soft': 128.0}
+PASS iops/copy/dual/hard_total {'actual': 134.77599309482886}
+PASS iops/copy/dual/hard_envelope {'hard_max_excess': 1.0, 'soft_max_excess': 63.98742374399999, 'packet_allowance': 1, 'soft_credit_capacity': 64.0, 'steady_rate': 128.2, 'first_half_second_rate': 246.0}
+PASS iops/copy/dual/soft_envelope {'hard_max_excess': 1.0, 'soft_max_excess': 63.98742374399999, 'packet_allowance': 1, 'soft_credit_capacity': 64.0, 'steady_rate': 128.2, 'first_half_second_rate': 246.0}
+PASS iops/copy/dual/steady_ceiling {'hard_max_excess': 1.0, 'soft_max_excess': 63.98742374399999, 'packet_allowance': 1, 'soft_credit_capacity': 64.0, 'steady_rate': 128.2, 'first_half_second_rate': 246.0}
+PASS iops/copy/dual/steady_at_least_95_percent {'hard_max_excess': 1.0, 'soft_max_excess': 63.98742374399999, 'packet_allowance': 1, 'soft_credit_capacity': 64.0, 'steady_rate': 128.2, 'first_half_second_rate': 246.0}
+PASS iops/copy/dual/burst_observed {'hard_max_excess': 1.0, 'soft_max_excess': 63.98742374399999, 'packet_allowance': 1, 'soft_credit_capacity': 64.0, 'steady_rate': 128.2, 'first_half_second_rate': 246.0}
+RUN combined read bandwidth
+  8.532 MiB/s, 136.518 IOPS, 7.501s
+PASS combined/read/average_95_percent {'mibps': 8.532346352462543, 'iops': 136.5175416394007}
+PASS combined/read/bandwidth/hard_envelope {}
+PASS combined/read/bandwidth/soft_envelope {}
+PASS combined/read/bandwidth/steady_ceiling {}
+PASS combined/read/bandwidth/steady_at_least_95_percent {}
+PASS combined/read/bandwidth/burst_observed {}
+PASS combined/read/iops/hard_envelope {}
+PASS combined/read/iops/soft_envelope {}
+PASS combined/read/iops/steady_ceiling {}
+PASS combined/read/iops/steady_at_least_95_percent {}
+PASS combined/read/iops/burst_observed {}
+RUN combined copy bandwidth
+  8.419 MiB/s, 134.699 IOPS, 7.602s
+PASS combined/copy/average_95_percent {'mibps': 8.418660311955284, 'iops': 134.69856499128454}
+PASS combined/copy/bandwidth/hard_envelope {}
+PASS combined/copy/bandwidth/soft_envelope {}
+PASS combined/copy/bandwidth/steady_ceiling {}
+PASS combined/copy/bandwidth/steady_at_least_95_percent {}
+PASS combined/copy/bandwidth/burst_observed {}
+PASS combined/copy/iops/hard_envelope {}
+PASS combined/copy/iops/soft_envelope {}
+PASS combined/copy/iops/steady_ceiling {}
+PASS combined/copy/iops/steady_at_least_95_percent {}
+PASS combined/copy/iops/burst_observed {}
+Results: .scratch/local-qos-final-20261029; failed 0/82

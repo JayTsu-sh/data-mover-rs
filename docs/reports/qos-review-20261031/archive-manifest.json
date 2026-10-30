@@ -1,0 +1,28 @@
+{
+  "files": {
+    "logs/make-ci-stable-interrupted.log": "473f3710ed8dfe484089fb4af422a7cce3931d1b76c64b3a5a5da2d1498a3d69",
+    "logs/toolchain-revision.json": "c40844d09a067b81cb3cb083201df7f73319f4743fb21e0142f8b300e3254d97",
+    "logs/make-ci.log": "dc05f981255bc5d6d186ef2e1957c9929389fa922f9d04a4ae9e212c45f8f449",
+    "logs/make-verify.log": "371810bf37282bb8f5a63cd1580592e18000a741f4a814a0a8a92f0acb4d7ff4",
+    "logs/all-features-clippy.log": "47b3412d9f0dffd484e26e5627156c525336e4871e9b131a5e0f1a8978002921",
+    "logs/all-features-tests.log": "7ef8a787d3228aca4ef01df5f038614aa9613f37fdefd034993e42ef98770fe2",
+    "logs/python-all.log": "07151bed6d0386d9bfccb8c244c19c708fad8c7aed2fc3ff3a52e29667fb8490",
+    "logs/python-qos.log": "e0fa241657b33b8747bbb26a7c010545ee1b8186307ad0f3c86ee928f0b80416",
+    "logs/cleanup-scope-tests.log": "a74b43c1d907286a97fae62b300b0938abe4c869cf7b0239ef534ebb3474b213",
+    "logs/cleanup-build.log": "f0c990ea3e66d65980a41e42829fd06468cbd423b2797ede5470b7e87131dcbe",
+    "logs/cleanup-safety-e2e.log": "e30332548d953e7d047b7149a04684d0ce67f40ae760d06f68acce918948a1e5",
+    "review/architect-import-equivalence.json": "3f980bb0917a5c1a3ef754c871bfc28fc5d99fe23705059d922e6b0ed43c2602",
+    "review/cleanup-safety-e2e.json": "27d5cb6d50fd9c7bd13cd133bbe670062919ff3a3168079e35081fe308f59ec3",
+    "review/cleanup-safety-e2e.py": "00e4859abb535daa7a4f04588c93004f4e75ff857c851b2130d14773c05b9497",
+    "review/function-size-review.md": "a66311f7476a9cda2510344aa088d6311aebfc8c5545926275800e1c0f1fc45c",
+    "review/source-manifest.json": "a4d483ff2ea5e916d1b504627071c93d255a73b26b163bfb0067e559dfebbfb3",
+    "review/spec-final-review.md": "acea96d8b85791dfb9cf4567c44803d10b0f92f2563e3b0d80e0f4e82baae71d",
+    "review/spec-rereview.md": "af5276773170e853d0eaa6eaf1877429e40d17062b1edf37f9158d6e14227dad",
+    "review/spec-review.md": "ea95982e579e0e2a18f8fcdaba5735866233d1dc46f559efbf8f6ddc79df850d",
+    "review/standards-final-review.md": "a50f096c42f6d6e28c48f1369b54053f8340bf6102bc636e26c215d370b8e193",
+    "review/standards-rereview.md": "2fd857403d81438ef16ba1fa960b9710135e9c875bb390879bdaa6b113c63c50",
+    "review/standards-review.md": "765472af2b812900f269ab8ce8e413410fa3dcbaeb19f8fc58c5c7edadcc6067",
+    "review/validation.json": "06f25d82121dc693fff55ccea3073965803fb39612a0085089e18896111b5236"
+  },
+  "scope": "review reports and local validation logs; no private endpoint config, credential file, executable or large payload"
+}

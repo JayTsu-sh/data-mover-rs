@@ -1,6 +1,6 @@
-use crate::Result;
-use crate::error::StorageError;
-use crate::storage::backends::s3::S3VersioningAtConnect;
+use std::sync::OnceLock;
+use std::time::Duration;
+
 use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_credential_types::Credentials;
@@ -13,9 +13,12 @@ use data_mover_storage_core::storage::config::s3::{
     ParsedS3Url, parse_s3_endpoint_url, parse_s3_url,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use tls::{build_skip_verify_http_client, untrusted_certificate, warn_unverified};
 use tracing::{debug, error, info, warn};
+
+use crate::Result;
+use crate::error::StorageError;
+use crate::storage::backends::s3::S3VersioningAtConnect;
+use tls::{build_skip_verify_http_client, untrusted_certificate, warn_unverified};
 use url_options::{S3BucketType, S3Compatibility, S3UrlOptions};
 
 mod architecture;
@@ -26,6 +29,7 @@ mod delete_objects_md5;
 #[cfg(test)]
 mod directory_object_write_tests;
 mod dxn;
+mod qos_client;
 mod storagegrid;
 mod tls;
 mod url_options;
@@ -107,6 +111,8 @@ pub struct S3Storage {
     bucket_name: String,
     prefix: Option<String>,
     client: Client,
+    single_attempt_client: OnceLock<Client>,
+    http_client_capture: qos_client::HttpClientCapture,
     pub is_bucket_versioned: bool,
     /// `GetBucketVersioning` answered `Suspended` when the bucket was connected: a write there
     /// creates the `"null"` version, whether or not its reply says so (`RustFS` names none). A
@@ -367,7 +373,8 @@ impl S3Storage {
         // 创建 S3 客户端，强制使用路径样式以支持 FQDN 和自定义域名
         // 禁用自动 checksum 计算（WhenRequired），避免 SDK 对 UploadPart 等操作
         // 自动附加 trailing CRC32 + aws-chunked 编码，某些 S3 兼容存储不支持该编码
-        let client = Client::from_conf(build_s3_config(&sdk_config, options.compat));
+        let (client, http_client_capture) =
+            qos_client::capturing_client(build_s3_config(&sdk_config, options.compat));
 
         // 只有当prefix不为空时才设置
         let prefix_option = if prefix.is_empty() {
@@ -404,6 +411,11 @@ impl S3Storage {
             endpoint,
             bucket_name,
             prefix: prefix_option,
+            single_attempt_client: OnceLock::from(qos_client::single_attempt_client(
+                &client,
+                &http_client_capture,
+            )),
+            http_client_capture,
             client,
             is_bucket_versioned,
             versioning_suspended,
@@ -469,6 +481,8 @@ mod tests {
             bucket_name: "test-bucket".to_string(),
             prefix: prefix.map(std::string::ToString::to_string),
             client,
+            single_attempt_client: OnceLock::new(),
+            http_client_capture: qos_client::HttpClientCapture::default(),
             is_bucket_versioned: false,
             versioning_suspended: false,
             versioning_at_connect: S3VersioningAtConnect::Never,

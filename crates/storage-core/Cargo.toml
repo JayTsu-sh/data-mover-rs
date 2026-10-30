@@ -31,6 +31,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32", "Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_SystemServices", "Win32_System_Memory", "Win32_Storage_FileSystem"] }

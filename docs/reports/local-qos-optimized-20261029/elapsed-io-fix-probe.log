@@ -1,0 +1,9 @@
+{"case": "unlimited", "median_iops": 9549.867730601514, "cpu_seconds": 0.07141}
+{"case": "high", "median_iops": 9138.677503424684, "cpu_seconds": 0.074468}
+{"case": "strict", "median_iops": 111.49539683675958, "cpu_seconds": 0.14269700000000002}
+high/unlimited = 0.9569428353589426 strict/128 = 0.8710577877871842
+Traceback (most recent call last):
+  File "/root/jay/rust/github/data-mover-rs/.scratch/qos-diagnosis.py", line 24, in <module>
+    assert rates['high'] >= rates['unlimited'] * .95 and rates['strict'] >= 128 * .95, 'QoS performance below 95%'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: QoS performance below 95%

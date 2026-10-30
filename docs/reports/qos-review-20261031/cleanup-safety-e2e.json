@@ -1,0 +1,64 @@
+{
+  "binary_sha256": "c8e61a0b558f35ad51b383cafd41fba949d8a71bad5d73b6f554e776a83c1aee",
+  "checks": [
+    {
+      "case": "parent",
+      "rejected": true,
+      "sibling_sentinel_preserved": true
+    },
+    {
+      "case": "multiple-parents",
+      "rejected": true,
+      "sibling_sentinel_preserved": true
+    },
+    {
+      "case": "run-symlink",
+      "rejected": true,
+      "sibling_sentinel_preserved": true
+    },
+    {
+      "case": "child-symlink",
+      "rejected": true,
+      "sibling_sentinel_preserved": true
+    },
+    {
+      "case": "encoded-parent",
+      "rejected": true,
+      "sibling_sentinel_preserved": true
+    },
+    {
+      "case": "credential-slash",
+      "rejected": true,
+      "sibling_sentinel_preserved": true
+    },
+    {
+      "case": "query-is-not-root",
+      "rejected": true,
+      "sibling_sentinel_preserved": true
+    },
+    {
+      "case": "unknown-file-scheme",
+      "rejected": true,
+      "sibling_sentinel_preserved": true
+    },
+    {
+      "case": "unknown-uppercase-scheme",
+      "rejected": true,
+      "sibling_sentinel_preserved": true
+    },
+    {
+      "case": "unknown-local-scheme-symlink",
+      "rejected": true,
+      "sibling_sentinel_preserved": true
+    },
+    {
+      "case": "valid-local-tree",
+      "deleted_owned_children_only": true,
+      "root_retained": true,
+      "sibling_sentinel_preserved": true
+    }
+  ],
+  "passed": 11,
+  "failed": 0,
+  "scope": "actual cleanup executable; only disposable local trees; no external backend contacted"
+}

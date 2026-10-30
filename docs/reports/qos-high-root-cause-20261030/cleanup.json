@@ -1,0 +1,49 @@
+{
+  "lifecycle": [
+    [
+      "nfs40",
+      "tree",
+      0
+    ],
+    [
+      "nfs40",
+      "run-root",
+      0
+    ],
+    [
+      "cifs",
+      "tree",
+      0
+    ],
+    [
+      "cifs",
+      "run-root",
+      0
+    ],
+    [
+      "standard",
+      "lifecycle",
+      0
+    ]
+  ],
+  "s3": [
+    {
+      "endpoint": "source",
+      "prefix": "ci/nightly-qos-high-20261029234234/",
+      "versioning": "Unversioned",
+      "versions_and_markers_deleted": 0,
+      "multipart_aborted": 0,
+      "empty": true
+    },
+    {
+      "endpoint": "destination",
+      "prefix": "ci/nightly-qos-high-20261029234234/",
+      "versioning": "Unversioned",
+      "versions_and_markers_deleted": 0,
+      "multipart_aborted": 0,
+      "empty": true
+    }
+  ],
+  "all_lifecycle_operations_succeeded": true,
+  "local_fixture_directories_remaining": []
+}

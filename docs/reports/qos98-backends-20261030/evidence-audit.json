@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "main_checks": 406,
+  "timed_samples": 189,
+  "finite_limit_samples": 49,
+  "performance_samples": 140,
+  "full_content_digest_consistent_per_size": true,
+  "final_binary_consistent": true,
+  "envelopes_and_98_percent_floors_recomputed": true,
+  "archive_sha256_verified": true
+}

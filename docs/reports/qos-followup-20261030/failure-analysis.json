@@ -1,0 +1,254 @@
+[
+  {
+    "experiment": "buffer-limits",
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "failed_gates": [
+      {
+        "profile": "cifs-to-s3",
+        "case": "iops-strict",
+        "name": "end_to_end_at_least_98_percent",
+        "old_passed": false,
+        "passed": false,
+        "new_failure": false
+      }
+    ],
+    "operations": 128,
+    "bytes": 134217728,
+    "seconds": 16.399797566,
+    "source_envelope_and_steady_gates_all_passed": true,
+    "phases": [
+      {
+        "resource": "iops",
+        "soft_rate": 8,
+        "ideal_total_seconds": 16.0,
+        "end_to_end_ratio": 0.9756217987209269,
+        "first_admission_seconds": 0.124697971,
+        "last_admission_seconds": 16.002001602,
+        "ideal_active_admission_span_seconds": 15.875,
+        "active_admission_drift_seconds": 0.0023036310000001947,
+        "post_last_admission_tail_seconds": 0.39779596400000017,
+        "extra_time_allowed_for_98_percent_seconds": 0.3265306122448983,
+        "source_schedule_timing_consistent_with_quota": true,
+        "explanation": "read admission schedule matches quota within measured drift; startup and positive data/commit tail reduce end-to-end utilization"
+      }
+    ],
+    "diagnostic_only": true
+  },
+  {
+    "experiment": "buffer-limits",
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "failed_gates": [
+      {
+        "profile": "hdfs-to-s3",
+        "case": "iops-strict",
+        "name": "end_to_end_at_least_98_percent",
+        "old_passed": false,
+        "passed": false,
+        "new_failure": false
+      }
+    ],
+    "operations": 64,
+    "bytes": 134217728,
+    "seconds": 16.394879644,
+    "source_envelope_and_steady_gates_all_passed": true,
+    "phases": [
+      {
+        "resource": "iops",
+        "soft_rate": 4,
+        "ideal_total_seconds": 16.0,
+        "end_to_end_ratio": 0.975914453013718,
+        "first_admission_seconds": 0.248883226,
+        "last_admission_seconds": 15.999946904,
+        "ideal_active_admission_span_seconds": 15.75,
+        "active_admission_drift_seconds": 0.0010636779999995127,
+        "post_last_admission_tail_seconds": 0.3949327399999998,
+        "extra_time_allowed_for_98_percent_seconds": 0.3265306122448983,
+        "source_schedule_timing_consistent_with_quota": true,
+        "explanation": "read admission schedule matches quota within measured drift; startup and positive data/commit tail reduce end-to-end utilization"
+      }
+    ],
+    "diagnostic_only": true
+  },
+  {
+    "experiment": "buffer-limits",
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "failed_gates": [
+      {
+        "profile": "local-to-s3",
+        "case": "iops-strict",
+        "name": "end_to_end_at_least_98_percent",
+        "old_passed": false,
+        "passed": false,
+        "new_failure": false
+      }
+    ],
+    "operations": 64,
+    "bytes": 134217728,
+    "seconds": 16.372798081,
+    "source_envelope_and_steady_gates_all_passed": true,
+    "phases": [
+      {
+        "resource": "iops",
+        "soft_rate": 4,
+        "ideal_total_seconds": 16.0,
+        "end_to_end_ratio": 0.977230643219584,
+        "first_admission_seconds": 0.248921474,
+        "last_admission_seconds": 15.999863857,
+        "ideal_active_admission_span_seconds": 15.75,
+        "active_admission_drift_seconds": 0.0009423829999999356,
+        "post_last_admission_tail_seconds": 0.37293422399999976,
+        "extra_time_allowed_for_98_percent_seconds": 0.3265306122448983,
+        "source_schedule_timing_consistent_with_quota": true,
+        "explanation": "read admission schedule matches quota within measured drift; startup and positive data/commit tail reduce end-to-end utilization"
+      }
+    ],
+    "diagnostic_only": true
+  },
+  {
+    "experiment": "buffer-limits",
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "failed_gates": [
+      {
+        "profile": "nfs41-to-s3",
+        "case": "bandwidth-strict",
+        "name": "end_to_end_at_least_98_percent",
+        "old_passed": true,
+        "passed": false,
+        "new_failure": true
+      }
+    ],
+    "operations": 2694,
+    "bytes": 134217728,
+    "seconds": 27.986756539,
+    "source_envelope_and_steady_gates_all_passed": true,
+    "phases": [
+      {
+        "resource": "bytes",
+        "soft_rate": 4982843,
+        "ideal_total_seconds": 26.93597370015471,
+        "end_to_end_ratio": 0.9624542830684575,
+        "first_admission_seconds": 0.087373364,
+        "last_admission_seconds": 27.03590978,
+        "ideal_active_admission_span_seconds": 26.925973585762183,
+        "active_admission_drift_seconds": 0.02256283023781691,
+        "post_last_admission_tail_seconds": 0.9508467590000009,
+        "extra_time_allowed_for_98_percent_seconds": 0.5497137489827498,
+        "source_schedule_timing_consistent_with_quota": true,
+        "explanation": "read admission schedule matches quota within measured drift; startup and positive data/commit tail reduce end-to-end utilization"
+      }
+    ],
+    "diagnostic_only": true
+  },
+  {
+    "experiment": "buffer-limits",
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "failed_gates": [
+      {
+        "profile": "nfs41-to-s3",
+        "case": "iops-strict",
+        "name": "end_to_end_at_least_98_percent",
+        "old_passed": false,
+        "passed": false,
+        "new_failure": false
+      }
+    ],
+    "operations": 129,
+    "bytes": 134217728,
+    "seconds": 16.55618598,
+    "source_envelope_and_steady_gates_all_passed": true,
+    "phases": [
+      {
+        "resource": "iops",
+        "soft_rate": 8,
+        "ideal_total_seconds": 16.125,
+        "end_to_end_ratio": 0.9739562009921322,
+        "first_admission_seconds": 0.125052233,
+        "last_admission_seconds": 16.127422292,
+        "ideal_active_admission_span_seconds": 16.0,
+        "active_admission_drift_seconds": 0.0023700589999968713,
+        "post_last_admission_tail_seconds": 0.4287636880000001,
+        "extra_time_allowed_for_98_percent_seconds": 0.32908163265306156,
+        "source_schedule_timing_consistent_with_quota": true,
+        "explanation": "read admission schedule matches quota within measured drift; startup and positive data/commit tail reduce end-to-end utilization"
+      }
+    ],
+    "diagnostic_only": true
+  },
+  {
+    "experiment": "buffer-limits",
+    "profile": "s3-to-s3",
+    "case": "bandwidth-strict",
+    "failed_gates": [
+      {
+        "profile": "s3-to-s3",
+        "case": "bandwidth-strict",
+        "name": "end_to_end_at_least_98_percent",
+        "old_passed": null,
+        "passed": false,
+        "new_failure": false
+      }
+    ],
+    "operations": 16,
+    "bytes": 134217728,
+    "seconds": 16.563567129,
+    "source_envelope_and_steady_gates_all_passed": true,
+    "phases": [
+      {
+        "resource": "bytes",
+        "soft_rate": 8388608,
+        "ideal_total_seconds": 16.0,
+        "end_to_end_ratio": 0.9659754976321925,
+        "first_admission_seconds": 0.999039374,
+        "last_admission_seconds": 15.999163673,
+        "ideal_active_admission_span_seconds": 15.0,
+        "active_admission_drift_seconds": 0.00012429899999943927,
+        "post_last_admission_tail_seconds": 0.5644034559999991,
+        "extra_time_allowed_for_98_percent_seconds": 0.3265306122448983,
+        "source_schedule_timing_consistent_with_quota": true,
+        "explanation": "read admission schedule matches quota within measured drift; startup and positive data/commit tail reduce end-to-end utilization"
+      }
+    ],
+    "diagnostic_only": true
+  },
+  {
+    "experiment": "buffer-limits",
+    "profile": "s3-to-s3",
+    "case": "iops-strict",
+    "failed_gates": [
+      {
+        "profile": "s3-to-s3",
+        "case": "iops-strict",
+        "name": "end_to_end_at_least_98_percent",
+        "old_passed": null,
+        "passed": false,
+        "new_failure": false
+      }
+    ],
+    "operations": 16,
+    "bytes": 134217728,
+    "seconds": 16.489916069,
+    "source_envelope_and_steady_gates_all_passed": true,
+    "phases": [
+      {
+        "resource": "iops",
+        "soft_rate": 1,
+        "ideal_total_seconds": 16.0,
+        "end_to_end_ratio": 0.9702899598184729,
+        "first_admission_seconds": 0.999122855,
+        "last_admission_seconds": 15.999247055,
+        "ideal_active_admission_span_seconds": 15.0,
+        "active_admission_drift_seconds": 0.00012420000000012976,
+        "post_last_admission_tail_seconds": 0.49066901399999985,
+        "extra_time_allowed_for_98_percent_seconds": 0.3265306122448983,
+        "source_schedule_timing_consistent_with_quota": true,
+        "explanation": "read admission schedule matches quota within measured drift; startup and positive data/commit tail reduce end-to-end utilization"
+      }
+    ],
+    "diagnostic_only": true
+  }
+]

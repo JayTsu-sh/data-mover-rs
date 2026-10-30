@@ -268,11 +268,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             path: request.path,
             offset: requested.start,
             next_issue: requested.start,
-            depth: if request.source_qos.is_some() {
-                1
-            } else {
-                request.read_inflight.min(self.read_concurrency())
-            },
+            depth: request.read_inflight.min(self.read_concurrency()),
             inflight: FuturesOrdered::new(),
             limit: requested.end,
             chunk_size: (self.maximum_read_chunk_bytes() as u64)
@@ -322,14 +318,10 @@ async fn next_range<P: S3Protocol + 'static>(
     }
     while state.inflight.len() < state.depth && state.next_issue < state.limit {
         let requested = state.chunk_size.min(state.limit - state.next_issue);
-        let granted = if let Some(budget) = &state.qos {
-            budget
-                .admit_request(requested, &state.cancel)
-                .await
-                .map_err(|_| cancelled(path, Operation::Read))?
-        } else {
-            requested
-        };
+        let granted = state
+            .qos
+            .as_ref()
+            .map_or(requested, |budget| budget.request_size(requested));
         let offset = state.next_issue;
         let end = offset + granted;
         let protocol = Arc::clone(&state.protocol);
@@ -338,6 +330,13 @@ async fn next_range<P: S3Protocol + 'static>(
         let cancel = state.cancel.clone();
         let qos = state.qos.clone();
         state.inflight.push_back(Box::pin(async move {
+            // Admit where this future is polled, immediately before its GET.
+            // Pacing while merely queuing futures delays earlier requests and
+            // releases several GETs together when the queue is finally polled.
+            if let Some(budget) = &qos {
+                budget.admit_request(granted, &cancel).await
+                    .map_err(|_| cancelled(&path, Operation::Read))?;
+            }
             let bytes = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(cancelled(&path, Operation::Read)),

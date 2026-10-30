@@ -91,7 +91,7 @@ arch-guard-selftest:
 	python3 -m unittest tests/test_architecture_dependencies.py
 
 harness-contract:
-	python3 -m unittest tests/test_cargo_examples.py tests/test_lab_migration_paths.py tests/test_nfs40_contract.py tests/test_nfs41_contract.py tests/test_qos_lab.py tests/test_resume_lab.py
+	python3 -m unittest tests/test_cargo_examples.py tests/test_lab_migration_paths.py tests/test_nfs40_contract.py tests/test_nfs41_contract.py tests/test_qos_lab.py tests/test_resume_lab.py tests/test_cross_backend_qos.py tests/test_local_qos_acceptance.py
 	python3 -m unittest discover -s tests -p 'test_hdfs_memory*.py'
 	python3 -m unittest discover -s tests/lab -p 'test_nfs_read_audit.py'
 

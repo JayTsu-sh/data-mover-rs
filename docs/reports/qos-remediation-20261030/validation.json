@@ -1,0 +1,20 @@
+{
+  "rust_lib": {
+    "passed": 2076,
+    "failed": 0,
+    "ignored": 9,
+    "suites": 14
+  },
+  "python_qos": {
+    "passed": 30,
+    "failed": 0
+  },
+  "clippy": "workspace lib/tests -D warnings passed",
+  "architecture": "passed",
+  "fmt": "passed",
+  "retained_binary_sha256": "9b56c318e8547d358eadc4bbc05914cce34fc9a4683d784a869216905376e4dd",
+  "original_binary_sha256": "9b56c318e8547d358eadc4bbc05914cce34fc9a4683d784a869216905376e4dd",
+  "production_reverted_to_original": true,
+  "new_production_performance_change_accepted": false,
+  "accepted_changes": "Python measurement setup, duration calibration/binding, strict timing diagnostics and documentation"
+}

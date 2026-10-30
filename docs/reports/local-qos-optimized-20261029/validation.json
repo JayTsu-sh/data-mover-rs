@@ -1,0 +1,22 @@
+{
+  "real_local_acceptance": {
+    "passed": true,
+    "checks": 82
+  },
+  "automated_tests": {
+    "storage_core": 200,
+    "backend_local": 124,
+    "transfer": 260,
+    "python_qos_validator": 7,
+    "total": 591
+  },
+  "checks": [
+    "release Clippy with -D warnings",
+    "workspace rustfmt",
+    "architecture dependency guard",
+    "git diff --check"
+  ],
+  "exact_validated_binary_sha256": "91bfb476863c2138fd55171af3ed30364054c4d160b01b05080f814f6ad3d036",
+  "exact_validated_binary_copy": "/work/local-qos-diagnosis/optimized-traced",
+  "scope": "Linux Local/XFS; warm page cache. No live network backend benchmark performed."
+}

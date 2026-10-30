@@ -1,0 +1,184 @@
+{
+  "git_commit": "2c86e68c1626e71df765234b91d367aa1f0247c8",
+  "retained_binary_sha256": "9b56c318e8547d358eadc4bbc05914cce34fc9a4683d784a869216905376e4dd",
+  "rejected_candidate_binary_sha256": "0070c0b704ae2c22fd1af5635c76d878f45c8ca9e6963e47ef6087dbcb792a74",
+  "production_Rust_and_Cargo_files_identical_to_accepted_9b": true,
+  "head_patch_replay_all_source_sha256_verified": true,
+  "accepted_changes_since_9b": "Python acceptance correctness and diagnostics plus lab README only; no new production Rust performance change",
+  "files": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "393141e244b2942210542efbf01bc27c55131770b823a911374b118a01cae4bb"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "26695a51d442dae81f94ad1205411ebd8b5ef96f78a0b1175eb6d5d109bd6eff"
+    },
+    {
+      "path": "crates/backend-cifs/src/backend/read_pipeline.rs",
+      "sha256": "9b315d72251ce96f889a637704e3150681e6558d1ec77ff335240749852c7ee9"
+    },
+    {
+      "path": "crates/backend-hdfs/src/backend/source.rs",
+      "sha256": "80afa073543f564f84baef57e8467b872382384128273925fe0afcd1025a9e46"
+    },
+    {
+      "path": "crates/backend-nfs/src/backend/source.rs",
+      "sha256": "c73612a52737330bf5761ea1881ab99df227e2c22c62ea09695ed8c8d12fcf23"
+    },
+    {
+      "path": "crates/backend-nfs/src/backend/source_tests.rs",
+      "sha256": "3106d2f0a530f41a648d39d7b2d265416df4cbba15cf00e056c9e685dd96b9c0"
+    },
+    {
+      "path": "crates/backend-s3/Cargo.toml",
+      "sha256": "14ec64d6cdfcf8ff4b5bf5e33b20f6cc4ffe110d29afa41f203f2c6bc6d713b4"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/client.rs",
+      "sha256": "95aee0a432f3642545182aac11b4c569286004ea24008f0c8770323af43993f9"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/client/copy_request.rs",
+      "sha256": "cbad9232ea86e8b1963b4ee486ef56ce6929da4280f81729b7a0ca5a94d1b188"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/client/directory_object_write_tests.rs",
+      "sha256": "4b7df450cc5bd62741ed75e2ee04698858e4bff5f1f7c702f240868094121868"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/client/qos_client.rs",
+      "sha256": "99f1ec6efa927b862c318359e942d53d5a11e3f01be039327da2a4e2ab2f80dc"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/client/role_protocol.rs",
+      "sha256": "f3a4c0b340aa93ef14d5dab6e32a2907b78161097829fdf54252d4b94678617d"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/client/role_protocol/native.rs",
+      "sha256": "1448cc0f5814885830a1acf86057d51bc16a25852fcc6e6a7d0de73c06dfa784"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/client/role_protocol/qos_pool_tests.rs",
+      "sha256": "91db1ffacc0bf9f7b65ca3665567a9468cbaea90d930b2717a95f898854f9f04"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/source.rs",
+      "sha256": "efb552a7eb3b450830fba28cfb941cfb1610a70b6ef342fd03a7967bced1074b"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/source_pipeline_tests.rs",
+      "sha256": "0589ccfe8389d53eb49c0e733eb472bf2dabe6abcfb5267a19f85f252fa64d0c"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/staged.rs",
+      "sha256": "78794d108024fcbbbab826f954e55cb6851ac6b084cdb69179d0b516ed471976"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/staged/parts.rs",
+      "sha256": "fd8f60da04bdcdf02b7b086a6a52e2383761a42f66f934e1dad30a09d8874c6d"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/tests.rs",
+      "sha256": "2f825c2d8d1be1b1b9b47c82867677c28e4e986cca343eaf0ab960b3517bb53c"
+    },
+    {
+      "path": "crates/storage-core/Cargo.toml",
+      "sha256": "903d01a28b0ac0db957ce2599ae5e0ce63670b8768f84260d28e3bbe1c154b35"
+    },
+    {
+      "path": "crates/storage-core/src/runtime/qos.rs",
+      "sha256": "b6d628b7cdb6c188e9e658718198d4feca0c4e9d40d8f43d87ef9f30a6a875dc"
+    },
+    {
+      "path": "crates/storage-core/src/runtime/qos/wait.rs",
+      "sha256": "a01271c62f651edac83824f217dfda211392a44c21e92ce3b9883d33405d327c"
+    },
+    {
+      "path": "crates/storage-core/src/storage/roles.rs",
+      "sha256": "e76cdfa797b962a63ea2ebd69683c95c2eef17f876c79b5579e4f9b5054e4393"
+    },
+    {
+      "path": "crates/transfer/src/transfer/engine/payload.rs",
+      "sha256": "5a564df1c2fcef9ab211bd4d70a9a2f1331f6b879e6b49f347473e240768f0ff"
+    },
+    {
+      "path": "crates/transfer/src/transfer/engine/producer.rs",
+      "sha256": "4b384f55b6a8ed17ee905affef2739f0729bb033aa96248d628b93ef97800ba1"
+    },
+    {
+      "path": "crates/transfer/src/transfer/engine/producer_tests.rs",
+      "sha256": "0ac75db6bf60138a8cc393f90de00f372cf698185baea94135171ae7906bd863"
+    },
+    {
+      "path": "crates/transfer/src/transfer/mod.rs",
+      "sha256": "aa0784298f9876b76c5d80eaad84d21e5af97b20b67d1d20e2437a69ed645c53"
+    },
+    {
+      "path": "tests/lab/README.md",
+      "sha256": "8f3d7024621293be6b6a78f4d2342994fcc845fb756c82825554ccc2aaa127b5"
+    },
+    {
+      "path": "tests/lab/cross_qos_matrix.py",
+      "sha256": "ac771a227a6ed6294cd97df537a715fe37cb686f03153b647856821572354bc9"
+    },
+    {
+      "path": "tests/lab/qos_evidence.py",
+      "sha256": "b073f445bcafbb687bd46f86fafd52a70dc7226769c9fe0a5a41037f4145ba2d"
+    },
+    {
+      "path": "tests/lab/run-backend-qos.py",
+      "sha256": "5e84ee1713ea05ab9ad8ee137f1e3e4c41403bb525fe24cae9bc2cee99c3dd8d"
+    },
+    {
+      "path": "tests/lab/run-cross-backend-qos.py",
+      "sha256": "600126c9e934886728e2e78d9b042a9cb19d70eda7736801bad8db9abf8287a0"
+    },
+    {
+      "path": "tests/lab/run-local-qos.py",
+      "sha256": "58db8dbb167ea1f2ed91e3fec7591bfb12b8d92912fb21d9befc6d99cc99aff3"
+    },
+    {
+      "path": "tests/lab/tools/backend_qos_acceptance.rs",
+      "sha256": "56fdc87b049c3bc992b05ed5f80a4cf9e050d5d1e0b81950c7877621da9ce04b"
+    },
+    {
+      "path": "tests/lab/tools/backend_qos_cleanup.rs",
+      "sha256": "04fc86fe1303c09710999f3543e5521cf67c0b4a9f38f3275f182fe8cc0535a2"
+    },
+    {
+      "path": "tests/lab/tools/local_qos_acceptance.rs",
+      "sha256": "65cb1fbcf05f79549b93816a178983f39d320b98e9cb5e8b1fc07cbe6451173b"
+    },
+    {
+      "path": "tests/test_cross_backend_qos.py",
+      "sha256": "31ecb5daaf2b02d82977e861caf77cc44164aec4c4688e194bfcaefccffa0aee"
+    },
+    {
+      "path": "tests/test_local_qos_acceptance.py",
+      "sha256": "ddf79c61631dbe194b49184d35e38678faca641197b28b67bd66e6693ed44522"
+    }
+  ],
+  "all_dirty_production_Rust_paths_in_source_snapshot": true,
+  "dirty_Rust_paths": [
+    "crates/backend-cifs/src/backend/read_pipeline.rs",
+    "crates/backend-hdfs/src/backend/source.rs",
+    "crates/backend-nfs/src/backend/source.rs",
+    "crates/backend-nfs/src/backend/source_tests.rs",
+    "crates/backend-s3/src/backend/client.rs",
+    "crates/backend-s3/src/backend/client/copy_request.rs",
+    "crates/backend-s3/src/backend/client/directory_object_write_tests.rs",
+    "crates/backend-s3/src/backend/client/qos_client.rs",
+    "crates/backend-s3/src/backend/client/role_protocol.rs",
+    "crates/backend-s3/src/backend/client/role_protocol/native.rs",
+    "crates/backend-s3/src/backend/client/role_protocol/qos_pool_tests.rs",
+    "crates/backend-s3/src/backend/source.rs",
+    "crates/backend-s3/src/backend/source_pipeline_tests.rs",
+    "crates/backend-s3/src/backend/tests.rs",
+    "crates/storage-core/src/runtime/qos.rs",
+    "crates/storage-core/src/runtime/qos/wait.rs",
+    "tests/lab/tools/backend_qos_acceptance.rs",
+    "tests/lab/tools/backend_qos_cleanup.rs",
+    "tests/lab/tools/local_qos_acceptance.rs"
+  ]
+}
