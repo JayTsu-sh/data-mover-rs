@@ -1,0 +1,944 @@
+{
+  "status": "\u4e25\u683c\u5168\u7eff\u9a8c\u6536\u672a\u901a\u8fc7",
+  "retained_state": {
+    "git_commit": "2c86e68c1626e71df765234b91d367aa1f0247c8",
+    "retained_binary_sha256": "9b56c318e8547d358eadc4bbc05914cce34fc9a4683d784a869216905376e4dd",
+    "rejected_candidate_binary_sha256": "0070c0b704ae2c22fd1af5635c76d878f45c8ca9e6963e47ef6087dbcb792a74",
+    "production_Rust_and_Cargo_files_identical_to_accepted_9b": true,
+    "head_patch_replay_all_source_sha256_verified": true,
+    "accepted_changes_since_9b": "Python acceptance correctness and diagnostics plus lab README only; no new production Rust performance change",
+    "files": [
+      {
+        "path": "Cargo.lock",
+        "sha256": "393141e244b2942210542efbf01bc27c55131770b823a911374b118a01cae4bb"
+      },
+      {
+        "path": "Cargo.toml",
+        "sha256": "26695a51d442dae81f94ad1205411ebd8b5ef96f78a0b1175eb6d5d109bd6eff"
+      },
+      {
+        "path": "crates/backend-cifs/src/backend/read_pipeline.rs",
+        "sha256": "9b315d72251ce96f889a637704e3150681e6558d1ec77ff335240749852c7ee9"
+      },
+      {
+        "path": "crates/backend-hdfs/src/backend/source.rs",
+        "sha256": "80afa073543f564f84baef57e8467b872382384128273925fe0afcd1025a9e46"
+      },
+      {
+        "path": "crates/backend-nfs/src/backend/source.rs",
+        "sha256": "c73612a52737330bf5761ea1881ab99df227e2c22c62ea09695ed8c8d12fcf23"
+      },
+      {
+        "path": "crates/backend-nfs/src/backend/source_tests.rs",
+        "sha256": "3106d2f0a530f41a648d39d7b2d265416df4cbba15cf00e056c9e685dd96b9c0"
+      },
+      {
+        "path": "crates/backend-s3/Cargo.toml",
+        "sha256": "14ec64d6cdfcf8ff4b5bf5e33b20f6cc4ffe110d29afa41f203f2c6bc6d713b4"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/client.rs",
+        "sha256": "95aee0a432f3642545182aac11b4c569286004ea24008f0c8770323af43993f9"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/client/copy_request.rs",
+        "sha256": "cbad9232ea86e8b1963b4ee486ef56ce6929da4280f81729b7a0ca5a94d1b188"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/client/directory_object_write_tests.rs",
+        "sha256": "4b7df450cc5bd62741ed75e2ee04698858e4bff5f1f7c702f240868094121868"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/client/qos_client.rs",
+        "sha256": "99f1ec6efa927b862c318359e942d53d5a11e3f01be039327da2a4e2ab2f80dc"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/client/role_protocol.rs",
+        "sha256": "f3a4c0b340aa93ef14d5dab6e32a2907b78161097829fdf54252d4b94678617d"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/client/role_protocol/native.rs",
+        "sha256": "1448cc0f5814885830a1acf86057d51bc16a25852fcc6e6a7d0de73c06dfa784"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/client/role_protocol/qos_pool_tests.rs",
+        "sha256": "91db1ffacc0bf9f7b65ca3665567a9468cbaea90d930b2717a95f898854f9f04"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/source.rs",
+        "sha256": "efb552a7eb3b450830fba28cfb941cfb1610a70b6ef342fd03a7967bced1074b"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/source_pipeline_tests.rs",
+        "sha256": "0589ccfe8389d53eb49c0e733eb472bf2dabe6abcfb5267a19f85f252fa64d0c"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/staged.rs",
+        "sha256": "78794d108024fcbbbab826f954e55cb6851ac6b084cdb69179d0b516ed471976"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/staged/parts.rs",
+        "sha256": "fd8f60da04bdcdf02b7b086a6a52e2383761a42f66f934e1dad30a09d8874c6d"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/tests.rs",
+        "sha256": "2f825c2d8d1be1b1b9b47c82867677c28e4e986cca343eaf0ab960b3517bb53c"
+      },
+      {
+        "path": "crates/storage-core/Cargo.toml",
+        "sha256": "903d01a28b0ac0db957ce2599ae5e0ce63670b8768f84260d28e3bbe1c154b35"
+      },
+      {
+        "path": "crates/storage-core/src/runtime/qos.rs",
+        "sha256": "b6d628b7cdb6c188e9e658718198d4feca0c4e9d40d8f43d87ef9f30a6a875dc"
+      },
+      {
+        "path": "crates/storage-core/src/runtime/qos/wait.rs",
+        "sha256": "a01271c62f651edac83824f217dfda211392a44c21e92ce3b9883d33405d327c"
+      },
+      {
+        "path": "crates/storage-core/src/storage/roles.rs",
+        "sha256": "e76cdfa797b962a63ea2ebd69683c95c2eef17f876c79b5579e4f9b5054e4393"
+      },
+      {
+        "path": "crates/transfer/src/transfer/engine/payload.rs",
+        "sha256": "5a564df1c2fcef9ab211bd4d70a9a2f1331f6b879e6b49f347473e240768f0ff"
+      },
+      {
+        "path": "crates/transfer/src/transfer/engine/producer.rs",
+        "sha256": "4b384f55b6a8ed17ee905affef2739f0729bb033aa96248d628b93ef97800ba1"
+      },
+      {
+        "path": "crates/transfer/src/transfer/engine/producer_tests.rs",
+        "sha256": "0ac75db6bf60138a8cc393f90de00f372cf698185baea94135171ae7906bd863"
+      },
+      {
+        "path": "crates/transfer/src/transfer/mod.rs",
+        "sha256": "aa0784298f9876b76c5d80eaad84d21e5af97b20b67d1d20e2437a69ed645c53"
+      },
+      {
+        "path": "tests/lab/README.md",
+        "sha256": "8f3d7024621293be6b6a78f4d2342994fcc845fb756c82825554ccc2aaa127b5"
+      },
+      {
+        "path": "tests/lab/cross_qos_matrix.py",
+        "sha256": "ac771a227a6ed6294cd97df537a715fe37cb686f03153b647856821572354bc9"
+      },
+      {
+        "path": "tests/lab/qos_evidence.py",
+        "sha256": "b073f445bcafbb687bd46f86fafd52a70dc7226769c9fe0a5a41037f4145ba2d"
+      },
+      {
+        "path": "tests/lab/run-backend-qos.py",
+        "sha256": "5e84ee1713ea05ab9ad8ee137f1e3e4c41403bb525fe24cae9bc2cee99c3dd8d"
+      },
+      {
+        "path": "tests/lab/run-cross-backend-qos.py",
+        "sha256": "600126c9e934886728e2e78d9b042a9cb19d70eda7736801bad8db9abf8287a0"
+      },
+      {
+        "path": "tests/lab/run-local-qos.py",
+        "sha256": "58db8dbb167ea1f2ed91e3fec7591bfb12b8d92912fb21d9befc6d99cc99aff3"
+      },
+      {
+        "path": "tests/lab/tools/backend_qos_acceptance.rs",
+        "sha256": "56fdc87b049c3bc992b05ed5f80a4cf9e050d5d1e0b81950c7877621da9ce04b"
+      },
+      {
+        "path": "tests/lab/tools/backend_qos_cleanup.rs",
+        "sha256": "04fc86fe1303c09710999f3543e5521cf67c0b4a9f38f3275f182fe8cc0535a2"
+      },
+      {
+        "path": "tests/lab/tools/local_qos_acceptance.rs",
+        "sha256": "65cb1fbcf05f79549b93816a178983f39d320b98e9cb5e8b1fc07cbe6451173b"
+      },
+      {
+        "path": "tests/test_cross_backend_qos.py",
+        "sha256": "31ecb5daaf2b02d82977e861caf77cc44164aec4c4688e194bfcaefccffa0aee"
+      },
+      {
+        "path": "tests/test_local_qos_acceptance.py",
+        "sha256": "ddf79c61631dbe194b49184d35e38678faca641197b28b67bd66e6693ed44522"
+      }
+    ],
+    "all_dirty_production_Rust_paths_in_source_snapshot": true,
+    "dirty_Rust_paths": [
+      "crates/backend-cifs/src/backend/read_pipeline.rs",
+      "crates/backend-hdfs/src/backend/source.rs",
+      "crates/backend-nfs/src/backend/source.rs",
+      "crates/backend-nfs/src/backend/source_tests.rs",
+      "crates/backend-s3/src/backend/client.rs",
+      "crates/backend-s3/src/backend/client/copy_request.rs",
+      "crates/backend-s3/src/backend/client/directory_object_write_tests.rs",
+      "crates/backend-s3/src/backend/client/qos_client.rs",
+      "crates/backend-s3/src/backend/client/role_protocol.rs",
+      "crates/backend-s3/src/backend/client/role_protocol/native.rs",
+      "crates/backend-s3/src/backend/client/role_protocol/qos_pool_tests.rs",
+      "crates/backend-s3/src/backend/source.rs",
+      "crates/backend-s3/src/backend/source_pipeline_tests.rs",
+      "crates/backend-s3/src/backend/tests.rs",
+      "crates/storage-core/src/runtime/qos.rs",
+      "crates/storage-core/src/runtime/qos/wait.rs",
+      "tests/lab/tools/backend_qos_acceptance.rs",
+      "tests/lab/tools/backend_qos_cleanup.rs",
+      "tests/lab/tools/local_qos_acceptance.rs"
+    ]
+  },
+  "candidate_rejection": {
+    "candidate_sha256": "0070c0b704ae2c22fd1af5635c76d878f45c8ca9e6963e47ef6087dbcb792a74",
+    "status": "rejected and all production Rust changes rolled back to9b; no new performance optimization accepted",
+    "reason": "original-target raw regression gates and Local fast-target raw regression gates below98%; preserve failures and uncertainty; user requires no regression",
+    "preserved_source_snapshot": "candidate-source-snapshot",
+    "restored_files": [
+      {
+        "path": "crates/backend-s3/src/backend/staged.rs",
+        "restored_9b_sha256": "78794d108024fcbbbab826f954e55cb6851ac6b084cdb69179d0b516ed471976"
+      },
+      {
+        "path": "crates/backend-s3/src/backend/tests.rs",
+        "restored_9b_sha256": "2f825c2d8d1be1b1b9b47c82867677c28e4e986cca343eaf0ab960b3517bb53c"
+      },
+      {
+        "path": "crates/storage-core/src/storage/roles.rs",
+        "restored_9b_sha256": "e76cdfa797b962a63ea2ebd69683c95c2eef17f876c79b5579e4f9b5054e4393"
+      },
+      {
+        "path": "crates/transfer/src/transfer/engine/payload.rs",
+        "restored_9b_sha256": "5a564df1c2fcef9ab211bd4d70a9a2f1331f6b879e6b49f347473e240768f0ff"
+      },
+      {
+        "path": "crates/transfer/src/transfer/engine/producer.rs",
+        "restored_9b_sha256": "4b384f55b6a8ed17ee905affef2739f0729bb033aa96248d628b93ef97800ba1"
+      },
+      {
+        "path": "crates/transfer/src/transfer/engine/producer_tests.rs",
+        "restored_9b_sha256": "0ac75db6bf60138a8cc393f90de00f372cf698185baea94135171ae7906bd863"
+      },
+      {
+        "path": "crates/transfer/src/transfer/mod.rs",
+        "restored_9b_sha256": "aa0784298f9876b76c5d80eaad84d21e5af97b20b67d1d20e2437a69ed645c53"
+      },
+      {
+        "path": "crates/transfer/src/transfer/s3_input_buffer_tests.rs",
+        "restored_9b_sha256": null
+      }
+    ],
+    "remaining_changes": "acceptance tooling correctness, paired controls, isolation/lifecycle and report only; existing HTTP pool fix retained"
+  },
+  "candidate_binary_sha256": "0070c0b704ae2c22fd1af5635c76d878f45c8ca9e6963e47ef6087dbcb792a74",
+  "performance_original_target": {
+    "cifs-to-s3": {
+      "medians": {
+        "old-baseline": 37.35875116711253,
+        "old-high": 35.15714046276877,
+        "fixed-baseline": 35.34030983021591,
+        "fixed-control": 35.79009836003843,
+        "fixed-high": 38.877305180158785
+      },
+      "checks": [
+        {
+          "name": "old_high_to_old_baseline",
+          "ratio": 0.9410684073861155,
+          "passed": false
+        },
+        {
+          "name": "fixed_high_to_fixed_baseline",
+          "ratio": 1.1000838806149558,
+          "passed": true
+        },
+        {
+          "name": "fixed_high_to_old_high",
+          "ratio": 1.1058153384610345,
+          "passed": true
+        },
+        {
+          "name": "fixed_baseline_to_old_baseline",
+          "ratio": 0.9459713916060051,
+          "passed": false
+        }
+      ],
+      "fixed_aa_control": {
+        "baseline_mibps": 35.34030983021591,
+        "high_mibps": 38.877305180158785,
+        "ratio": 1.1000838806149558,
+        "passed": true,
+        "control_mibps": 35.79009836003843,
+        "control_ratio": 1.0127273510612504,
+        "control_ratio_interval_95": [
+          0.9092482094066316,
+          1.113373656839631
+        ],
+        "high_ratio_interval_95": [
+          0.9993279323197921,
+          1.1724703888797714
+        ],
+        "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+        "control_repeatable": false,
+        "qualified": false,
+        "classification": "environment_not_repeatable"
+      },
+      "samples": 50
+    },
+    "local-to-s3": {
+      "medians": {
+        "old-baseline": 38.60720355194539,
+        "old-high": 37.3335168729559,
+        "fixed-baseline": 39.66109496434396,
+        "fixed-high": 38.74130891157454
+      },
+      "checks": [
+        {
+          "name": "old_high_to_old_baseline",
+          "ratio": 0.9670090925576682,
+          "passed": false
+        },
+        {
+          "name": "fixed_high_to_fixed_baseline",
+          "ratio": 0.9768088588175309,
+          "passed": false
+        },
+        {
+          "name": "fixed_high_to_old_high",
+          "ratio": 1.0377085299359632,
+          "passed": true
+        },
+        {
+          "name": "fixed_baseline_to_old_baseline",
+          "ratio": 1.0272977920035202,
+          "passed": true
+        }
+      ]
+    },
+    "nfs41-to-s3": {
+      "medians": {
+        "old-baseline": 39.183588965260185,
+        "old-high": 36.65444799052874,
+        "fixed-baseline": 38.67011292010734,
+        "fixed-high": 36.751140850334735
+      },
+      "checks": [
+        {
+          "name": "old_high_to_old_baseline",
+          "ratio": 0.9354540755066167,
+          "passed": false
+        },
+        {
+          "name": "fixed_high_to_fixed_baseline",
+          "ratio": 0.9503758348537225,
+          "passed": false
+        },
+        {
+          "name": "fixed_high_to_old_high",
+          "ratio": 1.0026379570586081,
+          "passed": true
+        },
+        {
+          "name": "fixed_baseline_to_old_baseline",
+          "ratio": 0.9868956351699155,
+          "passed": true
+        }
+      ]
+    },
+    "hdfs-to-s3": {
+      "medians": {
+        "old-baseline": 30.897003007501688,
+        "old-high": 35.44170409722882,
+        "fixed-baseline": 36.79753754129754,
+        "fixed-high": 37.25399337735598
+      },
+      "checks": [
+        {
+          "name": "old_high_to_old_baseline",
+          "ratio": 1.1470919716266232,
+          "passed": true
+        },
+        {
+          "name": "fixed_high_to_fixed_baseline",
+          "ratio": 1.0124045212412969,
+          "passed": true
+        },
+        {
+          "name": "fixed_high_to_old_high",
+          "ratio": 1.0511343719578332,
+          "passed": true
+        },
+        {
+          "name": "fixed_baseline_to_old_baseline",
+          "ratio": 1.1909743327650004,
+          "passed": true
+        }
+      ]
+    },
+    "s3-to-s3": {
+      "medians": {
+        "old-baseline": 36.46930840484984,
+        "old-high": 36.03660430114989,
+        "fixed-baseline": 38.77296935887381,
+        "fixed-high": 35.11653074331569
+      },
+      "checks": [
+        {
+          "name": "old_high_to_old_baseline",
+          "ratio": 0.9881351162765015,
+          "passed": true
+        },
+        {
+          "name": "fixed_high_to_fixed_baseline",
+          "ratio": 0.9056961930948607,
+          "passed": false
+        },
+        {
+          "name": "fixed_high_to_old_high",
+          "ratio": 0.9744683613876227,
+          "passed": false
+        },
+        {
+          "name": "fixed_baseline_to_old_baseline",
+          "ratio": 1.0631671137947223,
+          "passed": true
+        }
+      ]
+    },
+    "s3-to-hdfs": {
+      "medians": {
+        "old-baseline": 277.3537166436256,
+        "old-high": 267.8528928717544,
+        "fixed-baseline": 285.1277604475087,
+        "fixed-high": 285.8109412520515
+      },
+      "checks": [
+        {
+          "name": "old_high_to_old_baseline",
+          "ratio": 0.9657447396528712,
+          "passed": false
+        },
+        {
+          "name": "fixed_high_to_fixed_baseline",
+          "ratio": 1.0023960515225545,
+          "passed": true
+        },
+        {
+          "name": "fixed_high_to_old_high",
+          "ratio": 1.0670444443879696,
+          "passed": true
+        },
+        {
+          "name": "fixed_baseline_to_old_baseline",
+          "ratio": 1.0280293478593332,
+          "passed": true
+        }
+      ]
+    },
+    "s3-to-local": {
+      "medians": {
+        "old-baseline": 339.96099114629635,
+        "old-high": 330.30672129117386,
+        "fixed-baseline": 319.32593796752775,
+        "fixed-high": 321.2112476783529
+      },
+      "checks": [
+        {
+          "name": "old_high_to_old_baseline",
+          "ratio": 0.971601830484816,
+          "passed": false
+        },
+        {
+          "name": "fixed_high_to_fixed_baseline",
+          "ratio": 1.0059040293526573,
+          "passed": true
+        },
+        {
+          "name": "fixed_high_to_old_high",
+          "ratio": 0.9724635527328459,
+          "passed": false
+        },
+        {
+          "name": "fixed_baseline_to_old_baseline",
+          "ratio": 0.9393017030889622,
+          "passed": false
+        }
+      ]
+    },
+    "s3-to-cifs": {
+      "medians": {
+        "old-baseline": 97.99251531780358,
+        "old-high": 97.13355570927905,
+        "fixed-baseline": 97.90782194984095,
+        "fixed-high": 97.56619224545062
+      },
+      "checks": [
+        {
+          "name": "old_high_to_old_baseline",
+          "ratio": 0.9912344365716218,
+          "passed": true
+        },
+        {
+          "name": "fixed_high_to_fixed_baseline",
+          "ratio": 0.9965107005999444,
+          "passed": true
+        },
+        {
+          "name": "fixed_high_to_old_high",
+          "ratio": 1.0044540378761224,
+          "passed": true
+        },
+        {
+          "name": "fixed_baseline_to_old_baseline",
+          "ratio": 0.9991357159504687,
+          "passed": true
+        }
+      ]
+    },
+    "s3-to-nfs41": {
+      "medians": {
+        "old-baseline": 359.11544672184675,
+        "old-high": 332.061702268589,
+        "fixed-baseline": 362.34404773732854,
+        "fixed-high": 324.0343903792115
+      },
+      "checks": [
+        {
+          "name": "old_high_to_old_baseline",
+          "ratio": 0.924665606282839,
+          "passed": false
+        },
+        {
+          "name": "fixed_high_to_fixed_baseline",
+          "ratio": 0.8942727013253201,
+          "passed": false
+        },
+        {
+          "name": "fixed_high_to_old_high",
+          "ratio": 0.9758258425029558,
+          "passed": false
+        },
+        {
+          "name": "fixed_baseline_to_old_baseline",
+          "ratio": 1.0089904264630045,
+          "passed": true
+        }
+      ]
+    }
+  },
+  "current_raw_performance_failures": [
+    {
+      "profile": "cifs-to-s3",
+      "gate": "fixed_baseline_to_old_baseline",
+      "ratio": 0.9459713916060051
+    },
+    {
+      "profile": "local-to-s3",
+      "gate": "fixed_high_to_fixed_baseline",
+      "ratio": 0.9768088588175309
+    },
+    {
+      "profile": "nfs41-to-s3",
+      "gate": "fixed_high_to_fixed_baseline",
+      "ratio": 0.9503758348537225
+    },
+    {
+      "profile": "s3-to-s3",
+      "gate": "fixed_high_to_fixed_baseline",
+      "ratio": 0.9056961930948607
+    },
+    {
+      "profile": "s3-to-s3",
+      "gate": "fixed_high_to_old_high",
+      "ratio": 0.9744683613876227
+    },
+    {
+      "profile": "s3-to-local",
+      "gate": "fixed_high_to_old_high",
+      "ratio": 0.9724635527328459
+    },
+    {
+      "profile": "s3-to-local",
+      "gate": "fixed_baseline_to_old_baseline",
+      "ratio": 0.9393017030889622
+    },
+    {
+      "profile": "s3-to-nfs41",
+      "gate": "fixed_high_to_fixed_baseline",
+      "ratio": 0.8942727013253201
+    },
+    {
+      "profile": "s3-to-nfs41",
+      "gate": "fixed_high_to_old_high",
+      "ratio": 0.9758258425029558
+    }
+  ],
+  "original_target_finite_limits": [
+    {
+      "experiment": "buffer-limits",
+      "samples": 25,
+      "passed": 186,
+      "checks": 193,
+      "new_failures": 1,
+      "failed": [
+        {
+          "profile": "cifs-to-s3",
+          "case": "iops-strict",
+          "name": "end_to_end_at_least_98_percent",
+          "old_passed": false,
+          "passed": false,
+          "new_failure": false
+        },
+        {
+          "profile": "hdfs-to-s3",
+          "case": "iops-strict",
+          "name": "end_to_end_at_least_98_percent",
+          "old_passed": false,
+          "passed": false,
+          "new_failure": false
+        },
+        {
+          "profile": "local-to-s3",
+          "case": "iops-strict",
+          "name": "end_to_end_at_least_98_percent",
+          "old_passed": false,
+          "passed": false,
+          "new_failure": false
+        },
+        {
+          "profile": "nfs41-to-s3",
+          "case": "bandwidth-strict",
+          "name": "end_to_end_at_least_98_percent",
+          "old_passed": true,
+          "passed": false,
+          "new_failure": true
+        },
+        {
+          "profile": "nfs41-to-s3",
+          "case": "iops-strict",
+          "name": "end_to_end_at_least_98_percent",
+          "old_passed": false,
+          "passed": false,
+          "new_failure": false
+        },
+        {
+          "profile": "s3-to-s3",
+          "case": "bandwidth-strict",
+          "name": "end_to_end_at_least_98_percent",
+          "old_passed": null,
+          "passed": false,
+          "new_failure": false
+        },
+        {
+          "profile": "s3-to-s3",
+          "case": "iops-strict",
+          "name": "end_to_end_at_least_98_percent",
+          "old_passed": null,
+          "passed": false,
+          "new_failure": false
+        }
+      ]
+    },
+    {
+      "experiment": "buffer-source-limits",
+      "samples": 20,
+      "passed": 152,
+      "checks": 152,
+      "new_failures": 0,
+      "failed": []
+    }
+  ],
+  "original_target_precision": {
+    "baseline_mibps": 35.34030983021591,
+    "high_mibps": 38.877305180158785,
+    "ratio": 1.1000838806149558,
+    "passed": true,
+    "control_mibps": 35.79009836003843,
+    "control_ratio": 1.0127273510612504,
+    "control_ratio_interval_95": [
+      0.9092482094066316,
+      1.113373656839631
+    ],
+    "high_ratio_interval_95": [
+      0.9993279323197921,
+      1.1724703888797714
+    ],
+    "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+    "control_repeatable": false,
+    "qualified": false,
+    "classification": "environment_not_repeatable"
+  },
+  "diagnostic_fast_target": {
+    "baseline_mibps": 103.19691755644614,
+    "baseline_iops": 103.19691755644614,
+    "high_mibps": 103.39034595459611,
+    "high_ratio": 1.0018743621682709,
+    "request_cap_bytes": 1048576,
+    "soft_bytes": 8388608,
+    "soft_iops": 8,
+    "source_kind": "cifs",
+    "destination_kind": "s3",
+    "transfer_profile": "cross",
+    "size_mib": 128,
+    "performance_size_mib": 512,
+    "cases": {
+      "bandwidth-strict": {
+        "actual": 8348654.69998298,
+        "ratio": 0.9952371954897619,
+        "trace": {
+          "hard_envelope": true,
+          "soft_envelope": true,
+          "steady_ceiling": true,
+          "steady_window_after_peak": true,
+          "steady_at_least_98_percent": true,
+          "burst_observed": true,
+          "hard_max_excess": 83887.0,
+          "soft_max_excess": 83887.0,
+          "packet_allowance": 83887,
+          "soft_credit_capacity": 0.0,
+          "steady_rate": 8373777.468992122,
+          "first_half_second_rate": 8388700.0
+        }
+      },
+      "bandwidth-dual": {
+        "actual": 8621240.465232082,
+        "ratio": 1.0277319509067633,
+        "trace": {
+          "hard_envelope": true,
+          "soft_envelope": true,
+          "steady_ceiling": true,
+          "steady_window_after_peak": true,
+          "steady_at_least_98_percent": true,
+          "burst_observed": true,
+          "hard_max_excess": 167773.0,
+          "soft_max_excess": 4194316.868956679,
+          "packet_allowance": 167773,
+          "soft_credit_capacity": 4194304.0,
+          "steady_rate": 8388651.994448237,
+          "first_half_second_rate": 16441754.0
+        }
+      },
+      "iops-strict": {
+        "actual": 7.964794103224264,
+        "ratio": 0.995599262903033,
+        "trace": {
+          "hard_envelope": true,
+          "soft_envelope": true,
+          "steady_ceiling": true,
+          "steady_window_after_peak": true,
+          "steady_at_least_98_percent": true,
+          "burst_observed": true,
+          "hard_max_excess": 1.0,
+          "soft_max_excess": 1.0,
+          "packet_allowance": 1,
+          "soft_credit_capacity": 0.0,
+          "steady_rate": 7.998605535416504,
+          "first_half_second_rate": 8.0
+        }
+      },
+      "iops-dual": {
+        "actual": 9.091792133157195,
+        "ratio": 1.1364740166446494,
+        "trace": {
+          "hard_envelope": true,
+          "soft_envelope": true,
+          "steady_ceiling": true,
+          "steady_window_after_peak": true,
+          "steady_at_least_98_percent": true,
+          "burst_observed": true,
+          "hard_max_excess": 1.0,
+          "soft_max_excess": 16.000017552,
+          "packet_allowance": 1,
+          "soft_credit_capacity": 16.0,
+          "steady_rate": 7.999963124682796,
+          "first_half_second_rate": 15.5
+        }
+      },
+      "combined": {
+        "bandwidth": {
+          "ratio": 1.1371903315746519,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 167773.0,
+            "soft_max_excess": 16777231.903041538,
+            "packet_allowance": 167773,
+            "soft_credit_capacity": 16777216,
+            "steady_rate": 8388608.960184561,
+            "first_half_second_rate": 16693413.5
+          }
+        },
+        "iops": {
+          "ratio": 1.1371903315746517,
+          "trace": {
+            "hard_envelope": true,
+            "soft_envelope": true,
+            "steady_ceiling": true,
+            "steady_window_after_peak": true,
+            "steady_at_least_98_percent": true,
+            "burst_observed": true,
+            "hard_max_excess": 1.0,
+            "soft_max_excess": 100.000039,
+            "packet_allowance": 1,
+            "soft_credit_capacity": 100,
+            "steady_rate": 50.000556476193246,
+            "first_half_second_rate": 99.5
+          }
+        }
+      }
+    },
+    "performance_comparison": {
+      "baseline_mibps": 103.19691755644614,
+      "high_mibps": 103.39034595459611,
+      "ratio": 1.0018743621682709,
+      "passed": true,
+      "control_mibps": 103.41651753966124,
+      "control_ratio": 1.002127970373679,
+      "control_ratio_interval_95": [
+        1.0001866529309658,
+        1.0070867356925397
+      ],
+      "high_ratio_interval_95": [
+        1.0006889349060277,
+        1.0018743621682709
+      ],
+      "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+      "control_repeatable": true,
+      "qualified": true,
+      "classification": "passed"
+    }
+  },
+  "validation": {
+    "rust_passed": 2078,
+    "rust_failed": 0,
+    "rust_ignored": 9,
+    "rust_suites": 14,
+    "python_passed": 23,
+    "checks": [
+      "rust-tests 0",
+      "clippy 0",
+      "test-clippy 0",
+      "format 0"
+    ],
+    "architecture_exit_code": 0,
+    "architecture_passed": true,
+    "candidate_binary_sha256": "0070c0b704ae2c22fd1af5635c76d878f45c8ca9e6963e47ef6087dbcb792a74"
+  },
+  "measurement_records": 734,
+  "nfs_source_diagnostics": {
+    "original512MiB": {
+      "medians": {
+        "baseline": 1958.2460149749686,
+        "high": 1801.7177727984595
+      },
+      "ratio": 0.9200671207909952,
+      "passed": false,
+      "diagnostic_only": true
+    },
+    "long4GiB": {
+      "medians": {
+        "baseline": 1752.2826387471785,
+        "control": 1714.3487504184359,
+        "high": 1808.1832250593686
+      },
+      "comparison": {
+        "baseline_mibps": 1752.2826387471785,
+        "high_mibps": 1808.1832250593686,
+        "ratio": 1.0319015808729106,
+        "passed": true,
+        "control_mibps": 1714.3487504184359,
+        "control_ratio": 0.9783517296297223,
+        "control_ratio_interval_95": [
+          0.8614708366632962,
+          1.1669514283836935
+        ],
+        "high_ratio_interval_95": [
+          0.9319671072857011,
+          1.1788609018699565
+        ],
+        "interval_method": "paired-block percentile bootstrap, 4000 draws, seed 20261030; diagnostic precision guard",
+        "control_repeatable": false,
+        "qualified": false,
+        "classification": "environment_not_repeatable"
+      },
+      "samples": 18,
+      "diagnostic_only": true,
+      "original512MiB_failure_unchanged": true
+    }
+  },
+  "no_production_performance_optimization_accepted": true,
+  "cleanup": {
+    "lifecycle": [
+      [
+        "cifs",
+        "tree",
+        0
+      ],
+      [
+        "cifs",
+        "run-root",
+        0
+      ],
+      [
+        "standard",
+        "lifecycle",
+        0
+      ]
+    ],
+    "s3": [
+      {
+        "endpoint": "source",
+        "prefix": "ci/nightly-qos-followup-20261030045923/",
+        "versioning": "Unversioned",
+        "extra_versions_and_markers_deleted": 0,
+        "multipart_aborted": 0,
+        "empty": true
+      },
+      {
+        "endpoint": "destination",
+        "prefix": "ci/nightly-qos-followup-20261030045923/",
+        "versioning": "Unversioned",
+        "extra_versions_and_markers_deleted": 0,
+        "multipart_aborted": 0,
+        "empty": true
+      }
+    ],
+    "memory": {
+      "owned_pid": 471332,
+      "stopped": true,
+      "ram_root_removed": true,
+      "shared_pid": 816,
+      "shared_process_unchanged": true,
+      "shared_exe_sha256": "a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd"
+    },
+    "all_lifecycle_operations_succeeded": true,
+    "data_directories_remaining": [],
+    "nfs40": "not used or created in this followup; no unrelated export touched",
+    "scope": "exact isolated run only; shared services/keytab unchanged",
+    "supplemental_source_diagnostic": {
+      "owned_nfs_source_removed": true,
+      "scope": "only this run, no shared service change",
+      "local_fixture_and_unused_destination_removed": true,
+      "payload_exit_codes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "all_payload_commands_succeeded": true,
+      "original_cleanup_preserved": "cleanup.before-nfs-source-long-retry.json"
+    }
+  }
+}

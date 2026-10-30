@@ -1,0 +1,29 @@
+{
+  "git_base": "2c86e68c1626e71df765234b91d367aa1f0247c8",
+  "working_tree": "uncommitted authorized fixes; no commit/push",
+  "files": {
+    "Cargo.toml": "26695a51d442dae81f94ad1205411ebd8b5ef96f78a0b1175eb6d5d109bd6eff",
+    "crates/backend-cifs/src/backend/read_pipeline.rs": "9b315d72251ce96f889a637704e3150681e6558d1ec77ff335240749852c7ee9",
+    "crates/backend-hdfs/src/backend/source.rs": "80afa073543f564f84baef57e8467b872382384128273925fe0afcd1025a9e46",
+    "crates/backend-nfs/src/backend/source.rs": "c73612a52737330bf5761ea1881ab99df227e2c22c62ea09695ed8c8d12fcf23",
+    "crates/backend-nfs/src/backend/source_tests.rs": "3106d2f0a530f41a648d39d7b2d265416df4cbba15cf00e056c9e685dd96b9c0",
+    "crates/backend-s3/src/backend/client/copy_request.rs": "7f4ebb6e8d077d776440246397b398b4481ae66ff19d0c0b4b9cee5fa1af0651",
+    "crates/backend-s3/src/backend/client/directory_object_write_tests.rs": "d045e48e401249e20d4f69ef3497631e8eb7b8937b6b5f0dd2269adaa20bf775",
+    "crates/backend-s3/src/backend/client/role_protocol/native.rs": "ef84c57947c6bd1f92c81212f570d0870fd6c33ad34be55c1e4a4d2f0c5d4e14",
+    "crates/backend-s3/src/backend/client/role_protocol.rs": "767ee60c7bf438c8c616c95815f8aa7011f47e7e09071bc6ab3e82433e3e90b6",
+    "crates/backend-s3/src/backend/client.rs": "2d09e03b2ac1aa47b358b3f7f73199944389e5eb6dbfcc3ffa443650a13a89d6",
+    "crates/backend-s3/src/backend/source.rs": "efb552a7eb3b450830fba28cfb941cfb1610a70b6ef342fd03a7967bced1074b",
+    "crates/backend-s3/src/backend/source_pipeline_tests.rs": "0589ccfe8389d53eb49c0e733eb472bf2dabe6abcfb5267a19f85f252fa64d0c",
+    "crates/backend-s3/src/backend/tests.rs": "2f825c2d8d1be1b1b9b47c82867677c28e4e986cca343eaf0ab960b3517bb53c",
+    "crates/storage-core/Cargo.toml": "903d01a28b0ac0db957ce2599ae5e0ce63670b8768f84260d28e3bbe1c154b35",
+    "crates/storage-core/src/runtime/qos/wait.rs": "a01271c62f651edac83824f217dfda211392a44c21e92ce3b9883d33405d327c",
+    "crates/storage-core/src/runtime/qos.rs": "b6d628b7cdb6c188e9e658718198d4feca0c4e9d40d8f43d87ef9f30a6a875dc",
+    "tests/lab/run-backend-qos.py": "473aed2513ac26cf347cee69c44e0f9751103fda6180700faf03686e54380087",
+    "tests/lab/run-local-qos.py": "58db8dbb167ea1f2ed91e3fec7591bfb12b8d92912fb21d9befc6d99cc99aff3",
+    "tests/lab/tools/backend_qos_acceptance.rs": "751f1d716241391ca4814c49e3dce9d6ebb2aab57a315b6820f47bb1c22a1649",
+    "tests/lab/tools/backend_qos_cleanup.rs": "e8e06872e394e4891d1a124a141d1c8c4a83124bb2643fde58b17d24f9ed94de",
+    "tests/test_local_qos_acceptance.py": "ddf79c61631dbe194b49184d35e38678faca641197b28b67bd66e6693ed44522"
+  },
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8\n",
+  "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)"
+}

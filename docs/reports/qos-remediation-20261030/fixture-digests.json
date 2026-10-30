@@ -1,0 +1,23 @@
+{
+  "tool": "Python blake3 1.0.11",
+  "fixtures": {
+    "128": {
+      "size_bytes": 134217728,
+      "block_sha256": "fad057bf4abb0cc49dc89b6103a8d3d92b65728a52415c10f59094bab2d402f5",
+      "payload_blake3": "a5896d46eaf7009bbca09540987f327296293beeeaf89c9065bc3ae06affb997",
+      "payload_sha256": "69c14af79812fa8edaea3aed2fa2e54adec657cebe7c67fc5f47ce05e9ebbf03"
+    },
+    "512": {
+      "size_bytes": 536870912,
+      "block_sha256": "fad057bf4abb0cc49dc89b6103a8d3d92b65728a52415c10f59094bab2d402f5",
+      "payload_blake3": "262b4652547ec38797310429cf68c8d94ea8d79f3f97f46d231365b9f8f91972",
+      "payload_sha256": "f4cc742694405ab32e283a9796b63f8e382f233787e9fd562e80d8e62e462838"
+    },
+    "1024": {
+      "size_bytes": 1073741824,
+      "block_sha256": "fad057bf4abb0cc49dc89b6103a8d3d92b65728a52415c10f59094bab2d402f5",
+      "payload_blake3": "6f969fc8c243909b088d1ce698917b3ddcdd615d49eb217ca725f4196d975332",
+      "payload_sha256": "f1bf7830911b3f98a4c41466ce4eae299ffa29daf35603ca0856cd496955d76c"
+    }
+  }
+}

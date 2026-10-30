@@ -1,0 +1,98 @@
+[
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-strict",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-dual",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-strict",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-dual",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-strict",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-dual",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "s3_payload_requests_no_inflation",
+    "actual": 16,
+    "expected": 16,
+    "passed": true
+  }
+]

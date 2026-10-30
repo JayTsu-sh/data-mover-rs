@@ -215,6 +215,197 @@ soft and hard rates both set to 8 MiB/s. Set `QOS_LAB_SOFT_RATE_MIB`,
 soft-credit scenario; for example `8`, `12`, and `500` derive a 2 MiB credit
 capacity.
 
+`python3 tests/lab/run-local-qos.py --work-dir /work/qos-scratch --output
+.scratch/qos-local-<run-id>` runs the four performance acceptance scenarios on
+Local alone, without network services. Allow at least 1 GiB of scratch space.
+It builds the release `local_qos_acceptance` example with `transfer`,
+`backend-local` and the opt-in `qos-diagnostics` trace feature enabled. The fixed runtime has four workers. Fixtures are fully
+written files on the requested filesystem; every source is hashed before timing,
+so these measurements use a warm page cache. Every run checks the complete BLAKE3
+digest; scratch fixtures and destination files are removed when the run ends.
+
+Bandwidth and IOPS are exercised independently and together. Unlimited and very
+high QoS runs use identical 256 MiB files and request sizes, alternate order over
+three repetitions, and compare median throughput with a 98% minimum ratio.
+Reasonable limits are 16/32 MiB/s and 128/256 IOPS, plus strict limits with equal
+soft/hard values. The baseline must have at least 25% headroom over the hard rate.
+The dual-rate cases first idle for one second to accumulate bounded credit.
+They must show an initial burst, then settle below the soft ceiling. Both strict
+and dual-rate cases must attain 98% of the soft rate; the source-read trace also
+checks the last five seconds so initial credit cannot hide sustained underfill.
+
+Two paths are measured: serial `ReadSource` reads record every real Local read's
+completion, while public `transfer` uses eight reads/writes in flight and retains
+the default verification and durability policy. Both paths also record exact QoS
+admission timestamps under the shared scheduler lock. They check **every
+interval between admissions**, including event left limits, against hard and
+soft traffic envelopes. The hard envelope allows exactly one actual read packet,
+and the soft envelope adds `(hard - soft) * peak_duration` credit. There is no
+percentage tolerance on either ceiling. These are discrete application-read
+guarantees, not instantaneous disk-device bandwidth or physical device IOPS.
+Full-copy timings include default publication and verification, so the 98% floor
+also reveals overhead outside source admission. Unlimited copy IOPS is inferred
+from fixed Local read size; shaped copy IOPS is the actual QoS operation counter.
+Completion traces are retained separately: IO latency variation can compress
+completion spacing even when admission spacing obeys the hard limit, so completion
+timestamps cannot be substituted for admission timestamps in these ceiling checks.
+Diagnostic tracing is absent from normal builds and must be explicitly enabled;
+its unbounded event buffer is intended only for finite acceptance workloads.
+
+The runner saves environment details, commands, per-read traces, a measurement
+CSV and individual pass/fail checks. It runs all scenarios after a failed gate,
+then exits nonzero if any check failed. An IO or verification error aborts the
+run and preserves the completed raw measurements. `--output` must be a fresh
+directory. `python3 -m unittest discover -s tests -p test_local_qos_acceptance.py`
+checks the envelope validator, including overshoots hidden by idle time and
+startup bursts masking a steady rate below 98%.
+
+The [2026-10-29 Local/XFS measurements](../../docs/reports/local-qos-20261029/measurements.csv)
+and [individual acceptance results](../../docs/reports/local-qos-20261029/checks.json)
+record the original 95% acceptance run on commit `2c86e68`: soft/hard envelopes and
+content verification passed, while high-IOPS QoS overhead and the former 95% throughput
+floor failed. Raw per-read events, exact commands, environment and the run log
+are retained beside those files. No production QoS code was changed for this run.
+
+The [historical optimized Local/XFS results](../../docs/reports/local-qos-optimized-20261029/checks.json)
+passed the former 95% threshold and use exact admission traces for serial reads and eight-inflight public
+transfers. The scheduler now skips already-satisfied waits, counts elapsed IO
+towards the next strict-rate interval, and replenishes soft credit while waiting
+for either resource. Long waits use Tokio; the final at-most-2-ms tail uses
+OS sleep on a blocking worker, waking up to 200 microseconds early. The last
+margin yields cooperatively so timer-return latency does not accumulate.
+Initial waits of at most 8 microseconds use a bounded CPU wait to avoid a runtime
+handoff costing more than the remaining interval. A separate wall-clock bound
+keeps paused clocks safe; cancellation is rechecked after at most that margin.
+Longer waits do not block runtime workers. Cancellation is uncharged, and a
+detached blocking tail can occupy its worker until that bounded sleep finishes. Hard
+intervals round up to nanoseconds and restart from the actual release time, so
+late wakeups never accumulate permission for catch-up bursts. Admission tracing
+is an explicit diagnostic feature and adds no trace buffer to normal builds.
+
+`run-backend-qos.py --config <private.json> --root <isolated-local-run-root>
+--binary <release-backend_qos_acceptance> --phase survey|final|stress` extends this gate
+to real Local, NFSv3/v4.0/v4.1, CIFS, S3 and Kerberos HDFS sources. Build with
+`cargo build --release --locked --features qos-diagnostics --example backend_qos_acceptance`.
+A private JSON file contains `run_id` and `profiles`; every profile has `name`,
+`env` (including `QOS_SOURCE`), optional `size_mib` and `chunk_bytes`. Endpoint
+shortcuts and credentials follow `examples/support/endpoint.rs`; environment
+credentials can also be inherited. Never commit the private file. Use unique
+source directories/prefixes and the lab's preparation/cleanup lifecycle.
+
+The survey phase seeds fully written 64 MiB fixtures (128 MiB for S3); the final
+phase uses the same fixtures and copies each source to Local with default
+verification/durability. Seeding uses verified AtomicReplace: it does not require
+the source server to support recoverable checkpoint ACLs. Five baseline/high-QoS
+pairs alternate order. The high case enables both bandwidth and IOPS at once,
+retaining the same negotiated read cap and operation count as baseline.
+Strict, dual-rate and combined cases check the 98% end-to-end floor as well as
+steady source admission rates and all-interval hard/soft envelopes. Steady-rate
+windows anchor at actual admissions, excluding the left event, so large GETs and
+low IOPS do not create fixed-window quantization errors. Rates, request caps,
+peak credit duration, baseline headroom, exact binary hash and all raw traces
+are saved. High-QoS timings disable the diagnostic admission buffer and retain
+production accounting; every finite limit case enables the exact trace. Each final source fixture is removed, and cleanup failures fail the gate.
+Full run-root and versioned-object cleanup still belongs to the lab lifecycle.
+
+For longer performance samples, pass `--performance-size-mib 512`; only the
+baseline/high cases use that size, and finite limit cases keep their 64/128 MiB
+fixtures. A profile's `performance_size_mib` overrides the common size. The
+`stress` phase reads 128 MiB serially in 64 KiB requests and tests strict 128 IOPS
+and soft/hard 128/256 IOPS. Use `--phase stress --measure-only` to measure its
+baseline/high pairs without starting finite limit cases or removing their source.
+`--baseline <survey-output>` imports those exact measurements for `final` or
+`stress`; a binary SHA-256 mismatch is rejected. Performance surveys must run
+serially. Independent finite limit cases may be batched after surveys, provided
+the aggregate offered rate remains below measured backend capacity. Profiles
+sharing a source filename must be reseeded between cleanup and the next batch.
+
+On a capacity-constrained isolated export, `remove_old_seed: true` deletes only
+the selected old fixture before seeding its replacement. Build
+`cargo build --release --locked --example backend_qos_cleanup` for abandoned
+transfer-artifact cleanup inside a source endpoint containing `--run-id`.
+`QOS_SOURCE=... backend_qos_cleanup --run-id <run-id> --file 128.bin` also removes
+that known fixture; missing fixtures are accepted. This helper does not replace
+`cleanup-run.sh` or its versioned S3 and confined HDFS cleanup.
+
+The [2026-10-30 multi-backend 98% report](../../docs/reports/qos98-backends-20261030/REPORT.md)
+contains 406 passing final checks across seven real protocol profiles, earlier
+failures, root causes, raw evidence and the application-admission hard-limit scope.
+
+`run-cross-backend-qos.py --config <endpoints.private.json> --root <run-root>
+--binary <backend_qos_acceptance>` adds 23 directed routes: the seven source-to-Local
+regressions and all 20 off-diagonal pairs among Local, NFSv4.1, CIFS, S3 and HDFS.
+The endpoint file contains `run_id`, `sources` (seven keys, each containing `env`
+with `QOS_SOURCE`) and `destinations` (five keys, each containing `endpoint` with
+an optional `{pair}` placeholder and credential `env`). Endpoint credentials stay
+in the private file/environment and never appear in command arguments.
+
+The `default` transfer profile retains default copy-time read-back and recovery.
+Network destinations use the `cross` profile: AtomicReplace, timed payload transfer
+and atomic publication, then an independent complete destination read/hash outside
+that timer. AtomicReplace omits final persistence barriers on Local/NFS and does
+not promise crash durability; other backends retain their protocol close/commit
+requirements. These results must not be described as default durable-copy results. Its duration is saved as `verification_seconds`; integrity
+failure fails the sample and retains the destination for diagnosis. This avoids
+requiring protected checkpoint ACLs on the CIFS fixture and keeps independent
+acceptance read-back separate from source QoS performance. QoS still shapes source
+payload reads only. Both baseline and high use the same profile and request cap.
+
+Stages `warmup`, `seed`, `survey`, and `limits` may run separately. Warmup copies and
+hashes 16 MiB on every route; finite limits use 128 MiB. The survey runs five
+alternating baseline/high pairs serially. Finite limits may run in four independent
+processes after surveys. Shared source fixtures are explicitly retained until the
+matrix lifecycle cleans the isolated run. Imported baselines bind both the binary
+SHA-256, the complete endpoint/profile configuration SHA-256, repetition count,
+and unmeasured idle. An explicit
+`baseline-overrides.private.json` may name a route's larger-sample survey and
+matching private configuration after failed short-sample measurement; preserve
+both attempts and document this provenance in the report. Overrides may change only
+the performance fixture size, retaining the route, copy policy and finite limits.
+`--performance-idle-ms` applies the same unmeasured idle to both performance arms.
+A longer sample that passes does not erase a failed short-file end-to-end result.
+Native server-internal
+S3 copy is outside the client source-read shaping contract.
+
+For S3, bandwidth shaping must preserve the configured bounded GET size (up to
+8 MiB) and wait between requests, rather than inflate the request count with
+small GETs. Finite bandwidth and combined cases explicitly check the expected
+payload request count. Report any tolerated bandwidth deviation separately from
+IOPS and hard-envelope checks; record the tolerance and observation window before
+relaxing a verdict. Diagnostic wire counts must distinguish source payload, target
+uploads, metadata and independent acceptance read-back.
+
+Use the lab's `prepare-run.sh` / `cleanup-run.sh` lifecycle around the matrix.
+`backend_qos_cleanup --run-id <run-id> --tree` removes children recursively only
+inside an endpoint whose path contains that isolated run ID, retaining the root.
+
+The [2026-10-30 cross-backend report](../../docs/reports/qos98-cross-backends-20261030/REPORT.md)
+retains every failed gate and separates source steady rates, complete-copy rates,
+and longer-sample requalification. Short-file strict soft=hard checks are retained
+even when dual-rate QoS or a longer file meets the 98% floor.
+This supplements standard cleanup for the CIFS and NFSv4.0 fixtures.
+
+The [high-QoS root-cause and regression report](../../docs/reports/qos-high-root-cause-20261030/REPORT.md)
+documents the S3 HTTP transport reuse fix, original-size old/new controls,
+independent confirmation, and remaining failed gates. It preserves the initial
+matrix failures separately from subsequent controls.
+
+For noisy remote targets, add `--performance-control --isolated-destinations
+--cleanup-binary /path/to/backend_qos_cleanup` to `run-backend-qos.py` or the
+cross-backend runner. Use at least three repeats; multiples of three balance the
+baseline/control/high positions. The control repeats the same no-QoS workload.
+Every copy uses a fresh destination prefix and all destination cleanup runs after
+the profile loop, including when an exception or KeyboardInterrupt unwinds it. `config.run_id` and every
+selected destination must identify the same isolated `nightly-` or `release-` run.
+Baseline imports must retain both options.
+
+The original median high/baseline 98% gate remains unchanged. Additional gates
+check the A/A ratio's paired-block bootstrap interval against `[0.98, 1/0.98]`
+and the high/baseline interval's lower bound against 0.98. The deterministic
+4,000-draw interval is a diagnostic precision guard, not a guarantee for every
+future transfer. An unrepeatable baseline remains unsuccessful and is labeled
+`environment_not_repeatable`; it cannot qualify a favorable QoS point estimate.
+
 `run-hdfs-memory-e2e.sh` is the bounded-memory acceptance gate. It generates
 fully written deterministic `256 MiB + 137 byte` and `2 GiB + 137 byte`
 fixtures with a 1 MiB producer buffer, then measures only the release
@@ -453,3 +644,34 @@ beside the final file on the share, nothing is recorded where the test runs (ADR
 uses unique names, exercises both policies with read-back enabled, and cleans up
 its own final/stage/checkpoint files. See the [FAS2750 validation report](../../docs/reports/2026-09-16-cifs-policy-validation.md)
 for tested sizes, recovery coverage and debug-runtime limitations.
+
+The [continued high-QoS investigation](../../docs/reports/qos-followup-20261030/REPORT.md)
+records original-target A/A controls, all candidate regressions, rejected optimizations,
+source-only attribution, fixed-quota checks, and exact-run cleanup evidence.
+
+### Sustained QoS qualification
+
+The end-to-end 98% gate includes the last read, upload and publication. At strict
+quota a run with ideal duration `T` only has `T / 0.98 - T` extra seconds: a
+16-second run allows 0.327 seconds, less than the measured S3 publication tail.
+Keep short-run results as diagnostics; they must not be relabeled as passing.
+For sustained qualification, select a larger fixture and keep the quota fixed:
+
+```bash
+python3 tests/lab/run-cross-backend-qos.py \
+  --config "$PRIVATE_ENDPOINT_CONFIG" --root "$ISOLATED_RUN_ROOT" \
+  --binary "$QOS_BINARY" --cleanup-binary "$QOS_CLEANUP_BINARY" \
+  --limit-size-mib 1024 --limit-duration-seconds 128 \
+  --performance-control --isolated-destinations
+```
+
+For the single-backend runner set `profile.size_mib=1024` and pass
+`--limit-duration-seconds 128`. Increasing the fixture alone would also increase
+its automatically selected IOPS rate and leave the ideal test duration near
+16 seconds. The explicit duration prevents that; strict cases also check their
+ideal duration, and imported baselines bind this setting. A fixture with fewer
+than 128 source requests cannot run for 128 seconds at the minimum 1 IOPS: choose
+a larger fixture rather than hiding the failed duration check. S3 retains its
+8 MiB GETs. Strict summaries include admission timing and the remaining tail;
+these diagnostics never replace the end-to-end verdict. High-QoS raw ratios and
+A/A precision remain separate gates.

@@ -1,0 +1,47 @@
+[
+  {
+    "profile": "cifs-to-s3",
+    "gate": "high/self",
+    "ratio": 0.9776749900096662
+  },
+  {
+    "profile": "local-to-s3",
+    "gate": "new-baseline/old-baseline",
+    "ratio": 0.9526189484696276
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "gate": "new-baseline/old-baseline",
+    "ratio": 0.9435278443728736
+  },
+  {
+    "profile": "s3-to-s3",
+    "gate": "high/self",
+    "ratio": 0.8179726742059441
+  },
+  {
+    "profile": "s3-to-s3",
+    "gate": "new-high/old-high",
+    "ratio": 0.8230128615330592
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "gate": "new-baseline/old-baseline",
+    "ratio": 0.9698058678882135
+  },
+  {
+    "profile": "s3-to-local",
+    "gate": "new-high/old-high",
+    "ratio": 0.9526749016048858
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "gate": "high/self",
+    "ratio": 0.9567617607182615
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "gate": "new-high/old-high",
+    "ratio": 0.9792864740270988
+  }
+]

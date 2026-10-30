@@ -1,0 +1,18 @@
+{
+  "git_commit": "2c86e68c1626e71df765234b91d367aa1f0247c8",
+  "git_status": " M Cargo.toml\n M crates/storage-core/Cargo.toml\n M crates/storage-core/src/runtime/qos.rs\n M tests/lab/README.md\n?? crates/storage-core/src/runtime/qos/\n?? docs/reports/local-qos-20261029/\n?? tests/lab/run-local-qos.py\n?? tests/lab/tools/local_qos_acceptance.rs\n?? tests/test_local_qos_acceptance.py\n",
+  "kernel": "Linux-6.8.0-142-generic-x86_64-with-glibc2.39",
+  "cpu_count": 24,
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "filesystem": "Filesystem     Type  1K-blocks      Used Available Use% Mounted on\n/dev/sdc       xfs  1073485824 794349412 279136412  74% /work\n",
+  "runtime_workers": 4,
+  "repetitions": 3,
+  "minimum_ratio": 0.95,
+  "binary_sha256": "91bfb476863c2138fd55171af3ed30364054c4d160b01b05080f814f6ad3d036",
+  "cache": "source fully hashed before every timed run; warm page cache",
+  "read_mode": "Local ReadSource, inflight=1; admission + completion traces and full BLAKE3",
+  "copy_mode": "public transfer, inflight=8, default policy/read-back; admission trace and independent hash after timing",
+  "trace_scope": "exact QoS admission times; completion times retained separately, not used to infer dispatch spacing",
+  "hard_contract": "all-interval envelope <= hard*time + one actual IO packet; no percent slack",
+  "started_utc": "2026-10-29T14:45:31Z"
+}

@@ -1,0 +1,10 @@
+{
+  "candidate": "eab6995bd1d81f859788084fd8c3d4535acb99188c2880bd451ea4392d1faeaf",
+  "decision": "withdraw production prefetch changes; complete already-started comparison as rejected-candidate evidence",
+  "failed_absolute_gates": {
+    "local-to-s3/new-baseline-to-old-baseline": 0.9526189484696276,
+    "nfs41-to-s3/new-baseline-to-old-baseline": 0.9435278443728736
+  },
+  "precision": "A/A not repeatable; rejection does not prove code caused each low score",
+  "retained_production": "same Rust/Cargo as previously accepted 9b; sustained verification will use baseline-bin"
+}

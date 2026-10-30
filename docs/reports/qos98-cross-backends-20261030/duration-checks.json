@@ -1,0 +1,770 @@
+[
+  {
+    "profile": "nfs41-to-s3",
+    "case": "high",
+    "name": "matches_baseline_98_percent",
+    "passed": true,
+    "ratio": 0.9993638701580388,
+    "arms": {
+      "baseline": [
+        32.46034186092354,
+        36.225302533279276,
+        38.452426457604076,
+        38.94069726195648,
+        35.0876350159044
+      ],
+      "high": [
+        38.13433804778419,
+        35.5177348390736,
+        40.599751079603614,
+        36.202258537303784,
+        32.86221936747224
+      ]
+    },
+    "size_mib": 2048
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "high",
+    "name": "matches_baseline_98_percent",
+    "passed": true,
+    "ratio": 0.9847596056431188,
+    "arms": {
+      "baseline": [
+        226.91232324290362,
+        217.25433668626366,
+        221.90204465943057,
+        223.21130918722193,
+        211.4699476903616
+      ],
+      "high": [
+        225.4744881523067,
+        218.5201699902226,
+        220.47368096410443,
+        218.41513235195288,
+        215.14179280691917
+      ]
+    },
+    "size_mib": 12288
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "ratio": 0.9905695213515844,
+    "soft": 8,
+    "actual": 7.924556170812675,
+    "size_mib": 512
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 7.9991979963067426,
+      "first_half_second_rate": 6.0
+    }
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 7.9991979963067426,
+      "first_half_second_rate": 6.0
+    }
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 7.9991979963067426,
+      "first_half_second_rate": 6.0
+    }
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 7.9991979963067426,
+      "first_half_second_rate": 6.0
+    }
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "ratio": 0.983944832818692,
+    "soft": 4952032,
+    "actual": 4872526.298352813,
+    "size_mib": 512
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 49521.0,
+      "soft_max_excess": 49521.0,
+      "packet_allowance": 49521,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4949230.426038911,
+      "first_half_second_rate": 4159764.0
+    }
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 49521.0,
+      "soft_max_excess": 49521.0,
+      "packet_allowance": 49521,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4949230.426038911,
+      "first_half_second_rate": 4159764.0
+    }
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 49521.0,
+      "soft_max_excess": 49521.0,
+      "packet_allowance": 49521,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4949230.426038911,
+      "first_half_second_rate": 4159764.0
+    }
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 49521.0,
+      "soft_max_excess": 49521.0,
+      "packet_allowance": 49521,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4949230.426038911,
+      "first_half_second_rate": 4159764.0
+    }
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "ratio": 0.9817345526426183,
+    "soft": 4,
+    "actual": 3.9269382105704733,
+    "size_mib": 512
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 3.9999126233823925,
+      "first_half_second_rate": 4.0
+    }
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 3.9999126233823925,
+      "first_half_second_rate": 4.0
+    }
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 3.9999126233823925,
+      "first_half_second_rate": 4.0
+    }
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 3.9999126233823925,
+      "first_half_second_rate": 4.0
+    }
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "ratio": 0.9845349360554735,
+    "soft": 4532773,
+    "actual": 4462673.375708977,
+    "size_mib": 512
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 45328.0,
+      "soft_max_excess": 45328.0,
+      "packet_allowance": 45328,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4531124.667248504,
+      "first_half_second_rate": 3626240.0
+    }
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 45328.0,
+      "soft_max_excess": 45328.0,
+      "packet_allowance": 45328,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4531124.667248504,
+      "first_half_second_rate": 3626240.0
+    }
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 45328.0,
+      "soft_max_excess": 45328.0,
+      "packet_allowance": 45328,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4531124.667248504,
+      "first_half_second_rate": 3626240.0
+    }
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 45328.0,
+      "soft_max_excess": 45328.0,
+      "packet_allowance": 45328,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4531124.667248504,
+      "first_half_second_rate": 3626240.0
+    }
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "ratio": 0.988855865160735,
+    "soft": 4,
+    "actual": 3.95542346064294,
+    "size_mib": 512
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 3.999399809649581,
+      "first_half_second_rate": 4.0
+    }
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 3.999399809649581,
+      "first_half_second_rate": 4.0
+    }
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 3.999399809649581,
+      "first_half_second_rate": 4.0
+    }
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 3.999399809649581,
+      "first_half_second_rate": 4.0
+    }
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "ratio": 0.9887971018618911,
+    "soft": 4982843,
+    "actual": 4927020.717432811,
+    "size_mib": 512
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 49829.0,
+      "soft_max_excess": 49829.0,
+      "packet_allowance": 49829,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4980309.300972592,
+      "first_half_second_rate": 3687346.0
+    }
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 49829.0,
+      "soft_max_excess": 49829.0,
+      "packet_allowance": 49829,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4980309.300972592,
+      "first_half_second_rate": 3687346.0
+    }
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 49829.0,
+      "soft_max_excess": 49829.0,
+      "packet_allowance": 49829,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4980309.300972592,
+      "first_half_second_rate": 3687346.0
+    }
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 49829.0,
+      "soft_max_excess": 49829.0,
+      "packet_allowance": 49829,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 4980309.300972592,
+      "first_half_second_rate": 3687346.0
+    }
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "ratio": 0.9895906012277813,
+    "soft": 8,
+    "actual": 7.9167248098222505,
+    "size_mib": 512
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 7.998886678034216,
+      "first_half_second_rate": 6.0
+    }
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 7.998886678034216,
+      "first_half_second_rate": 6.0
+    }
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 7.998886678034216,
+      "first_half_second_rate": 6.0
+    }
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 7.998886678034216,
+      "first_half_second_rate": 6.0
+    }
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "ratio": 0.9971715374087083,
+    "soft": 1,
+    "actual": 0.9971715374087083,
+    "size_mib": 512
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 0.999976598047664,
+      "first_half_second_rate": 0.0
+    }
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 0.999976598047664,
+      "first_half_second_rate": 0.0
+    }
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 0.999976598047664,
+      "first_half_second_rate": 0.0
+    }
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "trace": {
+      "hard_envelope": true,
+      "soft_envelope": true,
+      "steady_ceiling": true,
+      "steady_window_after_peak": true,
+      "steady_at_least_98_percent": true,
+      "burst_observed": true,
+      "hard_max_excess": 1.0,
+      "soft_max_excess": 1.0,
+      "packet_allowance": 1,
+      "soft_credit_capacity": 0.0,
+      "steady_rate": 0.999976598047664,
+      "first_half_second_rate": 0.0
+    }
+  }
+]

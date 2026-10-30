@@ -1,0 +1,69 @@
+{
+  "scope": "Local backend / XFS / warm page cache / release / 4 runtime workers; no network backend performance claim",
+  "verdict": "82/82 acceptance checks passed; full payload verification passed for every run",
+  "copy_comparison": {
+    "bandwidth": {
+      "before": {
+        "baseline": 297.346634393205,
+        "high_qos": 287.2810524491082,
+        "high_qos_to_baseline": 0.9661486602508965,
+        "strict_qos": 13.886624615678931,
+        "strict_configured": 16,
+        "strict_qos_to_limit": 0.8679140384799332
+      },
+      "after": {
+        "baseline": 405.41947524175475,
+        "high_qos": 411.6613332001223,
+        "high_qos_to_baseline": 1.0153960486349243,
+        "strict_qos": 15.446351613375631,
+        "strict_configured": 16,
+        "strict_qos_to_limit": 0.965396975835977
+      }
+    },
+    "iops": {
+      "before": {
+        "baseline": 5859.334135713068,
+        "high_qos": 775.7367472259127,
+        "high_qos_to_baseline": 0.13239332819368346,
+        "strict_qos": 109.96569511463863,
+        "strict_configured": 128,
+        "strict_qos_to_limit": 0.8591069930831143
+      },
+      "after": {
+        "baseline": 6021.07404433299,
+        "high_qos": 5846.475804619662,
+        "high_qos_to_baseline": 0.9710021437325358,
+        "strict_qos": 124.00119830543937,
+        "strict_configured": 128,
+        "strict_qos_to_limit": 0.9687593617612451
+      }
+    }
+  },
+  "root_causes": [
+    {
+      "cause": "Unconditional timer creation and repaying elapsed IO time",
+      "evidence": "8 MiB reproduction: high QoS 789.99 IOPS vs unlimited 10741.42; strict 109.72 / 128. Paused-clock regression charged another 8 ms after 20 ms of source IO.",
+      "fix": "Compare strict and hard intervals with the last actual admission, count elapsed IO, and skip waiting when the deadline has passed. Keep actual release timestamps to prohibit accumulated catch-up slots.",
+      "differential_result": "Changing only this scheduling rule brought high QoS to 95.7% of its paired baseline; strict QoS remained at 87.1%."
+    },
+    {
+      "cause": "Coarse timer wakeup latency accumulates under strict minimum spacing",
+      "evidence": "After the elapsed-IO fix, 128 IOPS still measured 111.50. With only precise waiting changed, it measured 125.69 (98.2%).",
+      "fix": "Use the async timer for long waits and OS sleep on a blocking worker only for the final <=2 ms. Runtime workers never sleep or busy-spin. Outer cancellation remains immediate; detached tail work is bounded.",
+      "cpu_observation": "Across three 8 MiB strict runs, measured child CPU was 0.143 seconds before and 0.149 seconds after precision waiting; timings include setup and full hashing."
+    },
+    {
+      "cause": "Soft credit was not replenished during hard or combined-resource waits",
+      "evidence": "The deterministic dual bandwidth/IOPS peak regression took 700 ms instead of approximately 500 ms.",
+      "fix": "Refill from the scheduler observation through actual admission, charge the packet, then cap remaining credit. Both resources share a maximum deadline, so waiting for either refills both."
+    }
+  ],
+  "measurement_correction": {
+    "cause": "Read completion spacing can compress when source IO latency varies; it is not admission spacing.",
+    "fix": "Keep completion events, add exact admission timestamps under the scheduler lock, validate original hard/soft envelopes on admissions for BOTH serial reads and concurrent copies. Require trace counts and byte totals to match charged counters and verified payload.",
+    "thresholds": "No loosened rate ceilings or 95% floors. Hard envelope remains hard*duration plus one actual IO packet; soft envelope adds bounded configured credit.",
+    "production_impact": "Tracing only exists with test-support/qos-diagnostics and must be enabled explicitly for finite workloads."
+  },
+  "precision_correction": "Hard service intervals use integer ceil-to-nanosecond arithmetic, preventing fractional-nanosecond rounding below the configured minimum interval.",
+  "reproduce": "python3 tests/lab/run-local-qos.py --work-dir /work/qos-scratch --output .scratch/local-qos-recheck"
+}

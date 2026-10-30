@@ -1,0 +1,44 @@
+{
+  "all_943_original_verdicts_reproduced": true,
+  "main_passed": 933,
+  "main_failed": 10,
+  "accepted_performance_samples": 270,
+  "finite_samples": 115,
+  "supplemental_duration_checks": 42,
+  "supplemental_duration_passed": 42,
+  "supplemental_verdicts_reproduced": true,
+  "all_archive_manifest_hashes_verified": true,
+  "all_same_size_digests_match": true,
+  "unique_digests_by_size": {
+    "16777216": [
+      "afed25a8ee83ac4acf00b5d92613e88d92fa97728a200020d3add05dc7cc5e98"
+    ],
+    "67108864": [
+      "8c2623be4facc2220b4cc6053acf2340f8abb86cceb920bd3b66d70e42007595"
+    ],
+    "134217728": [
+      "68b86c86fe8a437127089d189b05f7820658c1b5964e4269d4559572dcb8be79"
+    ],
+    "536870912": [
+      "5c66822bde0018ff775e084a7277d8971ff362f400899c66b3082f83efe19702"
+    ],
+    "2147483648": [
+      "08747d8b85acb198a51ca66d469b53b759c39e139afdccb89bc59586d40c29a5"
+    ],
+    "12884901888": [
+      "63ed8d48c55437145fe894f9ea70bd53a001d0aacb7320637717a705c4b4c1ff"
+    ]
+  },
+  "all_measurement_files_including_copied_baselines": 889,
+  "baseline_binary_and_configuration_binding_verified": true,
+  "override_route_and_policy_guard_verified_before_private_config_removal": true,
+  "all_five_full_fixture_hashes_reconstructed_from_archived_blocks": true,
+  "rejected_optimization_verdicts_reproduced": true,
+  "actual_sdk_pressure_verdicts_reproduced": true,
+  "actual_sdk_pressure_checks": 44,
+  "actual_sdk_pressure_passed": 44,
+  "additional_existing_matrix_s3_request_count_checks": 12,
+  "additional_s3_checks_passed": 12,
+  "pressure_64MiB_fixture_hash_reconstructed": true,
+  "s3_cleanup_all_four_exact_scopes_empty": true
+}

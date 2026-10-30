@@ -1,0 +1,76 @@
+{
+  "lifecycle": [
+    [
+      "cifs",
+      "tree",
+      0
+    ],
+    [
+      "cifs",
+      "run-root",
+      0
+    ],
+    [
+      "standard",
+      "lifecycle",
+      0
+    ]
+  ],
+  "s3": [
+    {
+      "endpoint": "source",
+      "prefix": "ci/nightly-qos-followup-20261030045923/",
+      "versioning": "Unversioned",
+      "extra_versions_and_markers_deleted": 0,
+      "multipart_aborted": 0,
+      "empty": true
+    },
+    {
+      "endpoint": "destination",
+      "prefix": "ci/nightly-qos-followup-20261030045923/",
+      "versioning": "Unversioned",
+      "extra_versions_and_markers_deleted": 0,
+      "multipart_aborted": 0,
+      "empty": true
+    }
+  ],
+  "memory": {
+    "owned_pid": 471332,
+    "stopped": true,
+    "ram_root_removed": true,
+    "shared_pid": 816,
+    "shared_process_unchanged": true,
+    "shared_exe_sha256": "a2dedb783bdf1ff6c97a25a0a07230e6488b3b63cef4eb80a2ab4c94006002bd"
+  },
+  "all_lifecycle_operations_succeeded": true,
+  "data_directories_remaining": [],
+  "nfs40": "not used or created in this followup; no unrelated export touched",
+  "scope": "exact isolated run only; shared services/keytab unchanged",
+  "supplemental_source_diagnostic": {
+    "owned_nfs_source_removed": true,
+    "scope": "only this run, no shared service change",
+    "local_fixture_and_unused_destination_removed": true,
+    "payload_exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "all_payload_commands_succeeded": true,
+    "original_cleanup_preserved": "cleanup.before-nfs-source-long-retry.json"
+  }
+}

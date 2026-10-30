@@ -1,0 +1,18 @@
+{
+  "private_configs_removed": 4,
+  "ticket_caches_removed": 0,
+  "remaining_private_configs_or_ticket_caches": 0,
+  "binary_files_removed": [
+    "attempt-probe-bin",
+    "buffer-bin",
+    "hdfs-cleanup",
+    "pipeline-attempt-probe-bin",
+    "pipeline-bin",
+    "probe-bin",
+    "qos-bin",
+    "qos-cleanup",
+    "source-probe"
+  ],
+  "scope": "only this isolated run; shared keytab/services unchanged",
+  "data_fixture_directories_remaining": []
+}

@@ -1,0 +1,41 @@
+{
+  "candidate_sha256": "0070c0b704ae2c22fd1af5635c76d878f45c8ca9e6963e47ef6087dbcb792a74",
+  "status": "rejected and all production Rust changes rolled back to9b; no new performance optimization accepted",
+  "reason": "original-target raw regression gates and Local fast-target raw regression gates below98%; preserve failures and uncertainty; user requires no regression",
+  "preserved_source_snapshot": "candidate-source-snapshot",
+  "restored_files": [
+    {
+      "path": "crates/backend-s3/src/backend/staged.rs",
+      "restored_9b_sha256": "78794d108024fcbbbab826f954e55cb6851ac6b084cdb69179d0b516ed471976"
+    },
+    {
+      "path": "crates/backend-s3/src/backend/tests.rs",
+      "restored_9b_sha256": "2f825c2d8d1be1b1b9b47c82867677c28e4e986cca343eaf0ab960b3517bb53c"
+    },
+    {
+      "path": "crates/storage-core/src/storage/roles.rs",
+      "restored_9b_sha256": "e76cdfa797b962a63ea2ebd69683c95c2eef17f876c79b5579e4f9b5054e4393"
+    },
+    {
+      "path": "crates/transfer/src/transfer/engine/payload.rs",
+      "restored_9b_sha256": "5a564df1c2fcef9ab211bd4d70a9a2f1331f6b879e6b49f347473e240768f0ff"
+    },
+    {
+      "path": "crates/transfer/src/transfer/engine/producer.rs",
+      "restored_9b_sha256": "4b384f55b6a8ed17ee905affef2739f0729bb033aa96248d628b93ef97800ba1"
+    },
+    {
+      "path": "crates/transfer/src/transfer/engine/producer_tests.rs",
+      "restored_9b_sha256": "0ac75db6bf60138a8cc393f90de00f372cf698185baea94135171ae7906bd863"
+    },
+    {
+      "path": "crates/transfer/src/transfer/mod.rs",
+      "restored_9b_sha256": "aa0784298f9876b76c5d80eaad84d21e5af97b20b67d1d20e2437a69ed645c53"
+    },
+    {
+      "path": "crates/transfer/src/transfer/s3_input_buffer_tests.rs",
+      "restored_9b_sha256": null
+    }
+  ],
+  "remaining_changes": "acceptance tooling correctness, paired controls, isolation/lifecycle and report only; existing HTTP pool fix retained"
+}

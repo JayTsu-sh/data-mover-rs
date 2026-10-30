@@ -1,0 +1,11 @@
+{
+  "medians": {
+    "old-baseline": 764.2073488709067,
+    "old-high": 767.26054505539,
+    "fixed-baseline": 762.7040418929271,
+    "fixed-high": 766.4926983546835
+  },
+  "old_ratio": 1.0039952457785106,
+  "fixed_ratio": 1.0049674005297697,
+  "diagnostic_only": true
+}

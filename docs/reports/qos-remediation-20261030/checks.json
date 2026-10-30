@@ -1,0 +1,2526 @@
+[
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-strict",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-strict",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-strict",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "bandwidth-dual",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "bandwidth-dual",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "bandwidth-dual",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "iops-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "iops-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "iops-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "iops-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "bandwidth_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "bandwidth_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "bandwidth_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "bandwidth_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "bandwidth_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "bandwidth_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "bandwidth_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "iops_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "iops_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "iops_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "iops_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "iops_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "iops_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "iops_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-local",
+    "case": "combined",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "bandwidth_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "bandwidth_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "bandwidth_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "bandwidth_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "bandwidth_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "bandwidth_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "bandwidth_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "iops_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "iops_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "iops_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "iops_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "iops_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "iops_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "iops_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-hdfs",
+    "case": "combined",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "iops_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "iops_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "iops_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "iops_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "iops_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "iops_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "cifs-to-s3",
+    "case": "combined",
+    "name": "iops_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "bandwidth_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "bandwidth_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "bandwidth_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "bandwidth_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "bandwidth_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "bandwidth_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "bandwidth_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "iops_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "iops_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "iops_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "iops_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "iops_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "iops_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "iops_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-cifs",
+    "case": "combined",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "bandwidth-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "iops-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "bandwidth_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "bandwidth_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "bandwidth_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "bandwidth_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "iops_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "iops_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "iops_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "iops_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "iops_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "iops_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "nfs41-to-s3",
+    "case": "combined",
+    "name": "iops_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "bandwidth-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "iops-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "bandwidth_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "bandwidth_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "bandwidth_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "bandwidth_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "iops_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "iops_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "iops_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "iops_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "iops_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "iops_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "local-to-s3",
+    "case": "combined",
+    "name": "iops_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "bandwidth-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "iops-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "bandwidth_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "iops_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "iops_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "iops_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "iops_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "iops_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "iops_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "hdfs-to-s3",
+    "case": "combined",
+    "name": "iops_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-strict",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "bandwidth-dual",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "iops-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "bandwidth_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "bandwidth_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "bandwidth_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "bandwidth_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "bandwidth_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "iops_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "iops_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "iops_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "iops_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "iops_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "iops_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "iops_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-s3",
+    "case": "combined",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-strict",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "bandwidth-dual",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-dual",
+    "name": "hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-dual",
+    "name": "soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-dual",
+    "name": "steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "iops-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "bandwidth_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "bandwidth_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "bandwidth_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "bandwidth_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "bandwidth_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "bandwidth_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "bandwidth_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "iops_end_to_end_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "iops_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "iops_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "iops_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "iops_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "iops_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "iops_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "s3-to-nfs41",
+    "case": "combined",
+    "name": "s3_payload_requests_no_inflation",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "actual": 8318754.074592457,
+    "soft": 8388608,
+    "ratio": 0.9916727631798335
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-strict",
+    "name": "hard_envelope",
+    "passed": true,
+    "steady_rate": 8384648.920469066
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-strict",
+    "name": "soft_envelope",
+    "passed": true,
+    "steady_rate": 8384648.920469066
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-strict",
+    "name": "steady_ceiling",
+    "passed": true,
+    "steady_rate": 8384648.920469066
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "steady_rate": 8384648.920469066
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true,
+    "ideal_seconds": 128.0,
+    "minimum_seconds": 128.0
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "actual": 8355116.790976067,
+    "soft": 8388608,
+    "ratio": 0.9960075367660602
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-dual",
+    "name": "hard_envelope",
+    "passed": true,
+    "steady_rate": 8388608.31139625
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-dual",
+    "name": "soft_envelope",
+    "passed": true,
+    "steady_rate": 8388608.31139625
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-dual",
+    "name": "steady_ceiling",
+    "passed": true,
+    "steady_rate": 8388608.31139625
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "steady_rate": 8388608.31139625
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "bandwidth-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-strict",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "actual": 3.9682162990479215,
+    "soft": 4,
+    "ratio": 0.9920540747619804
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-strict",
+    "name": "hard_envelope",
+    "passed": true,
+    "steady_rate": 3.999886303021306
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-strict",
+    "name": "soft_envelope",
+    "passed": true,
+    "steady_rate": 3.999886303021306
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-strict",
+    "name": "steady_ceiling",
+    "passed": true,
+    "steady_rate": 3.999886303021306
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-strict",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "steady_rate": 3.999886303021306
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-strict",
+    "name": "minimum_ideal_duration",
+    "passed": true,
+    "ideal_seconds": 128.0,
+    "minimum_seconds": 128.0
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-dual",
+    "name": "end_to_end_at_least_98_percent",
+    "passed": true,
+    "actual": 4.030082599610937,
+    "soft": 4,
+    "ratio": 1.0075206499027343
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-dual",
+    "name": "hard_envelope",
+    "passed": true,
+    "steady_rate": 3.999999434947452
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-dual",
+    "name": "soft_envelope",
+    "passed": true,
+    "steady_rate": 3.999999434947452
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-dual",
+    "name": "steady_ceiling",
+    "passed": true,
+    "steady_rate": 3.999999434947452
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-dual",
+    "name": "steady_at_least_98_percent",
+    "passed": true,
+    "steady_rate": 3.999999434947452
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-dual",
+    "name": "steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "iops-dual",
+    "name": "burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "bandwidth_end_to_end_98_percent",
+    "passed": true,
+    "ratio": 1.007543398402526
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "bandwidth_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "bandwidth_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "bandwidth_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "bandwidth_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "bandwidth_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "bandwidth_burst_observed",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "iops_end_to_end_98_percent",
+    "passed": true,
+    "ratio": 1.007543398402526
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "iops_hard_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "iops_soft_envelope",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "iops_steady_ceiling",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "iops_steady_window_after_peak",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "iops_steady_at_least_98_percent",
+    "passed": true
+  },
+  {
+    "profile": "local-to-local",
+    "case": "combined",
+    "name": "iops_burst_observed",
+    "passed": true
+  }
+]

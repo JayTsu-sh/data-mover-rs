@@ -1,0 +1,20 @@
+{
+  "all_succeeded": true,
+  "utc": "2026-10-30T14:21:24.282863+00:00",
+  "removed": [
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local/fixtures",
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local/destination",
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local-final/fixtures",
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local-final/source",
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local-final/destination",
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local-retained/fixtures",
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local-retained/source",
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local-retained/destination",
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local-sustained/fixtures",
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local-sustained/source",
+    "/work/qos-remediation-20261030/nightly-qos-remediation-local-sustained/destination",
+    "/work/qos-remediation-20261030/local-final-preparation-error/fixtures",
+    "/work/qos-remediation-20261030/local-final-preparation-error/destination"
+  ],
+  "preserved": "raw measurement JSON/stderr, plans, configs, available reconstruction blocks and manifests"
+}

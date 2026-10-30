@@ -1,0 +1,49 @@
+{
+  "all_succeeded": true,
+  "utc": "2026-10-30T14:31:41.664961+00:00",
+  "local_removed": [
+    "/work/qos-remediation-20261030/profiles.private.json",
+    "/work/qos-remediation-20261030/cifs.private.json",
+    "/work/qos-remediation-20261030/baseline-bin",
+    "/work/qos-remediation-20261030/cleanup-bin",
+    "/work/qos-remediation-20261030/probe-bin",
+    "/work/qos-remediation-20261030/candidate-bin",
+    "/work/qos-remediation-20261030/candidate-cleanup",
+    "/work/qos-remediation-20261030/final-bin",
+    "/work/qos-remediation-20261030/final-cleanup",
+    "/work/qos-remediation-20261030/retained-bin",
+    "/work/qos-remediation-20261030/retained-cleanup",
+    "/work/qos-remediation-20261030/hash-tools"
+  ],
+  "binary_sha256_before_removal": {
+    "baseline-bin": "9b56c318e8547d358eadc4bbc05914cce34fc9a4683d784a869216905376e4dd",
+    "cleanup-bin": "30c3b76e54e193f1310460c358b60e2ca1f99084bce5e2a3fb2b2a4d4f14a911",
+    "probe-bin": "05c61548191ec107aac9e4d9165728973aa34152ccde72ce601b0597cdb5e884",
+    "candidate-bin": "046c57bc3fb349efbba65b36aec7efab1d4ee1621cf6895544d82bb1d13f9278",
+    "candidate-cleanup": "9aa19c6f8a3f68f37fe345bd3e6f54b32ca8cbedc34c9174d65ed616b53d5a01",
+    "final-bin": "eab6995bd1d81f859788084fd8c3d4535acb99188c2880bd451ea4392d1faeaf",
+    "final-cleanup": "571d0c989d7a975601dee5141d02599297c20cb2f64809a111bdb0438c27081f",
+    "retained-bin": "9b56c318e8547d358eadc4bbc05914cce34fc9a4683d784a869216905376e4dd",
+    "retained-cleanup": "30c3b76e54e193f1310460c358b60e2ca1f99084bce5e2a3fb2b2a4d4f14a911"
+  },
+  "remote": {
+    "all_succeeded": true,
+    "utc": "2026-10-30T14:29:19.748288+00:00",
+    "removed": [
+      "/tmp/nightly-qos-remediation-20261030/profiles.private.json",
+      "/tmp/nightly-qos-remediation-20261030/cifs.private.json",
+      "/tmp/nightly-qos-remediation-20261030/baseline-bin",
+      "/tmp/nightly-qos-remediation-20261030/candidate-bin",
+      "/tmp/nightly-qos-remediation-20261030/candidate-cleanup",
+      "/tmp/nightly-qos-remediation-20261030/cleanup-bin",
+      "/tmp/nightly-qos-remediation-20261030/final-bin",
+      "/tmp/nightly-qos-remediation-20261030/final-cleanup",
+      "/tmp/nightly-qos-remediation-20261030/probe-bin"
+    ],
+    "owned_credential_caches_absent": [
+      "/tmp/nightly-qos-remediation-20261030/unused.ccache"
+    ],
+    "shared_keys_keytabs_services_and_vm_settings": "unchanged"
+  },
+  "scope": "temporary copies in this exact run only; /work/cargo-target release output, source snapshots, shared SSH keys/keytab/services preserved"
+}
