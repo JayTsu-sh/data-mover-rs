@@ -327,9 +327,9 @@ backend, but it needs the endpoint the scan ran on: `ObservedEntry::decode_snaps
 `SnapshotDecodeError::BackendMismatch` for a whole generation means the endpoint moved or is
 spelled differently; treat it as no previous generation. The only entry format is **DMES v10**,
 including entries without history. Other versions return `UnsupportedVersion` and require a fresh
-scan. Every format change increments the version byte and updates golden-byte fixtures. This is
-a development policy; before release, choose N-1 decoding or a documented migration/rescan path
-([ADR-0008](../adr/0008-streaming-traversal-and-object-history.md)).
+scan. Every format change increments the version byte and updates golden-byte fixtures. Under the
+first-version policy in [AGENTS.md](../../AGENTS.md), historical codecs and fixtures are discarded;
+only the current format is maintained ([ADR-0008](../adr/0008-streaming-traversal-and-object-history.md)).
 
 Local observations carry optional inline `RenameEvidence` separately from runtime `dev + ino`.
 Its 16 bytes encode `ino_be64 || btime_ns_i64_be`; missing or overflowing birth times produce no

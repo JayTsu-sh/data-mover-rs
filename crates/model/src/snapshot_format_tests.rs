@@ -193,7 +193,10 @@ fn the_current_format_is_pinned_byte_for_byte() {
 fn another_version_byte_is_unsupported_never_misread() {
     assert_eq!(VERSION, 10);
     for (name, entry, golden) in fixtures() {
-        for version in [4, 5, 6, 7, 8, 9, 11, 0, u8::MAX] {
+        for version in u8::MIN..=u8::MAX {
+            if version == VERSION {
+                continue;
+            }
             let mut bytes = unhex(golden);
             bytes[4] = version;
             assert_eq!(
