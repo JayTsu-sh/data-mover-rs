@@ -451,6 +451,32 @@ pub trait StagedDestination: Send + Sync {
             .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
         ))
     }
+    /// 是否支持保留未触及区间的原地补丁；不能用会截断文件的 positioned writer 替代。
+    fn supports_sparse_patch(&self) -> bool {
+        false
+    }
+
+    /// 应用已验证且按 offset 递增、不重叠的补丁，再调整最终长度。
+    /// 调用方必须在写入前完成所有 basis 读取，失败可能留下部分更新。
+    async fn patch_direct(
+        &self,
+        stage: &PreparedStage,
+        _input: PositionedByteStream,
+        _final_size: u64,
+        _cancel: CancellationToken,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        Err(StorageRoleFailure::Entry(
+            EntryOperationFailure::new(
+                stage.final_destination().path().clone(),
+                Operation::Write,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "sparse direct patches are unsupported",
+            )
+            .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+        ))
+    }
+
     /// Target capabilities for baseline metadata copied by the ordinary transfer entry. `None`
     /// takes the destination out of metadata altogether — no plan, no report — so a destination
     /// that stores nothing should say so with a target whose `stores_nothing()` holds: every

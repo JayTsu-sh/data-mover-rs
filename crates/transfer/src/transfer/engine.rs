@@ -24,8 +24,12 @@ use publication::{content_mismatch, discard_stale_stage, verify_published};
 mod at_destination;
 mod checkpointed;
 mod delete_marker;
+mod direct_patch;
 mod directory_object;
 mod expert;
+pub use direct_patch::{
+    DirectPatchChunk, DirectPatchError, DirectPatchInput, DirectPatchProgress, DirectPatchSession,
+};
 mod failure;
 mod guard;
 mod native;

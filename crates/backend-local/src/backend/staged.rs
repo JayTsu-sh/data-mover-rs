@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -26,15 +27,17 @@ use crate::model::{
 use crate::storage::artifacts::{ArtifactKind, is_artifact_native};
 use crate::storage::durability::sync_directory;
 use crate::storage::{
-    ByteStream, CheckpointObservation, DestinationPrepareRequest, MetadataMutation, PrepareRequest,
-    PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest, StagedDestination,
-    StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence, VerifyRequest,
-    WriteEvidence,
+    ByteStream, CheckpointObservation, DestinationPrepareRequest, MetadataMutation,
+    PositionedByteStream, PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure,
+    PublishRequest, StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure,
+    VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 mod at_destination;
 mod checkpoint;
 mod direct;
+#[cfg(unix)]
+mod direct_patch;
 mod directory_sync;
 mod hash_checkpoint;
 #[cfg(unix)]
@@ -853,10 +856,36 @@ impl StagedDestination for LocalStagedDestination {
     async fn prepare_direct(
         &self,
         request: PrepareRequest,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<PreparedStage, StorageRoleFailure> {
         self.open_direct(request, cancel).await
     }
+    fn supports_sparse_patch(&self) -> bool {
+        cfg!(unix)
+    }
+
+    async fn patch_direct(
+        &self,
+        stage: &PreparedStage,
+        input: PositionedByteStream,
+        final_size: u64,
+        cancel: CancellationToken,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        #[cfg(unix)]
+        {
+            direct_patch::apply(self, stage, input, final_size, cancel).await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (input, final_size, cancel);
+            Err(failure(
+                stage.final_destination().path(),
+                Operation::Write,
+                FailureClass::Unsupported,
+            ))
+        }
+    }
+
     fn copied_metadata_target(&self) -> Option<crate::storage::CopiedMetadataTarget> {
         #[cfg(unix)]
         {
@@ -969,7 +998,7 @@ impl StagedDestination for LocalStagedDestination {
     async fn write_positioned(
         &self,
         stage: &PreparedStage,
-        input: crate::storage::PositionedByteStream,
+        input: PositionedByteStream,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
         positioned::write(self, stage, input).await
     }
@@ -1137,7 +1166,7 @@ impl StagedDestination for LocalStagedDestination {
         &self,
         stage: &PreparedStage,
         mutation: MetadataMutation,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
         if cancel.is_cancelled() {
             return Err(failure(
@@ -1182,7 +1211,7 @@ impl StagedDestination for LocalStagedDestination {
         &self,
         stage: &PreparedStage,
         mutations: Vec<MetadataMutation>,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<(), StagedMetadataApplicationFailure> {
         if mutations.is_empty() {
             return Ok(());
