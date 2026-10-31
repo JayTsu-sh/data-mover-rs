@@ -1,10 +1,12 @@
 # 元数据协商（拷贝带什么、谁能否决）
 
 > 场景：要打开或关闭 ACL / xattr 的拷贝、排查 S3→S3 object tags 为什么没带上、给新 backend 声明能力。
-> 代码：`src/transfer/model.rs`（请求）· `src/transfer/engine/negotiation.rs`（协商）·
-> `src/metadata/compile.rs`（规划）· `src/metadata/mod.rs`（应用）· `src/storage/roles.rs`（目的端能力）。
+> 代码：`crates/transfer/src/transfer/model.rs`（请求）· `crates/transfer/src/transfer/engine/negotiation.rs`（协商）·
+> `crates/metadata/src/metadata/compile.rs`（规划）· `crates/metadata/src/metadata/mod.rs`（应用）·
+> `crates/storage-core/src/storage/roles/metadata.rs`（元数据角色）·
+> `crates/storage-core/src/storage/copied_metadata.rs`（目的端能力）。
 
-## 默认复制规则（2026-09-23；严格 ACL 为 2026-10-28 显式新增选项）
+## 默认复制规则与当前 ACL 策略
 
 - **should**（要拷什么）由调用方给 —— terrasync-rs 的命令行 —— 对 data-mover 是用户输入，
   但**用户输入错误由上层处理**：data-mover 从不因「要了做不到」而失败。
@@ -162,8 +164,7 @@ m1-source NFSv3 文件 → Local 均成功并报该损失；`/usr/bin/passwd`（
 偏保守的角落（报损失，从不失败）：uid 是自己但 gid 不在所在组时，整族按 `OwnerAndGroupNotPermitted` 记、
 set-id 也去掉，尽管 uid 实际留住了；内核还允许 chgrp 到文件**当前**的 gid（从 setgid 父目录继承来的组），
 这里不认。能力在连接时读一次：之后凭据变少会回到「写被拒、文件失败」，不会静默出错。
-专家接口 `with_metadata_plan` 给的 `Numeric` 不经这一步，调用方可自己问 `may_set_owner`；
-legacy `src/local.rs` 的 `lchown` 未改。
+专家接口 `with_metadata_plan` 给的 `Numeric` 不经这一步，调用方可自己问 `may_set_owner`。
 
 ## 两条必须记住的不变式
 

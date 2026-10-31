@@ -2,6 +2,11 @@
 
 日期：2026-10-28。实施依据：[双向映射研究](../research/nfs-acl-bidirectional-mapping.md)。
 
+本文的实机数据、拒绝用例、接口和命令记录的是当时的严格 ACL 复制实现。复制策略后来已改为自动投影及损失报告；
+不能用本报告的旧复制接口或预期拒绝结果代替当前调用说明或当前策略的实机验收。当前入口见下文
+[当前调用接口](#当前调用接口)，策略见[元数据协商](../../.claude/docs/metadata-negotiation.md#acl-自动复制与错误报告)，
+后续自动投影实机证据见[自动 ACL 验收](2026-10-28-auto-acl-validation.md)。严格完整性比对接口仍然有效。
+
 ## 结果
 
 已实现 NFSv3 原生 POSIX ACL、NFSv4 原生 ACL 保留、双向受限映射，以及严格完整性比对。
@@ -41,7 +46,28 @@ data-mover-test/integrity-plan/acl-four-20261028-final-2000/
 原生协议专测根在两台 Linux 上均为 `acl-four-20261028-native-protocol-1828/`。
 仅创建和更改隔离测试数据；未修改服务器配置、身份数据库或导出策略。临时客户端挂载均已卸载。
 
-## 实现接口
+## 当前调用接口
+
+```rust
+// 请求 ACL 复制；普通文件自动投影，并报告未复制项或保守回退。
+CopiedMetadataRequest::default().with_acl();
+
+// 完整性比对独立选择原生配置或受限的当前文件访问等价。
+IntegrityPlan::default().with_required_acl();
+IntegrityPlan::default().with_acl_equivalence();
+```
+
+复制侧已移除 `with_required_acl()`、`with_acl_mapping()` 和 `RequireEquivalent` 策略。
+读取、写入及读回验证失败仍使复制失败；无法完整映射时的未复制项由
+`MetadataApplicationReport::acl_copy_report()` 报告，不能安全投影时使用拒绝数据访问的 ACL 并明确标记。
+`IntegrityPlan` 的严格比对仍要求完整证据，不能因为复制成功或已生成损失报告就认定 ACL 匹配。
+
+实现分别见 [CopiedMetadataRequest](../../crates/transfer/src/transfer/model.rs)、
+[ACL 规划](../../crates/metadata/src/metadata/acl_mapping.rs)和
+[严格完整性比对](../../crates/integrity/src/integrity/acl.rs)。当前工具 `nfs_metadata_copy` 使用 `--acl`；
+下文保留的严格复制命令仅用于解释历史实验。
+
+## 实现阶段接口（历史记录）
 
 ```rust
 // 原生配置必须保存，不能因能力不足而跳过。
@@ -52,9 +78,6 @@ IntegrityPlan::default().with_required_acl();
 CopiedMetadataRequest::default().with_acl_mapping();
 IntegrityPlan::default().with_acl_equivalence();
 ```
-
-旧 `IntegrityPlan { acl, xattrs }` 字面量需补充 `..IntegrityPlan::default()`；对新增
-`RequireEquivalent` / `Equivalent` / `AclMappingRejected` 等枚举变体的穷尽匹配也需更新。
 
 普通 `with_acl()` 仍按原有 BestEffort 规则报告不支持/编码不匹配。严格选择不会把 required ACL
 缺失、不可比或失败变成成功。严格复制同时要求能够保留 numeric owner/group。
@@ -210,3 +233,30 @@ capability 默认值断言，未发布任何 registry 产物；修复后使用�
 73 bytes，反例目的文件不存在。新控制文件保留在上文运行根的 `complex-src` 与 `complex-dst`；
 原四方向具名夹具继续保留。见 [原始日志](2026-10-28-nfs-acl-registry-0.9.1.log) 和
 [结构化结果](2026-10-28-nfs-acl-registry-0.9.1-results.json)。
+
+## 遗留 ACL 工作树的移植判断（2026-10-31）
+
+对照 GitHub main `4e0b879b73418734be260fac58ba45ee983e74ed` 与
+`/tmp/data-mover-nfs-acl-review` 的实际暂存、冲突及未跟踪内容，按独立 crate 的当前路径映射核查。
+共 48 份文件均有当前对应位置：13 份与当前内容相同，46 份完整内容存在于主分支历史；
+另两份是仍写 vendor 0.8.6 的旧依赖说明和包含 `PoisonError` 引用写法冲突的测试文件。
+这些数量只用于定位，是否移植以以下行为与测试检查为依据。
+
+| 旧稿中的合理要求 | 当前覆盖 | 处理 |
+| --- | --- | --- |
+| 原生 POSIX access/default、mask 潜在权限和有序 NFSv4 ACE 完整保留 | 共享 ACL codec、NFS `apply_acl` 写后完整读回及 `native_acl_tests` | 保留现行实现，不复制重复 codec |
+| 源文件替换或未知 owner 不能套用错误权限 | NFS `bound_entry` 与未知 owner 测试；现行权限角色还校验源版本 | 保留现行身份绑定，不恢复旧旁路 |
+| 恢复后核验 owner/group、特殊 mode 位及 ACL，不重写已发布文件 | `staged_acl` 与恢复反例测试 | 已覆盖，不重复移植 |
+| 严格比对不能忽略缺失、畸形、读取失败或 named 权限差异 | `integrity/acl`、`strict_acl_tests` 与旧稿对应文件内容一致 | 保留独立严格比对 |
+| 旧严格复制选择及缺失时拒绝 | 自动 ACL 投影、逐项损失报告、保守 ACL 和对应传输测试已替代 | 不恢复撤销的复制接口 |
+| ACL 源证据或策略变化不能复用另一元数据计划 | 当前 metadata binding 绑定源 ACL、mode、实际 mutation 与现行复制策略 | 保留现行绑定 |
+| 原生协议补丁与分层边界 | 正式 nfs-rs 0.9.1 和独立 ACL、metadata、integrity、backend crates | 不回迁 vendor 或单体模块 |
+
+两路语义复核未发现需要从旧工作树补入的运行时修复。应更新的内容是本报告的历史/当前接口区分、
+NFS 文档的失效锚点与元数据文档的旧接口标题和实现路由；本轮没有恢复旧 API，也没有修改历史测量结果。
+旧工作树及其冲突现场保持原样；本轮不据上述历史日志声称完成新的真实网络环境验收。
+
+本轮在 Rust 1.95.0 下完整重跑 `make ci`，2199 项通过、0 失败、46 项忽略；功能隔离、全目标 Clippy、
+示例构建及 Local E2E 均通过。其中逐项确认了 16 项相关现有测试，包括原始 mask/default/ACE 顺序读回、
+恢复时 owner/group/特殊 mode 位检查、四组合严格比对、源版本拒绝和自动 ACL 回退及遗漏绑定。
+这些是当前代码的自动化回归结果，不是本轮新增的真实网络 backend 验收。
