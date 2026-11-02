@@ -358,9 +358,11 @@ lease and directory-handle recovery remain operation-specific. S3 returns networ
 promptly, retains service retries for safe reads/idempotent parts, and disables automatic
 replay of uncertain writes. Service errors and throttling remain distinct from transport loss.
 
-`traversal::recoverable_scan` starts a default three-second wall-clock window at
-first fault detection. One reconnect/probe task verifies the original failed
-read, including its phase, plan, identity/version and listing page, while the old
+`traversal::recoverable_traversal` starts an explicitly selected wall-clock window at
+first fault detection. Ordinary listing and traversal do not enable recovery implicitly;
+applications choose budgets per use case (for example, three seconds for scans).
+One reconnect/probe task verifies the original failed read, including its phase,
+plan, identity/version and listing page, while the old
 attempt drains. Consumer backpressure cannot pause this deadline. A successful
 probe ends recovery before normal checkpoint rebuilding; a failed window reports
 its first typed cause. Active directories can replay under the checkpoint/history

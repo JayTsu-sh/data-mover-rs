@@ -46,10 +46,11 @@ remain `Protocol` / `Unknown`. SMB uses `Error::network_failure()` and retains u
 mutation outcomes. S3 interrupted HTTP bodies are transport loss; complete malformed XML
 and HTTP 5xx are protocol failures, with transient 5xx retried only where the operation permits safe service retries.
 All operations share `connect_backend`; backends do not branch on whether a caller is scanning.
-`traversal::recoverable_scan` and `ScanFailureSignal` own the scan-only recovery window (three
-seconds after the first detected fault) and scan operation deadlines; applications own task
-status and presentation. Transport failures surface after the client's bounded recovery rather
-than starting another backend network backoff. Non-scan retries are decided per operation:
+`traversal::recoverable_traversal` owns the caller-selected recovery window after the first
+detected fault; `ScanFailureSignal` supplies independent operation deadlines. Ordinary listing
+and traversal do not enable recovery implicitly. Applications select budgets (such as three
+seconds for scans) and own task status and presentation. Transport failures surface after the
+client's bounded recovery rather than starting another backend network backoff. Non-scan retries are decided per operation:
 stateless page/service retries and invalid-handle recovery differ from replay-sensitive writes.
 HDFS separates explicit `Connectivity` and `Timeout` from other I/O and unknown RPC errors;
 unknown server exceptions are `Protocol`, not evidence of a lost connection.

@@ -1,4 +1,4 @@
-//! Reconnect remote scans within one recovery window and resume safe directory positions.
+//! Reconnect remote traversals within a caller-selected window and resume safe positions.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,12 +26,13 @@ use probe::{Probe, ProbeContext};
 mod tests;
 
 /// Opens a fresh connection with the same endpoint identity and listing semantics.
-pub type ScanReconnect =
+pub type TraversalReconnect =
     Arc<dyn Fn() -> BoxFuture<'static, Result<Storage, BackendConnectError>> + Send + Sync>;
 
-/// Independent native-operation and reconnect budgets for a remote scan.
+/// Caller-selected native-operation and reconnect budgets for a remote traversal.
+/// Ordinary traversals do not enable this policy implicitly.
 #[derive(Clone, Copy, Debug)]
-pub struct ScanRecoveryPolicy {
+pub struct TraversalRecoveryPolicy {
     /// A native operation deadline; `None` preserves native protocol deadlines.
     pub operation_timeout: Option<Duration>,
     /// Wall-clock budget from the first detected fault through reconnection and
@@ -40,18 +41,9 @@ pub struct ScanRecoveryPolicy {
     pub recovery_window: Duration,
 }
 
-impl Default for ScanRecoveryPolicy {
-    fn default() -> Self {
-        Self {
-            operation_timeout: None,
-            recovery_window: Duration::from_secs(3),
-        }
-    }
-}
-
 /// Recovery activity; only `Failed` represents exhausted network recovery.
 #[derive(Clone, Debug)]
-pub enum ScanRecoveryState {
+pub enum TraversalRecoveryState {
     /// The faulting operation/path succeeded, or scanning has not encountered a fault.
     Running { recoveries: u64 },
     /// Native failure is being drained or a fresh connection is being tried.
@@ -65,15 +57,15 @@ pub enum ScanRecoveryState {
 
 /// Out-of-band recovery activity and the final typed network failure.
 #[derive(Clone)]
-pub struct ScanRecoveryStatus {
-    state: watch::Receiver<ScanRecoveryState>,
+pub struct TraversalRecoveryStatus {
+    state: watch::Receiver<TraversalRecoveryState>,
     failure: ScanFailureSignal,
 }
 
-impl ScanRecoveryStatus {
+impl TraversalRecoveryStatus {
     /// Observes recovery independently of traversal output backpressure.
     #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<ScanRecoveryState> {
+    pub fn subscribe(&self) -> watch::Receiver<TraversalRecoveryState> {
         self.state.clone()
     }
 
@@ -84,7 +76,8 @@ impl ScanRecoveryStatus {
     }
 }
 
-/// Scans with fresh connections and checkpoint recovery after native network failures.
+/// Traverses with fresh connections and checkpoint recovery after native network failures.
+/// The caller explicitly selects a recovery window; no scan budget is applied by default.
 ///
 /// Active directories may be replayed. Delivered items keep their order and complete history
 /// groups; completion totals describe the final resumed traversal, as for ordinary resume.
@@ -92,15 +85,15 @@ impl ScanRecoveryStatus {
 ///
 /// # Errors
 /// Rejects invalid operation deadlines or unavailable traversal roles before starting.
-pub fn recoverable_scan(
+pub fn recoverable_traversal(
     initial: &Storage,
     request: TraversalRequest,
-    policy: ScanRecoveryPolicy,
-    reconnect: ScanReconnect,
-) -> Result<(TraversalSession, ScanRecoveryStatus), ScanSetupError> {
+    policy: TraversalRecoveryPolicy,
+    reconnect: TraversalReconnect,
+) -> Result<(TraversalSession, TraversalRecoveryStatus), ScanSetupError> {
     let (source, signal) = ScanFailureSignal::source(initial, policy.operation_timeout)?;
     let failure = ScanFailureSignal::new(initial.kind(), policy.operation_timeout);
-    let (state, receiver) = watch::channel(ScanRecoveryState::Running { recoveries: 0 });
+    let (state, receiver) = watch::channel(TraversalRecoveryState::Running { recoveries: 0 });
     let (items, output) = channel::channel(DEFAULT_MAX_BUFFERED_ITEMS);
     let (completion, result) = oneshot::channel();
     let session = TraversalSession::new(
@@ -113,7 +106,7 @@ pub fn recoverable_scan(
         items,
         completion: Some(completion),
     };
-    let status = ScanRecoveryStatus {
+    let status = TraversalRecoveryStatus {
         state: receiver,
         failure: failure.clone(),
     };
@@ -140,10 +133,10 @@ struct Window {
 
 struct Recovery {
     request: TraversalRequest,
-    policy: ScanRecoveryPolicy,
-    reconnect: ScanReconnect,
+    policy: TraversalRecoveryPolicy,
+    reconnect: TraversalReconnect,
     producer: TraversalProducer,
-    state: watch::Sender<ScanRecoveryState>,
+    state: watch::Sender<TraversalRecoveryState>,
     failure: ScanFailureSignal,
     window: Option<Window>,
     checkpoint: Option<Checkpoint>,
@@ -202,7 +195,7 @@ impl Recovery {
             window.budget.complete();
         }
         self.recoveries = self.recoveries.saturating_add(1);
-        self.state.send_replace(ScanRecoveryState::Running {
+        self.state.send_replace(TraversalRecoveryState::Running {
             recoveries: self.recoveries,
         });
     }
@@ -252,7 +245,7 @@ impl Recovery {
             return Err(TraversalTerminalFailure::Internal);
         };
         self.failure.publish_failure(window.first.clone());
-        self.state.send_replace(ScanRecoveryState::Failed {
+        self.state.send_replace(TraversalRecoveryState::Failed {
             failure: window.first.clone(),
         });
         Err(TraversalTerminalFailure::Session(final_failure(

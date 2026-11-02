@@ -34,7 +34,7 @@ Rust 库，Edition 2024；具体依赖版本和固定 Git 提交以 `Cargo.toml`
 ## 公开入口
 
 - `storage::connect_backend(BackendConfig)` 建立连接并返回 `Storage` 角色集合。
-- 扫描与普通操作共用 `storage::connect_backend`；扫描恢复窗口只在 `traversal::recoverable_scan`。
+- 扫描与普通操作共用 `storage::connect_backend`；恢复窗口由调用方通过 `traversal::recoverable_traversal` 显式选择。
 - 配置类型和 NFS / S3 发现工具从 `storage` 导出。
 - HDFS 客户端构造辅助入口也从 `storage` 导出，协议实现仍在 HDFS backend。
 - Windows ACL 工具为 `storage::windows_acl`，角色路径使用能力目录内的文件句柄。
@@ -48,13 +48,14 @@ Rust 库，Edition 2024；具体依赖版本和固定 Git 提交以 `Cargo.toml`
 - `crates/traversal/src/traversal/scan.rs` 的 `ScanFailureSignal` 包装 namespace / metadata
   读取，记录首个原始网络故障并提供旁路信号；`operation_timeout=None` 沿用原生有界时限，
   显式时限只限制存储操作，不覆盖消费方等待。持有句柄的原生调用在调用方提前结束等待后仍完成清理。
-- `recovery.rs` / `recovery/probe.rs` 的 `recoverable_scan` 从首次故障识别开始，使用默认 3 秒墙钟窗口，
+- `recovery.rs` / `recovery/probe.rs` 的 `recoverable_traversal` 从首次故障识别开始，使用调用方显式提供的墙钟窗口，
   重连、退避和原故障操作验证共用截止时间，消费方背压不能暂停。单个有界 probe 与旧流安全排空并行；
   `scan/probe.rs` 只验证原路径、读取阶段、plan、identity/version 和列举页序，probe 结果不作为扫描条目输出。
   验证成功即进入 Running，随后在旧流与完整 history 排空后，从安全目录检查点正常重建；活跃目录可重放。
-  因而正常重建可以超过 3 秒，但 Recovering 状态不能靠健康前缀或背压无限延长。
+  普通 list / traversal 不隐式启用恢复；应用可为扫描明确选择 3 秒。正常重建可以超过所选窗口，
+  但 Recovering 状态不能靠健康前缀或背压无限延长。
   原目录 page N 没有跨连接 continuation 时仍须读取前 N 页；无法在窗口内验证时保守失败并保留检查点。
-- `ScanRecoveryStatus` 提供 Running / Recovering / Failed 活动；其 `failure_signal()` 只在恢复
+- `TraversalRecoveryStatus` 提供 Running / Recovering / Failed 活动；其 `failure_signal()` 只在恢复
   最终失败时发布该窗口最早的原始故障，后续重连时限不覆盖明确断连。取消保持 Cancelled，
   不发布最终网络故障；检查点可见性与取消后的排空策略保持调用方选择。
 - 应用负责选择时限 / 恢复窗口以及持久化、CLI / Web 展示；不能把原生库改为全局扫描恢复器。

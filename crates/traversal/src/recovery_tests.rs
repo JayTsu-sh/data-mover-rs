@@ -229,14 +229,14 @@ fn fixture_storage(fixture: impl Namespace + Metadata + 'static) -> Storage {
     .unwrap()
 }
 
-fn policy() -> ScanRecoveryPolicy {
-    ScanRecoveryPolicy {
+fn policy() -> TraversalRecoveryPolicy {
+    TraversalRecoveryPolicy {
         operation_timeout: Some(Duration::from_millis(100)),
         recovery_window: Duration::from_millis(80),
     }
 }
 
-fn reconnect(fails: bool, calls: Arc<AtomicUsize>) -> ScanReconnect {
+fn reconnect(fails: bool, calls: Arc<AtomicUsize>) -> TraversalReconnect {
     Arc::new(move || {
         calls.fetch_add(1, Ordering::Relaxed);
         async move { Ok(storage(fails, false)) }.boxed()
@@ -256,7 +256,7 @@ async fn drain(mut session: TraversalSession) -> (Vec<String>, Outcome) {
 #[tokio::test]
 async fn reset_reconnects_without_skipping_paths_or_publishing_a_final_fault() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let (session, status) = recoverable_scan(
+    let (session, status) = recoverable_traversal(
         &storage(true, true),
         TraversalRequest::new(StoragePath::root()),
         policy(),
@@ -273,7 +273,7 @@ async fn reset_reconnects_without_skipping_paths_or_publishing_a_final_fault() {
     assert!(status.failure_signal().failure().is_none());
     assert!(matches!(
         *status.subscribe().borrow(),
-        ScanRecoveryState::Running { recoveries: 1 }
+        TraversalRecoveryState::Running { recoveries: 1 }
     ));
 }
 
@@ -281,7 +281,7 @@ async fn reset_reconnects_without_skipping_paths_or_publishing_a_final_fault() {
 async fn repeated_immediate_failures_share_one_recovery_budget() {
     let calls = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
-    let (session, status) = recoverable_scan(
+    let (session, status) = recoverable_traversal(
         &storage(true, false),
         TraversalRequest::new(StoragePath::root()),
         policy(),
@@ -300,37 +300,46 @@ async fn repeated_immediate_failures_share_one_recovery_budget() {
     );
     assert!(matches!(
         *status.subscribe().borrow(),
-        ScanRecoveryState::Failed { .. }
+        TraversalRecoveryState::Failed { .. }
     ));
 }
 
-#[tokio::test]
-async fn a_hanging_reconnect_expires_and_keeps_the_original_reset_cause() {
-    let connect: ScanReconnect = Arc::new(|| pending().boxed());
-    let (session, status) = recoverable_scan(
-        &storage(true, false),
-        TraversalRequest::new(StoragePath::root()),
-        policy(),
-        connect,
-    )
-    .unwrap();
-    let (_, outcome) = timeout(Duration::from_secs(1), drain(session))
-        .await
+#[tokio::test(start_paused = true)]
+async fn a_hanging_reconnect_uses_the_callers_window_and_keeps_the_original_reset_cause() {
+    for window in [Duration::from_millis(40), Duration::from_millis(140)] {
+        let connect: TraversalReconnect = Arc::new(|| pending().boxed());
+        let selected = TraversalRecoveryPolicy {
+            recovery_window: window,
+            ..policy()
+        };
+        let start = Instant::now();
+        let (session, status) = recoverable_traversal(
+            &storage(true, false),
+            TraversalRequest::new(StoragePath::root()),
+            selected,
+            connect,
+        )
         .unwrap();
-    assert!(
-        matches!(outcome, Err(TraversalTerminalFailure::Session(failure))
-        if failure.class() == FailureClass::Connectivity)
-    );
-    let failure = status.failure_signal().failure().unwrap();
-    assert_eq!(failure.kind, RemoteScanFailureKind::ConnectionLost);
-    assert_eq!(failure.path, StoragePath::root());
+        let (_, outcome) = timeout(Duration::from_secs(1), drain(session))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, Err(TraversalTerminalFailure::Session(failure))
+            if failure.class() == FailureClass::Connectivity)
+        );
+        assert!(start.elapsed() >= window);
+        assert!(start.elapsed() < window + Duration::from_millis(5));
+        let failure = status.failure_signal().failure().unwrap();
+        assert_eq!(failure.kind, RemoteScanFailureKind::ConnectionLost);
+        assert_eq!(failure.path, StoragePath::root());
+    }
 }
 
 #[tokio::test]
 async fn cancellation_during_recovery_is_cancelled_without_a_final_network_fault() {
     let cancel = CancellationToken::new();
-    let connect: ScanReconnect = Arc::new(|| pending().boxed());
-    let (session, status) = recoverable_scan(
+    let connect: TraversalReconnect = Arc::new(|| pending().boxed());
+    let (session, status) = recoverable_traversal(
         &storage(true, false),
         TraversalRequest::new(StoragePath::root()).cancel(cancel.clone()),
         policy(),
@@ -339,7 +348,7 @@ async fn cancellation_during_recovery_is_cancelled_without_a_final_network_fault
     .unwrap();
     let mut state = status.subscribe();
     let draining = tokio::spawn(drain(session));
-    while !matches!(*state.borrow(), ScanRecoveryState::Recovering { .. }) {
+    while !matches!(*state.borrow(), TraversalRecoveryState::Recovering { .. }) {
         state.changed().await.unwrap();
     }
     cancel.cancel();
@@ -354,11 +363,11 @@ async fn cancellation_during_recovery_is_cancelled_without_a_final_network_fault
 #[tokio::test]
 async fn native_faults_recover_even_without_an_operation_timeout() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let selected = ScanRecoveryPolicy {
+    let selected = TraversalRecoveryPolicy {
         operation_timeout: None,
         ..policy()
     };
-    let (session, status) = recoverable_scan(
+    let (session, status) = recoverable_traversal(
         &storage(true, false),
         TraversalRequest::new(StoragePath::root()),
         selected,
@@ -376,12 +385,12 @@ async fn native_faults_recover_even_without_an_operation_timeout() {
 #[tokio::test]
 async fn resumable_cancellation_drains_its_checkpoint_before_completion() {
     let cancel = CancellationToken::new();
-    let connect: ScanReconnect = Arc::new(|| pending().boxed());
+    let connect: TraversalReconnect = Arc::new(|| pending().boxed());
     let request = TraversalRequest::new(StoragePath::root())
         .resumable(Resumable::on())
         .cancel(cancel.clone());
     let (mut session, status) =
-        recoverable_scan(&storage(true, false), request, policy(), connect).unwrap();
+        recoverable_traversal(&storage(true, false), request, policy(), connect).unwrap();
     let mut state = status.subscribe();
     let draining = tokio::spawn(async move {
         let mut checkpoint = false;
@@ -390,7 +399,7 @@ async fn resumable_cancellation_drains_its_checkpoint_before_completion() {
         }
         (checkpoint, session.finish().await)
     });
-    while !matches!(*state.borrow(), ScanRecoveryState::Recovering { .. }) {
+    while !matches!(*state.borrow(), TraversalRecoveryState::Recovering { .. }) {
         state.changed().await.unwrap();
     }
     cancel.cancel();
@@ -413,9 +422,9 @@ async fn successful_listing_cannot_refresh_a_persistent_metadata_failure_window(
             children: Children::Both,
         })
     };
-    let connect: ScanReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
+    let connect: TraversalReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
     let started = Instant::now();
-    let (session, status) = recoverable_scan(
+    let (session, status) = recoverable_traversal(
         &broken(),
         TraversalRequest::new(StoragePath::root())
             .observation_plan(ObservationPlan::default().with_tags(ObservationMode::BestEffort)),
@@ -437,7 +446,7 @@ async fn successful_listing_cannot_refresh_a_persistent_metadata_failure_window(
 fn waiting_recovery() -> (Recovery, channel::ItemReceiver, ScanFailureSignal) {
     use std::num::NonZeroUsize;
     let (items, output) = channel::channel(NonZeroUsize::MIN);
-    let (state, _) = watch::channel(ScanRecoveryState::Running { recoveries: 0 });
+    let (state, _) = watch::channel(TraversalRecoveryState::Running { recoveries: 0 });
     let signal = ScanFailureSignal::new(BackendKind::Cifs, None);
     signal.publish_failure(RemoteScanFailure {
         backend: BackendKind::Cifs,
@@ -516,8 +525,8 @@ async fn inline_metadata_cannot_refresh_a_persistent_additional_rpc_failure_wind
             children: Children::Both,
         })
     };
-    let connect: ScanReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
-    let (session, status) = recoverable_scan(
+    let connect: TraversalReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
+    let (session, status) = recoverable_traversal(
         &broken(),
         TraversalRequest::new(StoragePath::root())
             .observation_plan(ObservationPlan::default().with_tags(ObservationMode::BestEffort)),
@@ -543,7 +552,7 @@ async fn a_clean_completed_attempt_recovers_when_the_faulting_path_disappears() 
             metadata: MetadataMode::Fails,
             children: Children::Both,
         });
-        let connect: ScanReconnect = Arc::new(move || {
+        let connect: TraversalReconnect = Arc::new(move || {
             async move {
                 Ok(fixture_storage(Fixture {
                     fails: false,
@@ -554,7 +563,7 @@ async fn a_clean_completed_attempt_recovers_when_the_faulting_path_disappears() 
             }
             .boxed()
         });
-        let (session, status) = recoverable_scan(
+        let (session, status) = recoverable_traversal(
             &initial,
             TraversalRequest::new(StoragePath::root()).observation_plan(
                 ObservationPlan::default().with_tags(ObservationMode::BestEffort),
@@ -573,7 +582,7 @@ async fn a_clean_completed_attempt_recovers_when_the_faulting_path_disappears() 
         assert!(status.failure_signal().failure().is_none());
         assert!(matches!(
             *status.subscribe().borrow(),
-            ScanRecoveryState::Running { recoveries: 1 }
+            TraversalRecoveryState::Running { recoveries: 1 }
         ));
     }
 }
@@ -592,8 +601,8 @@ async fn another_successful_read_cannot_renew_a_persistent_fault_at_the_same_pat
                 children,
             })
         };
-        let connect: ScanReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
-        let (session, status) = recoverable_scan(
+        let connect: TraversalReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
+        let (session, status) = recoverable_traversal(
             &broken(),
             TraversalRequest::new(StoragePath::root()).observation_plan(
                 ObservationPlan::default().with_tags(ObservationMode::BestEffort),

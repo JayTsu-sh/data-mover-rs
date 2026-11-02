@@ -5,7 +5,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::time::sleep;
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
-use super::{ScanReconnect, ScanRecoveryState, StorageTraversalSource};
+use super::{StorageTraversalSource, TraversalReconnect, TraversalRecoveryState};
 use crate::storage::Storage;
 use crate::traversal::scan::{RecoveryBudget, RecoveryTarget, RetainedOperation};
 use crate::traversal::{RemoteScanFailure, ScanFailureSignal};
@@ -22,9 +22,9 @@ pub(super) struct ProbeContext {
     pub(super) target: Option<RecoveryTarget>,
     pub(super) budget: RecoveryBudget,
     pub(super) operation_timeout: Option<Duration>,
-    pub(super) reconnect: ScanReconnect,
+    pub(super) reconnect: TraversalReconnect,
     pub(super) cancel: CancellationToken,
-    pub(super) state: watch::Sender<ScanRecoveryState>,
+    pub(super) state: watch::Sender<TraversalRecoveryState>,
     pub(super) failure: ScanFailureSignal,
     pub(super) recoveries: u64,
 }
@@ -36,7 +36,7 @@ impl ProbeContext {
             let ready = self.run().await;
             if ready.is_some() && !self.budget.is_exhausted() {
                 self.budget.complete();
-                self.state.send_replace(ScanRecoveryState::Running {
+                self.state.send_replace(TraversalRecoveryState::Running {
                     recoveries: self.recoveries,
                 });
                 let _ = send.send(ready);
@@ -44,7 +44,7 @@ impl ProbeContext {
                 self.budget.exhaust();
                 if !self.cancel.is_cancelled() {
                     self.failure.publish_failure(self.first.clone());
-                    self.state.send_replace(ScanRecoveryState::Failed {
+                    self.state.send_replace(TraversalRecoveryState::Failed {
                         failure: self.first.clone(),
                     });
                 }
@@ -61,7 +61,7 @@ impl ProbeContext {
         let mut attempt = 0_u64;
         loop {
             attempt = attempt.saturating_add(1);
-            self.state.send_replace(ScanRecoveryState::Recovering {
+            self.state.send_replace(TraversalRecoveryState::Recovering {
                 first_failure: self.first.clone(),
                 attempt,
             });
