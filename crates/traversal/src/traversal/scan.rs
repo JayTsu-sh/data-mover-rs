@@ -145,47 +145,44 @@ impl ScanFailureSignal {
         let Some(limit) = self.limit else {
             return work.await;
         };
-        match timeout(limit, work).await {
-            Ok(result) => {
-                if let Err(error) = &result {
-                    let class = match error {
-                        StorageRoleFailure::Session(failure) => failure.class(),
-                        StorageRoleFailure::Entry(failure) => failure.class(),
-                    };
-                    if class == FailureClass::Connectivity {
-                        self.record(
-                            operation,
-                            path,
-                            RemoteScanFailureKind::ConnectionLost,
-                            Some(error.clone()),
-                        );
-                    } else if class == FailureClass::Timeout {
-                        self.record(
-                            operation,
-                            path,
-                            RemoteScanFailureKind::OperationTimedOut,
-                            Some(error.clone()),
-                        );
-                    }
+        if let Ok(result) = timeout(limit, work).await {
+            if let Err(error) = &result {
+                let class = match error {
+                    StorageRoleFailure::Session(failure) => failure.class(),
+                    StorageRoleFailure::Entry(failure) => failure.class(),
+                };
+                if class == FailureClass::Connectivity {
+                    self.record(
+                        operation,
+                        path,
+                        RemoteScanFailureKind::ConnectionLost,
+                        Some(error.clone()),
+                    );
+                } else if class == FailureClass::Timeout {
+                    self.record(
+                        operation,
+                        path,
+                        RemoteScanFailureKind::OperationTimedOut,
+                        Some(error.clone()),
+                    );
                 }
-                result
             }
-            Err(_) => {
-                self.record(
-                    operation,
-                    path,
-                    RemoteScanFailureKind::OperationTimedOut,
-                    None,
-                );
-                let failure = BackendSessionFailure::new(
-                    operation,
-                    FailureClass::Timeout,
-                    Transience::Transient,
-                    "remote scan operation deadline exceeded",
-                )
-                .unwrap_or_else(|_| unreachable!("static remote scan diagnostic"));
-                Err(StorageRoleFailure::Session(failure))
-            }
+            result
+        } else {
+            self.record(
+                operation,
+                path,
+                RemoteScanFailureKind::OperationTimedOut,
+                None,
+            );
+            let failure = BackendSessionFailure::new(
+                operation,
+                FailureClass::Timeout,
+                Transience::Transient,
+                "remote scan operation deadline exceeded",
+            )
+            .unwrap_or_else(|_| unreachable!("static remote scan diagnostic"));
+            Err(StorageRoleFailure::Session(failure))
         }
     }
 }

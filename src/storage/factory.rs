@@ -38,6 +38,9 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
 /// Connects a source whose caller owns scan restart and checkpoint recovery.
 /// Definite transport loss reaches traversal before RPC/page replay delays.
 /// S3 uses one SDK attempt; HDFS allows one standby failover unless explicitly configured.
+///
+/// # Errors
+/// Returns configuration, authentication, connection or role construction failures.
 pub async fn connect_scan_backend(
     mut config: BackendConfig,
 ) -> Result<Storage, BackendConnectError> {

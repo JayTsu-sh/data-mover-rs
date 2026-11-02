@@ -35,8 +35,8 @@ macro_rules! classify_sdk {
     };
 }
 
-/// Body reads can fail after HTTP headers, when the SDK uses ResponseError rather
-/// than DispatchFailure. Inspect typed causes; malformed XML is still Protocol.
+/// Body reads can fail after HTTP headers, when the SDK uses `ResponseError` rather
+/// than `DispatchFailure`. Inspect typed causes; malformed XML is still Protocol.
 fn interrupted_transport<E: std::error::Error + ?Sized>(error: &E) -> bool {
     let mut cause = error.source();
     while let Some(error) = cause {
