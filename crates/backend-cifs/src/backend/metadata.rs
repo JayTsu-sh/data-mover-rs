@@ -411,7 +411,12 @@ fn system_time(
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as StdError;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use smb_domain::error::NetworkFailure;
+
+    use crate::model::BackendKind;
 
     use super::*;
 
@@ -428,7 +433,7 @@ mod tests {
         async fn metadata(&self, _path: &StoragePath) -> smb_domain::Result<CifsInlineMetadata> {
             if self.network_metadata {
                 return Err(smb_domain::Error::NetworkOutcomeUnknown(
-                    smb_domain::error::NetworkFailure::ConnectionLost,
+                    NetworkFailure::ConnectionLost,
                 ));
             }
             Ok(CifsInlineMetadata {
@@ -466,7 +471,7 @@ mod tests {
             self.acl_calls.fetch_add(1, Ordering::SeqCst);
             if self.network_acl {
                 return Err(smb_domain::Error::NetworkOutcomeUnknown(
-                    smb_domain::error::NetworkFailure::ConnectionLost,
+                    NetworkFailure::ConnectionLost,
                 ));
             }
             Err(smb_domain::Error::InvalidMessage(
@@ -485,15 +490,14 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_and_optional_acl_observations_propagate_network_loss()
-    -> Result<(), Box<dyn std::error::Error>> {
+    -> Result<(), Box<dyn StdError>> {
         for acl_fault in [false, true] {
             let protocol = Arc::new(ProbeProtocol {
                 network_metadata: !acl_fault,
                 network_acl: acl_fault,
                 ..ProbeProtocol::default()
             });
-            let identity =
-                BackendIdentity::new(crate::model::BackendKind::Cifs, "network-fixture")?;
+            let identity = BackendIdentity::new(BackendKind::Cifs, "network-fixture")?;
             let path = StoragePath::new("source")?;
             let facts = ProbeProtocol::default().metadata(&path).await?.facts;
             let expected = descriptor_from_facts(&identity, &path, &facts, Operation::Observe)?

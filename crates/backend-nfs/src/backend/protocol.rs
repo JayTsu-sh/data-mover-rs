@@ -171,18 +171,21 @@ fn with_server_status(failure: NfsProtocolFailure, error: &nfs_rs::NfsError) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use nfs_rs::{
+        NFSVersion, Nfs3ErrorCode, RecoveryAction, RequestContext, RetryExhaustion, ServerBusyError,
+    };
+
     use super::super::source::role_failure;
     use super::*;
 
     #[test]
     fn retry_guidance_is_not_network_evidence_for_malformed_replies() {
-        for recovery in [
-            nfs_rs::RecoveryAction::Retry,
-            nfs_rs::RecoveryAction::Remount,
-        ] {
+        for recovery in [RecoveryAction::Retry, RecoveryAction::Remount] {
             let failure = classify_error(wrapped(
                 recovery,
-                nfs_rs::NfsError::Rpc("malformed response".into()),
+                NfsError::Rpc("malformed response".into()),
             ));
             assert_eq!(failure.class, FailureClass::Protocol);
             assert_eq!(failure.transience, Transience::Transient);
@@ -191,18 +194,16 @@ mod tests {
 
     #[test]
     fn exhausted_server_busy_retains_its_class_and_original_status() {
-        let busy = nfs_rs::NfsError::ServerBusy(Box::new(nfs_rs::ServerBusyError {
-            context: nfs_rs::RequestContext {
+        let busy = NfsError::ServerBusy(Box::new(ServerBusyError {
+            context: RequestContext {
                 operation: "readdir".into(),
-                protocol: nfs_rs::NFSVersion::NFSv3,
+                protocol: NFSVersion::NFSv3,
                 request_id: None,
             },
             retries: 16,
-            elapsed: std::time::Duration::from_secs(60),
-            reason: nfs_rs::RetryExhaustion::Deadline,
-            source: Box::new(nfs_rs::NfsError::Nfs3(
-                nfs_rs::Nfs3ErrorCode::NFS3ERR_JUKEBOX,
-            )),
+            elapsed: Duration::from_mins(1),
+            reason: RetryExhaustion::Deadline,
+            source: Box::new(NfsError::Nfs3(Nfs3ErrorCode::NFS3ERR_JUKEBOX)),
         }));
         let failure = classify_error(busy);
         assert_eq!(failure.class, FailureClass::Throttled);
