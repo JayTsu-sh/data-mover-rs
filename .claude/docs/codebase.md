@@ -67,3 +67,5 @@ Rust 库，Edition 2024；具体依赖版本和固定 Git 提交以 `Cargo.toml`
 
 `tests/` 包含公开契约与集成测试，backend 内部测试覆盖协议适配行为；真实环境脚本位于
 `tests/lab/` 与 `.claude/skills/e2e-*/`。运行 `make ci` 检查本地门禁；网络验证需要对应环境。
+
+HDFS 扫描连接在根验证、stat、listing 三处将 Connectivity/Timeout 直接交给统一恢复层，避免 250/500/1000/2000ms 的 adapter 退避遮蔽 3 秒恢复窗口。私有 HdfsReadRecovery 策略在构造前选择；普通连接、服务忙重试及单次 RPC 时限保持原策略。

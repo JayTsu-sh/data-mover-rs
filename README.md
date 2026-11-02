@@ -353,7 +353,8 @@ adapter preserves those categories as `Connectivity` and `Timeout`; uncertain
 mutations retain their outcome semantics. NFS uses its short default disconnect
 recovery budget without URL switches. `connect_scan_backend` disables S3
 SDK/page transport resends and bounds HDFS failover attempts (one standby failover
-by default). S3 service errors and throttling remain distinct from transport loss.
+by default). HDFS scan root checks, metadata and listing return native network failures
+without adapter backoff; normal connections retain their read retry policy. S3 service errors and throttling remain distinct from transport loss.
 
 `traversal::recoverable_scan` starts a default three-second wall-clock window at
 first fault detection. One reconnect/probe task verifies the original failed

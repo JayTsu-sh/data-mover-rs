@@ -127,7 +127,8 @@ where
     /// How long to wait before continuing after `error`, when it may be retried: a retryable
     /// failure with retries left.
     fn retry_delay(&mut self, error: &StorageError) -> Option<Duration> {
-        if !matches!(error, StorageError::HdfsOperation(details) if details.retryable) {
+        if !self.storage.read_recovery.allows_adapter_retry(error)
+            || !matches!(error, StorageError::HdfsOperation(details) if details.retryable) {
             return None;
         }
         let delay = HDFS_ADAPTER_RETRY_DELAYS.get(self.retries).copied()?;

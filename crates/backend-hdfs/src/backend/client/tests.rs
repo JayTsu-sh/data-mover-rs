@@ -7,13 +7,15 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use tokio::time::sleep;
 
     use hdfs_native::HdfsError;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
+        HdfsConfig, HdfsEndpointKind, HdfsReadRecovery, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
     };
     use crate::error::StorageError;
     use crate::model::FailureClass;
@@ -635,4 +637,43 @@ mod tests {
             String::from_utf8_lossy(&output.stdout)
         );
     }
+    #[tokio::test(start_paused = true)]
+    async fn scan_root_and_stat_delegate_network_retries_to_the_caller() {
+        for operation in ["get storage root", "get metadata"] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let called = attempts.clone();
+            let result = HdfsReadRecovery::Caller.read(operation, None, move || {
+                called.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>(HdfsError::IOError(IoError::from(ErrorKind::ConnectionReset))) }
+            }).await;
+            assert!(result.is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_single_attempt_keeps_a_healthy_slow_rpc() {
+        let result = HdfsReadRecovery::Caller.read("get metadata", None, || async {
+            sleep(Duration::from_millis(600)).await;
+            Ok(7_u8)
+        }).await;
+        assert_eq!(result.ok(), Some(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_nonnetwork_retryable_failures_keep_the_adapter_policy() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let called = attempts.clone();
+        let result = HdfsReadRecovery::Caller.read("get metadata", None, move || {
+            let attempt = called.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err(HdfsError::DataTransferError("retryable data transfer".into()))
+                } else { Ok(7_u8) }
+            }
+        }).await;
+        assert_eq!(result.ok(), Some(7));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
 }
