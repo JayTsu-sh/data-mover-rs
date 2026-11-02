@@ -1,5 +1,8 @@
+use std::error::Error as StdError;
 use std::sync::Arc;
 
+use super::super::connect_roles;
+use super::super::paging::ListingLimits;
 use super::{S3BucketType, S3Compatibility, S3Storage, S3UrlOptions};
 use crate::model::BackendIdentity;
 use crate::storage::Storage;
@@ -25,8 +28,8 @@ pub(super) fn identity(
 pub(super) fn connect(
     storage: &S3Storage,
     single_put_threshold: u64,
-    limits: super::super::paging::ListingLimits,
-) -> Result<Storage, Box<dyn std::error::Error>> {
+    limits: ListingLimits,
+) -> Result<Storage, Box<dyn StdError>> {
     let identity = identity(
         &storage.endpoint,
         &storage.bucket_name,
@@ -43,7 +46,7 @@ pub(super) fn connect(
             S3NativeContext::new(&storage.endpoint, label, bucket, prefix)
         }
     });
-    super::super::connect_roles(
+    connect_roles(
         Arc::new(storage.clone()),
         identity,
         native,

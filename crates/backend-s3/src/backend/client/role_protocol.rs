@@ -1,8 +1,12 @@
-use super::{CompletedPart, ProvideErrorMetadata, S3Storage, build_copy_source};
+use std::error::Error as StdError;
+use std::io::{Error as IoError, ErrorKind};
 use std::time::Duration;
 
 use aws_smithy_types::byte_stream::AggregatedBytes;
 use bytes::Bytes;
+use hyper::Error as HttpError;
+
+use super::{CompletedPart, ProvideErrorMetadata, S3Storage, build_copy_source};
 
 use crate::model::{FailureClass, Transience};
 use crate::storage::backends::s3::{
@@ -37,23 +41,23 @@ macro_rules! classify_sdk {
 
 /// Body reads can fail after HTTP headers, when the SDK uses `ResponseError` rather
 /// than `DispatchFailure`. Inspect typed causes; malformed XML is still Protocol.
-fn interrupted_transport<E: std::error::Error + ?Sized>(error: &E) -> bool {
+fn interrupted_transport<E: StdError + ?Sized>(error: &E) -> bool {
     let mut cause = error.source();
     while let Some(error) = cause {
-        if let Some(io) = error.downcast_ref::<std::io::Error>()
+        if let Some(io) = error.downcast_ref::<IoError>()
             && matches!(
                 io.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::NotConnected
-                    | std::io::ErrorKind::UnexpectedEof
+                ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::NotConnected
+                    | ErrorKind::UnexpectedEof
             )
         {
             return true;
         }
-        if let Some(http) = error.downcast_ref::<hyper::Error>()
+        if let Some(http) = error.downcast_ref::<HttpError>()
             && (http.is_closed() || http.is_incomplete_message() || http.is_canceled())
         {
             return true;

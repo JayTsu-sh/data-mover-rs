@@ -1,3 +1,5 @@
+use std::io::{Error as IoError, ErrorKind};
+
 fn plan_read_range(
     file_length: u64,
     offset: u64,
@@ -259,15 +261,7 @@ fn hdfs_structured_attributes(
             "authentication failed",
             false,
         ),
-        HdfsError::IOError(error) => (
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                crate::error::HdfsErrorKind::Timeout
-            } else {
-                crate::error::HdfsErrorKind::Io
-            },
-            "I/O operation failed",
-            is_retryable_io(error.kind()),
-        ),
+        HdfsError::IOError(error) => hdfs_io_attributes(error),
         HdfsError::OperationFailed(_)
         | HdfsError::InternalError(_)
         | HdfsError::InvalidRPCResponse(_)
@@ -284,6 +278,15 @@ fn hdfs_structured_attributes(
             false,
         ),
     }
+}
+
+fn hdfs_io_attributes(error: &IoError) -> (HdfsErrorKind, &'static str, bool) {
+    let kind = if error.kind() == ErrorKind::TimedOut {
+        HdfsErrorKind::Timeout
+    } else {
+        HdfsErrorKind::Io
+    };
+    (kind, "I/O operation failed", is_retryable_io(error.kind()))
 }
 
 fn is_retryable_io(kind: std::io::ErrorKind) -> bool {

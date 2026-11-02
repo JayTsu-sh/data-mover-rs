@@ -1,3 +1,5 @@
+use url::Url;
+
 #[allow(unused_imports)]
 use super::backends;
 use super::{BackendConfig, BackendConnectError, Storage};
@@ -45,7 +47,7 @@ pub async fn connect_scan_backend(
     mut config: BackendConfig,
 ) -> Result<Storage, BackendConnectError> {
     if let BackendConfig::Nfs(nfs) = &mut config {
-        let mut url = url::Url::parse(&nfs.url)
+        let mut url = Url::parse(&nfs.url)
             .map_err(|error| BackendConnectError::new(BackendKind::Nfs, error))?;
         let pairs: Vec<(String, String)> = url
             .query_pairs()
