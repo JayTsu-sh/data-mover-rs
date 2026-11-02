@@ -362,8 +362,10 @@ honor the ordinary checkpoint/history contract. `ScanRecoveryStatus` exposes
 Running, Recovering and Failed; its failure signal is terminal only.
 
 `ScanFailureSignal::source` provides the lower-level operation guard and raw first
-fault signal. Healthy checkpoint rebuilding and consumer backpressure do not
-consume the recovery budget; native operation deadlines remain independent. Failed
+fault signal. Healthy checkpoint rebuilding and consumer-only waits do not
+consume the recovery budget. A known fault keeps its deadline during reconnects
+and faulting reads even if output is blocked; native operation deadlines remain
+independent. Failed
 rebuilding, the original failing read, reconnects and retry backoff share one
 budget. Applications select scan deadlines and recovery windows, keep Local
 traversal on its ordinary path, and persist or display the typed result.

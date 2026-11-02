@@ -33,7 +33,8 @@ pub struct ScanRecoveryPolicy {
     /// A native operation deadline; `None` preserves native protocol deadlines.
     pub operation_timeout: Option<Duration>,
     /// Cumulative reconnect and failed-operation recovery budget. Healthy checkpoint
-    /// replay and time blocked delivering output to the consumer are excluded.
+    /// replay and consumer-only waits are excluded. Reconnects and faulting reads
+    /// keep their deadline even while the output consumer is blocked.
     pub recovery_window: Duration,
 }
 
@@ -192,7 +193,7 @@ impl Recovery {
         if self.restoring && signal.failure().is_none() && signal.recovered_at().is_some() {
             self.recovered();
         }
-        self.start_window(signal, false);
+        self.start_window(signal);
         if signal.failure().is_some()
             && let Some(window) = &self.window
         {
@@ -211,16 +212,12 @@ impl Recovery {
         });
     }
 
-    fn start_window(&mut self, signal: &ScanFailureSignal, output_wait: bool) {
+    fn start_window(&mut self, signal: &ScanFailureSignal) {
         if self.window.is_none()
             && let Some(first) = signal.failure()
         {
             let started = signal.failure_detected_at().unwrap_or_else(Instant::now);
-            let elapsed = if output_wait {
-                Duration::ZERO
-            } else {
-                started.elapsed()
-            };
+            let elapsed = started.elapsed();
             self.window = Some(Window {
                 first,
                 target: signal.failure_target(),
