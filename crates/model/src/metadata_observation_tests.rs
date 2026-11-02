@@ -162,13 +162,14 @@ fn every_failure_class_round_trips_through_its_snapshot_tag() {
         FailureClass::Cancelled,
         FailureClass::Internal,
         FailureClass::Throttled,
+        FailureClass::Timeout,
     ];
     for (tag, class) in classes.into_iter().enumerate() {
         let tag = u8::try_from(tag).unwrap_or(u8::MAX);
         assert_eq!(super::failure_tag(class), tag, "{class:?}");
         assert_eq!(super::failure_from_tag(tag), Some(class));
     }
-    assert_eq!(super::failure_from_tag(13), None);
+    assert_eq!(super::failure_from_tag(14), None);
 }
 
 #[test]

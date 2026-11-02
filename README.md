@@ -345,3 +345,25 @@ mapping. `smb2_only` and the legacy `CifsStorage` path remain removed (#150).
 `tests/lab/tools/cifs_mount_comparison.rs` and `tests/cifs_policy_contract.rs` read
 `CIFS_REAL_SERVER`, `CIFS_REAL_SECOND_SERVER`, `CIFS_REAL_SHARE`, `CIFS_REAL_USER`,
 and `CIFS_REAL_PASS`.
+
+### Scan network failures
+
+Protocol clients report definite connection loss and typed deadlines. The CIFS
+adapter preserves those categories as `Connectivity` and `Timeout`; uncertain
+mutations retain their outcome semantics. NFS uses its short default disconnect
+recovery budget without URL switches. `connect_scan_backend` disables S3
+SDK/page transport resends and bounds HDFS failover attempts (one standby failover
+by default). S3 service errors and throttling remain distinct from transport loss.
+
+`traversal::recoverable_scan` provides a default three-second recovery budget:
+it opens fresh connections and resumes safe directory checkpoints, retaining the
+first typed fault if recovery fails. Active directories may replay; consumers must
+honor the ordinary checkpoint/history contract. `ScanRecoveryStatus` exposes
+Running, Recovering and Failed; its failure signal is terminal only.
+
+`ScanFailureSignal::source` provides the lower-level operation guard and raw first
+fault signal. Healthy checkpoint rebuilding and consumer backpressure do not
+consume the recovery budget; native operation deadlines remain independent. Failed
+rebuilding, the original failing read, reconnects and retry backoff share one
+budget. Applications select scan deadlines and recovery windows, keep Local
+traversal on its ordinary path, and persist or display the typed result.

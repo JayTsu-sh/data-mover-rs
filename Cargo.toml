@@ -30,6 +30,7 @@ backend-s3 = ["dep:data-mover-backend-s3", "dep:aws-config", "dep:aws-credential
 backend-hdfs = ["dep:data-mover-backend-hdfs", "dep:hdfs-native"]
 
 [dependencies]
+url = { workspace = true }
 data-mover-model = { path = "crates/model" }
 data-mover-storage-core = { path = "crates/storage-core" }
 data-mover-acl = { path = "crates/acl", optional = true }
@@ -503,13 +504,14 @@ glob = "0.3.3"
 governor = "0.10.4"
 hdfs-native = { git = "https://github.com/kimahriman/hdfs-native", rev = "695fc47e9f88804e39bba1d30bf128e66da9b8d6" }
 http-body = "1.0.1"
+hyper = { version = "1" }
 hyper-rustls = { version = "0.27" }
 hyper-util = { version = "0.1" }
 indicatif = "0.18.4"
 libc = "0.2"
 md-5 = "0.10"
 moka = { version = "0.12.15" }
-nfs-rs = "0.9.1"
+nfs-rs = "0.11.1"
 num-traits = "0.2.19"
 parking_lot = "0.12"
 path-clean = "1.0.1"
@@ -519,7 +521,7 @@ rustix = { version = "1.1" }
 rustls = { version = "0.23", default-features = false }
 serde = { version = "1" }
 serde_json = "1"
-smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "2649a0bbd615c23d64faca0053e969288694e034" }
+smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "02c80bb4f28e4566533e5ff4abc741b59e251ee3" }
 tempfile = "3"
 thiserror = "2.0.18"
 tokio = { version = "1.51.1", default-features = false }

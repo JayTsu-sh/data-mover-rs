@@ -11,9 +11,23 @@
 - backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
 - data-mover 不得重新依赖 smb-rs 的 connection、runtime、wire create/query/set 类型或协议 handle。
 - `smb_domain::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
-- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = 2649a0b... }`
-  (smb-rs main 顶端，#89 的 merge commit；smb 0.14.0)。升级历史与每次的真机矩阵见下方
+- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = "02c80bb4f28e4566533e5ff4abc741b59e251ee3" }`
+  (smb-rs main，#91 的 merge commit；smb 0.14.0，原生 CI 全绿)。升级历史与每次的真机矩阵见下方
   "升级 smb-rs 依赖"。不得改成浮动 branch。`[patch.crates-io] smb` 与历史 API 提交 `c3ecf00` 已删除。
+
+## 扫描网络失败与恢复
+
+`source.rs` 从 domain facade 的 `Error::network_failure()` 获取类型化原因：原生断连 / 会话失效
+是会话 `Connectivity`，原生操作时限是会话 `Timeout`；超时不等于连接已断。`RuntimeTerminated`
+是条目 `Internal` / Unknown；显式关闭、畸形协议与无网络证据的 transport 错误不冒充断连。
+已发送请求的 `NetworkOutcomeUnknown` 在 Traverse / Observe / Read 中仍提供原始网络分类；
+写操作保留 `Protocol` / Unknown，不能据网络原因自动重放。ACL 和 metadata 观察用 Observe，
+元数据应用仍用 Metadata。
+
+`ScanFailureSignal` 是首个原始故障信号；`recoverable_scan` 在 data-mover 层提供默认 3 秒恢复窗口，
+重建连接并从安全目录检查点续扫，窗口失败才发布最终网络故障。普通连接保留原生有界恢复。
+详见 [扫描恢复分层](codebase.md#远程扫描)。消费者等待不计入操作预算或恢复等待；
+超时 / 取消不会直接丢弃持有句柄的原生调用，清理仍由其完成。
 
 ## 连接配置
 
@@ -345,6 +359,13 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 
 ## 升级 smb-rs 依赖
 
+2026-11-02：固定到 main `02c80bb4f28e4566533e5ff4abc741b59e251ee3`（#91）。
+新增 `Error::network_failure()` / `outcome_unknown()` 与 `NetworkOutcomeUnknown`；
+断连、时限和非网络关闭分别保留类型，已关闭 generation 后提交也保留首次退出原因。
+显式 close / 内部终止不制造网络证据，写请求已发出的不确定性不因错误分类而消失。
+原生 CI 已通过；本库本地门禁及两轮真实矩阵的结果须按本次实际日志回填，不能以原生 CI 替代。
+
+
 > 2026-09-27：`37d9404` → main 顶端 **`2649a0b`**（#89，issue #88）：`FileOpenOptions::open_existing()` 只请求
 > `GENERIC_READ`，写 / flush 要 `.write(true)`、删除 / 改名要 `.delete(true)`、改时间戳要 `.write_attributes(true)`；
 > 破坏性变更，smb 0.13.0 → 0.14.0，只编得过、不报错的地方靠运行时暴露，所以 `protocol.rs` 调用点与 rev 同一提交。
@@ -464,3 +485,18 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 服务端要求签名时始终遵守；SMB 3.1.1 TREE_CONNECT、认证/绑定及加密完整性保护保留。
 无加密且省略签名时，普通流量不具备 SMB 消息完整性保护。
 基准例子提供 `--signing required|when-required`，默认使用协商策略。
+
+### 2026-11-02 依赖验证边界
+
+在 `02c80bb` 上真实具名 namespace、停车列举、只读 share、认证/签名 capability probe 各两轮通过。
+完整 policy 两轮均在 64 MiB hash checkpoint 的保护 DACL 读回校验处返回 `Unsupported`；
+不会降级保护或宣称通过。匿名 share 两轮返回 `STATUS_SERVER_UNAVAILABLE` (0xc0000466)，
+与既有域控不可用现象一致，但本次没有管理凭据独立确认 DC 发现状态。
+未配置 `CIFS_PROBE_NFS_URL`，跨协议 symlink probe 未执行。
+服务端 `STATUS_IO_TIMEOUT` 与原生传输 deadline 都映射 `Timeout`，不据此宣称连接已断开。
+
+基线复核：同环境下原 main `546646d`（旧 smb-rs 固定版本）在相同 64 MiB+1
+保护 DACL 校验处返回同样 `Unsupported`，因此不是本次断连分类改动引入。
+按 D9 既定的 4096 / 67108864 字节矩阵单独复测；扩展 64 MiB+1 限制仍保留并报告。
+
+D9 指定的 4096 / 67108864 字节 Checkpointed / AtomicReplace 双 LIF roundtrip 两轮全部通过（各 2 个测试，22.45 / 18.61 秒）；64 MiB+1 扩展失败已在原 main 基线复现。

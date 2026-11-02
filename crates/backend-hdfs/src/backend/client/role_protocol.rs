@@ -514,6 +514,9 @@ fn hdfs_role_classify(error: &StorageError) -> (RoleFailureClass, RoleTransience
                 RoleHdfsErrorKind::Unsupported => {
                     (RoleFailureClass::Unsupported, transience, false)
                 }
+                RoleHdfsErrorKind::Timeout => {
+                    (RoleFailureClass::Timeout, transience, true)
+                }
                 RoleHdfsErrorKind::Io | RoleHdfsErrorKind::Rpc => {
                     (RoleFailureClass::Connectivity, transience, true)
                 }

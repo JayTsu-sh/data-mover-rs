@@ -1,6 +1,8 @@
+use std::error::Error as StdError;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_credential_types::Credentials;
@@ -15,8 +17,10 @@ use data_mover_storage_core::storage::config::s3::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
+use super::paging::ListingLimits;
 use crate::Result;
 use crate::error::StorageError;
+use crate::storage::Storage;
 use crate::storage::backends::s3::S3VersioningAtConnect;
 use tls::{build_skip_verify_http_client, untrusted_certificate, warn_unverified};
 use url_options::{S3BucketType, S3Compatibility, S3UrlOptions};
@@ -181,6 +185,28 @@ fn s3_timeout_config() -> TimeoutConfig {
     s3_timeout_config_from_values(connect.as_deref(), operation.as_deref(), read.as_deref())
 }
 
+fn s3_sdk_config(
+    endpoint: &str,
+    credentials_provider: SharedCredentialsProvider,
+    options: S3UrlOptions,
+    attempts: Option<u32>,
+) -> Result<SdkConfig> {
+    let mut builder = SdkConfig::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1".to_string()))
+        .endpoint_url(endpoint.to_owned())
+        .credentials_provider(credentials_provider)
+        .timeout_config(s3_timeout_config());
+    if let Some(attempts) = attempts {
+        builder = builder.retry_config(RetryConfig::standard().with_max_attempts(attempts));
+    }
+    if options.skips_tls_verification() {
+        warn_unverified("connection", endpoint);
+        builder = builder.http_client(build_skip_verify_http_client()?);
+    }
+    Ok(builder.build())
+}
+
 impl S3Storage {
     /// Builds connected roles with a configured single-PUT threshold. Sources of at most
     /// `single_put_threshold` bytes (default 8 MiB, within `[5 MiB, 5 GiB]`) use one `PutObject`.
@@ -188,7 +214,14 @@ impl S3Storage {
         &self,
         single_put_threshold: u64,
     ) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
-        architecture::connect(self, single_put_threshold)
+        architecture::connect(self, single_put_threshold, ListingLimits::PRODUCTION)
+    }
+
+    pub(super) fn architecture_scan_storage(
+        &self,
+        single_put_threshold: u64,
+    ) -> std::result::Result<Storage, Box<dyn StdError>> {
+        architecture::connect(self, single_put_threshold, ListingLimits::SCAN)
     }
 
     /// What the bucket's versioning status was (P7 Q-A: never `Err` for a refusal or a lost
@@ -315,6 +348,14 @@ impl S3Storage {
     ///
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn new(url: &str, block_size: Option<u64>) -> Result<Self> {
+        Self::new_with_attempts(url, block_size, None).await
+    }
+
+    pub(super) async fn new_with_attempts(
+        url: &str,
+        block_size: Option<u64>,
+        attempts: Option<u32>,
+    ) -> Result<Self> {
         if block_size == Some(0) {
             return Err(StorageError::ConfigError(
                 "S3 read chunk must be non-zero".into(),
@@ -340,7 +381,6 @@ impl S3Storage {
             prefix,
             options,
         } = parse_s3_url(url)?;
-        let region = "us-east-1"; // MinIO 默认区域
 
         // 凭据一个字符都不记（R8）：AK 与 SK 都不写，连 SK 的长度也不写。
         debug!("从URL解析结果:");
@@ -356,19 +396,7 @@ impl S3Storage {
         // 将凭据包装成SharedCredentialsProvider
         let credentials_provider = SharedCredentialsProvider::new(credentials);
 
-        // 构建 SDK 配置，增加超时配置以提高HTTPS连接稳定性
-        let mut sdk_builder = SdkConfig::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new(region.to_string()))
-            .endpoint_url(endpoint.clone())
-            .credentials_provider(credentials_provider)
-            // 配置超时参数，避免连接挂起或不完整消息错误
-            .timeout_config(s3_timeout_config());
-        if options.skips_tls_verification() {
-            warn_unverified("connection", &endpoint);
-            sdk_builder = sdk_builder.http_client(build_skip_verify_http_client()?);
-        }
-        let sdk_config = sdk_builder.build();
+        let sdk_config = s3_sdk_config(&endpoint, credentials_provider, options, attempts)?;
 
         // 创建 S3 客户端，强制使用路径样式以支持 FQDN 和自定义域名
         // 禁用自动 checksum 计算（WhenRequired），避免 SDK 对 UploadPart 等操作

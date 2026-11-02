@@ -548,7 +548,7 @@ async fn a_lookup_failure_of_the_session_or_the_directory_ends_the_read() {
                 no_getattr,
             ),
             NfsRestart::Resend,
-            FailureClass::Connectivity,
+            FailureClass::Timeout,
         ),
         (
             Answering::new(
@@ -726,11 +726,11 @@ fn read_failure_cases() -> Vec<(NfsError, NfsRestart, FailureClass)> {
         (
             wrapped(nfs_rs::RecoveryAction::Retry, timeout()),
             NfsRestart::Resend,
-            FailureClass::Connectivity,
+            FailureClass::Timeout,
         ),
         (
             NfsError::Io(io::Error::new(io::ErrorKind::ConnectionReset, "reset")),
-            NfsRestart::Resend,
+            NfsRestart::Never,
             FailureClass::Connectivity,
         ),
         (
@@ -752,7 +752,7 @@ fn read_failure_cases() -> Vec<(NfsError, NfsRestart, FailureClass)> {
         (
             wrapped(nfs_rs::RecoveryAction::Remount, timeout()),
             NfsRestart::Never,
-            FailureClass::Connectivity,
+            FailureClass::Timeout,
         ),
     ]
 }

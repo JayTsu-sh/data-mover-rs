@@ -9,6 +9,7 @@ publish = false
 workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
 data-mover-model = { path = "../model" }
 data-mover-storage-core = { path = "../storage-core" }
 async-trait = { workspace = true }

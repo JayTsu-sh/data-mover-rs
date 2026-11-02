@@ -2,17 +2,21 @@
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::io::{Error as IoError, ErrorKind};
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use hdfs_native::HdfsError;
     use tokio_util::sync::CancellationToken;
 
     use super::{
         HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
     };
     use crate::error::StorageError;
+    use crate::model::FailureClass;
 
     #[test]
     fn append_open_waits_only_for_a_bounded_lease_recovery_window() {
@@ -299,6 +303,20 @@ mod tests {
             let displayed = error.to_string();
             assert!(!displayed.contains("password"));
             assert!(!displayed.contains("/absolute"));
+        }
+    }
+
+    #[test]
+    fn native_io_timeout_is_not_reported_as_a_disconnected_connection() {
+        for (kind, expected) in [
+            (ErrorKind::TimedOut, FailureClass::Timeout),
+            (ErrorKind::ConnectionReset, FailureClass::Connectivity),
+        ] {
+            let error =
+                super::hdfs_operation_error("list", None, &HdfsError::IOError(IoError::from(kind)));
+            let (class, _, session) = super::hdfs_role_classify(&error);
+            assert_eq!(class, expected);
+            assert!(session);
         }
     }
 

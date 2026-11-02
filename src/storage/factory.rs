@@ -34,3 +34,26 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
         BackendConfig::Hdfs(_) => Err(BackendConnectError::not_compiled(BackendKind::Hdfs)),
     }
 }
+
+/// Connects a source whose caller owns scan restart and checkpoint recovery.
+/// NFS uses its short default disconnect recovery policy; other scan adapters
+/// expose transport loss without additional SDK/page replay delays.
+/// S3 uses one SDK attempt; HDFS allows one standby failover unless explicitly configured.
+///
+/// # Errors
+/// Returns configuration, authentication, connection or role construction failures.
+pub async fn connect_scan_backend(
+    mut config: BackendConfig,
+) -> Result<Storage, BackendConnectError> {
+    if let BackendConfig::Hdfs(hdfs) = &mut config {
+        hdfs.client
+            .overrides
+            .entry("dfs.client.failover.max.attempts".into())
+            .or_insert_with(|| "1".into());
+    }
+    #[cfg(feature = "backend-s3")]
+    if let BackendConfig::S3(s3) = config {
+        return backends::s3::connect_scan_backend(s3).await;
+    }
+    connect_backend(config).await
+}

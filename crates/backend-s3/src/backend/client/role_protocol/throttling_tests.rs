@@ -6,7 +6,7 @@ use crate::storage::backends::s3::S3ProtocolFailure;
 
 /// The service asking for fewer requests is `Throttled` / `Transient` (P7 §8), not a lost
 /// connection: by status (429, 503) or by code, whatever status carried it. Other 5xx stay
-/// `Connectivity`. The scope stays the session's; a listing backs off and scopes it to itself.
+/// `Protocol` / `Transient`. The scope stays the session's; a listing backs off and scopes it to itself.
 #[test]
 fn throttling_is_its_own_transient_class() {
     for (status, code) in [
@@ -33,7 +33,7 @@ fn throttling_is_its_own_transient_class() {
         assert!(matches!(
             s3_role_remote_failure(Some(status), None, "list"),
             S3ProtocolFailure::Session {
-                class: FailureClass::Connectivity,
+                class: FailureClass::Protocol,
                 ..
             }
         ));
@@ -41,12 +41,12 @@ fn throttling_is_its_own_transient_class() {
 }
 
 #[test]
-fn sdk_retryable_request_timeouts_keep_their_transient_class() {
+fn sdk_request_timeouts_are_distinct_from_connection_loss() {
     for code in ["RequestTimeout", "RequestTimeoutException"] {
         assert!(matches!(
             s3_role_remote_failure(Some(400), Some(code), "read"),
             S3ProtocolFailure::Session {
-                class: FailureClass::Connectivity,
+                class: FailureClass::Timeout,
                 transience: Transience::Transient,
                 ..
             }
