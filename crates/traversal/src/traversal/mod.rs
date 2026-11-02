@@ -646,3 +646,8 @@ mod producer_tests {
 
 mod scan;
 pub use scan::{RemoteScanFailure, RemoteScanFailureKind, ScanFailureSignal, ScanSetupError};
+
+mod recovery;
+pub use recovery::{
+    ScanReconnect, ScanRecoveryPolicy, ScanRecoveryState, ScanRecoveryStatus, recoverable_scan,
+};

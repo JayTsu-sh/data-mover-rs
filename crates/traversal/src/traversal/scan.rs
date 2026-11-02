@@ -1,31 +1,38 @@
 //! Shared scan operation budgets and first-failure notification for every remote backend.
 //! 远程扫描的操作时限与旁路失败信号；不对消费者等待或整轮扫描计时。
 
+use std::{
+    future::Future,
+    num::NonZeroUsize,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use futures::StreamExt;
+use tokio::{
+    sync::Mutex,
+    time::{Instant, timeout},
+};
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     model::{
         BackendKind, BackendSessionFailure, FailureClass, MetadataCapabilities,
         MetadataObservations, ObservationPlan, Operation, RenameContext, SourceIdentity,
-        StoragePath, SymlinkTarget, Transience,
+        SourceVersion, StoragePath, SymlinkTarget, Transience,
     },
     storage::{
-        BackendCapabilities, CapabilityAvailability, ListRequest, ListingStream, Metadata,
-        Namespace, NamespaceCapabilities, SourceDescriptor, Storage, StorageBuilder,
-        StorageRoleFailure, UnsupportedReason,
+        BackendCapabilities, CapabilityAvailability, CapabilityUnavailable,
+        CopiedMetadataObservation, ListRequest, ListingPage, ListingStream, Metadata,
+        MetadataMutation, Namespace, NamespaceCapabilities, SourceDescriptor, Storage,
+        StorageBuildError, StorageBuilder, StorageRoleFailure, UnsupportedReason,
     },
     traversal::StorageTraversalSource,
 };
-use async_trait::async_trait;
-use futures::StreamExt;
 
-use std::{
-    future::Future,
-    num::NonZeroUsize,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
-use tokio::time::timeout;
-use tokio_util::sync::CancellationToken;
-
+/// The evidence that stopped remote scanning; a timeout does not prove disconnection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteScanFailureKind {
     ConnectionLost,
@@ -47,6 +54,7 @@ pub struct RemoteScanFailure {
     pub source: Option<StorageRoleFailure>,
 }
 impl RemoteScanFailure {
+    /// Stable error code for applications and persisted task diagnostics.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self.kind {
@@ -56,12 +64,17 @@ impl RemoteScanFailure {
     }
 }
 
+/// First remote failure notification, independent of buffered traversal entries.
 #[derive(Clone)]
 pub struct ScanFailureSignal {
     backend: BackendKind,
     limit: Option<Duration>,
     failed: CancellationToken,
     failure: Arc<OnceLock<RemoteScanFailure>>,
+    successful_listing: Arc<OnceLock<Instant>>,
+    failure_at: Arc<OnceLock<Instant>>,
+    recovery_target: Arc<OnceLock<(Operation, StoragePath)>>,
+    recovered_at: Arc<OnceLock<Instant>>,
 }
 impl ScanFailureSignal {
     pub(crate) fn new(backend: BackendKind, limit: Option<Duration>) -> Self {
@@ -70,6 +83,10 @@ impl ScanFailureSignal {
             limit,
             failed: CancellationToken::new(),
             failure: Arc::default(),
+            successful_listing: Arc::default(),
+            failure_at: Arc::default(),
+            recovery_target: Arc::default(),
+            recovered_at: Arc::default(),
         }
     }
     /// Builds traversal over the connected roles with bounded remote operations.
@@ -84,9 +101,6 @@ impl ScanFailureSignal {
             return Err(ScanSetupError::InvalidDeadline);
         }
         let guard = Self::new(storage.kind(), limit);
-        if storage.kind() == BackendKind::Local || limit.is_none() {
-            return Ok((StorageTraversalSource::new(storage)?, guard));
-        }
         // 只借用遍历需要的角色；不改变原始 Storage 的拷贝、删除或发布行为。
         let unsupported = CapabilityAvailability::Unsupported(
             UnsupportedReason::new("scan-only storage role")
@@ -112,12 +126,41 @@ impl ScanFailureSignal {
         .build()?;
         Ok((StorageTraversalSource::new(&roles)?, guard))
     }
+    /// Returns the first failure, preserving its original classification.
     #[must_use]
     pub fn failure(&self) -> Option<RemoteScanFailure> {
         self.failure.get().cloned()
     }
+    /// Completes as soon as a remote operation has failed or exceeded its budget.
     pub async fn failed(&self) {
         self.failed.cancelled().await;
+    }
+    pub(super) fn publish_failure(&self, failure: RemoteScanFailure) {
+        self.failure.get_or_init(|| failure);
+        self.failed.cancel();
+    }
+    #[cfg(test)]
+    pub(super) fn successful_listing_at(&self) -> Option<Instant> {
+        self.successful_listing.get().copied()
+    }
+    pub(super) fn failure_detected_at(&self) -> Option<Instant> {
+        self.failure_at.get().copied()
+    }
+    pub(super) fn watch_recovery(&self, operation: Operation, path: StoragePath) {
+        let _ = self.recovery_target.set((operation, path));
+    }
+    pub(super) fn recovered_at(&self) -> Option<Instant> {
+        self.recovered_at.get().copied()
+    }
+    fn record_success(&self, operation: Operation, path: &StoragePath) {
+        if self.failure.get().is_none()
+            && self
+                .recovery_target
+                .get()
+                .is_some_and(|(expected, target)| *expected == operation && target == path)
+        {
+            self.recovered_at.get_or_init(Instant::now);
+        }
     }
     fn record(
         &self,
@@ -126,6 +169,7 @@ impl ScanFailureSignal {
         kind: RemoteScanFailureKind,
         source: Option<StorageRoleFailure>,
     ) {
+        self.failure_at.get_or_init(Instant::now);
         self.failure.get_or_init(|| RemoteScanFailure {
             backend: self.backend,
             operation,
@@ -136,38 +180,93 @@ impl ScanFailureSignal {
         });
         self.failed.cancel();
     }
-    async fn operation<T>(
+    fn normalize_error(
         &self,
         operation: Operation,
         path: &StoragePath,
-        work: impl Future<Output = std::result::Result<T, StorageRoleFailure>>,
-    ) -> std::result::Result<T, StorageRoleFailure> {
-        let Some(limit) = self.limit else {
-            return work.await;
+        error: StorageRoleFailure,
+    ) -> StorageRoleFailure {
+        let class = match &error {
+            StorageRoleFailure::Session(failure) => failure.class(),
+            StorageRoleFailure::Entry(failure) => failure.class(),
         };
-        if let Ok(result) = timeout(limit, work).await {
-            if let Err(error) = &result {
-                let class = match error {
-                    StorageRoleFailure::Session(failure) => failure.class(),
-                    StorageRoleFailure::Entry(failure) => failure.class(),
-                };
-                if class == FailureClass::Connectivity {
-                    self.record(
-                        operation,
-                        path,
-                        RemoteScanFailureKind::ConnectionLost,
-                        Some(error.clone()),
-                    );
-                } else if class == FailureClass::Timeout {
-                    self.record(
-                        operation,
-                        path,
-                        RemoteScanFailureKind::OperationTimedOut,
-                        Some(error.clone()),
-                    );
-                }
-            }
-            result
+        let kind = match class {
+            FailureClass::Connectivity => RemoteScanFailureKind::ConnectionLost,
+            FailureClass::Timeout => RemoteScanFailureKind::OperationTimedOut,
+            _ => return error,
+        };
+        self.record(operation, path, kind, Some(error));
+        stopped_failure(operation, kind)
+    }
+
+    fn checked_page(
+        &self,
+        path: &StoragePath,
+        page: Option<ListingPage>,
+    ) -> Result<Option<ListingPage>, StorageRoleFailure> {
+        if let Some(failure) = page.as_ref().and_then(|page| {
+            page.failures.iter().find(|error| {
+                matches!(
+                    error.failure.class(),
+                    FailureClass::Connectivity | FailureClass::Timeout
+                )
+            })
+        }) {
+            return Err(self.normalize_error(
+                Operation::Traverse,
+                path,
+                StorageRoleFailure::Entry(failure.failure.clone()),
+            ));
+        }
+        self.successful_listing.get_or_init(Instant::now);
+        self.record_success(Operation::Traverse, path);
+        Ok(page)
+    }
+
+    fn checked_metadata(
+        &self,
+        path: &StoragePath,
+        observations: MetadataObservations,
+    ) -> Result<MetadataObservations, StorageRoleFailure> {
+        if let Some(failure) = observations.failures().find(|failure| {
+            matches!(
+                failure.class,
+                FailureClass::Connectivity | FailureClass::Timeout
+            )
+        }) {
+            let source = BackendSessionFailure::new(
+                Operation::Observe,
+                failure.class,
+                failure.transience,
+                "backend returned a failed scan metadata observation",
+            )
+            .unwrap_or_else(|_| unreachable!("static observation diagnostic"));
+            return Err(self.normalize_error(
+                Operation::Observe,
+                path,
+                StorageRoleFailure::Session(source),
+            ));
+        }
+        self.record_success(Operation::Observe, path);
+        Ok(observations)
+    }
+
+    async fn operation<T: Send + 'static>(
+        &self,
+        operation: Operation,
+        path: &StoragePath,
+        work: impl Future<Output = Result<T, StorageRoleFailure>> + Send + 'static,
+    ) -> Result<T, StorageRoleFailure> {
+        if let Some(failure) = self.failure.get() {
+            return Err(stopped_failure(operation, failure.kind));
+        }
+        let mut work = RetainedOperation::new(work);
+        let result = match self.limit {
+            Some(limit) => timeout(limit, work.wait()).await,
+            None => Ok(work.wait().await),
+        };
+        if let Ok(result) = result {
+            result.map_err(|error| self.normalize_error(operation, path, error))
         } else {
             self.record(
                 operation,
@@ -175,16 +274,59 @@ impl ScanFailureSignal {
                 RemoteScanFailureKind::OperationTimedOut,
                 None,
             );
-            let failure = BackendSessionFailure::new(
+            Err(stopped_failure(
                 operation,
-                FailureClass::Timeout,
-                Transience::Transient,
-                "remote scan operation deadline exceeded",
-            )
-            .unwrap_or_else(|_| unreachable!("static remote scan diagnostic"));
-            Err(StorageRoleFailure::Session(failure))
+                RemoteScanFailureKind::OperationTimedOut,
+            ))
         }
     }
+}
+
+/// Poll normally in the caller. If its wait ends early, retain the native call
+/// until its own deadline/cleanup completes; the first-failure gate bounds admission.
+pub(super) struct RetainedOperation<F: Future + Send + 'static> {
+    pending: Option<Pin<Box<F>>>,
+}
+impl<F: Future + Send + 'static> RetainedOperation<F> {
+    pub(super) fn new(work: F) -> Self {
+        Self {
+            pending: Some(Box::pin(work)),
+        }
+    }
+    pub(super) async fn wait(&mut self) -> F::Output {
+        let pending = self
+            .pending
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("owned operation is awaited once"));
+        let result = pending.await;
+        self.pending.take();
+        result
+    }
+}
+impl<F: Future + Send + 'static> Drop for RetainedOperation<F> {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            drop(tokio::spawn(async move {
+                let _ = pending.await;
+            }));
+        }
+    }
+}
+
+fn stopped_failure(operation: Operation, kind: RemoteScanFailureKind) -> StorageRoleFailure {
+    let class = match kind {
+        RemoteScanFailureKind::ConnectionLost => FailureClass::Connectivity,
+        RemoteScanFailureKind::OperationTimedOut => FailureClass::Timeout,
+    };
+    StorageRoleFailure::Session(
+        BackendSessionFailure::new(
+            operation,
+            class,
+            Transience::Transient,
+            "remote scan stopped after its first failure",
+        )
+        .unwrap_or_else(|_| unreachable!("static remote scan diagnostic")),
+    )
 }
 
 struct GuardedNamespace {
@@ -197,24 +339,31 @@ impl GuardedNamespace {
         let inner = self.inner.clone();
         let guard = self.guard.clone();
         ListingStream::from_producer(path.clone(), move |sink| async move {
-            let mut pages = match root {
+            let pages = Arc::new(Mutex::new(match root {
                 Some(root) => inner.list_for_traversal(request, root),
                 None => inner.list(request),
-            };
+            }));
             loop {
                 // 计时仅覆盖取下一页；send 等待消费者时不计时。
+                let next_page = pages.clone();
                 let next = guard
-                    .operation(Operation::Traverse, &path, async {
-                        pages.next().await.transpose()
+                    .operation(Operation::Traverse, &path, async move {
+                        next_page.lock().await.next().await.transpose()
                     })
                     .await;
                 match next {
-                    Ok(Some(page)) => {
-                        if sink.send(page).await.is_err() {
+                    Ok(page) => match guard.checked_page(&path, page) {
+                        Ok(Some(page)) => {
+                            if sink.send(page).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            sink.fail(error).await;
                             break;
                         }
-                    }
-                    Ok(None) => break,
+                    },
                     Err(error) => {
                         sink.fail(error).await;
                         break;
@@ -230,9 +379,16 @@ impl Namespace for GuardedNamespace {
         &self,
         path: &StoragePath,
     ) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
-        self.guard
-            .operation(Operation::Observe, path, self.inner.stat(path))
-            .await
+        let inner = self.inner.clone();
+        let owned_path = path.clone();
+        let value = self
+            .guard
+            .operation(Operation::Observe, path, async move {
+                inner.stat(&owned_path).await
+            })
+            .await?;
+        self.guard.record_success(Operation::Observe, path);
+        Ok(value)
     }
     fn list(&self, request: ListRequest) -> ListingStream {
         self.listing(request, None)
@@ -256,9 +412,16 @@ impl Namespace for GuardedNamespace {
         &self,
         path: &StoragePath,
     ) -> std::result::Result<SymlinkTarget, StorageRoleFailure> {
-        self.guard
-            .operation(Operation::Observe, path, self.inner.read_link(path))
-            .await
+        let inner = self.inner.clone();
+        let owned_path = path.clone();
+        let value = self
+            .guard
+            .operation(Operation::Observe, path, async move {
+                inner.read_link(&owned_path).await
+            })
+            .await?;
+        self.guard.record_success(Operation::Observe, path);
+        Ok(value)
     }
 }
 struct GuardedMetadata {
@@ -270,7 +433,7 @@ impl Metadata for GuardedMetadata {
     async fn apply(
         &self,
         path: &StoragePath,
-        mutation: crate::storage::MetadataMutation,
+        mutation: MetadataMutation,
         cancel: CancellationToken,
     ) -> std::result::Result<(), StorageRoleFailure> {
         self.inner.apply(path, mutation, cancel).await
@@ -283,16 +446,29 @@ impl Metadata for GuardedMetadata {
         descriptor: &SourceDescriptor,
         plan: ObservationPlan,
     ) -> Option<std::result::Result<MetadataObservations, StorageRoleFailure>> {
-        self.inner.observe_listed(descriptor, plan)
+        self.inner.observe_listed(descriptor, plan).map(|result| {
+            result
+                .map_err(|error| {
+                    self.guard
+                        .normalize_error(Operation::Observe, &descriptor.path, error)
+                })
+                .and_then(|value| self.guard.checked_metadata(&descriptor.path, value))
+        })
     }
     async fn observe(
         &self,
         path: &StoragePath,
         plan: ObservationPlan,
     ) -> std::result::Result<MetadataObservations, StorageRoleFailure> {
-        self.guard
-            .operation(Operation::Observe, path, self.inner.observe(path, plan))
-            .await
+        let inner = self.inner.clone();
+        let owned_path = path.clone();
+        let value = self
+            .guard
+            .operation(Operation::Observe, path, async move {
+                inner.observe(&owned_path, plan).await
+            })
+            .await?;
+        self.guard.checked_metadata(path, value)
     }
     async fn observe_bound(
         &self,
@@ -300,13 +476,16 @@ impl Metadata for GuardedMetadata {
         expected: &SourceIdentity,
         plan: ObservationPlan,
     ) -> std::result::Result<MetadataObservations, StorageRoleFailure> {
-        self.guard
-            .operation(
-                Operation::Observe,
-                path,
-                self.inner.observe_bound(path, expected, plan),
-            )
-            .await
+        let inner = self.inner.clone();
+        let owned_path = path.clone();
+        let expected = expected.clone();
+        let value = self
+            .guard
+            .operation(Operation::Observe, path, async move {
+                inner.observe_bound(&owned_path, &expected, plan).await
+            })
+            .await?;
+        self.guard.checked_metadata(path, value)
     }
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
         self.inner.copied_metadata_observation_plan()
@@ -316,30 +495,42 @@ impl Metadata for GuardedMetadata {
         path: &StoragePath,
         expected: &SourceIdentity,
         plan: ObservationPlan,
-    ) -> Result<crate::storage::CopiedMetadataObservation, StorageRoleFailure> {
-        self.guard
-            .operation(
-                Operation::Observe,
-                path,
-                self.inner.observe_copy_bound(path, expected, plan),
-            )
-            .await
+    ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
+        let inner = self.inner.clone();
+        let owned_path = path.clone();
+        let expected = expected.clone();
+        let value = self
+            .guard
+            .operation(Operation::Observe, path, async move {
+                inner.observe_copy_bound(&owned_path, &expected, plan).await
+            })
+            .await?;
+        let mut value = value;
+        value.observations = self.guard.checked_metadata(path, value.observations)?;
+        Ok(value)
     }
     async fn observe_copy_bound_version(
         &self,
         path: &StoragePath,
         expected: &SourceIdentity,
-        version: &crate::model::SourceVersion,
+        version: &SourceVersion,
         plan: ObservationPlan,
-    ) -> Result<crate::storage::CopiedMetadataObservation, StorageRoleFailure> {
-        self.guard
-            .operation(
-                Operation::Observe,
-                path,
-                self.inner
-                    .observe_copy_bound_version(path, expected, version, plan),
-            )
-            .await
+    ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
+        let inner = self.inner.clone();
+        let owned_path = path.clone();
+        let expected = expected.clone();
+        let version = version.clone();
+        let value = self
+            .guard
+            .operation(Operation::Observe, path, async move {
+                inner
+                    .observe_copy_bound_version(&owned_path, &expected, &version, plan)
+                    .await
+            })
+            .await?;
+        let mut value = value;
+        value.observations = self.guard.checked_metadata(path, value.observations)?;
+        Ok(value)
     }
 }
 
@@ -349,160 +540,12 @@ pub enum ScanSetupError {
     #[error("scan operation timeout must be positive")]
     InvalidDeadline,
     #[error(transparent)]
-    Capability(#[from] crate::storage::CapabilityUnavailable),
+    Capability(#[from] CapabilityUnavailable),
     #[error(transparent)]
-    Roles(#[from] crate::storage::StorageBuildError),
+    Roles(#[from] StorageBuildError),
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use crate::model::{BackendIdentity, EntryKind, EntryOperationFailure, IdentityStrength};
-    use crate::storage::MetadataMutation;
-    use crate::traversal::{
-        TraversalItem, TraversalRequest, TraversalSource, TraversalTerminalFailure,
-    };
-
-    struct Fixture {
-        backend: BackendKind,
-        denied: bool,
-    }
-    #[async_trait]
-    impl Namespace for Fixture {
-        async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
-            Ok(SourceDescriptor::new(
-                path.clone(),
-                EntryKind::Directory,
-                None,
-                SourceIdentity::new(
-                    BackendIdentity::new(self.backend, "guard-fixture").unwrap(),
-                    IdentityStrength::PathScoped,
-                    "root",
-                )
-                .unwrap(),
-            ))
-        }
-        fn list(&self, request: ListRequest) -> ListingStream {
-            if self.denied {
-                ListingStream::failed(
-                    request.path.clone(),
-                    StorageRoleFailure::Entry(
-                        EntryOperationFailure::new(
-                            request.path,
-                            Operation::Traverse,
-                            FailureClass::PermissionDenied,
-                            Transience::Permanent,
-                            "denied",
-                        )
-                        .unwrap(),
-                    ),
-                )
-            } else {
-                ListingStream::from_producer(request.path, |_sink| async {
-                    std::future::pending::<()>().await
-                })
-            }
-        }
-    }
-    #[async_trait]
-    impl Metadata for Fixture {
-        async fn observe(
-            &self,
-            _: &StoragePath,
-            _: ObservationPlan,
-        ) -> Result<MetadataObservations, StorageRoleFailure> {
-            Ok(MetadataObservations::default())
-        }
-        async fn apply(
-            &self,
-            _: &StoragePath,
-            _: MetadataMutation,
-            _: CancellationToken,
-        ) -> Result<(), StorageRoleFailure> {
-            unreachable!()
-        }
-    }
-    fn roles(backend: BackendKind, denied: bool) -> Storage {
-        let role = Arc::new(Fixture { backend, denied });
-        let unsupported =
-            CapabilityAvailability::Unsupported(UnsupportedReason::new("test only").unwrap());
-        StorageBuilder::new(
-            BackendIdentity::new(backend, "guard-fixture").unwrap(),
-            BackendCapabilities::new(
-                unsupported.clone(),
-                unsupported,
-                CapabilityAvailability::Supported,
-                CapabilityAvailability::Supported,
-            ),
-        )
-        .namespace(role.clone())
-        .metadata(role)
-        .build()
-        .unwrap()
-    }
-    #[tokio::test]
-    async fn all_remote_backends_report_operation_timeout_without_waiting_for_native_retries() {
-        for backend in [
-            BackendKind::Nfs,
-            BackendKind::S3,
-            BackendKind::Cifs,
-            BackendKind::Hdfs,
-        ] {
-            let (source, signal) =
-                ScanFailureSignal::source(&roles(backend, false), Some(Duration::from_millis(20)))
-                    .unwrap();
-            let mut session = source.traverse(TraversalRequest::new(StoragePath::root()));
-            let result = timeout(Duration::from_millis(250), async {
-                while session.next_item().await.is_some() {}
-                session.finish().await
-            })
-            .await
-            .unwrap();
-            assert!(
-                matches!(result,Err(TraversalTerminalFailure::Session(failure)) if failure.class()==FailureClass::Timeout)
-            );
-            let error = signal.failure().unwrap();
-            assert_eq!(error.backend, backend);
-            assert_eq!(error.code(), "storage_operation_timeout");
-        }
-    }
-    #[tokio::test]
-    async fn permission_denied_never_becomes_a_network_failure() {
-        let (source, signal) = ScanFailureSignal::source(
-            &roles(BackendKind::Cifs, true),
-            Some(Duration::from_millis(20)),
-        )
-        .unwrap();
-        let mut session = source.traverse(TraversalRequest::new(StoragePath::root()));
-        let mut denied = false;
-        while let Some(item) = session.next_item().await {
-            if let TraversalItem::Failure(failure) = item {
-                denied |= failure.failure.class() == FailureClass::PermissionDenied;
-            }
-        }
-        session.finish().await.unwrap();
-        assert!(denied);
-        assert!(signal.failure().is_none());
-    }
-    #[tokio::test]
-    async fn already_failed_notification_preserves_the_first_failure() {
-        let signal = ScanFailureSignal::new(BackendKind::Nfs, Some(Duration::from_secs(3)));
-        signal.record(
-            Operation::Traverse,
-            &StoragePath::root(),
-            RemoteScanFailureKind::ConnectionLost,
-            None,
-        );
-        signal.record(
-            Operation::Observe,
-            &StoragePath::root(),
-            RemoteScanFailureKind::OperationTimedOut,
-            None,
-        );
-        timeout(Duration::from_millis(50), signal.failed())
-            .await
-            .unwrap();
-        assert_eq!(signal.failure().unwrap().code(), "storage_connection_lost");
-    }
-}
+#[path = "../scan_tests.rs"]
+mod tests;

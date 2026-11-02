@@ -717,7 +717,7 @@ SKILL.md）上跑出来的差异，以及各自的处理：
 | legal hold 下删指针版本 | 拒（403 / MinIO 400 WORM） | 403 `AccessDenied` | 告警，改发普通 DELETE |
 | legal hold 下普通 DELETE（当前版本被扣） | 加删除标记 | **403 `AccessDenied`** | 告警，指针留在原处，传输照常（见 C17 节） |
 | 带 Object Lock 建桶 | 同时开版本 | **不开版本**（`ObjectLockEnabled=Enabled`，版本 off） | 矩阵脚本检测到后自己开版本 |
-| 重试一个仍在完成中的 `CompleteMultipartUpload` | MinIO 404 `NoSuchUpload` | 500 `InternalError`「This multipart completion is already in progress」 | 会话 `Connectivity` / Transient：不是提交前的拒绝 → `ListParts`；还列得到 → 报已变 + transient（C15c） |
+| 重试一个仍在完成中的 `CompleteMultipartUpload` | MinIO 404 `NoSuchUpload` | 500 `InternalError`「This multipart completion is already in progress」 | 会话 `Protocol` / Transient：服务端已返回有效 5xx，不能据此判定连接中断；不是提交前的拒绝 → `ListParts`；还列得到 → 报已变 + transient（C15c） |
 | 完成后 `ListParts` | MinIO 404 `NoSuchUpload` | 404 `NoSuchKey` | 同为 `NotFound` → 按版本结算（C17）；单测 `dxn_answers_to_a_completion_in_progress_and_after_it` |
 | `x-amz-server-side-encryption: aws:kms` 不给 key id | （AWS 用默认 key） | 403 `InvalidAccessKeyId` | 只记录：DXN 上用 SSE-KMS 必须给 `x-amz-server-side-encryption-aws-kms-key-id` |
 

@@ -355,8 +355,13 @@ fast-fail recovery for callers that own checkpoint restart. It also disables S3
 SDK/page transport resends and bounds HDFS failover attempts (one standby failover
 by default). S3 service errors and throttling remain distinct from transport loss.
 
-`ScanFailureSignal::source` applies a per-operation budget to remote namespace
-and metadata I/O and reports the first failure independently of buffered scan
-entries. Consumer backpressure has its own lifetime. Local traversal keeps its
-ordinary behavior. Product applications choose the budget and persist or display
-the typed result.
+`traversal::recoverable_scan` provides a default three-second recovery budget:
+it opens fresh connections and resumes safe directory checkpoints, retaining the
+first typed fault if recovery fails. Active directories may replay; consumers must
+honor the ordinary checkpoint/history contract. `ScanRecoveryStatus` exposes
+Running, Recovering and Failed; its failure signal is terminal only.
+
+`ScanFailureSignal::source` provides the lower-level operation guard and raw first
+fault signal. Consumer backpressure consumes neither operation nor recovery
+budgets. Applications select scan deadlines and recovery windows, keep Local
+traversal on its ordinary path, and persist or display the typed result.

@@ -148,13 +148,13 @@ impl Metadata for CifsMetadata {
             .protocol
             .metadata(path)
             .await
-            .map_err(|error| classify(path, Operation::Metadata, &error))?;
+            .map_err(|error| classify(path, Operation::Observe, &error))?;
         let observed =
-            descriptor_from_facts(&self.identity, path, &inline.facts, Operation::Metadata)?;
+            descriptor_from_facts(&self.identity, path, &inline.facts, Operation::Observe)?;
         if observed.source_identity != *expected {
             return Err(entry_failure(
                 path,
-                Operation::Metadata,
+                Operation::Observe,
                 FailureClass::Conflict,
             ));
         }
@@ -170,7 +170,7 @@ impl Metadata for CifsMetadata {
             .protocol
             .metadata(path)
             .await
-            .map_err(|error| classify(path, Operation::Metadata, &error))?;
+            .map_err(|error| classify(path, Operation::Observe, &error))?;
         self.observe_inline(path, plan, inline).await
     }
 
@@ -329,18 +329,16 @@ async fn observe_acl(
             let mut output = Cursor::new(Vec::new());
             explicit_dacl(descriptor)
                 .write_le(&mut output)
-                .map_err(|_| entry_failure(path, Operation::Metadata, FailureClass::Protocol))?;
+                .map_err(|_| entry_failure(path, Operation::Observe, FailureClass::Protocol))?;
             let value =
                 AclMetadata::new(AclEncoding::WindowsSecurityDescriptor, output.into_inner())
-                    .map_err(|_| {
-                        entry_failure(path, Operation::Metadata, FailureClass::Protocol)
-                    })?;
+                    .map_err(|_| entry_failure(path, Operation::Observe, FailureClass::Protocol))?;
             Ok(MetadataObservation::Value {
                 value,
                 provenance: MetadataProvenance::AdditionalCall,
             })
         }
-        Err(error) => match classify(path, Operation::Metadata, &error) {
+        Err(error) => match classify(path, Operation::Observe, &error) {
             StorageRoleFailure::Entry(error) if mode == ObservationMode::BestEffort => {
                 Ok(MetadataObservation::Failed {
                     class: error.class(),
@@ -419,6 +417,8 @@ mod tests {
 
     #[derive(Default)]
     struct ProbeProtocol {
+        network_metadata: bool,
+        network_acl: bool,
         acl_calls: AtomicUsize,
         sets: std::sync::Mutex<Vec<TimestampMetadata>>,
     }
@@ -426,6 +426,11 @@ mod tests {
     #[async_trait]
     impl CifsMetadataProtocol for ProbeProtocol {
         async fn metadata(&self, _path: &StoragePath) -> smb_domain::Result<CifsInlineMetadata> {
+            if self.network_metadata {
+                return Err(smb_domain::Error::NetworkOutcomeUnknown(
+                    smb_domain::error::NetworkFailure::ConnectionLost,
+                ));
+            }
             Ok(CifsInlineMetadata {
                 facts: CifsSourceFacts {
                     kind: crate::model::EntryKind::File,
@@ -459,6 +464,11 @@ mod tests {
             _path: &StoragePath,
         ) -> smb_domain::Result<smb_domain::SecurityDescriptor> {
             self.acl_calls.fetch_add(1, Ordering::SeqCst);
+            if self.network_acl {
+                return Err(smb_domain::Error::NetworkOutcomeUnknown(
+                    smb_domain::error::NetworkFailure::ConnectionLost,
+                ));
+            }
             Err(smb_domain::Error::InvalidMessage(
                 "scripted ACL failure".into(),
             ))
@@ -471,6 +481,36 @@ mod tests {
         ) -> smb_domain::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_and_optional_acl_observations_propagate_network_loss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for acl_fault in [false, true] {
+            let protocol = Arc::new(ProbeProtocol {
+                network_metadata: !acl_fault,
+                network_acl: acl_fault,
+                ..ProbeProtocol::default()
+            });
+            let identity =
+                BackendIdentity::new(crate::model::BackendKind::Cifs, "network-fixture")?;
+            let path = StoragePath::new("source")?;
+            let facts = ProbeProtocol::default().metadata(&path).await?.facts;
+            let expected = descriptor_from_facts(&identity, &path, &facts, Operation::Observe)?
+                .source_identity;
+            let adapter = CifsMetadata::new(protocol, identity);
+            let plan = ObservationPlan::default().with_acl(ObservationMode::BestEffort);
+            for bound in [false, true] {
+                let result = if bound {
+                    adapter.observe_bound(&path, &expected, plan).await
+                } else {
+                    adapter.observe(&path, plan).await
+                };
+                assert!(matches!(result, Err(StorageRoleFailure::Session(error))
+                    if error.class() == FailureClass::Connectivity));
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]

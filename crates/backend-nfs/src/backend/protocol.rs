@@ -1,3 +1,7 @@
+use std::io::ErrorKind;
+
+use nfs_rs::{Nfs4ErrorCode, NfsError};
+
 use super::source::NfsProtocolFailure;
 use crate::model::{FailureClass, NfsVersion, Transience};
 
@@ -18,6 +22,12 @@ pub struct NfsDialectError;
 
 #[allow(clippy::needless_pass_by_value)]
 pub fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
+    if error.is_server_busy() {
+        return with_server_status(
+            NfsProtocolFailure::new(FailureClass::Throttled, Transience::Transient),
+            &error,
+        );
+    }
     if let Some(outcome) = error.operation_outcome() {
         let (class, transience) = match outcome.recovery {
             // The request got no authoritative answer. `Retry`: nfs-rs certifies sending it
@@ -25,11 +35,7 @@ pub fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
             // `role_failure` promotes both Connectivity failures to session scope (the role
             // listing keeps a `Retry` after its first page to that listing, P7 C7).
             nfs_rs::RecoveryAction::Retry | nfs_rs::RecoveryAction::Remount => {
-                let class = if error.transport_error_kind() == Some(std::io::ErrorKind::TimedOut) {
-                    FailureClass::Timeout
-                } else {
-                    FailureClass::Connectivity
-                };
+                let class = recovery_failure_class(&error);
                 (class, Transience::Transient)
             }
             // Reopen remains entry-scoped because the mounted session is usable.
@@ -66,33 +72,42 @@ pub fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
             (FailureClass::Capacity, Transience::Permanent)
         }
         nfs_rs::NfsError::InvalidInput(_) => (FailureClass::InvalidInput, Transience::Permanent),
-        nfs_rs::NfsError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
+        nfs_rs::NfsError::Io(io) if io.kind() == ErrorKind::PermissionDenied => {
             (FailureClass::PermissionDenied, Transience::Permanent)
         }
-        nfs_rs::NfsError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+        nfs_rs::NfsError::Io(io) if io.kind() == ErrorKind::NotFound => {
             (FailureClass::NotFound, Transience::Permanent)
         }
-        nfs_rs::NfsError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
+        nfs_rs::NfsError::Io(io) if io.kind() == ErrorKind::TimedOut => {
             (FailureClass::Timeout, Transience::Transient)
         }
         value if value.is_connection_lost() => (FailureClass::Connectivity, Transience::Transient),
         nfs_rs::NfsError::Io(_) | nfs_rs::NfsError::Rpc(_) => {
             (FailureClass::Protocol, Transience::Unknown)
         }
-        // The server asks the client to come back later: throttling, not a protocol fault
-        // (P7 §8). `NFS4ERR_GRACE` is the same request while a restarted server recovers its
-        // state. nfs-rs backs off on `NFS4ERR_DELAY` / `NFS4ERR_GRACE` itself and returns the bare
-        // status once it gives up; the role listing backs off on all three before its first page
-        // (P7 C7). Elsewhere `NFS3ERR_JUKEBOX` is not retried yet, so it surfaces at once.
-        nfs_rs::NfsError::Nfs4(
-            nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY | nfs_rs::Nfs4ErrorCode::NFS4ERR_GRACE,
-        )
-        | nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_JUKEBOX) => {
-            (FailureClass::Throttled, Transience::Transient)
-        }
         _ => (FailureClass::Protocol, Transience::Unknown),
     };
     with_server_status(NfsProtocolFailure::new(class, transience), &error)
+}
+
+/// Recovery guidance describes safe replay, while this class comes from the cause.
+fn recovery_failure_class(error: &NfsError) -> FailureClass {
+    if error.transport_error_kind() == Some(ErrorKind::TimedOut) {
+        return FailureClass::Timeout;
+    }
+    if error.is_connection_lost() {
+        return FailureClass::Connectivity;
+    }
+    match error {
+        NfsError::OperationOutcome(outcome) => recovery_failure_class(&outcome.source),
+        NfsError::Nfs4(
+            Nfs4ErrorCode::NFS4ERR_BADSESSION
+            | Nfs4ErrorCode::NFS4ERR_DEADSESSION
+            | Nfs4ErrorCode::NFS4ERR_STALE_CLIENTID
+            | Nfs4ErrorCode::NFS4ERR_EXPIRED,
+        ) => FailureClass::Connectivity,
+        _ => FailureClass::Protocol,
+    }
 }
 
 /// Server statuses that refuse a request for the state it meets or the name it carries — the
@@ -149,6 +164,7 @@ fn with_server_status(failure: NfsProtocolFailure, error: &nfs_rs::NfsError) -> 
         nfs_rs::NfsError::Nfs3(code) => failure.with_status(code),
         nfs_rs::NfsError::Nfs4(code) => failure.with_status(code),
         nfs_rs::NfsError::OperationOutcome(outcome) => with_server_status(failure, &outcome.source),
+        nfs_rs::NfsError::ServerBusy(busy) => with_server_status(failure, &busy.source),
         _ => failure,
     }
 }
@@ -157,6 +173,47 @@ fn with_server_status(failure: NfsProtocolFailure, error: &nfs_rs::NfsError) -> 
 mod tests {
     use super::super::source::role_failure;
     use super::*;
+
+    #[test]
+    fn retry_guidance_is_not_network_evidence_for_malformed_replies() {
+        for recovery in [
+            nfs_rs::RecoveryAction::Retry,
+            nfs_rs::RecoveryAction::Remount,
+        ] {
+            let failure = classify_error(wrapped(
+                recovery,
+                nfs_rs::NfsError::Rpc("malformed response".into()),
+            ));
+            assert_eq!(failure.class, FailureClass::Protocol);
+            assert_eq!(failure.transience, Transience::Transient);
+        }
+    }
+
+    #[test]
+    fn exhausted_server_busy_retains_its_class_and_original_status() {
+        let busy = nfs_rs::NfsError::ServerBusy(Box::new(nfs_rs::ServerBusyError {
+            context: nfs_rs::RequestContext {
+                operation: "readdir".into(),
+                protocol: nfs_rs::NFSVersion::NFSv3,
+                request_id: None,
+            },
+            retries: 16,
+            elapsed: std::time::Duration::from_secs(60),
+            reason: nfs_rs::RetryExhaustion::Deadline,
+            source: Box::new(nfs_rs::NfsError::Nfs3(
+                nfs_rs::Nfs3ErrorCode::NFS3ERR_JUKEBOX,
+            )),
+        }));
+        let failure = classify_error(busy);
+        assert_eq!(failure.class, FailureClass::Throttled);
+        assert!(
+            failure
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("NFS3ERR_JUKEBOX")
+        );
+    }
 
     #[test]
     fn exact_dialects_are_distinct_and_ambiguous_v4_is_rejected() {
@@ -245,7 +302,7 @@ mod tests {
             ),
             (
                 nfs_rs::NfsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
+                    ErrorKind::ConnectionReset,
                     "connection reset",
                 )),
                 FailureClass::Connectivity,
@@ -364,10 +421,7 @@ mod tests {
                 protocol: nfs_rs::NFSVersion::NFSv4p1,
                 request_id: None,
             },
-            nfs_rs::NfsError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "test timeout",
-            )),
+            nfs_rs::NfsError::Io(std::io::Error::new(ErrorKind::TimedOut, "test timeout")),
         )))
     }
 
@@ -405,7 +459,7 @@ mod tests {
             ),
             (
                 nfs_rs::NfsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
+                    ErrorKind::ConnectionReset,
                     "connection reset",
                 )),
                 None,

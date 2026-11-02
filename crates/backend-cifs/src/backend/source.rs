@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 
+use smb_domain::error::NetworkFailure as SmbNetworkFailure;
+
 use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
     IdentityStrength, Operation, SourceIdentity, StoragePath, Transience,
@@ -272,22 +274,8 @@ pub(super) fn classify(
     // fallback is undiagnosable from the caller's side.
     // `required` rejects NUL, and a few facade variants carry server-derived strings.
     let diagnostic = format!("CIFS {operation:?} failed: {error}").replace('\0', "\\0");
-    if let Some(network) = error.network_failure().filter(|_| {
-        !error.outcome_unknown()
-            || matches!(
-                operation,
-                Operation::Traverse | Operation::Observe | Operation::Read
-            )
-    }) {
-        let class = match network {
-            smb_domain::error::NetworkFailure::TimedOut => FailureClass::Timeout,
-            smb_domain::error::NetworkFailure::ConnectionLost
-            | smb_domain::error::NetworkFailure::SessionInvalidated => FailureClass::Connectivity,
-        };
-        return StorageRoleFailure::Session(
-            BackendSessionFailure::new(operation, class, Transience::Transient, diagnostic)
-                .unwrap_or_else(|_| unreachable!("prefixed, NUL-free diagnostic")),
-        );
+    if let Some(class) = network_class(error, operation) {
+        return session_failure(operation, class, Transience::Transient, diagnostic);
     }
     let (class, transience) = match error {
         smb_domain::Error::ReceivedErrorMessage(status, _)
@@ -304,28 +292,41 @@ pub(super) fn classify(
         }
         smb_domain::Error::Cancelled(_) => (FailureClass::Cancelled, Transience::Transient),
         smb_domain::Error::RuntimeTerminated => (FailureClass::Internal, Transience::Unknown),
-        smb_domain::Error::ConnectionStopped
-        | smb_domain::Error::SessionInvalidated
-        | smb_domain::Error::TransportError(_) => {
-            return StorageRoleFailure::Session(
-                BackendSessionFailure::new(
-                    operation,
-                    FailureClass::Connectivity,
-                    Transience::Unknown,
-                    diagnostic,
-                )
-                .unwrap_or_else(|_| unreachable!("prefixed, NUL-free diagnostic is valid")),
-            );
-        }
         _ => (FailureClass::Protocol, Transience::Unknown),
     };
-    if class == FailureClass::Connectivity {
-        return StorageRoleFailure::Session(
-            BackendSessionFailure::new(operation, class, transience, diagnostic)
-                .unwrap_or_else(|_| unreachable!("prefixed, NUL-free diagnostic is valid")),
-        );
+    if matches!(class, FailureClass::Connectivity | FailureClass::Timeout) {
+        return session_failure(operation, class, transience, diagnostic);
     }
     entry_failure_with_transience(path, operation, class, transience, &diagnostic)
+}
+
+fn network_class(error: &smb_domain::Error, operation: Operation) -> Option<FailureClass> {
+    if error.outcome_unknown()
+        && !matches!(
+            operation,
+            Operation::Traverse | Operation::Observe | Operation::Read
+        )
+    {
+        return None;
+    }
+    error.network_failure().map(|failure| match failure {
+        SmbNetworkFailure::TimedOut => FailureClass::Timeout,
+        SmbNetworkFailure::ConnectionLost | SmbNetworkFailure::SessionInvalidated => {
+            FailureClass::Connectivity
+        }
+    })
+}
+
+fn session_failure(
+    operation: Operation,
+    class: FailureClass,
+    transience: Transience,
+    diagnostic: String,
+) -> StorageRoleFailure {
+    StorageRoleFailure::Session(
+        BackendSessionFailure::new(operation, class, transience, diagnostic)
+            .unwrap_or_else(|_| unreachable!("prefixed, NUL-free diagnostic")),
+    )
 }
 
 /// Whether the entry was already gone.
@@ -384,7 +385,8 @@ fn classify_status(status: u32) -> (FailureClass, Transience) {
             (FailureClass::Unsupported, Transience::Permanent)
         }
         Ok(Status::Cancelled) => (FailureClass::Cancelled, Transience::Transient),
-        Ok(Status::IoTimeout | Status::NetworkNameDeleted | Status::NetworkSessionExpired) => {
+        Ok(Status::IoTimeout) => (FailureClass::Timeout, Transience::Transient),
+        Ok(Status::NetworkNameDeleted | Status::NetworkSessionExpired) => {
             (FailureClass::Connectivity, Transience::Transient)
         }
         _ => (FailureClass::Protocol, Transience::Unknown),
@@ -476,6 +478,50 @@ mod mode_tests {
 #[cfg(test)]
 mod network_classification_tests {
     use super::*;
+    #[test]
+    fn server_io_timeout_is_not_a_confirmed_disconnect() {
+        assert_eq!(
+            classify_status(smb_domain::protocol::Status::IoTimeout as u32),
+            (FailureClass::Timeout, Transience::Transient)
+        );
+        let error = smb_domain::Error::UnexpectedMessageStatus(
+            smb_domain::protocol::Status::IoTimeout as u32,
+        );
+        assert!(
+            matches!(classify(&StoragePath::root(), Operation::Traverse, &error),
+            StorageRoleFailure::Session(failure) if failure.class() == FailureClass::Timeout)
+        );
+    }
+
+    #[test]
+    fn non_network_transport_faults_do_not_become_connection_loss() {
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let error = smb_domain::Error::TransportError(std::io::Error::from(kind).into());
+            assert!(
+                matches!(classify(&StoragePath::root(), Operation::Traverse, &error),
+                StorageRoleFailure::Entry(failure) if failure.class() == FailureClass::Protocol)
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_mutations_keep_protocol_uncertainty_but_observations_keep_network_cause() {
+        let error = smb_domain::Error::NetworkOutcomeUnknown(
+            smb_domain::error::NetworkFailure::ConnectionLost,
+        );
+        assert!(
+            matches!(classify(&StoragePath::root(), Operation::Observe, &error),
+            StorageRoleFailure::Session(failure) if failure.class() == FailureClass::Connectivity)
+        );
+        assert!(
+            matches!(classify(&StoragePath::root(), Operation::Metadata, &error),
+            StorageRoleFailure::Entry(failure) if failure.class() == FailureClass::Protocol && failure.transience()==Transience::Unknown)
+        );
+    }
+
     #[test]
     fn typed_smb_timeout_and_disconnect_never_fall_back_to_protocol() {
         let path = StoragePath::root();

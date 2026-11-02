@@ -45,8 +45,8 @@ NFS recovery wrappers retain transport timeouts while replay-sensitive uncertain
 remain `Protocol` / `Unknown`. SMB uses `Error::network_failure()` and retains unknown
 mutation outcomes. S3 interrupted HTTP bodies are transport loss; complete malformed XML
 and HTTP 5xx are protocol failures, with transient 5xx still retryable outside scan policy.
-`connect_scan_backend` and `traversal::ScanFailureSignal` own scan recovery policy and
-per-operation deadlines; applications own task status and presentation.
+`connect_scan_backend`, `traversal::recoverable_scan` and `ScanFailureSignal` own
+scan connection policy, a default three-second recovery window and per-operation deadlines; applications own task status and presentation.
 
 ## Retry Taxonomy (commit `7eb3046`)
 
@@ -103,8 +103,8 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | 节流：429、503，或错误码 `SlowDown` / `ServiceUnavailable` / `Throttling*` / `TooManyRequests*` / `RequestLimitExceeded` / `RequestThrottled*` / `BandwidthLimitExceeded`（不论状态码；P7 C3） | 会话 **`Throttled`** / Transient（此前是 `Connectivity`）。范围保持会话级，传输侧行为不变（引擎不按类别分支；`definite_refusal` 不含它，仍走 reconcile）。**列举**在生产者内按页退避（`src/storage/throttle.rs`：首个约 125–250 ms、翻倍、单次 ≤15 s、单个列举累计 ≤约 2 分钟，带抖动，取消即停），预算耗尽才是**该列举**的条目 `Throttled` / Transient（目录 `Unreadable`）；遍历把任何 `Throttled` 会话失败收窄为那个列举 / 那个子项的失败，**节流不结束遍历**（P7 评审现存问题 1） |
 | 未写 `bucket_type=nas` 的 NAS 桶（P7 §14.2 N6）：条件 GET / `CreateMultipartUpload` / `CopyObject` / `UploadPartCopy` 回 501；`compat=ontap` 下 `ListMultipartUploads` / `ListParts` 回 403 | 类别不变（`Unsupported` / `PermissionDenied`，Permanent），诊断追加「add ?compat=ontap&bucket_type=nas」提示 |
 | 501，或错误码 `NotImplemented`（任何状态）：存储不实现这个请求（ONTAP 9.19.1 NAS 桶的 `CreateMultipartUpload`、带 `If-Match` / `If-None-Match` 的 GET、对象桶与 NAS 桶之间的 `CopyObject`，2026-09-26 实测） | 条目 **`Unsupported`** / Permanent（此前落进通用 5xx，是会话 `Connectivity` / Transient，传输报成可重试的断连）。`definite_refusal` 含 `Unsupported` → PUT / CopyObject / Complete 被 501 拒算最终 key 未变、不对账；删指针版本被 501 拒 → 降级为普通删除 + 告警（`not_deletable_by_version`）；**列举**不再重发，报在该目录上（目录 `Unreadable`，遍历继续兄弟）—— 整个桶都不能列的存储因此逐目录报，不升会话（NAS 桶能列，没遇到过） |
-| 其余 5xx（500 / 502 / 504 …，501 除外） | 会话 `Connectivity` / Transient（不变） |
-| DXN 重试一个仍在完成中的 Complete：500 `InternalError`（"This multipart completion is already in progress"） | 通用 5xx：会话 `Connectivity` / Transient —— 不是提交前的拒绝，`settle_completion` 查 `ListParts` |
+| 其余 5xx（500 / 502 / 504 …，501 除外） | 会话 `Protocol` / Transient；有效 HTTP 错误不证明断连 |
+| DXN 重试一个仍在完成中的 Complete：500 `InternalError`（"This multipart completion is already in progress"） | 通用 5xx：会话 `Protocol` / Transient —— 不是提交前的拒绝，`settle_completion` 查 `ListParts` |
 | DXN 完成后的 `ListParts`：404 `NoSuchKey`（MinIO 回 `NoSuchUpload`） | 条目 `NotFound` / Permanent（同上第一行）—— 与 `NoSuchUpload` 一样进入按版本结算（C17） |
 | 按 versionId 删除一个不存在的版本 | 成功（S3 / MinIO 回 204），不是错误 |
 | 按 versionId 的 DeleteObject 回 405（存储不支持按版本删） | 条目 `Unsupported` / Permanent —— **不是**带版本读的「删除标记」`NotFound`（清理会把它当成已删）；删指针时降级为普通删除 + 告警 |
@@ -143,7 +143,7 @@ nfs-rs 错误产出 `FailureClass` + `Transience`，并记下服务端状态名�
 
 | nfs-rs 错误 | FailureClass | Transience |
 |---|---|---|
-| `OperationOutcome` Retry / Remount | `Connectivity` | Transient |
+| `OperationOutcome` Retry / Remount | 按原始原因：断连 `Connectivity`、超时 `Timeout`、其他 `Protocol` | Transient |
 | `OperationOutcome` Reopen | `Protocol` | Transient |
 | `OperationOutcome` VerifyThenResume | `Protocol` | Unknown |
 | `OperationOutcome` DoNotRetry | `Protocol` | Permanent |
@@ -157,8 +157,9 @@ nfs-rs 错误产出 `FailureClass` + `Transience`，并记下服务端状态名�
 | `INVAL` / `NAMETOOLONG`（v3 / v4）、`NFS4ERR_BADNAME`（rename 进自己的子树是 `INVAL`） | `InvalidInput` | Permanent |
 | `InvalidInput` | `InvalidInput` | Permanent |
 | `Io` PermissionDenied / NotFound | `PermissionDenied` / `NotFound` | Permanent |
-| `Io` ConnectionReset / TimedOut / WouldBlock | `Connectivity` | Transient |
-| 其他 `Io` / `Rpc` | `Connectivity` | Unknown |
+| `Io` ConnectionReset / ConnectionAborted / BrokenPipe / NotConnected | `Connectivity` | Transient |
+| `Io` TimedOut | `Timeout` | Transient |
+| 其他 `Io` / `Rpc` | `Protocol` | Unknown |
 | `NFS4ERR_DELAY` / `NFS3ERR_JUKEBOX` / `NFS4ERR_GRACE`（`GRACE` 自 P7 C7 起，此前是 `Protocol` / Unknown）（服务端忙 / 重启后的恢复期。`NFS4ERR_DELAY`、`NFS4ERR_GRACE` 由 nfs-rs 先退避，用尽后返回原状态；role 列举首页前后都按列举的节流预算退避、保留缓冲从 cookie 续读（C7c；首页前由 `c0ff649` 补齐），预算用尽是该列举的失败；其他 role 路径的 `NFS3ERR_JUKEBOX` 仍立即浮出——待补） | **`Throttled`** | Transient |
 | 其他服务端状态（如 `NFS4ERR_BADOWNER`、`NFS4ERR_STALE`） | `Protocol` | Unknown |
 
@@ -222,7 +223,8 @@ CIFS 只有 role-based 实现，不经过 `StorageError`；映射表在
 | `STATUS_INVALID_PARAMETER` / `STATUS_OBJECT_NAME_INVALID` | `InvalidInput` | Permanent |
 | `STATUS_NOT_IMPLEMENTED` / `STATUS_NOT_SUPPORTED` / `STATUS_DEVICE_FEATURE_NOT_SUPPORTED` | `Unsupported` | Permanent |
 | `STATUS_CANCELLED` | `Cancelled` | Transient |
-| `STATUS_IO_TIMEOUT` / `STATUS_NETWORK_NAME_DELETED` / `STATUS_NETWORK_SESSION_EXPIRED` | `Connectivity` (session failure) | Transient |
+| `STATUS_IO_TIMEOUT` | `Timeout` (session failure) | Transient |
+| `STATUS_NETWORK_NAME_DELETED` / `STATUS_NETWORK_SESSION_EXPIRED` | `Connectivity` (session failure) | Transient |
 | `STATUS_NOT_A_DIRECTORY` (0xC0000103，目录 open 命中文件) | `Conflict` | Permanent |
 | `STATUS_CANNOT_DELETE` (0xC0000121) | `PermissionDenied` | **Unknown** |
 | 其他 NTSTATUS / 非状态类 smb 错误 | `Protocol` | Unknown |
@@ -234,7 +236,7 @@ CIFS 只有 role-based 实现，不经过 `StorageError`；映射表在
 
 非状态类 smb-rs 错误：`NotFound` → NotFound；`MissingPermissions` → PermissionDenied；
 `InvalidArgument` → InvalidInput；`UnsupportedOperation` → Unsupported；`Cancelled` → Cancelled；
-`ConnectionStopped` / `SessionInvalidated` / `RuntimeTerminated` / `TransportError` → session 级 Connectivity。
+`Error::network_failure()` 为 ConnectionLost / SessionInvalidated → session 级 Connectivity，为 TimedOut → Timeout；传输封装自身不证明断连。主动 ConnectionClosed 和无网络原因的运行时关闭保持 Protocol / Unknown。
 legacy 的"`OBJECT_NAME_COLLISION` 当成功"已随 #150 删除：role 返回 `Conflict`，由调用方决定是否幂等。
 **role 列举 (P7 C9)** 不改分类，只决定重不重来：smb-rs 重连后不重开目录句柄，旧句柄上的请求报
 `InvalidState` ("stale share generation"，恢复期内的 #79 也是它) 或 `StaleObject`，服务端回
