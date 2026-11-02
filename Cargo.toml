@@ -511,7 +511,7 @@ indicatif = "0.18.4"
 libc = "0.2"
 md-5 = "0.10"
 moka = { version = "0.12.15" }
-nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git", rev = "9f3f98b2b19186a6e8edbf4414152015d055c415" }
+nfs-rs = "0.10.1"
 num-traits = "0.2.19"
 parking_lot = "0.12"
 path-clean = "1.0.1"
@@ -521,7 +521,7 @@ rustix = { version = "1.1" }
 rustls = { version = "0.23", default-features = false }
 serde = { version = "1" }
 serde_json = "1"
-smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "ea4c1c5a4189a24cb12ecdedd387c1676de6c516" }
+smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "02c80bb4f28e4566533e5ff4abc741b59e251ee3" }
 tempfile = "3"
 thiserror = "2.0.18"
 tokio = { version = "1.51.1", default-features = false }

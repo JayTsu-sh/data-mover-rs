@@ -67,8 +67,10 @@
 - **`[lints.rust]`**：`unsafe_code = deny`。新增 unsafe 必须有 SAFETY 注释 + PR 说明。
 - **异步**：tokio (full)。**错误**：thiserror。**日志**：tracing。
 - **依赖管理**：默认全 crates.io，无 `[patch.crates-io]` (与 terrasync-rs 不同)。升级 `smb-domain` / `nfs-rs` / `aws-sdk-s3` 是真实风险。
-  经项目授权的 git 固定：`smb-domain` (package `smb`) 固定 JayTsu-sh/smb-rs 已验证提交
-  `2649a0b` (smb-rs main 顶端，2026-09-27：#89 文件 `open_existing()` 只读，写 / flush 要 `.write(true)`、
+  `nfs-rs` 使用 crates.io 正式版本 `0.10.1`。经项目授权的 git 固定：`smb-domain`
+  (package `smb`) 固定 JayTsu-sh/smb-rs main 提交 `02c80bb4f28e4566533e5ff4abc741b59e251ee3`
+  (2026-11-02，#91：类型化断连 / 超时原因、已关闭 generation 的真实退出原因与写操作不确定性；原生 CI 全绿，
+  本库升级矩阵记录见 `.claude/docs/storage-cifs.md`)。此前 `2649a0b` (2026-09-27：#89 文件 `open_existing()` 只读，写 / flush 要 `.write(true)`、
   删除 / 改名要 `.delete(true)`；其前 `37d9404` #87 目录 `open_existing()` 只读、删除 / 改名目录要
   `.delete(true)`，#86 连接被 RST 后读循环不再二次 poll 而 panic；其前 `91e6cfb` #83 预备阶段取消修复、
   #82 runtime / 签名批处理 / 真机 CIFS 验收，domain ACL 只保留 account 类 ACE —— 有意为之；再前 #78 drop 连接即结束恢复、#76 丢流 /

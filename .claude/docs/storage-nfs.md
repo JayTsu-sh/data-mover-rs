@@ -2,9 +2,23 @@
 
 ## 底层依赖
 
-- **crate**：`nfs-rs` 0.9.1，crates.io 正式依赖。原生 NFSACL v3 与 NFSv4 ACL 分别保留各自编码；协议实现由 nfs-rs 独立发布。
+- **crate**：`nfs-rs` 0.10.1，crates.io 正式依赖（同版本亦已发布 PyPI）。原生 NFSACL v3 与 NFSv4 ACL 分别保留各自编码；协议实现由 nfs-rs 独立发布。
 - 支持 NFSv3 和 NFSv4 (自动协商 / 升级)。
 - 属性缓存用 `moka` (0.12.15)，减少冗余 GETATTR RPC。
+
+## 扫描连接与恢复
+
+`storage::connect_backend` 保留 nfs-rs 的默认有界恢复；`connect_scan_backend` 在 URL 上设置
+`fail_fast=true`，让明确断连先以类型化原因返回，再由 data-mover 的 `recoverable_scan`
+在默认 3 秒窗口内重连并从安全检查点续扫。这不是首个断连即结束整轮扫描；
+普通连接不启用该策略。窗口、消费者背压与最终故障信号见 [扫描恢复分层](codebase.md#远程扫描)。
+
+`transport_error_kind()` / `is_connection_lost()` 区分明确断连与 TimedOut；
+Retry / Remount 只是恢复指导，不会把畸形 RPC / XDR 自动变成 Connectivity。
+VerifyThenResume 的修改操作仍是 Protocol / Unknown，重放前需核验。
+0.10.x 对 JUKEBOX / DELAY / GRACE 做原生有界退避，耗尽后返回 ServerBusy：
+data-mover 保留 Throttled 与原始状态，不再次启动列举退避预算。
+原生库增加 v4.2 不表示 data-mover 自动声明该版本；当前 dialect 仍明确映射 v3 / v4.0 / v4.1。
 
 ## ACL 能力（2026-10-28）
 
@@ -171,7 +185,9 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
     13.5 万项 / 92 MB、另有过期碎片约 99 MB（P7 §12.7 内存根因）。变更路径（`create_dir_all`、`lookup_fh`、
     rmdir / rename 的失效）照旧用它。
   - **重试分类**：句柄失效 → 解析路径（提示失效时一次，之后忘掉缓存再解析
-    至多 3 次）；`DELAY` / `JUKEBOX` / `GRACE`（`GRACE` C7 起分类为 `Throttled`）→ 列举的节流预算内退避；nfs-rs 认证可安全重发的传输失败 → 250 ms / 1 s / 2 s。
+    至多 3 次）；`DELAY` / `JUKEBOX` / `GRACE` 的原生 ServerBusy 耗尽结果保持 Throttled，
+    不再启动外层退避；明确断连立即结束本次列举，让扫描恢复窗口处理。其他获准 Resend 的失败
+    仍按既有 250 ms / 1 s / 2 s 预算处理，不能仅凭“可安全重发”认定连接健康。
     错误直接经 `classify_error`，保留服务端状态名。
   - **首页前后都按 cookie 续读（P7 C7c，`c0ff649` 补齐首页前；nfs-rs 0.8.5 `Mount::readdirplus_page`）**：读者一页一页地从列举持有的
     `DirectoryCookie`（cookie + verifier）读，整个回复取完且目录未完才把 `next` 报给列举（`reached`）。失败按上面
