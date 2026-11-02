@@ -480,7 +480,7 @@ fn a_failed_parent_lookup_keeps_the_role_classification() {
         ),
         (
             NfsError::Rpc("session slot table closed".to_owned()),
-            FailureClass::Connectivity,
+            FailureClass::Protocol,
             Transience::Unknown,
         ),
     ] {

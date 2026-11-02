@@ -541,6 +541,8 @@ pub enum Operation {
 pub enum FailureClass {
     /// Connectivity or transport loss.
     Connectivity,
+    /// An operation deadline elapsed without an authoritative response; not proof of disconnect.
+    Timeout,
     /// Authentication failed.
     Authentication,
     /// Permission was denied.

@@ -13,11 +13,13 @@ use crate::time_util::http_last_modified;
 
 macro_rules! classify_sdk {
     ($error:expr, $diagnostic:literal) => {
-        if matches!(
-            &$error,
-            aws_smithy_runtime_api::client::result::SdkError::TimeoutError(_)
-                | aws_smithy_runtime_api::client::result::SdkError::DispatchFailure(_)
-        ) {
+        if matches!(&$error, aws_smithy_runtime_api::client::result::SdkError::TimeoutError(_))
+            || matches!(&$error, aws_smithy_runtime_api::client::result::SdkError::DispatchFailure(failure) if failure.is_timeout())
+        {
+            $crate::backend::client::role_protocol::s3_role_timeout_failure($diagnostic)
+        } else if matches!(&$error, aws_smithy_runtime_api::client::result::SdkError::DispatchFailure(failure) if failure.is_io())
+            || $crate::backend::client::role_protocol::interrupted_transport(&$error)
+        {
             s3_role_transport_failure($diagnostic)
         } else {
             s3_role_remote_failure(
@@ -32,6 +34,37 @@ macro_rules! classify_sdk {
         }
     };
 }
+
+/// Body reads can fail after HTTP headers, when the SDK uses ResponseError rather
+/// than DispatchFailure. Inspect typed causes; malformed XML is still Protocol.
+fn interrupted_transport<E: std::error::Error + ?Sized>(error: &E) -> bool {
+    let mut cause = error.source();
+    while let Some(error) = cause {
+        if let Some(io) = error.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        {
+            return true;
+        }
+        if let Some(http) = error.downcast_ref::<hyper::Error>()
+            && (http.is_closed() || http.is_incomplete_message() || http.is_canceled())
+        {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
+}
+
+#[cfg(test)]
+mod network_tests;
 
 mod delete_batch;
 mod delete_marker;
@@ -603,6 +636,10 @@ fn s3_role_session(diagnostic: String) -> crate::storage::backends::s3::S3Protoc
     )
 }
 
+fn s3_role_timeout_failure(diagnostic: &'static str) -> S3ProtocolFailure {
+    S3ProtocolFailure::session(FailureClass::Timeout, Transience::Transient, diagnostic)
+}
+
 fn s3_role_transport_failure(
     diagnostic: &'static str,
 ) -> crate::storage::backends::s3::S3ProtocolFailure {
@@ -686,10 +723,12 @@ pub(super) fn s3_role_remote_failure(
         // AWS retries these even when carried by a 400 response. Preserve that
         // classification when source admission owns the per-attempt retry loop.
         (_, Some("RequestTimeout" | "RequestTimeoutException")) => {
-            s3_role_transport_failure(diagnostic)
+            s3_role_timeout_failure(diagnostic)
         }
+        // A server response proves the transport answered; retain a transient protocol
+        // failure instead of reporting a disconnected storage.
         (Some(500..=599), _) => crate::storage::backends::s3::S3ProtocolFailure::session(
-            FailureClass::Connectivity,
+            FailureClass::Protocol,
             Transience::Transient,
             diagnostic,
         ),
@@ -790,7 +829,7 @@ mod tests {
         assert!(matches!(
             s3_role_remote_failure(Some(502), None, "request"),
             S3ProtocolFailure::Session {
-                class: FailureClass::Connectivity,
+                class: FailureClass::Protocol,
                 transience: Transience::Transient,
                 ..
             }
@@ -848,7 +887,7 @@ mod tests {
         assert!(matches!(
             s3_role_remote_failure(Some(500), Some("InternalError"), "complete"),
             S3ProtocolFailure::Session {
-                class: FailureClass::Connectivity,
+                class: FailureClass::Protocol,
                 transience: Transience::Transient,
                 ..
             }

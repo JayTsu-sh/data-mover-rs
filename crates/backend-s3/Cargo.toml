@@ -23,6 +23,7 @@ blake3 = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
 http-body = { workspace = true }
+hyper = { workspace = true }
 percent-encoding = { workspace = true }
 tracing = { workspace = true }
 md-5 = { workspace = true }

@@ -25,7 +25,12 @@ pub fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
             // `role_failure` promotes both Connectivity failures to session scope (the role
             // listing keeps a `Retry` after its first page to that listing, P7 C7).
             nfs_rs::RecoveryAction::Retry | nfs_rs::RecoveryAction::Remount => {
-                (FailureClass::Connectivity, Transience::Transient)
+                let class = if error.transport_error_kind() == Some(std::io::ErrorKind::TimedOut) {
+                    FailureClass::Timeout
+                } else {
+                    FailureClass::Connectivity
+                };
+                (class, Transience::Transient)
             }
             // Reopen remains entry-scoped because the mounted session is usable.
             nfs_rs::RecoveryAction::Reopen => (FailureClass::Protocol, Transience::Transient),
@@ -67,18 +72,12 @@ pub fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
         nfs_rs::NfsError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
             (FailureClass::NotFound, Transience::Permanent)
         }
-        nfs_rs::NfsError::Io(io)
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::WouldBlock
-            ) =>
-        {
-            (FailureClass::Connectivity, Transience::Transient)
+        nfs_rs::NfsError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => {
+            (FailureClass::Timeout, Transience::Transient)
         }
+        value if value.is_connection_lost() => (FailureClass::Connectivity, Transience::Transient),
         nfs_rs::NfsError::Io(_) | nfs_rs::NfsError::Rpc(_) => {
-            (FailureClass::Connectivity, Transience::Unknown)
+            (FailureClass::Protocol, Transience::Unknown)
         }
         // The server asks the client to come back later: throttling, not a protocol fault
         // (P7 §8). `NFS4ERR_GRACE` is the same request while a restarted server recovers its
@@ -221,7 +220,7 @@ mod tests {
             ),
             (
                 nfs_rs::NfsError::Rpc("malformed reply".to_owned()),
-                FailureClass::Connectivity,
+                FailureClass::Protocol,
                 Transience::Unknown,
             ),
             // A refused chown: the metadata role's SETATTR reaches this arm unwrapped.
@@ -459,7 +458,7 @@ mod tests {
                     nfs_rs::OperationClass::ReadOnly,
                     nfs_rs::RecoveryAction::Retry,
                 ),
-                FailureClass::Connectivity,
+                FailureClass::Timeout,
                 Transience::Transient,
             ),
             (
@@ -477,7 +476,7 @@ mod tests {
                     nfs_rs::OperationClass::SessionControl,
                     nfs_rs::RecoveryAction::Remount,
                 ),
-                FailureClass::Connectivity,
+                FailureClass::Timeout,
                 Transience::Transient,
             ),
             (

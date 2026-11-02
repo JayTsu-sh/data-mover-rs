@@ -48,7 +48,6 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
     }
 
     /// The same role with other paging bounds, so tests reach them with a few objects.
-    #[cfg(any(test, feature = "test-support"))]
     pub(super) const fn with_limits(mut self, limits: ListingLimits) -> Self {
         self.limits = limits;
         self

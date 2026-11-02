@@ -320,7 +320,7 @@ fn lookup_failed(directory: &StoragePath, child: &Path, failed: LookupFailure) -
     let failure = read_failure(error);
     if matches!(
         failure.failure.class,
-        FailureClass::Connectivity | FailureClass::Throttled
+        FailureClass::Connectivity | FailureClass::Timeout | FailureClass::Throttled
     ) || (stale_directory && failure.restart == NfsRestart::Relookup)
     {
         return Examined::Abort(failure);
@@ -403,6 +403,11 @@ fn server_error(error: &NfsError) -> &NfsError {
 /// `Retry` makes a transport failure worth resending (`Remount` means the session must be
 /// replaced), and looking inside only names the server's status.
 fn restart_for(error: &NfsError) -> NfsRestart {
+    // Replay safety is not connection health. Once nfs-rs reports a dead connection,
+    // return it to traversal so the caller can choose checkpoint recovery immediately.
+    if error.is_connection_lost() {
+        return NfsRestart::Never;
+    }
     if let Some(outcome) = error.operation_outcome() {
         if matches!(outcome.recovery, RecoveryAction::Retry) {
             return NfsRestart::Resend;

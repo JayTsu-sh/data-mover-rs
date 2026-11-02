@@ -643,3 +643,6 @@ mod producer_tests {
         )))
     }
 }
+
+mod scan;
+pub use scan::{RemoteScanFailure, RemoteScanFailureKind, ScanFailureSignal, ScanSetupError};

@@ -25,6 +25,7 @@ pub(super) fn identity(
 pub(super) fn connect(
     storage: &S3Storage,
     single_put_threshold: u64,
+    limits: super::super::paging::ListingLimits,
 ) -> Result<Storage, Box<dyn std::error::Error>> {
     let identity = identity(
         &storage.endpoint,
@@ -42,7 +43,7 @@ pub(super) fn connect(
             S3NativeContext::new(&storage.endpoint, label, bucket, prefix)
         }
     });
-    crate::storage::backends::s3::connect_configured(
+    super::super::connect_roles(
         Arc::new(storage.clone()),
         identity,
         native,
@@ -53,6 +54,8 @@ pub(super) fn connect(
             }
         },
         Some(single_put_threshold),
+        limits,
+        |staged| staged,
     )
 }
 

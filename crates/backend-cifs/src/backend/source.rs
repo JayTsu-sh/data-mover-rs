@@ -272,6 +272,23 @@ pub(super) fn classify(
     // fallback is undiagnosable from the caller's side.
     // `required` rejects NUL, and a few facade variants carry server-derived strings.
     let diagnostic = format!("CIFS {operation:?} failed: {error}").replace('\0', "\\0");
+    if let Some(network) = error.network_failure().filter(|_| {
+        !error.outcome_unknown()
+            || matches!(
+                operation,
+                Operation::Traverse | Operation::Observe | Operation::Read
+            )
+    }) {
+        let class = match network {
+            smb_domain::error::NetworkFailure::TimedOut => FailureClass::Timeout,
+            smb_domain::error::NetworkFailure::ConnectionLost
+            | smb_domain::error::NetworkFailure::SessionInvalidated => FailureClass::Connectivity,
+        };
+        return StorageRoleFailure::Session(
+            BackendSessionFailure::new(operation, class, Transience::Transient, diagnostic)
+                .unwrap_or_else(|_| unreachable!("prefixed, NUL-free diagnostic")),
+        );
+    }
     let (class, transience) = match error {
         smb_domain::Error::ReceivedErrorMessage(status, _)
         | smb_domain::Error::UnexpectedMessageStatus(status) => classify_status(*status),
@@ -286,9 +303,9 @@ pub(super) fn classify(
             (FailureClass::Unsupported, Transience::Permanent)
         }
         smb_domain::Error::Cancelled(_) => (FailureClass::Cancelled, Transience::Transient),
+        smb_domain::Error::RuntimeTerminated => (FailureClass::Internal, Transience::Unknown),
         smb_domain::Error::ConnectionStopped
         | smb_domain::Error::SessionInvalidated
-        | smb_domain::Error::RuntimeTerminated
         | smb_domain::Error::TransportError(_) => {
             return StorageRoleFailure::Session(
                 BackendSessionFailure::new(
@@ -453,5 +470,34 @@ mod mode_tests {
         assert_eq!(smb_attributes_to_mode(false, true), 0o444);
         assert_eq!(smb_attributes_to_mode(true, false), 0o755);
         assert_eq!(smb_attributes_to_mode(true, true), 0o555);
+    }
+}
+
+#[cfg(test)]
+mod network_classification_tests {
+    use super::*;
+    #[test]
+    fn typed_smb_timeout_and_disconnect_never_fall_back_to_protocol() {
+        let path = StoragePath::root();
+        let timeout = smb_domain::Error::OperationTimeout(
+            smb_domain::error::TimedOutTask::ReceiveNextMessage,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            matches!(classify(&path,Operation::Traverse,&timeout),StorageRoleFailure::Session(failure) if failure.class()==FailureClass::Timeout)
+        );
+        let reset =
+            smb_domain::Error::IoError(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(
+            matches!(classify(&path,Operation::Traverse,&reset),StorageRoleFailure::Session(failure) if failure.class()==FailureClass::Connectivity)
+        );
+        assert!(
+            matches!(classify(&path, Operation::Traverse, &smb_domain::Error::RuntimeTerminated),
+            StorageRoleFailure::Entry(failure) if failure.class() == FailureClass::Internal)
+        );
+        let malformed = smb_domain::Error::InvalidMessage("redacted".into());
+        assert!(
+            matches!(classify(&path,Operation::Traverse,&malformed),StorageRoleFailure::Entry(failure) if failure.class()==FailureClass::Protocol)
+        );
     }
 }

@@ -38,6 +38,16 @@
 > 放在末尾。2026-09-17 复核：`grep -c '#\[error' src/error.rs` = 29，此前表与 R3 的 verify
 > 命令都停在 24，25-29 是期间新增但没同步进来的。
 
+## Remote scan network categories (2026-11-02)
+
+Role-based adapters distinguish `FailureClass::Timeout` from definite `Connectivity`.
+NFS recovery wrappers retain transport timeouts while replay-sensitive uncertain mutations
+remain `Protocol` / `Unknown`. SMB uses `Error::network_failure()` and retains unknown
+mutation outcomes. S3 interrupted HTTP bodies are transport loss; complete malformed XML
+and HTTP 5xx are protocol failures, with transient 5xx still retryable outside scan policy.
+`connect_scan_backend` and `traversal::ScanFailureSignal` own scan recovery policy and
+per-operation deadlines; applications own task status and presentation.
+
 ## Retry Taxonomy (commit `7eb3046`)
 
 调用方 (例如 sync 引擎) 根据 `StorageError` 决定是否重试：

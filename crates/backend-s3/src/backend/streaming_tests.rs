@@ -353,6 +353,24 @@ async fn a_throttled_page_mid_listing_is_requested_again_with_the_same_token() -
     Ok(())
 }
 
+/// Scan policy surfaces a failed continuation once, after preserving earlier pages.
+#[tokio::test]
+async fn scan_listing_surfaces_connection_loss_without_resending_the_page() -> TestResult {
+    let protocol = failing_third_page(connection_lost(), usize::MAX).await?;
+    let namespace = S3Namespace::new(protocol.clone(), identity()).with_limits(ListingLimits::SCAN);
+    let mut stream = listing(&namespace, "d", CancellationToken::new())?;
+    assert_eq!(names(&next_page(&mut stream).await?), ["a"]);
+    assert_eq!(names(&next_page(&mut stream).await?), ["b"]);
+    let failure = timeout(PATIENCE, stream.next()).await?;
+    assert!(
+        matches!(failure, Some(Err(StorageRoleFailure::Session(ref error)))
+        if error.class() == FailureClass::Connectivity),
+        "{failure:?}"
+    );
+    assert_eq!(protocol.listing().calls.len(), 3);
+    Ok(())
+}
+
 /// The resends start over after every page that arrives: two pages that each fail transiently as
 /// often as the resends allow still list whole (the first page's resends do not use up the
 /// second's).

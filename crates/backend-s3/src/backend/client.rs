@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_credential_types::Credentials;
@@ -188,7 +189,22 @@ impl S3Storage {
         &self,
         single_put_threshold: u64,
     ) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
-        architecture::connect(self, single_put_threshold)
+        architecture::connect(
+            self,
+            single_put_threshold,
+            super::paging::ListingLimits::PRODUCTION,
+        )
+    }
+
+    pub(super) fn architecture_scan_storage(
+        &self,
+        single_put_threshold: u64,
+    ) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
+        architecture::connect(
+            self,
+            single_put_threshold,
+            super::paging::ListingLimits::SCAN,
+        )
     }
 
     /// What the bucket's versioning status was (P7 Q-A: never `Err` for a refusal or a lost
@@ -315,6 +331,14 @@ impl S3Storage {
     ///
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn new(url: &str, block_size: Option<u64>) -> Result<Self> {
+        Self::new_with_attempts(url, block_size, None).await
+    }
+
+    pub(super) async fn new_with_attempts(
+        url: &str,
+        block_size: Option<u64>,
+        attempts: Option<u32>,
+    ) -> Result<Self> {
         if block_size == Some(0) {
             return Err(StorageError::ConfigError(
                 "S3 read chunk must be non-zero".into(),
@@ -364,6 +388,10 @@ impl S3Storage {
             .credentials_provider(credentials_provider)
             // 配置超时参数，避免连接挂起或不完整消息错误
             .timeout_config(s3_timeout_config());
+        if let Some(attempts) = attempts {
+            sdk_builder =
+                sdk_builder.retry_config(RetryConfig::standard().with_max_attempts(attempts));
+        }
         if options.skips_tls_verification() {
             warn_unverified("connection", &endpoint);
             sdk_builder = sdk_builder.http_client(build_skip_verify_http_client()?);

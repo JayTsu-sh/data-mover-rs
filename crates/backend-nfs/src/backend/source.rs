@@ -467,7 +467,10 @@ pub(super) fn role_failure(
     operation: Operation,
     error: NfsProtocolFailure,
 ) -> StorageRoleFailure {
-    if error.class == FailureClass::Connectivity {
+    if matches!(
+        error.class,
+        FailureClass::Connectivity | FailureClass::Timeout
+    ) {
         let diagnostic = diagnostic("session", error.status.as_deref());
         return StorageRoleFailure::Session(
             BackendSessionFailure::new(operation, error.class, error.transience, diagnostic)

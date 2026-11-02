@@ -57,17 +57,39 @@ pub use data_mover_storage_core::storage::config::s3::endpoint_identity;
 pub async fn connect_backend(
     config: crate::storage::S3BackendConfig,
 ) -> Result<Storage, crate::storage::BackendConnectError> {
+    connect_with_attempts(config, None).await
+}
+
+/// Scanners own recovery and need the first SDK transport failure immediately.
+pub async fn connect_scan_backend(
+    config: crate::storage::S3BackendConfig,
+) -> Result<Storage, crate::storage::BackendConnectError> {
+    connect_with_attempts(config, Some(1)).await
+}
+
+async fn connect_with_attempts(
+    config: crate::storage::S3BackendConfig,
+    attempts: Option<u32>,
+) -> Result<Storage, crate::storage::BackendConnectError> {
     // Refuse an invalid threshold before any network I/O.
     let threshold = single_put_threshold(config.single_put_threshold)
         .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::S3, error))?;
-    let storage = client::S3Storage::new(&config.url, config.block_size)
-        .await
-        .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::S3, error))?;
-    storage
-        .architecture_storage_with_single_put_threshold(threshold)
-        .map_err(|error| {
-            crate::storage::BackendConnectError::from_roles(BackendKind::S3, error.as_ref())
-        })
+    let storage = match attempts {
+        Some(attempts) => {
+            client::S3Storage::new_with_attempts(&config.url, config.block_size, Some(attempts))
+                .await
+        }
+        None => client::S3Storage::new(&config.url, config.block_size).await,
+    }
+    .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::S3, error))?;
+    let roles = if attempts.is_some() {
+        storage.architecture_scan_storage(threshold)
+    } else {
+        storage.architecture_storage_with_single_put_threshold(threshold)
+    };
+    roles.map_err(|error| {
+        crate::storage::BackendConnectError::from_roles(BackendKind::S3, error.as_ref())
+    })
 }
 #[cfg(any(test, feature = "test-support"))]
 pub fn connect<P>(
@@ -119,6 +141,7 @@ where
         native_context,
         tag_support,
         single_put_threshold,
+        paging::ListingLimits::PRODUCTION,
         |staged| staged,
     )
 }
@@ -141,6 +164,7 @@ where
         None,
         S3TagSupport::Supported,
         Some(DEFAULT_SINGLE_PUT_THRESHOLD),
+        paging::ListingLimits::PRODUCTION,
         |staged| staged.with_checkpoint_interval(checkpoint_interval),
     )
 }
@@ -164,6 +188,7 @@ where
         Some(tests::native_context()),
         S3TagSupport::Supported,
         Some(DEFAULT_SINGLE_PUT_THRESHOLD),
+        paging::ListingLimits::PRODUCTION,
         |staged| {
             staged
                 .with_checkpoint_interval(checkpoint_interval)
@@ -178,6 +203,7 @@ fn connect_roles<P>(
     native_context: Option<S3NativeContext>,
     tag_support: S3TagSupport,
     single_put_threshold: Option<u64>,
+    limits: paging::ListingLimits,
     configure: impl FnOnce(staged::S3StagedDestination<P>) -> staged::S3StagedDestination<P>,
 ) -> Result<Storage, Box<dyn std::error::Error>>
 where
@@ -202,10 +228,9 @@ where
             .with_tag_support(matches!(tag_support, S3TagSupport::Supported))
             .with_single_put_threshold(single_put_threshold),
     ));
-    let namespace: Arc<dyn Namespace> = Arc::new(namespace::S3Namespace::new(
-        protocol.clone(),
-        identity.clone(),
-    ));
+    let namespace: Arc<dyn Namespace> = Arc::new(
+        namespace::S3Namespace::new(protocol.clone(), identity.clone()).with_limits(limits),
+    );
     let native = native_context.map(|context| {
         Arc::new(native::S3NativeEndpoint::new(
             protocol.clone(),

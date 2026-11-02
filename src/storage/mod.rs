@@ -10,4 +10,4 @@ pub use backends::local::windows_acl;
 pub use backends::nfs::list_exports;
 #[cfg(feature = "backend-s3")]
 pub use backends::s3::{S3BucketInfo, list_buckets};
-pub use factory::connect_backend;
+pub use factory::{connect_backend, connect_scan_backend};

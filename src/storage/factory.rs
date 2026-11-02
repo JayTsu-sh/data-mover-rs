@@ -34,3 +34,36 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
         BackendConfig::Hdfs(_) => Err(BackendConnectError::not_compiled(BackendKind::Hdfs)),
     }
 }
+
+/// Connects a source whose caller owns scan restart and checkpoint recovery.
+/// Definite transport loss reaches traversal before RPC/page replay delays.
+/// S3 uses one SDK attempt; HDFS allows one standby failover unless explicitly configured.
+pub async fn connect_scan_backend(
+    mut config: BackendConfig,
+) -> Result<Storage, BackendConnectError> {
+    if let BackendConfig::Nfs(nfs) = &mut config {
+        let mut url = url::Url::parse(&nfs.url)
+            .map_err(|error| BackendConnectError::new(BackendKind::Nfs, error))?;
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(key, _)| key != "fail_fast")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        url.set_query(None);
+        url.query_pairs_mut()
+            .extend_pairs(pairs)
+            .append_pair("fail_fast", "true");
+        nfs.url = url.to_string();
+    }
+    if let BackendConfig::Hdfs(hdfs) = &mut config {
+        hdfs.client
+            .overrides
+            .entry("dfs.client.failover.max.attempts".into())
+            .or_insert_with(|| "1".into());
+    }
+    #[cfg(feature = "backend-s3")]
+    if let BackendConfig::S3(s3) = config {
+        return backends::s3::connect_scan_backend(s3).await;
+    }
+    connect_backend(config).await
+}

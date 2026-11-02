@@ -55,6 +55,12 @@ impl ListingLimits {
     /// 2026-09-26: the limit bounds memory, not the size of a flat prefix). As many continuations:
     /// at 1 000 objects a page, 5 billion objects. Three resends 0.25–2 s
     /// apart, on top of the SDK's own attempts, as the HDFS listing does (P7 C8).
+    /// Scans surface transport failures to their owner without page-level resends.
+    pub(super) const SCAN: Self = Self {
+        resends: &[],
+        ..Self::PRODUCTION
+    };
+
     pub(super) const PRODUCTION: Self = Self {
         max_entries: 5_000_000,
         max_empty_pages: 16,

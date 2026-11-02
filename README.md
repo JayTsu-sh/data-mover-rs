@@ -345,3 +345,18 @@ mapping. `smb2_only` and the legacy `CifsStorage` path remain removed (#150).
 `tests/lab/tools/cifs_mount_comparison.rs` and `tests/cifs_policy_contract.rs` read
 `CIFS_REAL_SERVER`, `CIFS_REAL_SECOND_SERVER`, `CIFS_REAL_SHARE`, `CIFS_REAL_USER`,
 and `CIFS_REAL_PASS`.
+
+### Scan network failures
+
+Protocol clients report definite connection loss and typed deadlines. The CIFS
+adapter preserves those categories as `Connectivity` and `Timeout`; uncertain
+mutations retain their outcome semantics. `connect_scan_backend` selects NFS
+fast-fail recovery for callers that own checkpoint restart. It also disables S3
+SDK/page transport resends and bounds HDFS failover attempts (one standby failover
+by default). S3 service errors and throttling remain distinct from transport loss.
+
+`ScanFailureSignal::source` applies a per-operation budget to remote namespace
+and metadata I/O and reports the first failure independently of buffered scan
+entries. Consumer backpressure has its own lifetime. Local traversal keeps its
+ordinary behavior. Product applications choose the budget and persist or display
+the typed result.
