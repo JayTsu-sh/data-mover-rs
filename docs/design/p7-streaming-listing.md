@@ -696,7 +696,7 @@ struct VersionRecord {
 | 一项的观察可能要做很多次 I/O（每个版本单独读 tags / 元数据） | 只在观察计划要求时才做；每条记录的观察结果与失败各自独立，一条失败不让整项失败；一项内的 I/O 受同一个并发窗口约束。**C11b 实现（R2）**：一项内逐条串行（占遍历的同一个观察名额），绑定各自版本（`observe_copy_bound_version`，`VersionRecord::source()` 选版本），失败记在那条记录上（`MetadataObservation::Failed`，`Required` 也一样，NotFound 也不算 vanish），删除标记不观察，会话级失败照常结束遍历、节流按条目限定，取消即停（不交出）|
 | 拷贝 | 消费方按 `records` 顺序逐条处理：对象版本用 `record.source`（`SourceVersion::Id`，最新的 `"null"` 为 `Current`）交给 `TransferRequest::with_source_version`；删除标记用 `transfer::write_delete_marker`（H1，只在 `Enabled` 的目标桶上；未开 / 暂停版本的目标只拷最新状态并记原因“目的桶未开版本，历史未重建”，D12）。一个 key 严格串行，重放不去重（D11）；参考 `examples/s3_history_replay.rs` |
 | 身份与改名识别 | 项的 `source_identity` 是 key 级的 `PathScoped`；每条记录另有自己的 `VersionScoped` 身份，拷贝前按记录核对 |
-| 快照 | **用户 2026-09-27 定：条目快照不考虑版本兼容**。C11b 只保留一种当前格式（版本字节升为 7，带历史的条目带完整 ObjectHistory 段，不带历史的条目同一格式），删除 v4 / v5 / v6 的编码与解码分支；旧快照解码报 `UnsupportedVersion`，调用方按首次扫描处理。守则：① 保留 `DMES` 魔数与版本字节；② **格式任何变化都把版本字节加 1**（哪怕只加一个字段），并有 golden 字节测试（当前格式的编码与存下的字节不符即失败），防止同一版本号下新旧字节混存而被静默读错；③ 这是开发期规则，正式发布前重新决定（至少解码 N-1，或给 terrasync 迁移 / 重扫说明），写进 ADR-0008。目的端恢复指针 / binding 格式（ADR-0006）不在此列：它们关系在途传输能否续传，开发期也可以不兼容，但每次变更的 commit 要写明“升级前排空在途传输” |
+| 快照 | **首版只维护当前格式**，以 [AGENTS.md](../../AGENTS.md) 和 [ADR-0008](../adr/0008-streaming-traversal-and-object-history.md) 为准。当前为 DMES v10，v1–v9 的编码、解码和专用夹具不保留；旧快照报 `UnsupportedVersion`，调用方丢弃旧观察状态并重新扫描。保留魔数、版本、完整性校验与当前格式 golden 字节测试；任何布局变化均更新版本字节和夹具。目的端恢复状态同样不要求兼容历史开发格式，但清理、重新传输必须遵守所有权及用户数据保护规则 |
 | 计数 | `listed` / `emitted` 按 key 计；另加 `versions`（对象版本数）与 `delete_markers`；`bytes` 分为“当前版本字节”和“全部版本字节”。**C11b 实现**：`BlockCounts` / `ScanTotals` 加 `versions`、`delete_markers`、`all_versions_bytes`（没有历史的文件记它自己的大小，所以存储没有历史时它等于 `bytes`）；`bytes` = 当前版本字节（当前已删的 key 为 0）；分段之前对整段历史计一次，listed / emitted / filtered / files 按 key，不按段 |
 | 目录对象的历史（R3） | `directory_object_action`：目的端能存目录对象时，任何一版超过单次请求上限就整个 key `Skip(TOO_LARGE)`（按 `ObjectHistory::largest_version`，每段都带整个 key 的最大值，所以各段答案相同 —— 重放中途停下会在目的端历史里留缺口，D11）；目的端是文件系统时看当前版本（没有或 0 字节 → `NothingToDo`，有内容 → `Skip`）；非最后一段 `NothingToDo`（由最后一段决定） |
 | 已知限制（C11b） | ① 版本化桶上单目录超过 500 万条记录现在报 `Capacity`（Q9），今天的 Current 流式在版本化桶上没有这个上限 —— 对版本化桶是一次能力倒退，要放开等真实需求。② 只有 `s3:ListBucket`、却被拒 `GetBucketVersioning` **和** `ListBucketVersions` 的主体（常见的最小权限策略）：按 Q26 列历史，每个目录的列举都会权限失败；C11b 之前默认的 Current 遍历对它可用（评审指出，待定是否加回退，见 §14 C11b 行）。③ 物化期间整个目录的原始记录驻留内存，Blocks 预取最多 2 × min(c, 64) 个列举（与之前 All 相同） |
@@ -1241,7 +1241,7 @@ Q4  feat(traversal): Blocks 已关闭目录块的配对辅助 —— 已实现 `
 C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/docs/{architecture,error-taxonomy,storage-*}.md；ADR-0008
     —— 已完成：文档同步当前接口；ADR-0008 记录决策与验收边界，C11b 真机验收见 §14.3。
     （含 C11b 定下的**写入快照格式开发期规则**：一种当前格式、版本字节 + golden 字节测试、任何改动都升版本、旧格式
-    `UnsupportedVersion`；正式发布前重新决定 —— 至少解码 N-1，或给 terrasync 迁移 / 重扫说明）
+    `UnsupportedVersion`；首版按 AGENTS.md 只维护当前格式，不保留旧版编解码或专用夹具，旧观察状态通过重新扫描生成）
 （terrasync 侧，另起：不丢批、分钟级退避、检查点落库顺序、消费者退出即失败、统计以库为准、全量扫描 generation 闸门、
   身份键只对 StableWithinBackend 关联、多版本每项展开成每版本一行）
 （可选）chore(deps): nfs-rs 公开 READDIRPLUS 页接口并升级（Q18）—— 已完成：nfs-rs 0.8.5 `17bb6fb`，用法见 C7c

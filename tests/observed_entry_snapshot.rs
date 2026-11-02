@@ -25,35 +25,6 @@ fn fixture_bytes(hex: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
 }
 
 #[test]
-fn frozen_v8_fixtures_remain_unsupported() -> Result<(), Box<dyn std::error::Error>> {
-    for (kind, endpoint, fixture) in [
-        (
-            BackendKind::Nfs,
-            "nfs://10.0.0.1/export",
-            include_str!("data/snapshot/v8-nfs-file.hex"),
-        ),
-        (
-            BackendKind::S3,
-            "s3://10.0.0.2:9000/bucket",
-            include_str!("data/snapshot/v8-s3-history.hex"),
-        ),
-        (
-            BackendKind::S3,
-            "s3://10.0.0.2:9000/bucket",
-            include_str!("data/snapshot/v8-s3-history-segment.hex"),
-        ),
-    ] {
-        let bytes = fixture_bytes(fixture)?;
-        assert_eq!(bytes[4], 8);
-        assert_eq!(
-            ObservedEntry::decode_snapshot(&bytes, &BackendIdentity::new(kind, endpoint)?),
-            Err(SnapshotDecodeError::UnsupportedVersion),
-        );
-    }
-    Ok(())
-}
-
-#[test]
 fn v10_marker_snapshot_exposes_the_exact_copyable_object() -> Result<(), Box<dyn std::error::Error>>
 {
     let backend = BackendIdentity::new(BackendKind::S3, "s3://bucket")?;
@@ -180,8 +151,11 @@ fn decoder_rejects_unknown_truncated_tampered_and_trailing_data()
     let local = backend(BackendKind::Local)?;
 
     assert_eq!(valid[4], 10, "the current format");
-    // Only the current format is read (P7 C11b): older formats and newer ones alike are refused.
-    for version in [4, 5, 6, 7, 8, 9, 99] {
+    // Refuse every other version without retaining historical encodings as fixtures.
+    for version in u8::MIN..=u8::MAX {
+        if version == valid[4] {
+            continue;
+        }
         let mut other_version = valid.clone();
         other_version[4] = version;
         assert_eq!(

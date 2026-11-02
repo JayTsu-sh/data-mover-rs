@@ -4,8 +4,10 @@
 构造 `Storage`，通过 typed roles 提供操作。另含 filter DSL 和 work-stealing 并发遍历。
 从 terrasync-rs 拆分独立 (commit `4289a15`)，仅库 (无 binary，无 GUI)。
 
-修改 crate 边界、features、公开兼容层或新增 backend 时，先读
-`docs/architecture/crate-workspace.md`。根包 `data-mover` 是兼容 facade；实现归属 `crates/`。
+首个版本的接口和历史数据处理规则见 [AGENTS.md](AGENTS.md)，涉及兼容性取舍时以该规则为准。
+
+修改 crate 边界、features、公开入口或新增 backend 时，先读
+`docs/architecture/crate-workspace.md`。根包 `data-mover` 是统一 facade；实现归属 `crates/`。
 
 > 这是 Claude Code 的项目入口。先读这页路由，再按场景按需展开 `.claude/docs/`。
 > 不堆知识，只路由。深入内容见各 doc。

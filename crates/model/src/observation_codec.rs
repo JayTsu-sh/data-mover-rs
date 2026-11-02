@@ -1,7 +1,7 @@
 //! The entry snapshot codec: `ObservedEntry` to and from its opaque, versioned bytes.
 //!
-//! **One format** (P7 §10.4, a development-phase rule to be decided again before a release,
-//! ADR-0008): a snapshot starts with the magic `DMES` and a version byte, and only the current
+//! **One format** (the first-version policy in `AGENTS.md`, ADR-0008): a snapshot starts with
+//! the magic `DMES` and a version byte, and only the current
 //! version is read — any other is `UnsupportedVersion`, never misread. **Any** change to the
 //! layout, even one added field, bumps [`VERSION`] and the golden bytes of
 //! `snapshot_format_tests`, so old and new bytes never share a version number.

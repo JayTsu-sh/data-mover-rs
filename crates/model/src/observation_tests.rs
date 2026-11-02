@@ -73,32 +73,6 @@ fn snapshots_no_longer_carry_the_endpoint_and_decode_against_the_callers() {
     );
 }
 
-/// `nfs_entry("source")` as the pre-C4c encoder wrote it (HEAD `cc952ef`), frozen: an older
-/// format is refused as a version this build does not read (P7 C11b), never misread.
-const V4_FIXTURE: &str = "444d45530401080000006469722f66696c65000001070000000000000000010600\
-0000736f757263650200000066680200000000000000000000ca80e48bbc766395ccd1dfb50572ec8ccd1d09e9dab9db73e0\
-183cb385635de4";
-
-fn unhex(text: &str) -> Vec<u8> {
-    (0..text.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&text[index..index + 2], 16)
-                .unwrap_or_else(|error| panic!("{error}"))
-        })
-        .collect()
-}
-
-#[test]
-fn frozen_v4_bytes_are_an_unsupported_version() {
-    let endpoint = BackendIdentity::new(BackendKind::Nfs, "nfs://h/v")
-        .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(
-        ObservedEntry::decode_snapshot(&unhex(V4_FIXTURE), &endpoint),
-        Err(SnapshotDecodeError::UnsupportedVersion)
-    );
-}
-
 #[test]
 fn symlink_without_target_is_rejected_at_construction_and_decode() {
     let backend =
