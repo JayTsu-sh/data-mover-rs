@@ -21,7 +21,7 @@ parking_lot = { workspace = true }
 tracing = { workspace = true }
 num-traits = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 filetime = { workspace = true }

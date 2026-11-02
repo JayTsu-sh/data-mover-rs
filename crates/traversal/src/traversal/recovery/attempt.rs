@@ -56,7 +56,6 @@ impl Recovery {
         source: StorageTraversalSource,
         signal: &ScanFailureSignal,
     ) -> Outcome {
-        self.restoring = self.window.is_some();
         let request = self.request_for_attempt();
         let cancel = AttemptCancellation(request.cancel.clone());
         let mut inner = source.traverse(request);

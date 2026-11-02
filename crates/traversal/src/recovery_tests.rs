@@ -461,7 +461,6 @@ fn waiting_recovery() -> (Recovery, channel::ItemReceiver, ScanFailureSignal) {
             window: None,
             checkpoint: None,
             recoveries: 0,
-            restoring: false,
         },
         output,
         signal,
@@ -485,10 +484,7 @@ fn permanent_item() -> TraversalItem {
 
 #[tokio::test]
 async fn healthy_replay_consumer_wait_does_not_exhaust_failure_budget() {
-    let (mut recovery, mut output, initial) = waiting_recovery();
-    recovery.start_window(&initial);
-    recovery.window.as_ref().unwrap().budget.reconnecting(false);
-    recovery.restoring = true;
+    let (mut recovery, mut output, _) = waiting_recovery();
     let signal = ScanFailureSignal::new(BackendKind::Cifs, None);
     recovery.failure = signal.clone();
     recovery
@@ -507,7 +503,7 @@ async fn healthy_replay_consumer_wait_does_not_exhaust_failure_budget() {
     output.recv().await.unwrap();
     let (recovery, result) = waiting.await.unwrap();
     assert!(result.is_ok());
-    assert!(!recovery.window.as_ref().unwrap().budget.is_exhausted());
+    assert!(recovery.window.is_none());
 }
 
 #[tokio::test]

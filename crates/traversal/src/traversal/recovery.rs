@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tokio::sync::{oneshot, watch};
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 
 use super::channel;
-use super::scan::{RecoveryBudget, RecoveryTarget, RetainedOperation, ScanFailureSignal};
+use super::scan::{RecoveryBudget, ScanFailureSignal};
 use super::{
     Checkpoint, DEFAULT_MAX_BUFFERED_ITEMS, RemoteScanFailure, RemoteScanFailureKind, Resumable,
     ScanSetupError, StorageTraversalSource, TraversalOutcome, TraversalProducer, TraversalRequest,
@@ -18,6 +18,8 @@ use crate::model::{BackendSessionFailure, FailureClass, Transience};
 use crate::storage::{BackendConnectError, Storage, StorageRoleFailure};
 
 mod attempt;
+mod probe;
+use probe::{Probe, ProbeContext};
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 #[path = "../recovery_tests.rs"]
@@ -32,9 +34,9 @@ pub type ScanReconnect =
 pub struct ScanRecoveryPolicy {
     /// A native operation deadline; `None` preserves native protocol deadlines.
     pub operation_timeout: Option<Duration>,
-    /// Cumulative reconnect and failed-operation recovery budget. Healthy checkpoint
-    /// replay and consumer-only waits are excluded. Reconnects and faulting reads
-    /// keep their deadline even while the output consumer is blocked.
+    /// Wall-clock budget from the first detected fault through reconnection and
+    /// verification of the original failed read. Verified recovery ends this
+    /// deadline before healthy checkpoint rebuilding or consumer waits continue.
     pub recovery_window: Duration,
 }
 
@@ -125,7 +127,6 @@ pub fn recoverable_scan(
         window: None,
         checkpoint: None,
         recoveries: 0,
-        restoring: false,
     };
     tokio::spawn(runner.run(source, signal));
     Ok((session, status))
@@ -133,9 +134,8 @@ pub fn recoverable_scan(
 
 struct Window {
     first: RemoteScanFailure,
-    target: Option<RecoveryTarget>,
     budget: RecoveryBudget,
-    attempt: u64,
+    probe: Probe,
 }
 
 struct Recovery {
@@ -148,7 +148,6 @@ struct Recovery {
     window: Option<Window>,
     checkpoint: Option<Checkpoint>,
     recoveries: u64,
-    restoring: bool,
 }
 
 type Outcome = Result<TraversalOutcome, TraversalTerminalFailure>;
@@ -190,9 +189,6 @@ impl Recovery {
     }
 
     fn observe(&mut self, signal: &ScanFailureSignal) {
-        if self.restoring && signal.failure().is_none() && signal.recovered_at().is_some() {
-            self.recovered();
-        }
         self.start_window(signal);
         if signal.failure().is_some()
             && let Some(window) = &self.window
@@ -202,7 +198,6 @@ impl Recovery {
     }
 
     fn recovered(&mut self) {
-        self.restoring = false;
         if let Some(window) = self.window.take() {
             window.budget.complete();
         }
@@ -218,36 +213,29 @@ impl Recovery {
         {
             let started = signal.failure_detected_at().unwrap_or_else(Instant::now);
             let elapsed = started.elapsed();
+            let budget = RecoveryBudget::new(self.policy.recovery_window.saturating_sub(elapsed));
+            let probe = ProbeContext {
+                first: first.clone(),
+                target: signal.failure_target(),
+                budget: budget.clone(),
+                operation_timeout: self.policy.operation_timeout,
+                reconnect: self.reconnect.clone(),
+                cancel: self.request.cancel.child_token(),
+                state: self.state.clone(),
+                failure: self.failure.clone(),
+                recoveries: self.recoveries.saturating_add(1),
+            }
+            .spawn();
             self.window = Some(Window {
                 first,
-                target: signal.failure_target(),
-                budget: RecoveryBudget::new(self.policy.recovery_window.saturating_sub(elapsed)),
-                attempt: 0,
-            });
-            self.publish_recovering();
-        }
-    }
-
-    fn publish_recovering(&self) {
-        if let Some(window) = &self.window {
-            self.state.send_replace(ScanRecoveryState::Recovering {
-                first_failure: window.first.clone(),
-                attempt: window.attempt,
+                budget,
+                probe,
             });
         }
     }
 
     fn retryable(&mut self, outcome: &Outcome, signal: &ScanFailureSignal) -> bool {
         self.observe(signal);
-        if self.restoring
-            && signal.failure().is_none()
-            && matches!(outcome, Ok(TraversalOutcome::Completed(_)))
-        {
-            // A clean full traversal also proves recovery if the old target vanished
-            // or no longer requires the storage call that previously failed.
-            self.recovered();
-            return false;
-        }
         if self.window.is_none() {
             return false;
         }
@@ -273,45 +261,18 @@ impl Recovery {
     }
 
     async fn reconnect_source(&mut self) -> Option<(StorageTraversalSource, ScanFailureSignal)> {
-        loop {
+        let result = {
             let window = self.window.as_mut()?;
-            let budget = window.budget.clone();
-            budget.reconnecting(true);
-            if budget.is_exhausted() {
-                return None;
-            }
-            window.attempt = window.attempt.saturating_add(1);
-            self.publish_recovering();
-            // Charge every failed fresh attempt, including immediate errors and successful
-            // reconnects which fail again before they reach the original read.
             tokio::select! {
                 biased;
                 () = self.request.cancel.cancelled() => return None,
-                () = budget.exhausted() => return None,
-                () = sleep(Duration::from_millis(25)) => {}
+                result = &mut window.probe.result => result.ok().flatten(),
             }
-            let mut work = RetainedOperation::new((self.reconnect)());
-            let result = tokio::select! {
-                biased;
-                () = self.request.cancel.cancelled() => return None,
-                () = budget.exhausted() => return None,
-                result = work.wait() => result,
-            };
-            if let Ok(storage) = result
-                && let Ok((source, signal)) =
-                    ScanFailureSignal::source(&storage, self.policy.operation_timeout)
-            {
-                if let Some(target) = self
-                    .window
-                    .as_ref()
-                    .and_then(|window| window.target.clone())
-                {
-                    signal.watch_recovery(target, budget.clone());
-                }
-                budget.reconnecting(false);
-                return Some((source, signal));
-            }
+        };
+        if result.is_some() {
+            self.recovered();
         }
+        result
     }
 }
 

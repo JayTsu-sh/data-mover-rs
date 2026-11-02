@@ -47,10 +47,12 @@ Rust 库，Edition 2024；具体依赖版本和固定 Git 提交以 `Cargo.toml`
 - `crates/traversal/src/traversal/scan.rs` 的 `ScanFailureSignal` 包装 namespace / metadata
   读取，记录首个原始网络故障并提供旁路信号；`operation_timeout=None` 沿用原生有界时限，
   显式时限只限制存储操作，不覆盖消费方等待。持有句柄的原生调用在调用方提前结束等待后仍完成清理。
-- `recovery.rs` / `recovery/attempt.rs` 的 `recoverable_scan` 负责默认 3 秒防抖窗口与重连，
-  同一窗口内连续失败不重新补满预算；原故障位置、读取阶段与参数（列举还绑定原页序）成功后重新进入 Running。重连后只从安全目录
-  检查点续扫，活跃目录可能重放，调用方不可把重放误当成新扫描世代。健康前缀重建和仅等待消费者时不消耗恢复预算；已知故障的重连与目标读取时限不会因输出背压暂停。失败前缀等待、目标读取、重连及逐次短退避扣同一预算。
-  因此 3 秒是累计故障恢复预算，恢复扫描的总墙钟时间可更长；健康前缀仍受独立操作时限约束。
+- `recovery.rs` / `recovery/probe.rs` 的 `recoverable_scan` 从首次故障识别开始，使用默认 3 秒墙钟窗口，
+  重连、退避和原故障操作验证共用截止时间，消费方背压不能暂停。单个有界 probe 与旧流安全排空并行；
+  `scan/probe.rs` 只验证原路径、读取阶段、plan、identity/version 和列举页序，probe 结果不作为扫描条目输出。
+  验证成功即进入 Running，随后在旧流与完整 history 排空后，从安全目录检查点正常重建；活跃目录可重放。
+  因而正常重建可以超过 3 秒，但 Recovering 状态不能靠健康前缀或背压无限延长。
+  原目录 page N 没有跨连接 continuation 时仍须读取前 N 页；无法在窗口内验证时保守失败并保留检查点。
 - `ScanRecoveryStatus` 提供 Running / Recovering / Failed 活动；其 `failure_signal()` 只在恢复
   最终失败时发布该窗口最早的原始故障，后续重连时限不覆盖明确断连。取消保持 Cancelled，
   不发布最终网络故障；检查点可见性与取消后的排空策略保持调用方选择。

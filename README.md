@@ -355,17 +355,20 @@ recovery budget without URL switches. `connect_scan_backend` disables S3
 SDK/page transport resends and bounds HDFS failover attempts (one standby failover
 by default). S3 service errors and throttling remain distinct from transport loss.
 
-`traversal::recoverable_scan` provides a default three-second recovery budget:
-it opens fresh connections and resumes safe directory checkpoints, retaining the
-first typed fault if recovery fails. Active directories may replay; consumers must
-honor the ordinary checkpoint/history contract. `ScanRecoveryStatus` exposes
-Running, Recovering and Failed; its failure signal is terminal only.
+`traversal::recoverable_scan` starts a default three-second wall-clock window at
+first fault detection. One reconnect/probe task verifies the original failed
+read, including its phase, plan, identity/version and listing page, while the old
+attempt drains. Consumer backpressure cannot pause this deadline. A successful
+probe ends recovery before normal checkpoint rebuilding; a failed window reports
+its first typed cause. Active directories can replay under the checkpoint/history
+contract, and probe output is never delivered as scan output.
+
+A listing probe may need to read its directory's earlier pages. If the original
+page cannot be verified within the window, recovery fails conservatively and the
+last safe checkpoint remains available. An earlier page or a different metadata
+stage cannot stand in for the failed operation.
 
 `ScanFailureSignal::source` provides the lower-level operation guard and raw first
-fault signal. Healthy checkpoint rebuilding and consumer-only waits do not
-consume the recovery budget. A known fault keeps its deadline during reconnects
-and faulting reads even if output is blocked; native operation deadlines remain
-independent. Failed
-rebuilding, the original failing read, reconnects and retry backoff share one
-budget. Applications select scan deadlines and recovery windows, keep Local
+fault signal. Native operation deadlines remain independent and exclude consumer
+waits. Applications select scan deadlines and recovery windows, keep Local
 traversal on its ordinary path, and persist or display the typed result.

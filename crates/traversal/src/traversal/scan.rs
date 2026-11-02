@@ -33,6 +33,7 @@ use crate::{
 };
 
 mod budget;
+mod probe;
 use budget::ReadClock;
 pub(super) use budget::RecoveryBudget;
 
@@ -86,6 +87,7 @@ impl ScanRead {
 pub(super) struct RecoveryTarget {
     read: ScanRead,
     path: StoragePath,
+    inline_descriptor: Option<Arc<SourceDescriptor>>,
 }
 
 impl RecoveryTarget {
@@ -255,6 +257,7 @@ impl ScanFailureSignal {
         kind: RemoteScanFailureKind,
         source: Option<StorageRoleFailure>,
         clock: Option<ReadClock>,
+        inline_descriptor: Option<&SourceDescriptor>,
     ) {
         self.failure.get_or_init(|| {
             if let Some(recovery) = self.recovery_target.get()
@@ -268,6 +271,8 @@ impl ScanFailureSignal {
                 target: Some(RecoveryTarget {
                     read: read.clone(),
                     path: path.clone(),
+                    inline_descriptor: inline_descriptor
+                        .map(|descriptor| Arc::new(descriptor.clone())),
                 }),
                 failure: RemoteScanFailure {
                     backend: self.backend,
@@ -287,6 +292,7 @@ impl ScanFailureSignal {
         path: &StoragePath,
         error: StorageRoleFailure,
         clock: Option<ReadClock>,
+        inline_descriptor: Option<&SourceDescriptor>,
     ) -> StorageRoleFailure {
         let class = match &error {
             StorageRoleFailure::Session(failure) => failure.class(),
@@ -297,7 +303,7 @@ impl ScanFailureSignal {
             FailureClass::Timeout => RemoteScanFailureKind::OperationTimedOut,
             _ => return error,
         };
-        self.record(read, path, kind, Some(error), clock);
+        self.record(read, path, kind, Some(error), clock, inline_descriptor);
         stopped_failure(read.operation(), kind)
     }
 
@@ -321,6 +327,7 @@ impl ScanFailureSignal {
                 path,
                 StorageRoleFailure::Entry(failure.failure.clone()),
                 clock,
+                None,
             ));
         }
         self.successful_listing.get_or_init(Instant::now);
@@ -334,6 +341,7 @@ impl ScanFailureSignal {
         path: &StoragePath,
         observations: MetadataObservations,
         clock: Option<ReadClock>,
+        inline_descriptor: Option<&SourceDescriptor>,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
         if let Some(failure) = observations.failures().find(|failure| {
             matches!(
@@ -353,6 +361,7 @@ impl ScanFailureSignal {
                 path,
                 StorageRoleFailure::Session(source),
                 clock,
+                inline_descriptor,
             ));
         }
         Ok(observations)
@@ -390,7 +399,7 @@ impl ScanFailureSignal {
             native.await
         };
         if let Some(result) = result {
-            result.map_err(|error| self.normalize_error(read, path, error, clock))
+            result.map_err(|error| self.normalize_error(read, path, error, clock, None))
         } else {
             self.record(
                 read,
@@ -398,6 +407,7 @@ impl ScanFailureSignal {
                 RemoteScanFailureKind::OperationTimedOut,
                 None,
                 clock,
+                None,
             );
             Err(stopped_failure(
                 read.operation(),
@@ -578,12 +588,22 @@ impl Metadata for GuardedMetadata {
         self.inner.observe_listed(descriptor, plan).map(|result| {
             result
                 .map_err(|error| {
-                    self.guard
-                        .normalize_error(&read, &descriptor.path, error, None)
+                    self.guard.normalize_error(
+                        &read,
+                        &descriptor.path,
+                        error,
+                        None,
+                        Some(descriptor),
+                    )
                 })
                 .and_then(|value| {
-                    self.guard
-                        .checked_metadata(&read, &descriptor.path, value, None)
+                    self.guard.checked_metadata(
+                        &read,
+                        &descriptor.path,
+                        value,
+                        None,
+                        Some(descriptor),
+                    )
                 })
         })
     }
@@ -602,7 +622,9 @@ impl Metadata for GuardedMetadata {
                 inner.observe(&owned_path, plan).await
             })
             .await?;
-        let value = self.guard.checked_metadata(&read, path, value, clock)?;
+        let value = self
+            .guard
+            .checked_metadata(&read, path, value, clock, None)?;
         self.guard.record_success(&read, path, false);
         Ok(value)
     }
@@ -623,7 +645,9 @@ impl Metadata for GuardedMetadata {
                 inner.observe_bound(&owned_path, &expected, plan).await
             })
             .await?;
-        let value = self.guard.checked_metadata(&read, path, value, clock)?;
+        let value = self
+            .guard
+            .checked_metadata(&read, path, value, clock, None)?;
         self.guard.record_success(&read, path, false);
         Ok(value)
     }
@@ -648,9 +672,9 @@ impl Metadata for GuardedMetadata {
             })
             .await?;
         let mut value = value;
-        value.observations = self
-            .guard
-            .checked_metadata(&read, path, value.observations, clock)?;
+        value.observations =
+            self.guard
+                .checked_metadata(&read, path, value.observations, clock, None)?;
         self.guard.record_success(&read, path, false);
         Ok(value)
     }
@@ -676,9 +700,9 @@ impl Metadata for GuardedMetadata {
             })
             .await?;
         let mut value = value;
-        value.observations = self
-            .guard
-            .checked_metadata(&read, path, value.observations, clock)?;
+        value.observations =
+            self.guard
+                .checked_metadata(&read, path, value.observations, clock, None)?;
         self.guard.record_success(&read, path, false);
         Ok(value)
     }
