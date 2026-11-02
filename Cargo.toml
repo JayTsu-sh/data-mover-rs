@@ -521,7 +521,7 @@ rustix = { version = "1.1" }
 rustls = { version = "0.23", default-features = false }
 serde = { version = "1" }
 serde_json = "1"
-smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "a0a2a4cf822fe559ee7ca04892d0f5294d714374" }
+smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "ea4c1c5a4189a24cb12ecdedd387c1676de6c516" }
 tempfile = "3"
 thiserror = "2.0.18"
 tokio = { version = "1.51.1", default-features = false }
