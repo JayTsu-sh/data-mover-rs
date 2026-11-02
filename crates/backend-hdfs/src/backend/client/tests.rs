@@ -303,6 +303,20 @@ mod tests {
     }
 
     #[test]
+    fn native_io_timeout_is_not_reported_as_a_disconnected_connection() {
+        for (kind, expected) in [
+            (std::io::ErrorKind::TimedOut, crate::model::FailureClass::Timeout),
+            (std::io::ErrorKind::ConnectionReset, crate::model::FailureClass::Connectivity),
+        ] {
+            let error = super::hdfs_operation_error("list", None,
+                &hdfs_native::HdfsError::IOError(std::io::Error::from(kind)));
+            let (class, _, session) = super::hdfs_role_classify(&error);
+            assert_eq!(class, expected);
+            assert!(session);
+        }
+    }
+
+    #[test]
     fn unknown_rpc_error_is_structured_conservative_and_redacted() {
         let error = super::hdfs_operation_error(
             "rename",

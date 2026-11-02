@@ -260,7 +260,11 @@ fn hdfs_structured_attributes(
             false,
         ),
         HdfsError::IOError(error) => (
-            crate::error::HdfsErrorKind::Io,
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                crate::error::HdfsErrorKind::Timeout
+            } else {
+                crate::error::HdfsErrorKind::Io
+            },
             "I/O operation failed",
             is_retryable_io(error.kind()),
         ),
