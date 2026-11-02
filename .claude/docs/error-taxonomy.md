@@ -44,9 +44,15 @@ Role-based adapters distinguish `FailureClass::Timeout` from definite `Connectiv
 NFS recovery wrappers retain transport timeouts while replay-sensitive uncertain mutations
 remain `Protocol` / `Unknown`. SMB uses `Error::network_failure()` and retains unknown
 mutation outcomes. S3 interrupted HTTP bodies are transport loss; complete malformed XML
-and HTTP 5xx are protocol failures, with transient 5xx still retryable outside scan policy.
-`connect_scan_backend`, `traversal::recoverable_scan` and `ScanFailureSignal` own
-scan connection policy, a default three-second recovery window and per-operation deadlines; applications own task status and presentation.
+and HTTP 5xx are protocol failures, with transient 5xx retried only where the operation permits safe service retries.
+All operations share `connect_backend`; backends do not branch on whether a caller is scanning.
+`traversal::recoverable_scan` and `ScanFailureSignal` own the scan-only recovery window (three
+seconds after the first detected fault) and scan operation deadlines; applications own task
+status and presentation. Transport failures surface after the client's bounded recovery rather
+than starting another backend network backoff. Non-scan retries are decided per operation:
+stateless page/service retries and invalid-handle recovery differ from replay-sensitive writes.
+HDFS separates explicit `Connectivity` and `Timeout` from other I/O and unknown RPC errors;
+unknown server exceptions are `Protocol`, not evidence of a lost connection.
 
 ## Retry Taxonomy (commit `7eb3046`)
 

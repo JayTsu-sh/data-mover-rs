@@ -1,4 +1,6 @@
 //! Count actual SDK connector attempts, including retryable service failures.
+use std::error::Error as StdError;
+use std::io::{Error as IoError, ErrorKind};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -7,14 +9,21 @@ use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
 use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;
+use bytes::Bytes;
 use futures::StreamExt as _;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::native::tests::storage;
-use crate::model::SourceVersion;
+use crate::model::{SourceVersion, StoragePath};
 use crate::storage::backends::s3::source::S3ReadSource;
 use crate::storage::backends::s3::tests::identity;
-use crate::storage::{ReadRequest, ReadSource, SourceQosGroup, SourceQosPolicy};
+use crate::storage::{
+    ReadRequest, ReadSource, SourceQosBudget, SourceQosGroup, SourceQosPolicy, StorageRoleFailure,
+};
+
+type TestResult<T = ()> = Result<T, Box<dyn StdError>>;
+type ReadResult = Result<Bytes, StorageRoleFailure>;
 
 #[derive(Clone, Debug)]
 struct RetryServer {
@@ -50,6 +59,11 @@ impl HttpConnector for RetryServer {
                 body = "x";
             }
         }
+        if status == 0 {
+            return HttpConnectorFuture::ready(Err(ConnectorError::io(Box::new(IoError::from(
+                ErrorKind::ConnectionReset,
+            )))));
+        }
         let result = StatusCode::try_from(status)
             .map(|status| {
                 let mut response = HttpResponse::new(status, SdkBody::from(body));
@@ -66,11 +80,11 @@ impl HttpConnector for RetryServer {
 }
 
 #[tokio::test(start_paused = true)]
-async fn source_qos_counts_and_paces_every_sdk_get_attempt()
--> Result<(), Box<dyn std::error::Error>> {
+async fn source_qos_counts_and_paces_every_sdk_get_attempt() -> TestResult {
     for (failures, failure_status, expected_gets, success, cancelled) in [
         (2, 503, 3, true, false),
-        (2, 400, 3, true, false),
+        (2, 400, 1, false, false),
+        (2, 0, 1, false, false),
         (10, 503, 3, false, false),
         (1, 403, 1, false, false),
         (10, 503, 1, false, true),
@@ -82,33 +96,11 @@ async fn source_qos_counts_and_paces_every_sdk_get_attempt()
             failure_status,
             cancel_after_first_get: cancelled.then(|| cancel.clone()),
         };
-        let source = S3ReadSource::new(Arc::new(storage(server.clone())), identity());
-        let path = crate::model::StoragePath::new("source")?;
-        let described = source.describe(&path).await?;
-        let budget =
-            SourceQosGroup::new(SourceQosPolicy::new(None, 8, Some((2, 2, Duration::ZERO)))?)
-                .transfer_budget();
-        let started = tokio::time::Instant::now();
-        let mut stream = source
-            .read(ReadRequest {
-                path,
-                range: Some(0..1),
-                expected_source: Some(described.source_identity),
-                maximum_chunk_bytes: 8,
-                read_inflight: 1,
-                read_budget: None,
-                cancel,
-                source_qos: Some(budget.clone()),
-                version: SourceVersion::Current,
-            })
-            .await?;
-        let item = stream.next().await.ok_or("missing GET result")?;
+        let (item, budget, started) = get_with_qos(&server, cancel).await?;
         assert_eq!(item.is_ok(), success, "{item:?}");
         if cancelled {
-            assert!(
-                matches!(&item, Err(crate::storage::StorageRoleFailure::Entry(error))
-                if error.class() == crate::model::FailureClass::Cancelled)
-            );
+            assert!(matches!(&item, Err(StorageRoleFailure::Entry(error))
+                if error.class() == crate::model::FailureClass::Cancelled));
         }
         assert_eq!(budget.stats().source_read_operations, expected_gets);
         assert_eq!(
@@ -123,4 +115,31 @@ async fn source_qos_counts_and_paces_every_sdk_get_attempt()
         }
     }
     Ok(())
+}
+
+async fn get_with_qos(
+    server: &RetryServer,
+    cancel: CancellationToken,
+) -> TestResult<(ReadResult, SourceQosBudget, Instant)> {
+    let source = S3ReadSource::new(Arc::new(storage(server.clone())), identity());
+    let path = StoragePath::new("source")?;
+    let described = source.describe(&path).await?;
+    let budget = SourceQosGroup::new(SourceQosPolicy::new(None, 8, Some((2, 2, Duration::ZERO)))?)
+        .transfer_budget();
+    let started = Instant::now();
+    let mut stream = source
+        .read(ReadRequest {
+            path,
+            range: Some(0..1),
+            expected_source: Some(described.source_identity),
+            maximum_chunk_bytes: 8,
+            read_inflight: 1,
+            read_budget: None,
+            cancel,
+            source_qos: Some(budget.clone()),
+            version: SourceVersion::Current,
+        })
+        .await?;
+    let item = stream.next().await.ok_or("missing GET result")?;
+    Ok((item, budget, started))
 }

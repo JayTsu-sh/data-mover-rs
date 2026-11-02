@@ -2,6 +2,8 @@
 
 use std::result::Result;
 
+use nfs_rs::RecoveryAction;
+
 use super::*;
 
 fn listed_file(has_attr: bool, has_handle: bool) -> nfs_rs::ReaddirplusEntry {
@@ -151,10 +153,10 @@ async fn completion_aborts_on_parent_staleness_transport_and_throttling() {
         ),
         (
             Answering::new(
-                || Err(wrapped(nfs_rs::RecoveryAction::Retry, timeout())),
+                || Err(wrapped(RecoveryAction::Retry, timeout())),
                 no_getattr,
             ),
-            NfsRestart::Resend,
+            NfsRestart::Never,
         ),
         (
             Answering::new(
@@ -289,4 +291,11 @@ async fn an_empty_lookup_handle_fails_without_sending_getattr() {
     .await;
     assert_eq!(outcome(&children), (vec![], vec!["dir/file"]));
     assert_eq!(lookup.asked(), ["LOOKUP file"]);
+}
+
+#[test]
+fn listing_timeouts_surface_without_backend_resends() {
+    for error in [timeout(), wrapped(RecoveryAction::Retry, timeout())] {
+        assert_eq!(restart_for(&error), NfsRestart::Never);
+    }
 }

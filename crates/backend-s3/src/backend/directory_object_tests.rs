@@ -226,11 +226,11 @@ async fn a_directory_object_on_a_later_shuffled_page_is_handed_over_once() -> Te
     Ok(())
 }
 
-fn connection_reset() -> S3ProtocolFailure {
+fn transient_service_failure() -> S3ProtocolFailure {
     S3ProtocolFailure::session(
-        FailureClass::Connectivity,
+        FailureClass::Protocol,
         Transience::Transient,
-        "connection reset",
+        "temporary server failure",
     )
 }
 
@@ -266,7 +266,10 @@ async fn a_retried_page_does_not_repeat_the_directory_object() -> TestResult {
         let mut knobs = protocol.listing();
         knobs.page_size = 1;
         // The first request fails, and the one after the page holding `d/`.
-        knobs.failing_calls = vec![(0, connection_reset()), (2, connection_reset())];
+        knobs.failing_calls = vec![
+            (0, transient_service_failure()),
+            (2, transient_service_failure()),
+        ];
     }
     let namespace = namespace(&protocol)?;
     let (rows, failures) = rows(&current(namespace.as_ref(), "d").await?);

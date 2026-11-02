@@ -10,7 +10,7 @@
 //!   on with its siblings, never a silently truncated block and never the end of the session.
 //! - **Retries.** A page request is stateless: the same continuation sent again asks for the same
 //!   page, before the first page as after it (P7 §5.2, §8). Throttling backs off within its own
-//!   budget ([`ThrottleBackoff`]); any other transient failure (a lost connection, a 5xx) is sent
+//!   budget ([`ThrottleBackoff`]); other transient service failures (such as 5xx) are sent
 //!   again a few times, the count starting over after every page that arrives. Only a failure that
 //!   outlasts both ends the listing, with its own scope.
 
@@ -54,13 +54,7 @@ impl ListingLimits {
     /// objects still holds its subdirectory names — but not its objects (user decision
     /// 2026-09-26: the limit bounds memory, not the size of a flat prefix). As many continuations:
     /// at 1 000 objects a page, 5 billion objects. Three resends 0.25–2 s
-    /// apart, on top of the SDK's own attempts, as the HDFS listing does (P7 C8).
-    /// Scans surface transport failures to their owner without page-level resends.
-    pub(super) const SCAN: Self = Self {
-        resends: &[],
-        ..Self::PRODUCTION
-    };
-
+    /// apart for service failures; network faults return without another page attempt.
     pub(super) const PRODUCTION: Self = Self {
         max_entries: 5_000_000,
         max_empty_pages: 16,
@@ -134,12 +128,16 @@ fn is_throttled(failure: &S3ProtocolFailure) -> bool {
     class_of(failure) == FailureClass::Throttled
 }
 
-/// A transient failure other than throttling (which has its own budget): the same request may
-/// well succeed a moment later.
+/// Service failures may resend the same page; network failures belong to the caller.
+/// Throttling has its own budget.
 fn resendable(failure: &S3ProtocolFailure) -> bool {
     let (S3ProtocolFailure::Entry { transience, .. }
     | S3ProtocolFailure::Session { transience, .. }) = failure;
-    *transience == Transience::Transient && !is_throttled(failure)
+    *transience == Transience::Transient
+        && !matches!(
+            class_of(failure),
+            FailureClass::Connectivity | FailureClass::Timeout | FailureClass::Throttled
+        )
 }
 
 const fn class_of(failure: &S3ProtocolFailure) -> FailureClass {

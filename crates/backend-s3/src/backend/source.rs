@@ -372,7 +372,8 @@ async fn next_range<P: S3Protocol + 'static>(
 }
 
 /// `QoS` GETs use one SDK attempt at a time. A replay is pinned to the same observed object and
-/// range, gets a fresh admission, and is bounded to three attempts. Metadata uses its own budget.
+/// range, gets a fresh admission, and is bounded to three service attempts. Network failures
+/// surface immediately. Metadata uses its own budget.
 async fn read_range<P: S3Protocol>(
     protocol: &P,
     path: &StoragePath,
@@ -391,12 +392,14 @@ async fn read_range<P: S3Protocol>(
         let retryable = matches!(
             &result,
             Err(S3ProtocolFailure::Entry {
+                class,
                 transience: Transience::Transient,
                 ..
             } | S3ProtocolFailure::Session {
+                class,
                 transience: Transience::Transient,
                 ..
-            })
+            }) if !matches!(class, FailureClass::Connectivity | FailureClass::Timeout)
         );
         if !retryable || attempt == 2 {
             return result;

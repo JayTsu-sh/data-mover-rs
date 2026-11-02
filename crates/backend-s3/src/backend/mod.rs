@@ -60,35 +60,17 @@ pub use client::{S3BucketInfo, list_buckets};
 pub use data_mover_storage_core::storage::config::s3::endpoint_identity;
 
 pub async fn connect_backend(config: S3BackendConfig) -> Result<Storage, BackendConnectError> {
-    connect_with_attempts(config, None).await
-}
-
-/// Scanners own recovery and need the first SDK transport failure immediately.
-pub async fn connect_scan_backend(config: S3BackendConfig) -> Result<Storage, BackendConnectError> {
-    connect_with_attempts(config, Some(1)).await
-}
-
-async fn connect_with_attempts(
-    config: S3BackendConfig,
-    attempts: Option<u32>,
-) -> Result<Storage, BackendConnectError> {
     // Refuse an invalid threshold before any network I/O.
     let threshold = single_put_threshold(config.single_put_threshold)
         .map_err(|error| BackendConnectError::new(BackendKind::S3, error))?;
-    let storage = match attempts {
-        Some(attempts) => {
-            S3Storage::new_with_attempts(&config.url, config.block_size, Some(attempts)).await
-        }
-        None => S3Storage::new(&config.url, config.block_size).await,
-    }
-    .map_err(|error| BackendConnectError::new(BackendKind::S3, error))?;
-    let roles = if attempts.is_some() {
-        storage.architecture_scan_storage(threshold)
-    } else {
-        storage.architecture_storage_with_single_put_threshold(threshold)
-    };
-    roles.map_err(|error| BackendConnectError::from_roles(BackendKind::S3, error.as_ref()))
+    let storage = S3Storage::new(&config.url, config.block_size)
+        .await
+        .map_err(|error| BackendConnectError::new(BackendKind::S3, error))?;
+    storage
+        .architecture_storage_with_single_put_threshold(threshold)
+        .map_err(|error| BackendConnectError::from_roles(BackendKind::S3, error.as_ref()))
 }
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn connect<P>(
     protocol: Arc<P>,

@@ -96,7 +96,11 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
 显式配置的 transport 直接复用；默认 runtime plugin 提供、未出现在 `Client::config().http_client()`
 中的 transport，通过连接期元数据请求的 interceptor 捕获。用于受 Source QoS 限制的 GET 的
 single-attempt 客户端沿用这个 transport 与连接池，仅为这些 GET 禁用 SDK 重试，避免一次 admission
-产生额外 GET。普通 GET、元数据和写请求继续使用原客户端及其既有重试配置。
+产生额外 GET。每次安全的非网络重试重新准入。所有操作统一尽早返回连接故障与超时；普通安全
+GET / HEAD / 列举与幂等 UploadPart 保留 SDK 的服务端错误重试。PutObject、CopyObject、
+CreateMultipartUpload、CompleteMultipartUpload 及未固定 versionId 的删除禁止 SDK 盲目重放，
+由发布或清理流程按服务端证据确认结果。backend 分页仅对明确可重试的非网络失败与限流退避，
+不按扫描身份切换客户端或分页策略。
 
 ### 404 → FileNotFound
 

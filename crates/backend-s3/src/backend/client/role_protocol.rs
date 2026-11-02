@@ -724,8 +724,8 @@ pub(super) fn s3_role_remote_failure(
         // backs off within its budget, and the traversal never ends on one.
         (Some(429 | 503), _) => throttled(diagnostic),
         (_, Some(code)) if is_throttling_code(code) => throttled(diagnostic),
-        // AWS retries these even when carried by a 400 response. Preserve that
-        // classification when source admission owns the per-attempt retry loop.
+        // A server-side request timeout is also handed back to the caller; the
+        // common SDK and shaped-GET policies do not replay it locally.
         (_, Some("RequestTimeout" | "RequestTimeoutException")) => {
             s3_role_timeout_failure(diagnostic)
         }

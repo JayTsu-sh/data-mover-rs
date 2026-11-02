@@ -122,6 +122,9 @@ contract: it reconciles source identity, metadata binding, durable byte/hash pro
 publication evidence. Backend-specific leases, multipart upload identities, file handles and
 persistence barriers stay inside adapters. A scan checkpoint is not a transfer resume token.
 No generic “resume” crate is introduced because these lifecycles have different invariants.
+All callers use the same backend connection policy. Native clients bound transport recovery;
+adapters retain only operation-specific safe recovery. Scan context is not a backend retry
+mode, and a scan's three-second recovery window does not govern ordinary operations.
 
 `PreparedStage` keeps its fields and synchronization state private. Adapters and engines use
 operations to retain claims, record progress, attach recovery evidence and inspect state;

@@ -54,7 +54,6 @@ pub(super) async fn create_hdfs_storage(
     config: &HdfsConfig,
     block_size: Option<u64>,
     ensure_dir: bool,
-    read_recovery: HdfsReadRecovery,
 ) -> Result<HDFSStorage, StorageError> {
     let transfer_concurrency = crate::transfer_concurrency::resolve_transfer_concurrency(
         crate::transfer_concurrency::TransferBackend::Hdfs,
@@ -62,7 +61,7 @@ pub(super) async fn create_hdfs_storage(
         None,
     )?;
     let (client, location) = build_hdfs_client(location, config)?;
-    match read_recovery.read("get storage root", None, || {
+    match retry_hdfs_read("get storage root", None, None, || {
         client.get_file_info(location.root())
     })
     .await
@@ -87,7 +86,6 @@ pub(super) async fn create_hdfs_storage(
     Ok(HDFSStorage {
         client,
         location,
-        read_recovery,
         block_size: block_size.unwrap_or(DEFAULT_BLOCK_SIZE),
         transfer_concurrency,
     })
@@ -152,24 +150,34 @@ fn hdfs_rpc_error(
     ) {
         StorageError::InsufficientSpace(safe_path)
     } else {
-        let kind = if class_has_suffix(
-            class,
-            &["FileAlreadyExistsException", "AlreadyBeingCreatedException"],
-        ) {
-            crate::error::HdfsErrorKind::AlreadyExists
-        } else if class_has_suffix(class, &["UnsupportedOperationException"]) {
-            crate::error::HdfsErrorKind::Unsupported
-        } else {
-            crate::error::HdfsErrorKind::Rpc
-        };
+        let (kind, retryable) = hdfs_rpc_attributes(class);
         structured_hdfs_error(
             operation,
             relative_path,
             kind,
             Some(class),
             "upstream RPC failure",
-            false,
+            retryable,
         )
+    }
+}
+
+/// Class names are structured protocol evidence; unknown server exceptions are not disconnects.
+fn hdfs_rpc_attributes(class: &str) -> (HdfsErrorKind, bool) {
+    if class_has_suffix(class, &["FileAlreadyExistsException", "AlreadyBeingCreatedException"]) {
+        (HdfsErrorKind::AlreadyExists, false)
+    } else if class_has_suffix(class, &["UnsupportedOperationException"]) {
+        (HdfsErrorKind::Unsupported, false)
+    } else if class_has_suffix(class, &["SocketTimeoutException"]) {
+        (HdfsErrorKind::Timeout, true)
+    } else if class_has_suffix(class, &[
+        "ConnectException", "NoRouteToHostException", "EOFException", "SocketException",
+    ]) {
+        (HdfsErrorKind::Connectivity, true)
+    } else if class_has_suffix(class, &["StandbyException", "ObserverRetryOnActiveException"]) {
+        (HdfsErrorKind::Rpc, true)
+    } else {
+        (HdfsErrorKind::Rpc, false)
     }
 }
 
@@ -283,24 +291,14 @@ fn hdfs_structured_attributes(
 }
 
 fn hdfs_io_attributes(error: &IoError) -> (HdfsErrorKind, &'static str, bool) {
-    let kind = if error.kind() == ErrorKind::TimedOut {
-        HdfsErrorKind::Timeout
-    } else {
-        HdfsErrorKind::Io
+    let (kind, retryable) = match error.kind() {
+        ErrorKind::TimedOut => (HdfsErrorKind::Timeout, true),
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::ConnectionRefused
+        | ErrorKind::NotConnected | ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe
+        | ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable | ErrorKind::NetworkDown
+        | ErrorKind::AddrNotAvailable => (HdfsErrorKind::Connectivity, true),
+        ErrorKind::Interrupted | ErrorKind::WouldBlock => (HdfsErrorKind::Io, true),
+        _ => (HdfsErrorKind::Io, false),
     };
-    (kind, "I/O operation failed", is_retryable_io(error.kind()))
-}
-
-fn is_retryable_io(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::UnexpectedEof
-    )
+    (kind, "I/O operation failed", retryable)
 }

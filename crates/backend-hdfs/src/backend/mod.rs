@@ -19,7 +19,6 @@ use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{
     BackendCapabilities, BackendConnectError, CapabilityAvailability, HdfsBackendConfig, Storage,
 };
-use client::HdfsReadRecovery;
 
 pub use client::{
     HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
@@ -27,34 +26,11 @@ pub use client::{
 pub use data_mover_storage_core::storage::config::hdfs::endpoint_identity;
 
 pub async fn connect_backend(config: HdfsBackendConfig) -> Result<Storage, BackendConnectError> {
-    connect_with_recovery(config, HdfsReadRecovery::Adapter).await
-}
-
-/// Connects a scan source whose caller owns bounded network recovery.
-///
-/// # Errors
-/// Returns configuration, root validation, authentication, or connection failures.
-pub async fn connect_scan_backend(
-    mut config: HdfsBackendConfig,
-) -> Result<Storage, BackendConnectError> {
-    config
-        .client
-        .overrides
-        .entry("dfs.client.failover.max.attempts".into())
-        .or_insert_with(|| "1".into());
-    connect_with_recovery(config, HdfsReadRecovery::Caller).await
-}
-
-async fn connect_with_recovery(
-    config: HdfsBackendConfig,
-    recovery: HdfsReadRecovery,
-) -> Result<Storage, BackendConnectError> {
     let storage = client::create_hdfs_storage(
         &config.location,
         &config.client,
         config.block_size,
         config.ensure_dir,
-        recovery,
     )
     .await
     .map_err(|error| BackendConnectError::new(BackendKind::Hdfs, error))?;

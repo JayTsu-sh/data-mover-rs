@@ -20,8 +20,8 @@ type HdfsStatuses = ListingStatusStream<'static, Result<ListedStatus, HdfsError>
 /// The listing is stateless on the name node (each batch is a `getListing` after the last name
 /// returned), so dropping it abandons the request in flight and leaves nothing open.
 ///
-/// A retryable failure (a lost connection, a batch slower than the adapter's attempt deadline)
-/// continues after the last name read, within the adapter's retry budget, which progress renews:
+/// A retryable non-network service failure continues after the last name read, within the
+/// adapter's retry budget, which progress renews. Transport failures and timeouts surface:
 /// the listing is opened again and skips what it already read (P7 §8, `startAfter`). `hdfs-native`
 /// keeps its `getListing` with `startAfter` crate-private and ends a listing at its first error,
 /// so the skip re-reads the batches before that name — only on a failure. Children are never
@@ -127,8 +127,7 @@ where
     /// How long to wait before continuing after `error`, when it may be retried: a retryable
     /// failure with retries left.
     fn retry_delay(&mut self, error: &StorageError) -> Option<Duration> {
-        if !self.storage.read_recovery.allows_adapter_retry(error)
-            || !matches!(error, StorageError::HdfsOperation(details) if details.retryable) {
+        if !hdfs_service_retry(error) {
             return None;
         }
         let delay = HDFS_ADAPTER_RETRY_DELAYS.get(self.retries).copied()?;

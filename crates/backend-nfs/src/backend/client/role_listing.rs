@@ -405,13 +405,11 @@ fn server_error(error: &NfsError) -> &NfsError {
     }
 }
 
-/// What reading anew could do about `error`. Wrapped in nfs-rs's recovery outcome, only
-/// `Retry` makes a transport failure worth resending (`Remount` means the session must be
-/// replaced), and looking inside only names the server's status.
+/// Protocol recovery may resend a safe read; transport failures surface after nfs-rs's budget.
 fn restart_for(error: &NfsError) -> NfsRestart {
     // Replay safety is not connection health. Once nfs-rs reports a dead connection,
     // return it to traversal so the caller can choose checkpoint recovery immediately.
-    if error.is_connection_lost() {
+    if error.is_connection_lost() || error.transport_error_kind() == Some(ErrorKind::TimedOut) {
         return NfsRestart::Never;
     }
     if let Some(outcome) = error.operation_outcome() {
@@ -420,14 +418,7 @@ fn restart_for(error: &NfsError) -> NfsRestart {
         }
         return restart_for_status(server_error(error));
     }
-    match error {
-        NfsError::Io(io)
-            if matches!(io.kind(), ErrorKind::ConnectionReset | ErrorKind::TimedOut) =>
-        {
-            NfsRestart::Resend
-        }
-        status => restart_for_status(status),
-    }
+    restart_for_status(error)
 }
 
 /// What reading anew could do about the server's status.
