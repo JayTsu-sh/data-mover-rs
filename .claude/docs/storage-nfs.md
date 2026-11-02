@@ -347,3 +347,5 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 2. 改 retry 决策必须更新两个 doc 的映射表。
 3. 调 `backend-specialist` agent 传 `nfs`。
 4. 改完跑 `make e2e-nfs` (需测试服务器)。
+
+目录列举的路径句柄解析使用 `role_lookup_fh`，保留原生 LOOKUP 的 Connectivity/Timeout 分类。旧 `lookup_fh` 会把原生错误转成字符串，不能用于扫描角色，否则恢复期间并发目录失败会被误报成 Protocol/Unknown。

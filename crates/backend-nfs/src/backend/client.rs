@@ -545,9 +545,7 @@ impl NfsNamespaceProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<Bytes, NfsProtocolFailure> {
-        self.role_directory_handle(path)
-            .await
-            .map_err(classify_role_error)
+        self.role_directory_handle(path).await
     }
 
     async fn read_directory(
