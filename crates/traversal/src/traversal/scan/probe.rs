@@ -122,10 +122,9 @@ impl RecoveryTarget {
             return false;
         };
         match &self.read {
-            ScanRead::BoundMetadata(_, identity) | ScanRead::CopyMetadata(_, identity) => {
-                current.source_identity != *identity
-            }
-            ScanRead::VersionMetadata(_, SourceVersion::Current, identity) => {
+            ScanRead::BoundMetadata(_, identity)
+            | ScanRead::CopyMetadata(_, identity)
+            | ScanRead::VersionMetadata(_, SourceVersion::Current, identity) => {
                 current.source_identity != *identity
             }
             _ => false,
