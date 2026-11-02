@@ -32,11 +32,86 @@ use crate::{
     traversal::StorageTraversalSource,
 };
 
+mod budget;
+use budget::ReadClock;
+pub(super) use budget::RecoveryBudget;
+
 /// The evidence that stopped remote scanning; a timeout does not prove disconnection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteScanFailureKind {
     ConnectionLost,
     OperationTimedOut,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ScanRead {
+    Listing {
+        // Raw page ordinal confirms progress; checkpoint resume still replays entries.
+        page: usize,
+        root: Option<bool>,
+        page_hint: NonZeroUsize,
+    },
+    Stat,
+    ReadLink,
+    InlineMetadata(ObservationPlan),
+    Metadata(ObservationPlan),
+    BoundMetadata(ObservationPlan, SourceIdentity),
+    CopyMetadata(ObservationPlan, SourceIdentity),
+    VersionMetadata(ObservationPlan, SourceVersion, SourceIdentity),
+}
+
+impl ScanRead {
+    fn listing(request: &ListRequest, root: Option<bool>) -> Self {
+        Self::Listing {
+            page: 0,
+            root,
+            page_hint: request.page_hint,
+        }
+    }
+    fn advance_page(&mut self) {
+        if let Self::Listing { page, .. } = self {
+            *page = page.saturating_add(1);
+        }
+    }
+
+    fn operation(&self) -> Operation {
+        match self {
+            Self::Listing { .. } => Operation::Traverse,
+            _ => Operation::Observe,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RecoveryTarget {
+    read: ScanRead,
+    path: StoragePath,
+}
+
+impl RecoveryTarget {
+    fn matches(&self, read: &ScanRead, path: &StoragePath, eof: bool) -> bool {
+        if self.path != *path {
+            return false;
+        }
+        if self.read == *read {
+            return true;
+        }
+        matches!((&self.read, read),
+            (ScanRead::Listing { page: target, root: a, page_hint: x },
+             ScanRead::Listing { page, root: b, page_hint: y })
+                if eof && page < target && a == b && x == y)
+    }
+}
+
+struct RecoveryRead {
+    target: RecoveryTarget,
+    budget: RecoveryBudget,
+}
+
+struct DetectedFailure {
+    failure: RemoteScanFailure,
+    detected_at: Instant,
+    target: Option<RecoveryTarget>,
 }
 
 /// 稳定类别供上层匹配；显示文本不含 URL、凭据或后端原始诊断。
@@ -70,10 +145,9 @@ pub struct ScanFailureSignal {
     backend: BackendKind,
     limit: Option<Duration>,
     failed: CancellationToken,
-    failure: Arc<OnceLock<RemoteScanFailure>>,
+    failure: Arc<OnceLock<DetectedFailure>>,
     successful_listing: Arc<OnceLock<Instant>>,
-    failure_at: Arc<OnceLock<Instant>>,
-    recovery_target: Arc<OnceLock<(Operation, StoragePath)>>,
+    recovery_target: Arc<OnceLock<RecoveryRead>>,
     recovered_at: Arc<OnceLock<Instant>>,
 }
 impl ScanFailureSignal {
@@ -84,7 +158,6 @@ impl ScanFailureSignal {
             failed: CancellationToken::new(),
             failure: Arc::default(),
             successful_listing: Arc::default(),
-            failure_at: Arc::default(),
             recovery_target: Arc::default(),
             recovered_at: Arc::default(),
         }
@@ -129,14 +202,18 @@ impl ScanFailureSignal {
     /// Returns the first failure, preserving its original classification.
     #[must_use]
     pub fn failure(&self) -> Option<RemoteScanFailure> {
-        self.failure.get().cloned()
+        self.failure.get().map(|detected| detected.failure.clone())
     }
     /// Completes as soon as a remote operation has failed or exceeded its budget.
     pub async fn failed(&self) {
         self.failed.cancelled().await;
     }
     pub(super) fn publish_failure(&self, failure: RemoteScanFailure) {
-        self.failure.get_or_init(|| failure);
+        self.failure.get_or_init(|| DetectedFailure {
+            failure,
+            detected_at: Instant::now(),
+            target: None,
+        });
         self.failed.cancel();
     }
     #[cfg(test)]
@@ -144,47 +221,72 @@ impl ScanFailureSignal {
         self.successful_listing.get().copied()
     }
     pub(super) fn failure_detected_at(&self) -> Option<Instant> {
-        self.failure_at.get().copied()
+        self.failure.get().map(|detected| detected.detected_at)
     }
-    pub(super) fn watch_recovery(&self, operation: Operation, path: StoragePath) {
-        let _ = self.recovery_target.set((operation, path));
+    pub(super) fn failure_target(&self) -> Option<RecoveryTarget> {
+        self.failure
+            .get()
+            .and_then(|detected| detected.target.clone())
+    }
+    pub(super) fn watch_recovery(&self, target: RecoveryTarget, budget: RecoveryBudget) {
+        let _ = self.recovery_target.set(RecoveryRead { target, budget });
     }
     pub(super) fn recovered_at(&self) -> Option<Instant> {
         self.recovered_at.get().copied()
     }
-    fn record_success(&self, operation: Operation, path: &StoragePath) {
+    fn record_success(&self, read: &ScanRead, path: &StoragePath, eof: bool) {
         if self.failure.get().is_none()
-            && self
-                .recovery_target
-                .get()
-                .is_some_and(|(expected, target)| *expected == operation && target == path)
+            && self.recovery_target.get().is_some_and(|recovery| {
+                !recovery.budget.is_exhausted() && recovery.target.matches(read, path, eof)
+            })
         {
             self.recovered_at.get_or_init(Instant::now);
         }
     }
+    fn read_clock(&self) -> Option<ReadClock> {
+        self.recovery_target
+            .get()
+            .map(|recovery| recovery.budget.clock())
+    }
     fn record(
         &self,
-        operation: Operation,
+        read: &ScanRead,
         path: &StoragePath,
         kind: RemoteScanFailureKind,
         source: Option<StorageRoleFailure>,
+        clock: Option<ReadClock>,
     ) {
-        self.failure_at.get_or_init(Instant::now);
-        self.failure.get_or_init(|| RemoteScanFailure {
-            backend: self.backend,
-            operation,
-            path: path.clone(),
-            kind,
-            operation_timeout: self.limit.unwrap_or_default(),
-            source,
+        self.failure.get_or_init(|| {
+            if let Some(recovery) = self.recovery_target.get()
+                && !recovery.target.matches(read, path, false)
+                && let Some(clock) = clock
+            {
+                recovery.budget.failed_replay(clock);
+            }
+            DetectedFailure {
+                detected_at: Instant::now(),
+                target: Some(RecoveryTarget {
+                    read: read.clone(),
+                    path: path.clone(),
+                }),
+                failure: RemoteScanFailure {
+                    backend: self.backend,
+                    operation: read.operation(),
+                    path: path.clone(),
+                    kind,
+                    operation_timeout: self.limit.unwrap_or_default(),
+                    source,
+                },
+            }
         });
         self.failed.cancel();
     }
     fn normalize_error(
         &self,
-        operation: Operation,
+        read: &ScanRead,
         path: &StoragePath,
         error: StorageRoleFailure,
+        clock: Option<ReadClock>,
     ) -> StorageRoleFailure {
         let class = match &error {
             StorageRoleFailure::Session(failure) => failure.class(),
@@ -195,14 +297,16 @@ impl ScanFailureSignal {
             FailureClass::Timeout => RemoteScanFailureKind::OperationTimedOut,
             _ => return error,
         };
-        self.record(operation, path, kind, Some(error));
-        stopped_failure(operation, kind)
+        self.record(read, path, kind, Some(error), clock);
+        stopped_failure(read.operation(), kind)
     }
 
     fn checked_page(
         &self,
+        read: &ScanRead,
         path: &StoragePath,
         page: Option<ListingPage>,
+        clock: Option<ReadClock>,
     ) -> Result<Option<ListingPage>, StorageRoleFailure> {
         if let Some(failure) = page.as_ref().and_then(|page| {
             page.failures.iter().find(|error| {
@@ -213,20 +317,23 @@ impl ScanFailureSignal {
             })
         }) {
             return Err(self.normalize_error(
-                Operation::Traverse,
+                read,
                 path,
                 StorageRoleFailure::Entry(failure.failure.clone()),
+                clock,
             ));
         }
         self.successful_listing.get_or_init(Instant::now);
-        self.record_success(Operation::Traverse, path);
+        self.record_success(read, path, page.is_none());
         Ok(page)
     }
 
     fn checked_metadata(
         &self,
+        read: &ScanRead,
         path: &StoragePath,
         observations: MetadataObservations,
+        clock: Option<ReadClock>,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
         if let Some(failure) = observations.failures().find(|failure| {
             matches!(
@@ -242,40 +349,58 @@ impl ScanFailureSignal {
             )
             .unwrap_or_else(|_| unreachable!("static observation diagnostic"));
             return Err(self.normalize_error(
-                Operation::Observe,
+                read,
                 path,
                 StorageRoleFailure::Session(source),
+                clock,
             ));
         }
-        self.record_success(Operation::Observe, path);
         Ok(observations)
     }
 
     async fn operation<T: Send + 'static>(
         &self,
-        operation: Operation,
+        read: &ScanRead,
         path: &StoragePath,
         work: impl Future<Output = Result<T, StorageRoleFailure>> + Send + 'static,
     ) -> Result<T, StorageRoleFailure> {
         if let Some(failure) = self.failure.get() {
-            return Err(stopped_failure(operation, failure.kind));
+            return Err(stopped_failure(read.operation(), failure.failure.kind));
         }
+        let recovery = self
+            .recovery_target
+            .get()
+            .filter(|recovery| recovery.target.matches(read, path, false));
+        let _target = recovery.map(|recovery| recovery.budget.target_read());
+        let clock = self.read_clock();
         let mut work = RetainedOperation::new(work);
-        let result = match self.limit {
-            Some(limit) => timeout(limit, work.wait()).await,
-            None => Ok(work.wait().await),
+        let native = async {
+            match self.limit {
+                Some(limit) => timeout(limit, work.wait()).await.ok(),
+                None => Some(work.wait().await),
+            }
         };
-        if let Ok(result) = result {
-            result.map_err(|error| self.normalize_error(operation, path, error))
+        let result = if let Some(recovery) = recovery {
+            tokio::select! {
+                biased;
+                () = recovery.budget.exhausted() => None,
+                result = native => result,
+            }
+        } else {
+            native.await
+        };
+        if let Some(result) = result {
+            result.map_err(|error| self.normalize_error(read, path, error, clock))
         } else {
             self.record(
-                operation,
+                read,
                 path,
                 RemoteScanFailureKind::OperationTimedOut,
                 None,
+                clock,
             );
             Err(stopped_failure(
-                operation,
+                read.operation(),
                 RemoteScanFailureKind::OperationTimedOut,
             ))
         }
@@ -336,6 +461,7 @@ struct GuardedNamespace {
 impl GuardedNamespace {
     fn listing(&self, request: ListRequest, root: Option<bool>) -> ListingStream {
         let path = request.path.clone();
+        let mut read = ScanRead::listing(&request, root);
         let inner = self.inner.clone();
         let guard = self.guard.clone();
         ListingStream::from_producer(path.clone(), move |sink| async move {
@@ -346,14 +472,16 @@ impl GuardedNamespace {
             loop {
                 // 计时仅覆盖取下一页；send 等待消费者时不计时。
                 let next_page = pages.clone();
+                let clock = guard.read_clock();
                 let next = guard
-                    .operation(Operation::Traverse, &path, async move {
+                    .operation(&read, &path, async move {
                         next_page.lock().await.next().await.transpose()
                     })
                     .await;
                 match next {
-                    Ok(page) => match guard.checked_page(&path, page) {
+                    Ok(page) => match guard.checked_page(&read, &path, page, clock) {
                         Ok(Some(page)) => {
+                            read.advance_page();
                             if sink.send(page).await.is_err() {
                                 break;
                             }
@@ -383,11 +511,11 @@ impl Namespace for GuardedNamespace {
         let owned_path = path.clone();
         let value = self
             .guard
-            .operation(Operation::Observe, path, async move {
+            .operation(&ScanRead::Stat, path, async move {
                 inner.stat(&owned_path).await
             })
             .await?;
-        self.guard.record_success(Operation::Observe, path);
+        self.guard.record_success(&ScanRead::Stat, path, false);
         Ok(value)
     }
     fn list(&self, request: ListRequest) -> ListingStream {
@@ -416,11 +544,11 @@ impl Namespace for GuardedNamespace {
         let owned_path = path.clone();
         let value = self
             .guard
-            .operation(Operation::Observe, path, async move {
+            .operation(&ScanRead::ReadLink, path, async move {
                 inner.read_link(&owned_path).await
             })
             .await?;
-        self.guard.record_success(Operation::Observe, path);
+        self.guard.record_success(&ScanRead::ReadLink, path, false);
         Ok(value)
     }
 }
@@ -446,13 +574,17 @@ impl Metadata for GuardedMetadata {
         descriptor: &SourceDescriptor,
         plan: ObservationPlan,
     ) -> Option<std::result::Result<MetadataObservations, StorageRoleFailure>> {
+        let read = ScanRead::InlineMetadata(plan);
         self.inner.observe_listed(descriptor, plan).map(|result| {
             result
                 .map_err(|error| {
                     self.guard
-                        .normalize_error(Operation::Observe, &descriptor.path, error)
+                        .normalize_error(&read, &descriptor.path, error, None)
                 })
-                .and_then(|value| self.guard.checked_metadata(&descriptor.path, value))
+                .and_then(|value| {
+                    self.guard
+                        .checked_metadata(&read, &descriptor.path, value, None)
+                })
         })
     }
     async fn observe(
@@ -460,15 +592,19 @@ impl Metadata for GuardedMetadata {
         path: &StoragePath,
         plan: ObservationPlan,
     ) -> std::result::Result<MetadataObservations, StorageRoleFailure> {
+        let read = ScanRead::Metadata(plan);
+        let clock = self.guard.read_clock();
         let inner = self.inner.clone();
         let owned_path = path.clone();
         let value = self
             .guard
-            .operation(Operation::Observe, path, async move {
+            .operation(&read, path, async move {
                 inner.observe(&owned_path, plan).await
             })
             .await?;
-        self.guard.checked_metadata(path, value)
+        let value = self.guard.checked_metadata(&read, path, value, clock)?;
+        self.guard.record_success(&read, path, false);
+        Ok(value)
     }
     async fn observe_bound(
         &self,
@@ -476,16 +612,20 @@ impl Metadata for GuardedMetadata {
         expected: &SourceIdentity,
         plan: ObservationPlan,
     ) -> std::result::Result<MetadataObservations, StorageRoleFailure> {
+        let read = ScanRead::BoundMetadata(plan, expected.clone());
+        let clock = self.guard.read_clock();
         let inner = self.inner.clone();
         let owned_path = path.clone();
         let expected = expected.clone();
         let value = self
             .guard
-            .operation(Operation::Observe, path, async move {
+            .operation(&read, path, async move {
                 inner.observe_bound(&owned_path, &expected, plan).await
             })
             .await?;
-        self.guard.checked_metadata(path, value)
+        let value = self.guard.checked_metadata(&read, path, value, clock)?;
+        self.guard.record_success(&read, path, false);
+        Ok(value)
     }
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
         self.inner.copied_metadata_observation_plan()
@@ -496,17 +636,22 @@ impl Metadata for GuardedMetadata {
         expected: &SourceIdentity,
         plan: ObservationPlan,
     ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
+        let read = ScanRead::CopyMetadata(plan, expected.clone());
+        let clock = self.guard.read_clock();
         let inner = self.inner.clone();
         let owned_path = path.clone();
         let expected = expected.clone();
         let value = self
             .guard
-            .operation(Operation::Observe, path, async move {
+            .operation(&read, path, async move {
                 inner.observe_copy_bound(&owned_path, &expected, plan).await
             })
             .await?;
         let mut value = value;
-        value.observations = self.guard.checked_metadata(path, value.observations)?;
+        value.observations = self
+            .guard
+            .checked_metadata(&read, path, value.observations, clock)?;
+        self.guard.record_success(&read, path, false);
         Ok(value)
     }
     async fn observe_copy_bound_version(
@@ -516,20 +661,25 @@ impl Metadata for GuardedMetadata {
         version: &SourceVersion,
         plan: ObservationPlan,
     ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
+        let read = ScanRead::VersionMetadata(plan, version.clone(), expected.clone());
+        let clock = self.guard.read_clock();
         let inner = self.inner.clone();
         let owned_path = path.clone();
         let expected = expected.clone();
         let version = version.clone();
         let value = self
             .guard
-            .operation(Operation::Observe, path, async move {
+            .operation(&read, path, async move {
                 inner
                     .observe_copy_bound_version(&owned_path, &expected, &version, plan)
                     .await
             })
             .await?;
         let mut value = value;
-        value.observations = self.guard.checked_metadata(path, value.observations)?;
+        value.observations = self
+            .guard
+            .checked_metadata(&read, path, value.observations, clock)?;
+        self.guard.record_success(&read, path, false);
         Ok(value)
     }
 }

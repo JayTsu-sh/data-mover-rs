@@ -1,7 +1,7 @@
 use std::future::pending;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time::sleep};
 
 use super::*;
 use crate::model::{BackendIdentity, EntryKind, EntryOperationFailure, IdentityStrength};
@@ -36,7 +36,7 @@ async fn timed_out_operation_keeps_ownership_until_backend_cleanup_finishes() {
     let done = finished.clone();
     let signal = ScanFailureSignal::new(BackendKind::Cifs, Some(Duration::from_millis(10)));
     let result = signal
-        .operation(Operation::Observe, &StoragePath::root(), async move {
+        .operation(&ScanRead::Stat, &StoragePath::root(), async move {
             let resource = evidence;
             release.notified().await;
             resource.closed.store(true, Ordering::SeqCst);
@@ -181,15 +181,20 @@ async fn permission_denied_never_becomes_a_network_failure() {
 async fn already_failed_notification_preserves_the_first_failure() {
     let signal = ScanFailureSignal::new(BackendKind::Nfs, Some(Duration::from_secs(3)));
     signal.record(
-        Operation::Traverse,
+        &ScanRead::listing(
+            &ListRequest::new(StoragePath::root(), CancellationToken::new()),
+            None,
+        ),
         &StoragePath::root(),
         RemoteScanFailureKind::ConnectionLost,
         None,
+        None,
     );
     signal.record(
-        Operation::Observe,
+        &ScanRead::Stat,
         &StoragePath::root(),
         RemoteScanFailureKind::OperationTimedOut,
+        None,
         None,
     );
     timeout(Duration::from_millis(50), signal.failed())
@@ -202,18 +207,25 @@ async fn already_failed_notification_preserves_the_first_failure() {
 async fn native_entry_network_errors_stop_the_session_without_operation_timeout() {
     let signal = ScanFailureSignal::new(BackendKind::Nfs, None);
     let result: Result<(), _> = signal
-        .operation(Operation::Traverse, &StoragePath::root(), async {
-            Err(StorageRoleFailure::Entry(
-                EntryOperationFailure::new(
-                    StoragePath::root(),
-                    Operation::Traverse,
-                    FailureClass::Connectivity,
-                    Transience::Transient,
-                    "native reset",
-                )
-                .unwrap(),
-            ))
-        })
+        .operation(
+            &ScanRead::listing(
+                &ListRequest::new(StoragePath::root(), CancellationToken::new()),
+                None,
+            ),
+            &StoragePath::root(),
+            async {
+                Err(StorageRoleFailure::Entry(
+                    EntryOperationFailure::new(
+                        StoragePath::root(),
+                        Operation::Traverse,
+                        FailureClass::Connectivity,
+                        Transience::Transient,
+                        "native reset",
+                    )
+                    .unwrap(),
+                ))
+            },
+        )
         .await;
     assert!(
         matches!(result, Err(StorageRoleFailure::Session(error)) if error.class() == FailureClass::Connectivity)
@@ -241,7 +253,7 @@ fn child_network_errors_in_successful_pages_cannot_complete_the_directory() {
         0,
     );
     assert!(
-        matches!(signal.checked_page(&StoragePath::root(), Some(page)),
+        matches!(signal.checked_page(&ScanRead::listing(&ListRequest::new(StoragePath::root(), CancellationToken::new()), None), &StoragePath::root(), Some(page), None),
         Err(StorageRoleFailure::Session(error)) if error.class() == FailureClass::Timeout)
     );
     assert_eq!(
@@ -262,8 +274,65 @@ fn retained_metadata_network_errors_cannot_be_silently_skipped() {
         transience: Transience::Transient,
     });
     assert!(
-        matches!(signal.checked_metadata(&StoragePath::root(), metadata),
+        matches!(signal.checked_metadata(&ScanRead::Metadata(ObservationPlan::default()), &StoragePath::root(), metadata, None),
         Err(StorageRoleFailure::Session(error)) if error.class() == FailureClass::Connectivity)
     );
     assert!(signal.failure().is_some());
+}
+
+#[tokio::test]
+async fn consumer_backpressure_pauses_the_actual_target_read_budget() {
+    let signal = ScanFailureSignal::new(BackendKind::Cifs, None);
+    let budget = RecoveryBudget::new(Duration::from_millis(80));
+    budget.reconnecting(false);
+    signal.watch_recovery(
+        RecoveryTarget {
+            read: ScanRead::Stat,
+            path: StoragePath::root(),
+        },
+        budget.clone(),
+    );
+    let ready = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let started = ready.clone();
+    let done = release.clone();
+    let guarded = signal.clone();
+    let consumer = budget.consumer_wait();
+    let call = tokio::spawn(async move {
+        guarded
+            .operation(&ScanRead::Stat, &StoragePath::root(), async move {
+                started.notify_one();
+                done.notified().await;
+                Ok(())
+            })
+            .await
+    });
+    ready.notified().await;
+    sleep(Duration::from_millis(160)).await;
+    assert!(!call.is_finished());
+    assert!(signal.failure().is_none());
+    drop(consumer);
+    release.notify_one();
+    timeout(Duration::from_millis(250), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_replay_failure_does_not_charge_concurrent_target_wait_twice() {
+    let budget = RecoveryBudget::new(Duration::from_millis(200));
+    budget.reconnecting(false);
+    let clock = budget.clock();
+    let target = budget.target_read();
+    sleep(Duration::from_millis(120)).await;
+    budget.failed_replay(clock);
+    drop(target);
+    assert!(!budget.is_exhausted());
+    budget.reconnecting(true);
+    timeout(Duration::from_millis(250), budget.exhausted())
+        .await
+        .unwrap();
+    assert!(budget.is_exhausted());
 }

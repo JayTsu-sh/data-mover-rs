@@ -5,24 +5,44 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::future::pending;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::model::{
-    BackendIdentity, BackendKind, EntryKind, IdentityStrength, MetadataObservations,
-    ObservationMode, ObservationPlan, Operation, SourceIdentity, StoragePath,
+    BackendIdentity, BackendKind, EntryKind, HistoryOrder, IdentityStrength, MetadataObservations,
+    ObjectHistory, ObservationMode, ObservationPlan, Operation, RecordKind, SourceIdentity,
+    SourceVersion, StoragePath, SymlinkTarget, VersionRecord,
 };
 use crate::storage::{
-    BackendCapabilities, CapabilityAvailability, ListRequest, ListingPage, ListingStream, Metadata,
-    MetadataMutation, Namespace, SourceDescriptor, StorageBuilder, UnsupportedReason,
+    BackendCapabilities, CapabilityAvailability, CopiedMetadataObservation, ListRequest,
+    ListingPage, ListingStream, Metadata, MetadataMutation, Namespace, NamespaceCapabilities,
+    SourceDescriptor, StorageBuilder, UnsupportedReason,
 };
 use crate::traversal::{RemoteScanFailureKind, TraversalItem};
 
 struct Fixture {
     fails: bool,
     first_page: bool,
-    metadata_fails: bool,
+    metadata: MetadataMode,
+    children: Children,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MetadataMode {
+    Healthy,
+    Fails,
+    InlineThenFails,
+    VersionFault,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Children {
+    Both,
+    OnlyB,
+    Empty,
+    Versions,
+    Link,
 }
 
 fn identity() -> BackendIdentity {
@@ -53,14 +73,29 @@ fn network_failure() -> StorageRoleFailure {
 
 #[async_trait]
 impl Namespace for Fixture {
+    fn capabilities(&self) -> NamespaceCapabilities {
+        NamespaceCapabilities {
+            symlinks: self.children == Children::Link,
+            ..NamespaceCapabilities::BASIC
+        }
+    }
+
     async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         Ok(descriptor(path.clone(), EntryKind::Directory))
     }
 
     fn list(&self, request: ListRequest) -> ListingStream {
-        let (fails, first_page) = (self.fails, self.first_page);
+        if matches!(self.children, Children::Versions | Children::Link) {
+            let child = match self.children {
+                Children::Versions => versioned_child(),
+                _ => descriptor(StoragePath::new("a").unwrap(), EntryKind::Symlink),
+            };
+            let page = ListingPage::from_descriptors(&request.path, vec![child], vec![], 0);
+            return ListingStream::from_pages(request.path, [Ok(page)]);
+        }
+        let (fails, first_page, children) = (self.fails, self.first_page, self.children);
         ListingStream::from_producer(request.path.clone(), move |sink| async move {
-            if first_page || !fails {
+            if (first_page || !fails) && children == Children::Both {
                 let page = ListingPage::from_descriptors(
                     &request.path,
                     vec![descriptor(StoragePath::new("a").unwrap(), EntryKind::File)],
@@ -73,7 +108,7 @@ impl Namespace for Fixture {
             }
             if fails {
                 sink.fail(network_failure()).await;
-            } else {
+            } else if children != Children::Empty {
                 let page = ListingPage::from_descriptors(
                     &request.path,
                     vec![descriptor(StoragePath::new("b").unwrap(), EntryKind::File)],
@@ -84,20 +119,60 @@ impl Namespace for Fixture {
             }
         })
     }
+
+    async fn read_link(&self, _: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
+        sleep(Duration::from_millis(25)).await;
+        Err(network_failure())
+    }
+}
+
+fn versioned_child() -> SourceDescriptor {
+    let mut child = descriptor(StoragePath::new("a").unwrap(), EntryKind::File);
+    let records = [("healthy", false), ("bad", true)]
+        .into_iter()
+        .map(|(version, latest)| {
+            VersionRecord::from_listing(
+                version,
+                latest,
+                RecordKind::Object {
+                    size: 0,
+                    etag: version.into(),
+                    modified: None,
+                },
+                child.source_identity.clone(),
+            )
+            .unwrap()
+        })
+        .collect();
+    child.listing.history = Some(Box::new(
+        ObjectHistory::whole(records, HistoryOrder::Server).unwrap(),
+    ));
+    child
 }
 
 #[async_trait]
 impl Metadata for Fixture {
+    fn observe_listed(
+        &self,
+        _: &SourceDescriptor,
+        plan: ObservationPlan,
+    ) -> Option<Result<MetadataObservations, StorageRoleFailure>> {
+        (self.metadata == MetadataMode::InlineThenFails && !plan.permits_io())
+            .then(|| Ok(MetadataObservations::default()))
+    }
+
     async fn observe(
         &self,
         _: &StoragePath,
         _: ObservationPlan,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
-        if self.metadata_fails {
-            Err(network_failure())
-        } else {
-            Ok(MetadataObservations::default())
+        if self.metadata == MetadataMode::Healthy {
+            return Ok(MetadataObservations::default());
         }
+        if self.metadata == MetadataMode::InlineThenFails {
+            sleep(Duration::from_millis(25)).await;
+        }
+        Err(network_failure())
     }
     async fn apply(
         &self,
@@ -107,17 +182,36 @@ impl Metadata for Fixture {
     ) -> Result<(), StorageRoleFailure> {
         unreachable!()
     }
+
+    async fn observe_copy_bound_version(
+        &self,
+        _: &StoragePath,
+        _: &SourceIdentity,
+        version: &SourceVersion,
+        _: ObservationPlan,
+    ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
+        sleep(Duration::from_millis(25)).await;
+        if self.metadata == MetadataMode::VersionFault && version.version_id() == Some("bad") {
+            return Err(network_failure());
+        }
+        Ok(CopiedMetadataObservation {
+            observations: MetadataObservations::default(),
+            mode_without_ownership: None,
+            owner_names_unmapped: false,
+        })
+    }
 }
 
 fn storage(fails: bool, first_page: bool) -> Storage {
     fixture_storage(Fixture {
         fails,
         first_page,
-        metadata_fails: false,
+        metadata: MetadataMode::Healthy,
+        children: Children::Both,
     })
 }
 
-fn fixture_storage(fixture: Fixture) -> Storage {
+fn fixture_storage(fixture: impl Namespace + Metadata + 'static) -> Storage {
     let roles = Arc::new(fixture);
     let no = CapabilityAvailability::Unsupported(UnsupportedReason::new("scan fixture").unwrap());
     StorageBuilder::new(
@@ -184,7 +278,7 @@ async fn reset_reconnects_without_skipping_paths_or_publishing_a_final_fault() {
 }
 
 #[tokio::test]
-async fn repeated_immediate_failures_share_one_absolute_window() {
+async fn repeated_immediate_failures_share_one_recovery_budget() {
     let calls = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
     let (session, status) = recoverable_scan(
@@ -315,7 +409,8 @@ async fn successful_listing_cannot_refresh_a_persistent_metadata_failure_window(
         fixture_storage(Fixture {
             fails: false,
             first_page: false,
-            metadata_fails: true,
+            metadata: MetadataMode::Fails,
+            children: Children::Both,
         })
     };
     let connect: ScanReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
@@ -401,11 +496,154 @@ async fn consumer_wait_longer_than_recovery_budget_does_not_exhaust_it() {
         let result = recovery.forward(permanent_item(), &signal).await;
         (recovery, result)
     });
-    tokio::time::sleep(Duration::from_millis(160)).await;
+    sleep(Duration::from_millis(160)).await;
     assert!(!waiting.is_finished());
     output.recv().await.unwrap();
     output.recv().await.unwrap();
     let (recovery, result) = waiting.await.unwrap();
     assert!(result.is_ok());
-    assert!(recovery.window.as_ref().unwrap().deadline > Instant::now());
+    assert!(!recovery.window.as_ref().unwrap().budget.is_exhausted());
+}
+
+#[tokio::test]
+async fn inline_metadata_cannot_refresh_a_persistent_additional_rpc_failure_window() {
+    let broken = || {
+        fixture_storage(Fixture {
+            fails: false,
+            first_page: false,
+            metadata: MetadataMode::InlineThenFails,
+            children: Children::Both,
+        })
+    };
+    let connect: ScanReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
+    let (session, status) = recoverable_scan(
+        &broken(),
+        TraversalRequest::new(StoragePath::root())
+            .observation_plan(ObservationPlan::default().with_tags(ObservationMode::BestEffort)),
+        policy(),
+        connect,
+    )
+    .unwrap();
+    let (_, outcome) = timeout(Duration::from_millis(500), drain(session))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, Err(TraversalTerminalFailure::Session(_))));
+    let failure = status.failure_signal().failure().unwrap();
+    assert_eq!(failure.kind, RemoteScanFailureKind::ConnectionLost);
+    assert_eq!(failure.operation, Operation::Observe);
+}
+
+#[tokio::test]
+async fn a_clean_completed_attempt_recovers_when_the_faulting_path_disappears() {
+    for children in [Children::OnlyB, Children::Empty] {
+        let initial = fixture_storage(Fixture {
+            fails: false,
+            first_page: false,
+            metadata: MetadataMode::Fails,
+            children: Children::Both,
+        });
+        let connect: ScanReconnect = Arc::new(move || {
+            async move {
+                Ok(fixture_storage(Fixture {
+                    fails: false,
+                    first_page: false,
+                    metadata: MetadataMode::Healthy,
+                    children,
+                }))
+            }
+            .boxed()
+        });
+        let (session, status) = recoverable_scan(
+            &initial,
+            TraversalRequest::new(StoragePath::root()).observation_plan(
+                ObservationPlan::default().with_tags(ObservationMode::BestEffort),
+            ),
+            policy(),
+            connect,
+        )
+        .unwrap();
+        let (paths, outcome) = timeout(Duration::from_millis(500), drain(session))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Ok(TraversalOutcome::Completed(_))));
+        if children == Children::OnlyB {
+            assert!(paths.iter().any(|path| path == "b"));
+        }
+        assert!(status.failure_signal().failure().is_none());
+        assert!(matches!(
+            *status.subscribe().borrow(),
+            ScanRecoveryState::Running { recoveries: 1 }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn another_successful_read_cannot_renew_a_persistent_fault_at_the_same_path() {
+    for (children, metadata) in [
+        (Children::Link, MetadataMode::Healthy),
+        (Children::Versions, MetadataMode::VersionFault),
+    ] {
+        let broken = move || {
+            fixture_storage(Fixture {
+                fails: false,
+                first_page: false,
+                metadata,
+                children,
+            })
+        };
+        let connect: ScanReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
+        let (session, status) = recoverable_scan(
+            &broken(),
+            TraversalRequest::new(StoragePath::root()).observation_plan(
+                ObservationPlan::default().with_tags(ObservationMode::BestEffort),
+            ),
+            policy(),
+            connect,
+        )
+        .unwrap();
+        let (_, outcome) = timeout(Duration::from_millis(500), drain(session))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Err(TraversalTerminalFailure::Session(_))));
+        assert_eq!(
+            status.failure_signal().failure().unwrap().kind,
+            RemoteScanFailureKind::ConnectionLost
+        );
+    }
+}
+
+#[path = "recovery_progress_tests.rs"]
+mod recovery_progress_tests;
+
+#[tokio::test]
+async fn a_fault_arriving_during_consumer_wait_keeps_its_recovery_budget() {
+    let (mut recovery, mut output, _) = waiting_recovery();
+    let signal = ScanFailureSignal::new(BackendKind::Cifs, None);
+    let failed = signal.clone();
+    recovery
+        .producer
+        .items
+        .send_one(permanent_item())
+        .await
+        .unwrap();
+    let waiting = tokio::spawn(async move {
+        let result = recovery.forward(permanent_item(), &signal).await;
+        (recovery, result)
+    });
+    sleep(Duration::from_millis(10)).await;
+    failed.publish_failure(RemoteScanFailure {
+        backend: BackendKind::Cifs,
+        operation: Operation::Traverse,
+        path: StoragePath::root(),
+        kind: RemoteScanFailureKind::ConnectionLost,
+        operation_timeout: Duration::ZERO,
+        source: None,
+    });
+    sleep(Duration::from_millis(160)).await;
+    assert!(!waiting.is_finished());
+    output.recv().await.unwrap();
+    output.recv().await.unwrap();
+    let (recovery, result) = waiting.await.unwrap();
+    assert!(result.is_ok());
+    assert!(!recovery.window.as_ref().unwrap().budget.is_exhausted());
 }

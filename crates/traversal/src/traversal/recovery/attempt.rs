@@ -1,8 +1,8 @@
 //! Drains each attempt before changing connection or directory checkpoint.
 
-use std::time::Duration;
+use std::{task::Poll, time::Duration};
 
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use super::{Outcome, Recovery};
@@ -91,7 +91,7 @@ impl Recovery {
 
     fn unsafe_history(&mut self) -> Outcome {
         if let Some(window) = &mut self.window {
-            window.deadline = Instant::now();
+            window.budget.exhaust();
             self.exhausted()
         } else {
             Err(TraversalTerminalFailure::Internal)
@@ -103,7 +103,7 @@ impl Recovery {
             && self
                 .window
                 .as_ref()
-                .is_some_and(|window| Instant::now() >= window.deadline)
+                .is_some_and(|window| window.budget.is_exhausted())
     }
 
     async fn next_item(
@@ -153,16 +153,26 @@ impl Recovery {
         let output = self.producer.items.clone();
         let sent = output.send_one(item);
         tokio::pin!(sent);
-        let mut waiting_since = Instant::now();
         loop {
-            self.account_output_wait(signal, waiting_since);
-            waiting_since = Instant::now();
+            if let Poll::Ready(result) = futures::poll!(&mut sent) {
+                self.start_window(signal, true);
+                return result.map_err(|_| ());
+            }
+            self.start_window(signal, true);
+            let _waiting = self
+                .window
+                .as_ref()
+                .map(|window| window.budget.consumer_wait());
+            self.observe(signal);
             tokio::select! {
                 biased;
                 () = self.request.cancel.cancelled(), if !self.drains() => return Err(()),
-                () = signal.failed(), if signal.failure().is_none() => self.observe(signal),
+                () = signal.failed(), if signal.failure().is_none() => {
+                    self.start_window(signal, true);
+                    self.observe(signal);
+                }
                 result = &mut sent => {
-                    self.account_output_wait(signal, waiting_since);
+                    self.start_window(signal, true);
                     return result.map_err(|_| ());
                 }
                 () = sleep(Duration::from_millis(10)) => {}
