@@ -2,7 +2,7 @@
 
 ## 底层依赖
 
-- **crate**：`nfs-rs` 0.10.1，crates.io 正式依赖（同版本亦已发布 PyPI）。原生 NFSACL v3 与 NFSv4 ACL 分别保留各自编码；协议实现由 nfs-rs 独立发布。
+- **crate**：`nfs-rs` 0.11.1，crates.io 正式依赖（同版本亦已发布 PyPI）。原生 NFSACL v3 与 NFSv4 ACL 分别保留各自编码；协议实现由 nfs-rs 独立发布。
 - 支持 NFSv3 和 NFSv4 (自动协商 / 升级)。
 - 属性缓存用 `moka` (0.12.15)，减少冗余 GETATTR RPC。
 

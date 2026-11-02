@@ -9,7 +9,7 @@ Rust 库，Edition 2024；具体依赖版本和固定 Git 提交以 `Cargo.toml`
 
 | 依赖 | 固定来源 |
 |---|---|
-| `nfs-rs` | crates.io `0.10.1`；Rust / PyPI 同版本正式发布 |
+| `nfs-rs` | crates.io `0.11.1`；Rust / PyPI 同版本正式发布 |
 | `smb-domain`（package `smb`） | JayTsu-sh/smb-rs main `02c80bb4f28e4566533e5ff4abc741b59e251ee3`，#91；升级验收见 [CIFS](storage-cifs.md#升级-smb-rs-依赖) |
 
 ## 模块与依赖方向

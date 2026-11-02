@@ -67,7 +67,7 @@
 - **`[lints.rust]`**：`unsafe_code = deny`。新增 unsafe 必须有 SAFETY 注释 + PR 说明。
 - **异步**：tokio (full)。**错误**：thiserror。**日志**：tracing。
 - **依赖管理**：默认全 crates.io，无 `[patch.crates-io]` (与 terrasync-rs 不同)。升级 `smb-domain` / `nfs-rs` / `aws-sdk-s3` 是真实风险。
-  `nfs-rs` 使用 crates.io 正式版本 `0.10.1`。经项目授权的 git 固定：`smb-domain`
+  `nfs-rs` 使用 crates.io 正式版本 `0.11.1`。经项目授权的 git 固定：`smb-domain`
   (package `smb`) 固定 JayTsu-sh/smb-rs main 提交 `02c80bb4f28e4566533e5ff4abc741b59e251ee3`
   (2026-11-02，#91：类型化断连 / 超时原因、已关闭 generation 的真实退出原因与写操作不确定性；原生 CI 全绿，
   本库升级矩阵记录见 `.claude/docs/storage-cifs.md`)。此前 `2649a0b` (2026-09-27：#89 文件 `open_existing()` 只读，写 / flush 要 `.write(true)`、
