@@ -461,7 +461,6 @@ fn waiting_recovery() -> (Recovery, channel::ItemReceiver, ScanFailureSignal) {
             window: None,
             checkpoint: None,
             recoveries: 0,
-            restoring: false,
         },
         output,
         signal,
@@ -484,8 +483,10 @@ fn permanent_item() -> TraversalItem {
 }
 
 #[tokio::test]
-async fn consumer_wait_longer_than_recovery_budget_does_not_exhaust_it() {
-    let (mut recovery, mut output, signal) = waiting_recovery();
+async fn healthy_replay_consumer_wait_does_not_exhaust_failure_budget() {
+    let (mut recovery, mut output, _) = waiting_recovery();
+    let signal = ScanFailureSignal::new(BackendKind::Cifs, None);
+    recovery.failure = signal.clone();
     recovery
         .producer
         .items
@@ -502,7 +503,7 @@ async fn consumer_wait_longer_than_recovery_budget_does_not_exhaust_it() {
     output.recv().await.unwrap();
     let (recovery, result) = waiting.await.unwrap();
     assert!(result.is_ok());
-    assert!(!recovery.window.as_ref().unwrap().budget.is_exhausted());
+    assert!(recovery.window.is_none());
 }
 
 #[tokio::test]
@@ -616,8 +617,8 @@ async fn another_successful_read_cannot_renew_a_persistent_fault_at_the_same_pat
 mod recovery_progress_tests;
 
 #[tokio::test]
-async fn a_fault_arriving_during_consumer_wait_keeps_its_recovery_budget() {
-    let (mut recovery, mut output, _) = waiting_recovery();
+async fn a_fault_during_consumer_wait_starts_its_deadline_at_detection() {
+    let (mut recovery, _output, _) = waiting_recovery();
     let signal = ScanFailureSignal::new(BackendKind::Cifs, None);
     let failed = signal.clone();
     recovery
@@ -630,7 +631,8 @@ async fn a_fault_arriving_during_consumer_wait_keeps_its_recovery_budget() {
         let result = recovery.forward(permanent_item(), &signal).await;
         (recovery, result)
     });
-    sleep(Duration::from_millis(10)).await;
+    sleep(Duration::from_millis(160)).await;
+    assert!(!waiting.is_finished());
     failed.publish_failure(RemoteScanFailure {
         backend: BackendKind::Cifs,
         operation: Operation::Traverse,
@@ -639,11 +641,32 @@ async fn a_fault_arriving_during_consumer_wait_keeps_its_recovery_budget() {
         operation_timeout: Duration::ZERO,
         source: None,
     });
-    sleep(Duration::from_millis(160)).await;
-    assert!(!waiting.is_finished());
-    output.recv().await.unwrap();
-    output.recv().await.unwrap();
-    let (recovery, result) = waiting.await.unwrap();
-    assert!(result.is_ok());
-    assert!(!recovery.window.as_ref().unwrap().budget.is_exhausted());
+    let (recovery, result) = timeout(Duration::from_millis(300), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_err());
+    assert!(recovery.window.as_ref().unwrap().budget.is_exhausted());
+}
+
+#[tokio::test]
+async fn known_disconnect_deadline_is_not_paused_by_blocked_output() {
+    let (mut recovery, _output, signal) = waiting_recovery();
+    recovery
+        .producer
+        .items
+        .send_one(permanent_item())
+        .await
+        .unwrap();
+    let result = timeout(
+        Duration::from_millis(300),
+        recovery.forward(permanent_item(), &signal),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "known disconnect exceeded its recovery window while output was blocked"
+    );
+    assert!(result.unwrap().is_err());
+    assert!(recovery.window.as_ref().unwrap().budget.is_exhausted());
 }

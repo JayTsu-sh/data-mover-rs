@@ -14,7 +14,7 @@ mod listing_tests {
     use hdfs_native::client::FileStatus;
 
     use super::{
-        HDFSStorage, HdfsConfig, HdfsStatusListing, HdfsStatuses, RoleFailure, RoleFailureClass,
+        HDFSStorage, HdfsConfig, HdfsReadRecovery, HdfsStatusListing, HdfsStatuses, RoleFailure, RoleFailureClass,
         RoleHdfsListing as _, RoleStoragePath, build_hdfs_client,
     };
 
@@ -33,6 +33,7 @@ mod listing_tests {
         Ok(HDFSStorage {
             client,
             location,
+            read_recovery: HdfsReadRecovery::Adapter,
             block_size: super::DEFAULT_BLOCK_SIZE,
             transfer_concurrency: crate::transfer_concurrency::TransferConcurrency::defaults(4, 1),
         })
@@ -362,4 +363,26 @@ mod listing_tests {
         assert_eq!(children.len(), 3);
         Ok(())
     }
+    #[tokio::test(start_paused = true)]
+    async fn scan_listing_returns_the_first_network_fault_without_reopening() -> Result {
+        let (mut listing, opens) = listing(vec![(vec![Err(reset())], ENDS), (children(0..5), ENDS)])?;
+        listing.storage.read_recovery = HdfsReadRecovery::Caller;
+        assert!(matches!(listing.next_page(hint(10)?).await,
+            Err(RoleFailure::Session(error)) if error.class()==RoleFailureClass::Connectivity));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_listing_retains_partial_pages_without_an_adapter_retry() -> Result {
+        let (mut listing, opens) = listing(vec![(then(children(0..12), reset()), ENDS), (children(0..20), ENDS)])?;
+        listing.storage.read_recovery = HdfsReadRecovery::Caller;
+        assert_eq!(page(&mut listing, 10).await?.len(), 10);
+        assert_eq!(page(&mut listing, 10).await?, ["d/f10", "d/f11"]);
+        assert!(matches!(listing.next_page(hint(10)?).await,
+            Err(RoleFailure::Session(error)) if error.class()==RoleFailureClass::Connectivity));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
 }

@@ -56,7 +56,6 @@ impl Recovery {
         source: StorageTraversalSource,
         signal: &ScanFailureSignal,
     ) -> Outcome {
-        self.restoring = self.window.is_some();
         let request = self.request_for_attempt();
         let cancel = AttemptCancellation(request.cancel.clone());
         let mut inner = source.traverse(request);
@@ -147,18 +146,18 @@ impl Recovery {
             }
         }
         self.observe(signal);
-        if self.expired() {
-            return Err(());
-        }
         let output = self.producer.items.clone();
         let sent = output.send_one(item);
         tokio::pin!(sent);
         loop {
+            if self.expired() {
+                return Err(());
+            }
             if let Poll::Ready(result) = futures::poll!(&mut sent) {
-                self.start_window(signal, true);
+                self.start_window(signal);
                 return result.map_err(|_| ());
             }
-            self.start_window(signal, true);
+            self.start_window(signal);
             let _waiting = self
                 .window
                 .as_ref()
@@ -168,11 +167,11 @@ impl Recovery {
                 biased;
                 () = self.request.cancel.cancelled(), if !self.drains() => return Err(()),
                 () = signal.failed(), if signal.failure().is_none() => {
-                    self.start_window(signal, true);
+                    self.start_window(signal);
                     self.observe(signal);
                 }
                 result = &mut sent => {
-                    self.start_window(signal, true);
+                    self.start_window(signal);
                     return result.map_err(|_| ());
                 }
                 () = sleep(Duration::from_millis(10)) => {}

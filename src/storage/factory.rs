@@ -1,5 +1,7 @@
 #[allow(unused_imports)]
 use super::backends;
+#[cfg(feature = "backend-hdfs")]
+use super::backends::hdfs::connect_scan_backend as connect_hdfs_scan_backend;
 use super::{BackendConfig, BackendConnectError, Storage};
 #[allow(unused_imports)]
 use crate::model::BackendKind;
@@ -42,14 +44,10 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
 ///
 /// # Errors
 /// Returns configuration, authentication, connection or role construction failures.
-pub async fn connect_scan_backend(
-    mut config: BackendConfig,
-) -> Result<Storage, BackendConnectError> {
-    if let BackendConfig::Hdfs(hdfs) = &mut config {
-        hdfs.client
-            .overrides
-            .entry("dfs.client.failover.max.attempts".into())
-            .or_insert_with(|| "1".into());
+pub async fn connect_scan_backend(config: BackendConfig) -> Result<Storage, BackendConnectError> {
+    #[cfg(feature = "backend-hdfs")]
+    if let BackendConfig::Hdfs(hdfs) = config {
+        return connect_hdfs_scan_backend(hdfs).await;
     }
     #[cfg(feature = "backend-s3")]
     if let BackendConfig::S3(s3) = config {

@@ -11,7 +11,7 @@
 NFS 原生连接默认允许短时间恢复明确断连：退避、TCP 重连、会话绑定及安全重发
 共用 500 毫秒总预算，最多四次重连，并受原请求的重放许可和时限进一步约束。
 耗尽后返回首个类型化断连及请求是否已经发送的证据；无需 URL 策略参数。
-`recoverable_scan` 在 data-mover 中提供独立的默认 3 秒故障恢复预算，
+`recoverable_scan` 在 data-mover 中提供独立的默认 3 秒故障恢复窗口，
 按安全检查点续扫；原生短重试与扫描的生命周期、消费方背压和故障展示分别处理。
 详见 [扫描恢复分层](codebase.md#远程扫描)。
 
@@ -347,3 +347,5 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 2. 改 retry 决策必须更新两个 doc 的映射表。
 3. 调 `backend-specialist` agent 传 `nfs`。
 4. 改完跑 `make e2e-nfs` (需测试服务器)。
+
+目录列举的路径句柄解析使用 `role_lookup_fh`，保留原生 LOOKUP 的 Connectivity/Timeout 分类。旧 `lookup_fh` 会把原生错误转成字符串，不能用于扫描角色，否则恢复期间并发目录失败会被误报成 Protocol/Unknown。

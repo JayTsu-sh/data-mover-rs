@@ -49,11 +49,12 @@ fn nanos_to_millis(value: i64) -> Result<u64, StorageError> {
 ///
 /// Returns an error when client construction, root lookup, or root creation
 /// fails, or when the configured root is an existing file.
-pub async fn create_hdfs_storage(
+pub(super) async fn create_hdfs_storage(
     location: &str,
     config: &HdfsConfig,
     block_size: Option<u64>,
     ensure_dir: bool,
+    read_recovery: HdfsReadRecovery,
 ) -> Result<HDFSStorage, StorageError> {
     let transfer_concurrency = crate::transfer_concurrency::resolve_transfer_concurrency(
         crate::transfer_concurrency::TransferBackend::Hdfs,
@@ -61,7 +62,7 @@ pub async fn create_hdfs_storage(
         None,
     )?;
     let (client, location) = build_hdfs_client(location, config)?;
-    match retry_hdfs_read("get storage root", None, None, || {
+    match read_recovery.read("get storage root", None, || {
         client.get_file_info(location.root())
     })
     .await
@@ -86,6 +87,7 @@ pub async fn create_hdfs_storage(
     Ok(HDFSStorage {
         client,
         location,
+        read_recovery,
         block_size: block_size.unwrap_or(DEFAULT_BLOCK_SIZE),
         transfer_concurrency,
     })

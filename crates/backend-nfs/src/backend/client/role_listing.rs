@@ -36,6 +36,7 @@ use crate::storage::backends::nfs::namespace::{
     unnamed_child,
 };
 use crate::storage::backends::nfs::protocol::classify_error;
+use crate::storage::backends::nfs::source::NfsProtocolFailure;
 use crate::storage::listing::child_path;
 
 /// One READDIRPLUS entry of a role listing, described straight from the reply: what the
@@ -115,8 +116,13 @@ fn observation(
 
 impl NFSStorage {
     /// The handle of the directory `path` names, through the directory handle cache.
-    pub(super) async fn role_directory_handle(&self, path: &StoragePath) -> Result<Bytes> {
-        Ok(self.lookup_fh(Path::new(path.as_str())).await?.fh)
+    pub(super) async fn role_directory_handle(
+        &self,
+        path: &StoragePath,
+    ) -> std::result::Result<Bytes, NfsProtocolFailure> {
+        // Keep the original LOOKUP error; the legacy adapter erases its native
+        // connection/timeout class into StorageError::NfsError(String).
+        Ok(self.role_lookup_fh(Path::new(path.as_str())).await?.fh)
     }
 
     /// Reads the directory `handle` with READDIRPLUS from `from` into `pages` (see

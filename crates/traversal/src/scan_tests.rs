@@ -61,6 +61,7 @@ async fn timed_out_operation_keeps_ownership_until_backend_cleanup_finishes() {
 struct Fixture {
     backend: BackendKind,
     denied: bool,
+    conflict: bool,
 }
 #[async_trait]
 impl Namespace for Fixture {
@@ -101,10 +102,37 @@ impl Namespace for Fixture {
 impl Metadata for Fixture {
     async fn observe(
         &self,
-        _: &StoragePath,
+        path: &StoragePath,
         _: ObservationPlan,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
+        if self.conflict {
+            return Err(StorageRoleFailure::Entry(
+                EntryOperationFailure::new(
+                    path.clone(),
+                    Operation::Metadata,
+                    FailureClass::Conflict,
+                    Transience::Transient,
+                    "source identity changed",
+                )
+                .unwrap(),
+            ));
+        }
         Ok(MetadataObservations::default())
+    }
+    async fn observe_copy_bound_version(
+        &self,
+        path: &StoragePath,
+        _: &SourceIdentity,
+        _: &SourceVersion,
+        plan: ObservationPlan,
+    ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
+        self.observe(path, plan)
+            .await
+            .map(|observations| CopiedMetadataObservation {
+                observations,
+                mode_without_ownership: None,
+                owner_names_unmapped: false,
+            })
     }
     async fn apply(
         &self,
@@ -116,7 +144,14 @@ impl Metadata for Fixture {
     }
 }
 fn roles(backend: BackendKind, denied: bool) -> Storage {
-    let role = Arc::new(Fixture { backend, denied });
+    fixture_roles(backend, denied, false)
+}
+fn fixture_roles(backend: BackendKind, denied: bool, conflict: bool) -> Storage {
+    let role = Arc::new(Fixture {
+        backend,
+        denied,
+        conflict,
+    });
     let unsupported =
         CapabilityAvailability::Unsupported(UnsupportedReason::new("test only").unwrap());
     StorageBuilder::new(
@@ -189,11 +224,13 @@ async fn already_failed_notification_preserves_the_first_failure() {
         RemoteScanFailureKind::ConnectionLost,
         None,
         None,
+        None,
     );
     signal.record(
         &ScanRead::Stat,
         &StoragePath::root(),
         RemoteScanFailureKind::OperationTimedOut,
+        None,
         None,
         None,
     );
@@ -274,14 +311,14 @@ fn retained_metadata_network_errors_cannot_be_silently_skipped() {
         transience: Transience::Transient,
     });
     assert!(
-        matches!(signal.checked_metadata(&ScanRead::Metadata(ObservationPlan::default()), &StoragePath::root(), metadata, None),
+        matches!(signal.checked_metadata(&ScanRead::Metadata(ObservationPlan::default()), &StoragePath::root(), metadata, None, None),
         Err(StorageRoleFailure::Session(error)) if error.class() == FailureClass::Connectivity)
     );
     assert!(signal.failure().is_some());
 }
 
 #[tokio::test]
-async fn consumer_backpressure_pauses_the_actual_target_read_budget() {
+async fn a_known_target_deadline_continues_while_the_consumer_waits() {
     let signal = ScanFailureSignal::new(BackendKind::Cifs, None);
     let budget = RecoveryBudget::new(Duration::from_millis(80));
     budget.reconnecting(false);
@@ -289,6 +326,7 @@ async fn consumer_backpressure_pauses_the_actual_target_read_budget() {
         RecoveryTarget {
             read: ScanRead::Stat,
             path: StoragePath::root(),
+            inline_descriptor: None,
         },
         budget.clone(),
     );
@@ -309,15 +347,17 @@ async fn consumer_backpressure_pauses_the_actual_target_read_budget() {
     });
     ready.notified().await;
     sleep(Duration::from_millis(160)).await;
-    assert!(!call.is_finished());
-    assert!(signal.failure().is_none());
+    assert!(call.is_finished());
+    assert_eq!(
+        signal.failure().unwrap().kind,
+        RemoteScanFailureKind::OperationTimedOut
+    );
     drop(consumer);
     release.notify_one();
-    timeout(Duration::from_millis(250), call)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    assert!(
+        matches!(timeout(Duration::from_millis(250), call).await.unwrap().unwrap(),
+        Err(StorageRoleFailure::Session(error)) if error.class() == FailureClass::Timeout)
+    );
 }
 
 #[tokio::test]
@@ -335,4 +375,106 @@ async fn a_replay_failure_does_not_charge_concurrent_target_wait_twice() {
         .await
         .unwrap();
     assert!(budget.is_exhausted());
+}
+
+#[tokio::test]
+async fn changed_inline_descriptor_recovers_without_reusing_stale_facts() {
+    let storage = roles(BackendKind::Cifs, false);
+    let (_, signal) = ScanFailureSignal::source(&storage, None).unwrap();
+    let path = StoragePath::root();
+    let mut original = storage.namespace().unwrap().stat(&path).await.unwrap();
+    original.kind = EntryKind::File;
+    let target = RecoveryTarget {
+        read: ScanRead::InlineMetadata(ObservationPlan::default()),
+        path,
+        inline_descriptor: Some(Arc::new(original)),
+    };
+    signal.watch_recovery(target.clone(), RecoveryBudget::new(Duration::from_secs(1)));
+    assert!(
+        target
+            .probe(&storage, &signal, CancellationToken::new())
+            .await
+    );
+    assert!(signal.failure().is_none());
+}
+
+#[tokio::test]
+async fn replaced_bound_identity_recovers_with_a_fresh_checkpoint_replay() {
+    let storage = fixture_roles(BackendKind::Cifs, false, true);
+    let (_, signal) = ScanFailureSignal::source(&storage, None).unwrap();
+    let path = StoragePath::root();
+    let identity = SourceIdentity::new(
+        BackendIdentity::new(BackendKind::Cifs, "guard-fixture").unwrap(),
+        IdentityStrength::PathScoped,
+        "replaced-old-identity",
+    )
+    .unwrap();
+    let target = RecoveryTarget {
+        read: ScanRead::BoundMetadata(ObservationPlan::default(), identity),
+        path,
+        inline_descriptor: None,
+    };
+    signal.watch_recovery(target.clone(), RecoveryBudget::new(Duration::from_secs(1)));
+    assert!(
+        target
+            .probe(&storage, &signal, CancellationToken::new())
+            .await
+    );
+    assert!(signal.failure().is_none());
+}
+
+#[tokio::test]
+async fn an_unchanged_identity_conflict_does_not_prove_network_recovery() {
+    let storage = fixture_roles(BackendKind::Cifs, false, true);
+    let (_, signal) = ScanFailureSignal::source(&storage, None).unwrap();
+    let path = StoragePath::root();
+    let identity = storage
+        .namespace()
+        .unwrap()
+        .stat(&path)
+        .await
+        .unwrap()
+        .source_identity;
+    let target = RecoveryTarget {
+        read: ScanRead::BoundMetadata(ObservationPlan::default(), identity),
+        path,
+        inline_descriptor: None,
+    };
+    signal.watch_recovery(target.clone(), RecoveryBudget::new(Duration::from_secs(1)));
+    assert!(
+        !target
+            .probe(&storage, &signal, CancellationToken::new())
+            .await
+    );
+    assert!(signal.recovered_at().is_none());
+}
+
+#[tokio::test]
+async fn current_descriptor_does_not_prove_a_historical_version_changed() {
+    let storage = fixture_roles(BackendKind::Cifs, false, true);
+    let (_, signal) = ScanFailureSignal::source(&storage, None).unwrap();
+    let path = StoragePath::root();
+    let identity = storage
+        .namespace()
+        .unwrap()
+        .stat(&path)
+        .await
+        .unwrap()
+        .source_identity;
+    let target = RecoveryTarget {
+        read: ScanRead::VersionMetadata(
+            ObservationPlan::default(),
+            SourceVersion::Id("v1".into()),
+            identity,
+        ),
+        path,
+        inline_descriptor: None,
+    };
+    signal.watch_recovery(target.clone(), RecoveryBudget::new(Duration::from_secs(1)));
+    assert!(
+        !target
+            .probe(&storage, &signal, CancellationToken::new())
+            .await
+    );
+    assert!(signal.recovered_at().is_none());
 }

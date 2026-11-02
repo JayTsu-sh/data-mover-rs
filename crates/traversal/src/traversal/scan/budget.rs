@@ -32,10 +32,10 @@ impl State {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.updated);
         self.updated = now;
-        if self.consumers == 0 && !self.complete {
+        if !self.complete {
             if self.reconnecting || self.targets > 0 {
                 self.remaining = self.remaining.saturating_sub(elapsed);
-            } else {
+            } else if self.consumers == 0 {
                 self.replay_total += elapsed;
             }
         }
@@ -129,7 +129,7 @@ impl RecoveryBudget {
                 state.settle();
                 (
                     state.remaining,
-                    state.consumers == 0 && (state.reconnecting || state.targets > 0),
+                    state.reconnecting || state.targets > 0,
                     state.complete,
                 )
             };

@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use hdfs_native::file::FileWriter;
 use hdfs_native::{Client, ClientBuilder, HdfsError};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{HdfsErrorKind, StorageError};
@@ -21,6 +21,31 @@ const HDFS_ADAPTER_RETRY_DELAYS: [Duration; 4] = [
 ];
 const HDFS_ADAPTER_MAX_ATTEMPTS: usize = HDFS_ADAPTER_RETRY_DELAYS.len() + 1;
 const HDFS_ADAPTER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The scan caller owns network recovery; service retries keep the adapter policy.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum HdfsReadRecovery {
+    Adapter,
+    Caller,
+}
+
+impl HdfsReadRecovery {
+    async fn read<T, F, Fut>(
+        self, operation: &'static str, path: Option<&Path>, mut action: F,
+    ) -> Result<T, StorageError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, HdfsError>>,
+    {
+        retry_hdfs_read_indexed_with_recovery(operation, path, None, self, |_| action()).await
+    }
+
+    fn allows_adapter_retry(self, error: &StorageError) -> bool {
+        matches!(self, Self::Adapter)
+            || !matches!(hdfs_role_classify(error).0,
+                RoleFailureClass::Connectivity | RoleFailureClass::Timeout)
+    }
+}
 
 async fn retry_hdfs_read<T, F, Fut>(
     operation: &'static str,
@@ -39,30 +64,31 @@ async fn retry_hdfs_read_indexed<T, F, Fut>(
     operation: &'static str,
     relative_path: Option<&Path>,
     cancel: Option<&CancellationToken>,
+    action: F,
+) -> Result<T, StorageError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<T, HdfsError>>,
+{
+    retry_hdfs_read_indexed_with_recovery(operation, relative_path, cancel, HdfsReadRecovery::Adapter, action).await
+}
+
+async fn retry_hdfs_read_indexed_with_recovery<T, F, Fut>(
+    operation: &'static str,
+    relative_path: Option<&Path>,
+    cancel: Option<&CancellationToken>,
+    recovery: HdfsReadRecovery,
     mut action: F,
 ) -> Result<T, StorageError>
 where
     F: FnMut(usize) -> Fut,
-    Fut: Future<Output = Result<T, hdfs_native::HdfsError>>,
+    Fut: Future<Output = Result<T, HdfsError>>,
 {
     for attempt in 0..HDFS_ADAPTER_MAX_ATTEMPTS {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err(StorageError::Cancelled);
         }
-        let future = tokio::time::timeout(HDFS_ADAPTER_ATTEMPT_TIMEOUT, action(attempt));
-        let result = if let Some(token) = cancel {
-            tokio::select! {
-                biased;
-                () = token.cancelled() => return Err(StorageError::Cancelled),
-                result = future => result,
-            }
-        } else {
-            future.await
-        };
-        let result = match result {
-            Ok(result) => result,
-            Err(_) => Err(adapter_deadline_error()),
-        };
+        let result = hdfs_read_attempt(cancel, action(attempt)).await?;
         match result {
             Ok(value) => return Ok(value),
             Err(error) => {
@@ -71,7 +97,7 @@ where
                     &mapped,
                     StorageError::HdfsOperation(details) if details.retryable
                 );
-                if !retryable {
+                if !retryable || !recovery.allows_adapter_retry(&mapped) {
                     return Err(mapped);
                 }
                 let Some(delay) = HDFS_ADAPTER_RETRY_DELAYS.get(attempt).copied() else {
@@ -90,6 +116,23 @@ where
         }
     }
     unreachable!("HDFS adapter retry loop always returns")
+}
+
+async fn hdfs_read_attempt<T>(
+    cancel: Option<&CancellationToken>,
+    work: impl Future<Output = Result<T, HdfsError>>,
+) -> Result<Result<T, HdfsError>, StorageError> {
+    let future = timeout(HDFS_ADAPTER_ATTEMPT_TIMEOUT, work);
+    let result = if let Some(token) = cancel {
+        tokio::select! {
+            biased;
+            () = token.cancelled() => return Err(StorageError::Cancelled),
+            result = future => result,
+        }
+    } else {
+        future.await
+    };
+    Ok(result.unwrap_or_else(|_| Err(adapter_deadline_error())))
 }
 
 /// The failure of one adapter attempt that outlived [`HDFS_ADAPTER_ATTEMPT_TIMEOUT`]: a

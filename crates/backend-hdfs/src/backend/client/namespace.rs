@@ -11,6 +11,7 @@ pub struct UndescribedHdfsChild {
 #[derive(Clone, Debug)]
 pub struct HDFSStorage {
     client: Client,
+    read_recovery: HdfsReadRecovery,
     location: HdfsLocation,
     block_size: u64,
     transfer_concurrency: crate::transfer_concurrency::TransferConcurrency,
@@ -117,7 +118,7 @@ impl HDFSStorage {
         relative_path: &std::path::Path,
     ) -> Result<RoleHdfsEntryFacts, StorageError> {
         let path = self.resolve_path(relative_path)?;
-        let status = retry_hdfs_read("get metadata", Some(relative_path), None, || {
+        let status = self.read_recovery.read("get metadata", Some(relative_path), || {
             self.client.get_file_info(&path)
         })
         .await?;
