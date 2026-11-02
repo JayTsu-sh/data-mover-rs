@@ -41,15 +41,16 @@ Rust 库，Edition 2024；具体依赖版本和固定 Git 提交以 `Cargo.toml`
 
 ## 远程扫描
 
-- 原生库负责准确报告类型化断连 / 时限和保留修改结果不确定性，默认有界恢复不变。
-  `connect_scan_backend` 为扫描打开 NFS fail_fast，关闭 S3 SDK / 普通分页重发，并将 HDFS
+- 原生库负责准确报告类型化断连 / 时限和保留修改结果不确定性；NFS 默认在 500 毫秒内短重试，
+  无需 URL 参数。`connect_scan_backend` 关闭 S3 SDK / 普通分页重发，并将 HDFS
   默认 failover 次数限制为一次（显式配置优先）。Local 继续普通遍历行为。
 - `crates/traversal/src/traversal/scan.rs` 的 `ScanFailureSignal` 包装 namespace / metadata
   读取，记录首个原始网络故障并提供旁路信号；`operation_timeout=None` 沿用原生有界时限，
   显式时限只限制存储操作，不覆盖消费方等待。持有句柄的原生调用在调用方提前结束等待后仍完成清理。
 - `recovery.rs` / `recovery/attempt.rs` 的 `recoverable_scan` 负责默认 3 秒防抖窗口与重连，
-  同一窗口内连续失败不重新补满预算；原故障位置的操作成功后重新进入 Running。重连后只从安全目录
-  检查点续扫，活跃目录可能重放，调用方不可把重放误当成新扫描世代。消费方背压不消耗恢复等待预算。
+  同一窗口内连续失败不重新补满预算；原故障位置、读取阶段与参数（列举还绑定原页序）成功后重新进入 Running。重连后只从安全目录
+  检查点续扫，活跃目录可能重放，调用方不可把重放误当成新扫描世代。健康前缀重建与消费方背压不消耗恢复预算；失败前缀等待、目标读取、重连及逐次短退避扣同一预算。
+  因此 3 秒是累计故障恢复预算，恢复扫描的总墙钟时间可更长；健康前缀仍受独立操作时限约束。
 - `ScanRecoveryStatus` 提供 Running / Recovering / Failed 活动；其 `failure_signal()` 只在恢复
   最终失败时发布该窗口最早的原始故障，后续重连时限不覆盖明确断连。取消保持 Cancelled，
   不发布最终网络故障；检查点可见性与取消后的排空策略保持调用方选择。

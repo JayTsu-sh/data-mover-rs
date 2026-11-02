@@ -1,5 +1,3 @@
-use url::Url;
-
 #[allow(unused_imports)]
 use super::backends;
 use super::{BackendConfig, BackendConnectError, Storage};
@@ -38,7 +36,8 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
 }
 
 /// Connects a source whose caller owns scan restart and checkpoint recovery.
-/// Definite transport loss reaches traversal before RPC/page replay delays.
+/// NFS uses its short default disconnect recovery policy; other scan adapters
+/// expose transport loss without additional SDK/page replay delays.
 /// S3 uses one SDK attempt; HDFS allows one standby failover unless explicitly configured.
 ///
 /// # Errors
@@ -46,20 +45,6 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
 pub async fn connect_scan_backend(
     mut config: BackendConfig,
 ) -> Result<Storage, BackendConnectError> {
-    if let BackendConfig::Nfs(nfs) = &mut config {
-        let mut url = Url::parse(&nfs.url)
-            .map_err(|error| BackendConnectError::new(BackendKind::Nfs, error))?;
-        let pairs: Vec<(String, String)> = url
-            .query_pairs()
-            .filter(|(key, _)| key != "fail_fast")
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
-        url.set_query(None);
-        url.query_pairs_mut()
-            .extend_pairs(pairs)
-            .append_pair("fail_fast", "true");
-        nfs.url = url.to_string();
-    }
     if let BackendConfig::Hdfs(hdfs) = &mut config {
         hdfs.client
             .overrides
