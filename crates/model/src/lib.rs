@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 pub const MAX_MODEL_FIELD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -387,7 +388,7 @@ impl fmt::Display for StoragePath {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BackendIdentity {
     kind: BackendKind,
-    stable_id: RedactedString,
+    stable_id: Arc<RedactedString>,
 }
 
 impl BackendIdentity {
@@ -398,7 +399,7 @@ impl BackendIdentity {
     pub fn new(kind: BackendKind, stable_id: impl Into<String>) -> Result<Self, ModelValueError> {
         Ok(Self {
             kind,
-            stable_id: required(stable_id, "stable_id")?,
+            stable_id: Arc::new(required(stable_id, "stable_id")?),
         })
     }
 
@@ -446,10 +447,21 @@ impl TimePrecision {
 }
 
 /// A signed Unix timestamp plus the precision actually observed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct StorageTimestamp {
-    unix_nanos: i128,
+    // 保留完整 i128 范围，避免对齐填充放大每条观察及其可选时间字段。
+    unix_nanos: [u8; 16],
     precision: TimePrecision,
+}
+
+impl fmt::Debug for StorageTimestamp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StorageTimestamp")
+            .field("unix_nanos", &self.unix_nanos())
+            .field("precision", &self.precision)
+            .finish()
+    }
 }
 
 impl StorageTimestamp {
@@ -461,7 +473,7 @@ impl StorageTimestamp {
         let quantum = precision.quantum_nanos();
         if unix_nanos % quantum == 0 {
             Ok(Self {
-                unix_nanos,
+                unix_nanos: unix_nanos.to_le_bytes(),
                 precision,
             })
         } else {
@@ -475,7 +487,7 @@ impl StorageTimestamp {
     /// Returns nanoseconds relative to the Unix epoch.
     #[must_use]
     pub const fn unix_nanos(self) -> i128 {
-        self.unix_nanos
+        i128::from_le_bytes(self.unix_nanos)
     }
 
     /// Returns the observed precision.
@@ -754,3 +766,6 @@ impl fmt::Display for BackendSessionFailure {
 }
 
 impl std::error::Error for BackendSessionFailure {}
+
+#[cfg(test)]
+mod compact_tests;

@@ -174,7 +174,7 @@ fn every_failure_class_round_trips_through_its_snapshot_tag() {
 
 #[test]
 fn failed_families_are_available_without_discarding_other_observations() {
-    let observations = MetadataObservations {
+    let observations = MetadataObservationParts {
         acl: MetadataObservation::Failed {
             class: FailureClass::PermissionDenied,
             transience: Transience::Permanent,
@@ -183,8 +183,10 @@ fn failed_families_are_available_without_discarding_other_observations() {
             class: FailureClass::Throttled,
             transience: Transience::Transient,
         },
-        ..MetadataObservations::default()
-    };
+        ..MetadataObservationParts::default()
+    }
+    .build()
+    .unwrap_or_else(|error| panic!("{error}"));
     let failures: Vec<_> = observations.failures().collect();
     assert_eq!(failures.len(), 2);
     assert_eq!(failures[0].family, MetadataFamily::Acl);
@@ -249,4 +251,74 @@ fn retained_failure_codec_refuses_unbounded_duplicate_or_unknown_families() {
         bytes.extend(tail);
         assert_eq!(decode(&mut Cursor::new(&bytes)), Err(expected));
     }
+}
+
+fn states<T: Clone>(value: T) -> Vec<MetadataObservation<T>> {
+    vec![
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotApplicable,
+        MetadataObservation::Unsupported,
+        MetadataObservation::Failed {
+            class: FailureClass::Timeout,
+            transience: Transience::Transient,
+        },
+        MetadataObservation::Value {
+            value: value.clone(),
+            provenance: MetadataProvenance::Inline,
+        },
+        MetadataObservation::Value {
+            value,
+            provenance: MetadataProvenance::AdditionalCall,
+        },
+    ]
+}
+
+#[test]
+fn cold_metadata_preserves_all_states_empty_values_provenance_and_fallbacks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let empty_acl = AclMetadata::new_posix(None, None)?;
+    for acl in states(empty_acl) {
+        for xattrs in states(Vec::<ExtendedAttribute>::new()) {
+            for tags in states(Vec::<ObjectTag>::new()) {
+                let parts = MetadataObservationParts {
+                    acl: acl.clone(),
+                    xattrs: xattrs.clone(),
+                    tags: tags.clone(),
+                    ..MetadataObservationParts::default()
+                };
+                let mut metadata = parts.clone().build()?;
+                assert_eq!(metadata.acl(), &parts.acl);
+                assert_eq!(metadata.xattrs(), &parts.xattrs);
+                assert_eq!(metadata.tags(), &parts.tags);
+                let mut encoded = Vec::new();
+                encode(&metadata, &mut encoded);
+                assert_eq!(decode(&mut Cursor::new(&encoded))?, metadata);
+                assert_eq!(MetadataObservationParts::from(metadata.clone()), parts);
+                let retained = MetadataObservationFailure {
+                    family: MetadataFamily::Timestamps,
+                    class: FailureClass::PermissionDenied,
+                    transience: Transience::Permanent,
+                };
+                metadata.retain_failure_summary(retained);
+                metadata.set_timestamps(MetadataObservation::Value {
+                    value: TimestampMetadata {
+                        accessed: None,
+                        modified: None,
+                        created: None,
+                    },
+                    provenance: MetadataProvenance::Inline,
+                });
+                encoded.clear();
+                encode(&metadata, &mut encoded);
+                let rebuilt = decode(&mut Cursor::new(&encoded))?;
+                assert_eq!(rebuilt, metadata);
+                assert!(rebuilt.failures().any(|failure| failure == retained));
+                assert_eq!(
+                    MetadataObservationParts::from(rebuilt.clone()).build()?,
+                    rebuilt
+                );
+            }
+        }
+    }
+    Ok(())
 }
