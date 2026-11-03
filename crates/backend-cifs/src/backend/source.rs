@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 
+use smb_domain::Error as SmbError;
 use smb_domain::error::NetworkFailure as SmbNetworkFailure;
 
 use crate::model::{
@@ -291,7 +292,7 @@ pub(super) fn classify(
             (FailureClass::Unsupported, Transience::Permanent)
         }
         smb_domain::Error::Cancelled(_) => (FailureClass::Cancelled, Transience::Transient),
-        smb_domain::Error::RuntimeTerminated => (FailureClass::Internal, Transience::Unknown),
+        SmbError::RuntimeTerminated => (FailureClass::Internal, Transience::Unknown),
         _ => (FailureClass::Protocol, Transience::Unknown),
     };
     if matches!(class, FailureClass::Connectivity | FailureClass::Timeout) {
@@ -536,7 +537,7 @@ mod network_classification_tests {
             matches!(classify(&path,Operation::Traverse,&reset),StorageRoleFailure::Session(failure) if failure.class()==FailureClass::Connectivity)
         );
         assert!(
-            matches!(classify(&path, Operation::Traverse, &smb_domain::Error::RuntimeTerminated),
+            matches!(classify(&path, Operation::Traverse, &SmbError::RuntimeTerminated),
             StorageRoleFailure::Entry(failure) if failure.class() == FailureClass::Internal)
         );
         let malformed = smb_domain::Error::InvalidMessage("redacted".into());
