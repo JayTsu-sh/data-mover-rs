@@ -20,12 +20,15 @@ impl MetadataObservations {
     pub fn failures(&self) -> impl Iterator<Item = MetadataObservationFailure> + '_ {
         F::ALL.into_iter().filter_map(|family| {
             self.current_failure(family).or_else(|| {
-                self.retained_failures.as_deref().and_then(|failures| {
-                    failures
-                        .iter()
-                        .find(|failure| failure.family == family)
-                        .copied()
-                })
+                self.cold
+                    .as_ref()
+                    .and_then(|cold| cold.retained_failures.as_deref())
+                    .and_then(|failures| {
+                        failures
+                            .iter()
+                            .find(|failure| failure.family == family)
+                            .copied()
+                    })
             })
         })
     }
@@ -39,14 +42,14 @@ impl MetadataObservations {
     }
 
     pub fn retain_failure_summary(&mut self, failure: MetadataObservationFailure) {
-        retain_summary(&mut self.retained_failures, failure);
+        retain_summary(&mut self.cold_mut().retained_failures, failure);
     }
 
     fn current_failure(&self, family: F) -> Option<MetadataObservationFailure> {
         match family {
-            F::Acl => failure(family, &self.acl),
-            F::Xattrs => failure(family, &self.xattrs),
-            F::Tags => failure(family, &self.tags),
+            F::Acl => failure(family, self.acl()),
+            F::Xattrs => failure(family, self.xattrs()),
+            F::Tags => failure(family, self.tags()),
             F::OwnershipMode => failure(family, &self.ownership_mode),
             F::Timestamps => failure(family, &self.timestamps),
         }
@@ -66,7 +69,11 @@ fn failure<T>(family: F, value: &MetadataObservation<T>) -> Option<MetadataObser
 }
 
 pub(super) fn encode(metadata: &MetadataObservations, output: &mut Vec<u8>) {
-    let failures = metadata.retained_failures.as_deref().unwrap_or_default();
+    let failures = metadata
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.retained_failures.as_deref())
+        .unwrap_or_default();
     output.push(u8::try_from(failures.len()).unwrap_or(u8::MAX));
     for failure in failures {
         output.extend_from_slice(&[

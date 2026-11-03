@@ -4,7 +4,9 @@ use super::TimePrecision;
 use super::observation::{Cursor, SnapshotDecodeError, decode_time, encode_time, put_bytes};
 use super::{FailureClass, MAX_MODEL_FIELD_BYTES, ModelValueError, StorageTimestamp, Transience};
 
+mod compact;
 mod failures;
+use compact::ColdMetadata;
 pub use failures::MetadataObservationFailure;
 
 const MAX_XATTR_COUNT: usize = 4_096;
@@ -354,12 +356,10 @@ pub struct TimestampMetadata {
     pub created: Option<StorageTimestamp>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct MetadataObservations {
-    pub(crate) retained_failures: Option<Box<[MetadataObservationFailure]>>,
-    pub(crate) acl: MetadataObservation<AclMetadata>,
-    pub(crate) xattrs: MetadataObservation<Vec<ExtendedAttribute>>,
-    pub(crate) tags: MetadataObservation<Vec<ObjectTag>>,
+    // 普通列举只携带所有权和时间；可变长度的元数据按需分配。
+    cold: Option<Box<ColdMetadata>>,
     pub(crate) ownership_mode: MetadataObservation<OwnershipMode>,
     pub(crate) timestamps: MetadataObservation<TimestampMetadata>,
 }
@@ -400,26 +400,14 @@ impl MetadataObservationParts {
             self.ownership_mode,
             self.timestamps,
         )?;
-        value.retained_failures = self
-            .retained_failures
-            .filter(|failures| !failures.is_empty());
+        for failure in self.retained_failures.as_deref().unwrap_or_default() {
+            value.retain_failure_summary(*failure);
+        }
         Ok(value)
     }
     /// Preserve a bounded failure summary while assembling observations.
     pub fn retain_failure_summary(&mut self, failure: MetadataObservationFailure) {
         failures::retain_summary(&mut self.retained_failures, failure);
-    }
-}
-impl From<MetadataObservations> for MetadataObservationParts {
-    fn from(value: MetadataObservations) -> Self {
-        Self {
-            retained_failures: value.retained_failures,
-            acl: value.acl,
-            xattrs: value.xattrs,
-            tags: value.tags,
-            ownership_mode: value.ownership_mode,
-            timestamps: value.timestamps,
-        }
     }
 }
 impl Default for MetadataObservationParts {
@@ -430,10 +418,7 @@ impl Default for MetadataObservationParts {
 impl Default for MetadataObservations {
     fn default() -> Self {
         Self {
-            retained_failures: None,
-            acl: MetadataObservation::NotRequested,
-            xattrs: MetadataObservation::NotRequested,
-            tags: MetadataObservation::NotRequested,
+            cold: None,
             ownership_mode: MetadataObservation::NotRequested,
             timestamps: MetadataObservation::NotRequested,
         }
@@ -451,10 +436,7 @@ impl MetadataObservations {
     ) -> Result<Self, ModelValueError> {
         validate_payload(&acl, &xattrs, &tags)?;
         Ok(Self {
-            retained_failures: None,
-            acl,
-            xattrs,
-            tags,
+            cold: ColdMetadata::pack(acl, xattrs, tags),
             ownership_mode,
             timestamps,
         })
@@ -466,18 +448,6 @@ impl MetadataObservations {
     /// Replace fixed-size ownership observations without changing payload bounds.
     pub fn set_ownership_mode(&mut self, value: MetadataObservation<OwnershipMode>) {
         self.ownership_mode = value;
-    }
-    #[must_use]
-    pub const fn acl(&self) -> &MetadataObservation<AclMetadata> {
-        &self.acl
-    }
-    #[must_use]
-    pub const fn xattrs(&self) -> &MetadataObservation<Vec<ExtendedAttribute>> {
-        &self.xattrs
-    }
-    #[must_use]
-    pub const fn tags(&self) -> &MetadataObservation<Vec<ObjectTag>> {
-        &self.tags
     }
     #[must_use]
     pub const fn ownership_mode(&self) -> &MetadataObservation<OwnershipMode> {
@@ -527,7 +497,7 @@ fn validate_payload(
 }
 
 pub(crate) fn encode(metadata: &MetadataObservations, output: &mut Vec<u8>) {
-    if let Some(value) = encode_state(&metadata.acl, output) {
+    if let Some(value) = encode_state(metadata.acl(), output) {
         output.push(match value.encoding {
             AclEncoding::Posix => 0,
             AclEncoding::NfsV4 => 1,
@@ -536,7 +506,7 @@ pub(crate) fn encode(metadata: &MetadataObservations, output: &mut Vec<u8>) {
         encode_optional_bytes(output, value.access.as_deref());
         encode_optional_bytes(output, value.default.as_deref());
     }
-    if let Some(values) = encode_state(&metadata.xattrs, output) {
+    if let Some(values) = encode_state(metadata.xattrs(), output) {
         let Ok(count) = u32::try_from(values.len()) else {
             unreachable!("metadata observation count exceeds snapshot encoding")
         };
@@ -546,7 +516,7 @@ pub(crate) fn encode(metadata: &MetadataObservations, output: &mut Vec<u8>) {
             put_bytes(output, &value.value);
         }
     }
-    if let Some(values) = encode_state(&metadata.tags, output) {
+    if let Some(values) = encode_state(metadata.tags(), output) {
         let Ok(count) = u32::try_from(values.len()) else {
             unreachable!("metadata observation count exceeds snapshot encoding")
         };
@@ -637,7 +607,9 @@ pub(crate) fn decode(cursor: &mut Cursor<'_>) -> Result<MetadataObservations, Sn
     let timestamps = finish(time_state, || decode_timestamps(cursor))?;
     let mut metadata = MetadataObservations::new(acl, xattrs, tags, ownership, timestamps)
         .map_err(|_| SnapshotDecodeError::FieldTooLarge)?;
-    metadata.retained_failures = failures::decode(cursor)?;
+    for failure in failures::decode(cursor)?.as_deref().unwrap_or_default() {
+        metadata.retain_failure_summary(*failure);
+    }
     Ok(metadata)
 }
 
