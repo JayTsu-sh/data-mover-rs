@@ -61,7 +61,7 @@ impl Recovery {
         let mut inner = source.traverse(request);
         let mut history = HistoryBoundary::default();
         loop {
-            self.observe(signal);
+            self.start_window(signal);
             if signal.failure().is_some() {
                 cancel.0.cancel();
             }
@@ -111,7 +111,7 @@ impl Recovery {
         signal: &ScanFailureSignal,
     ) -> Result<Option<TraversalItem>, TraversalTerminalFailure> {
         loop {
-            self.observe(signal);
+            self.start_window(signal);
             if self.expired() {
                 return self.exhausted().map(|_| None);
             }
@@ -119,7 +119,7 @@ impl Recovery {
                 biased;
                 () = self.request.cancel.cancelled(), if !self.drains() => return Ok(None),
                 () = signal.failed(), if signal.failure().is_none() => {
-                    self.observe(signal);
+                    self.start_window(signal);
                 }
                 item = inner.next_item() => return Ok(item),
                 () = sleep(Duration::from_millis(10)) => {}
@@ -145,7 +145,7 @@ impl Recovery {
                 return Ok(());
             }
         }
-        self.observe(signal);
+        self.start_window(signal);
         let output = self.producer.items.clone();
         let sent = output.send_one(item);
         tokio::pin!(sent);
@@ -158,17 +158,11 @@ impl Recovery {
                 return result.map_err(|_| ());
             }
             self.start_window(signal);
-            let _waiting = self
-                .window
-                .as_ref()
-                .map(|window| window.budget.consumer_wait());
-            self.observe(signal);
             tokio::select! {
                 biased;
                 () = self.request.cancel.cancelled(), if !self.drains() => return Err(()),
                 () = signal.failed(), if signal.failure().is_none() => {
                     self.start_window(signal);
-                    self.observe(signal);
                 }
                 result = &mut sent => {
                     self.start_window(signal);

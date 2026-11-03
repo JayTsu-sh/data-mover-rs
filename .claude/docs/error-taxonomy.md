@@ -43,7 +43,8 @@
 Role-based adapters distinguish `FailureClass::Timeout` from definite `Connectivity`.
 NFS recovery wrappers retain transport timeouts while replay-sensitive uncertain mutations
 remain `Protocol` / `Unknown`. SMB uses `Error::network_failure()` and retains unknown
-mutation outcomes. S3 interrupted HTTP bodies are transport loss; complete malformed XML
+mutation outcomes. S3 SDK/body typed timeout causes remain `Timeout`, including errors
+after response headers; truncated bodies are `Connectivity`. Complete malformed XML
 and HTTP 5xx are protocol failures, with transient 5xx retried only where the operation permits safe service retries.
 All operations share `connect_backend`; backends do not branch on whether a caller is scanning.
 `traversal::recoverable_traversal` owns the caller-selected recovery window after the first

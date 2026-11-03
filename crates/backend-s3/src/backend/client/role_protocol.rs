@@ -1,12 +1,9 @@
-use std::error::Error as StdError;
-use std::io::{Error as IoError, ErrorKind};
 use std::time::Duration;
 
 use aws_smithy_types::byte_stream::AggregatedBytes;
 use bytes::Bytes;
-use hyper::Error as HttpError;
 
-use super::{CompletedPart, ProvideErrorMetadata, S3Storage, build_copy_source};
+use super::{CompletedPart, ProvideErrorMetadata, S3Storage, build_copy_source, transport};
 
 use crate::model::{FailureClass, Transience};
 use crate::storage::backends::s3::{
@@ -17,14 +14,9 @@ use crate::time_util::http_last_modified;
 
 macro_rules! classify_sdk {
     ($error:expr, $diagnostic:literal) => {
-        if matches!(&$error, aws_smithy_runtime_api::client::result::SdkError::TimeoutError(_))
-            || matches!(&$error, aws_smithy_runtime_api::client::result::SdkError::DispatchFailure(failure) if failure.is_timeout())
+        if let Some(failure) = $crate::backend::client::transport::sdk_failure(&$error, $diagnostic)
         {
-            $crate::backend::client::role_protocol::s3_role_timeout_failure($diagnostic)
-        } else if matches!(&$error, aws_smithy_runtime_api::client::result::SdkError::DispatchFailure(failure) if failure.is_io())
-            || $crate::backend::client::role_protocol::interrupted_transport(&$error)
-        {
-            s3_role_transport_failure($diagnostic)
+            failure
         } else {
             s3_role_remote_failure(
                 $error
@@ -37,34 +29,6 @@ macro_rules! classify_sdk {
             )
         }
     };
-}
-
-/// Body reads can fail after HTTP headers, when the SDK uses `ResponseError` rather
-/// than `DispatchFailure`. Inspect typed causes; malformed XML is still Protocol.
-fn interrupted_transport<E: StdError + ?Sized>(error: &E) -> bool {
-    let mut cause = error.source();
-    while let Some(error) = cause {
-        if let Some(io) = error.downcast_ref::<IoError>()
-            && matches!(
-                io.kind(),
-                ErrorKind::BrokenPipe
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionRefused
-                    | ErrorKind::NotConnected
-                    | ErrorKind::UnexpectedEof
-            )
-        {
-            return true;
-        }
-        if let Some(http) = error.downcast_ref::<HttpError>()
-            && (http.is_closed() || http.is_incomplete_message() || http.is_canceled())
-        {
-            return true;
-        }
-        cause = error.source();
-    }
-    false
 }
 
 #[cfg(test)]
@@ -202,7 +166,7 @@ impl S3Storage {
             .collect()
             .await
             .map(AggregatedBytes::into_bytes)
-            .map_err(|error| s3_role_session(error.to_string()))
+            .map_err(|error| transport::body_failure(&error))
     }
 
     /// What a write reported: its `ETag` and its version as spelled — `"null"` when the reply
@@ -632,22 +596,8 @@ fn versioned_failure(
     }
 }
 
-fn s3_role_session(diagnostic: String) -> crate::storage::backends::s3::S3ProtocolFailure {
-    crate::storage::backends::s3::S3ProtocolFailure::session(
-        crate::model::FailureClass::Connectivity,
-        crate::model::Transience::Transient,
-        diagnostic,
-    )
-}
-
 fn s3_role_timeout_failure(diagnostic: &'static str) -> S3ProtocolFailure {
     S3ProtocolFailure::session(FailureClass::Timeout, Transience::Transient, diagnostic)
-}
-
-fn s3_role_transport_failure(
-    diagnostic: &'static str,
-) -> crate::storage::backends::s3::S3ProtocolFailure {
-    s3_role_session(diagnostic.to_string())
 }
 
 fn s3_role_entry(
@@ -843,14 +793,6 @@ mod tests {
             S3ProtocolFailure::Session {
                 class: FailureClass::Authentication,
                 transience: Transience::Permanent,
-                ..
-            }
-        ));
-        assert!(matches!(
-            s3_role_transport_failure("timeout"),
-            S3ProtocolFailure::Session {
-                class: FailureClass::Connectivity,
-                transience: Transience::Transient,
                 ..
             }
         ));

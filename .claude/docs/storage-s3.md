@@ -52,6 +52,8 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
   不读指针，走不到这里）；断开后的 `HEAD` 回 404 是条目 `NotFound`（读完后的确认 `HEAD` 回 404 报 `Conflict`：两者都是条目
   Permanent，有意保留 `HEAD` 自己的类别）；无源端版本、namespace
   `histories=false` / `directory_objects=false`；原生拷贝亲和 `ontap-nas` + 桶名（只与同一 NAS 桶配对）。
+  body 返回类型化超时时立即报告 `Timeout`，不再发 HEAD 延长等待；短 body 或明确连接中断仍沿用上述
+  HEAD 替换检查，保留真实替换和 HEAD 自身失败的分类。
   N2：目的端不续传（`resumable_at_destination() = false`、无自动间隔；Checkpointed 报
   `EffectiveRecovery::UnsupportedByDestination`、prepare 按 Restart、不看指针不列 upload）；`final_refusal`（`staged/limits.rs`）
   在 Preflight、目的端任何请求之前拒 > 5 GiB 与含空段 / `.` / `..` 段、段 > 255 字节的 key（条目 `Unsupported` / Permanent），

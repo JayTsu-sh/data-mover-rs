@@ -1,8 +1,5 @@
 //! Bounded, current-key bulk deletion. Content-MD5 is supplied by the connection interceptor.
-use super::{
-    ProvideErrorMetadata, S3ProtocolFailure, S3Result, S3Storage, s3_role_remote_failure,
-    s3_role_transport_failure,
-};
+use super::{ProvideErrorMetadata, S3ProtocolFailure, S3Result, S3Storage, s3_role_remote_failure};
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 
 pub(super) async fn delete(storage: &S3Storage, keys: &[String]) -> Vec<S3Result<()>> {

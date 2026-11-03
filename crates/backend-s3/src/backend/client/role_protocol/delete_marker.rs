@@ -3,9 +3,7 @@
 
 use aws_sdk_s3::types::BucketVersioningStatus;
 
-use super::{
-    ProvideErrorMetadata, S3Result, S3Storage, s3_role_remote_failure, s3_role_transport_failure,
-};
+use super::{ProvideErrorMetadata, S3Result, S3Storage, s3_role_remote_failure};
 use crate::storage::backends::s3::client::versioning_is_unsupported;
 use crate::storage::backends::s3::{S3BucketVersioning, S3DeleteReply};
 

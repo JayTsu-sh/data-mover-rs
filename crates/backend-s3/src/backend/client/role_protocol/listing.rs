@@ -6,10 +6,7 @@ use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{CommonPrefix, DeleteMarkerEntry, Object, ObjectVersion};
 
-use super::{
-    ProvideErrorMetadata, S3ProtocolFailure, S3Result, S3Storage, s3_role_remote_failure,
-    s3_role_transport_failure,
-};
+use super::{ProvideErrorMetadata, S3ProtocolFailure, S3Result, S3Storage, s3_role_remote_failure};
 use crate::model::{FailureClass, StorageTimestamp, Transience};
 use crate::storage::backends::s3::client::version_order::{
     UnknownResumePoint, VersionsInOrder, send_in_document_order,
