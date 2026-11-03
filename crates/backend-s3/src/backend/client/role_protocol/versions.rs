@@ -5,7 +5,7 @@ use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 
 use super::{
     ProvideErrorMetadata, S3ProtocolFailure, S3Result, S3Storage, s3_role_entry,
-    s3_role_remote_failure, s3_role_transport_failure, versioned_failure,
+    s3_role_remote_failure, versioned_failure,
 };
 use crate::model::FailureClass;
 use crate::storage::backends::s3::S3VersionFacts;

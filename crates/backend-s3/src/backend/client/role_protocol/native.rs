@@ -9,7 +9,7 @@ use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use super::hints;
 use super::{
     CompletedPart, ProvideErrorMetadata, S3NativeCopySource, S3ProtocolFailure, S3Result,
-    S3Storage, S3WriteFacts, build_copy_source, s3_role_remote_failure, s3_role_transport_failure,
+    S3Storage, S3WriteFacts, build_copy_source, s3_role_remote_failure,
 };
 use crate::storage::backends::s3::client::copy_request::state_empty_body;
 

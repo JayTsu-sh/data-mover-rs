@@ -1,7 +1,7 @@
 //! Same-bucket rename preserves object metadata and tags without downloading object bytes.
 use super::{
     ProvideErrorMetadata, S3NativeCopySource, S3ProtocolFailure, S3Result, S3Storage,
-    s3_role_remote_failure, s3_role_transport_failure,
+    s3_role_remote_failure,
 };
 use crate::model::{FailureClass, Transience};
 use crate::storage::backends::s3::S3Protocol;

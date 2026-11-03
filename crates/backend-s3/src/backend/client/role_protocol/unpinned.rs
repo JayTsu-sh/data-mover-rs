@@ -17,6 +17,8 @@ use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_smithy_types::byte_stream::AggregatedBytes;
 use bytes::Bytes;
 
+use super::super::transport;
+
 use crate::model::{FailureClass, StorageTimestamp, Transience};
 use crate::storage::backends::s3::{
     S3ObjectChange, S3ObjectFacts, S3ProtocolFailure, S3Result, S3SeenObject, broken_body_failure,
@@ -31,7 +33,7 @@ fn replaced(diagnostic: impl Into<String>) -> S3ProtocolFailure {
 
 /// The body of the response to an unpinned ranged `GET` of `expected` bytes, once its headers
 /// describe the described object. A body that broke off is classified by what `head` (one `HEAD`
-/// of the key) answers after it.
+/// of the key) answers after it. A typed timeout returns immediately without a second request.
 pub(super) async fn read<H, F>(
     response: GetObjectOutput,
     expected: u64,
@@ -53,6 +55,13 @@ where
         observed,
     )?;
     let body = response.body.collect().await;
+    // A timeout is already authoritative; do not stringify it or wait for HEAD.
+    // Short bodies and definite connection loss still use replacement evidence below.
+    if let Err(error) = &body
+        && transport::cause_class(error) == Some(FailureClass::Timeout)
+    {
+        return Err(transport::body_failure(error));
+    }
     match checked_body(body.map(AggregatedBytes::into_bytes), expected) {
         Ok(bytes) => Ok(bytes),
         Err(cause) => Err(broken_body_failure(head().await, observed, &cause)),

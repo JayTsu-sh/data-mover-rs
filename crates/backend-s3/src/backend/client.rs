@@ -37,6 +37,7 @@ mod retry_policy;
 mod retry_policy_tests;
 mod storagegrid;
 mod tls;
+mod transport;
 mod url_options;
 #[cfg(test)]
 mod url_options_tests;

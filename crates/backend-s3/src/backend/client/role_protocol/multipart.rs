@@ -7,7 +7,7 @@ use aws_sdk_s3::types::CompletedMultipartUpload;
 use super::hints;
 use super::{
     CompletedPart, ProvideErrorMetadata, S3ProtocolFailure, S3Result, S3Storage, S3WriteFacts,
-    s3_role_entry, s3_role_remote_failure, s3_role_transport_failure,
+    s3_role_entry, s3_role_remote_failure,
 };
 use crate::model::FailureClass;
 

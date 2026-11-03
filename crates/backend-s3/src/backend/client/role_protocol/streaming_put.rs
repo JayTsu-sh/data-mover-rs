@@ -31,10 +31,7 @@ use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use tokio::sync::mpsc;
 
-use super::{
-    ProvideErrorMetadata, S3ProtocolFailure, S3Result, S3Storage, s3_role_remote_failure,
-    s3_role_transport_failure,
-};
+use super::{ProvideErrorMetadata, S3ProtocolFailure, S3Result, S3Storage, s3_role_remote_failure};
 use crate::model::{FailureClass, Transience};
 use crate::storage::backends::s3::{S3Protocol as _, S3StreamedPut, S3WriteFacts};
 
