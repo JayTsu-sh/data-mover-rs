@@ -181,15 +181,6 @@ impl Recovery {
         request
     }
 
-    fn observe(&mut self, signal: &ScanFailureSignal) {
-        self.start_window(signal);
-        if signal.failure().is_some()
-            && let Some(window) = &self.window
-        {
-            window.budget.reconnecting(true);
-        }
-    }
-
     fn recovered(&mut self) {
         if let Some(window) = self.window.take() {
             window.budget.complete();
@@ -205,8 +196,7 @@ impl Recovery {
             && let Some(first) = signal.failure()
         {
             let started = signal.failure_detected_at().unwrap_or_else(Instant::now);
-            let elapsed = started.elapsed();
-            let budget = RecoveryBudget::new(self.policy.recovery_window.saturating_sub(elapsed));
+            let budget = RecoveryBudget::new(started + self.policy.recovery_window);
             let probe = ProbeContext {
                 first: first.clone(),
                 target: signal.failure_target(),
@@ -228,7 +218,7 @@ impl Recovery {
     }
 
     fn retryable(&mut self, outcome: &Outcome, signal: &ScanFailureSignal) -> bool {
-        self.observe(signal);
+        self.start_window(signal);
         if self.window.is_none() {
             return false;
         }

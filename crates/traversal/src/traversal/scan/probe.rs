@@ -149,14 +149,13 @@ impl RecoveryTarget {
         };
         let pages = Arc::new(Mutex::new(pages));
         for page in 0..=target_page {
-            let clock = guard.read_clock();
             let next_page = pages.clone();
             let next = guard
                 .operation(&read, &self.path, async move {
                     next_page.lock().await.next().await.transpose()
                 })
                 .await?;
-            let next = guard.checked_page(&read, &self.path, next, clock)?;
+            let next = guard.checked_page(&read, &self.path, next)?;
             if next.is_none() || page == target_page {
                 return Ok(());
             }

@@ -224,13 +224,11 @@ async fn already_failed_notification_preserves_the_first_failure() {
         RemoteScanFailureKind::ConnectionLost,
         None,
         None,
-        None,
     );
     signal.record(
         &ScanRead::Stat,
         &StoragePath::root(),
         RemoteScanFailureKind::OperationTimedOut,
-        None,
         None,
         None,
     );
@@ -290,7 +288,7 @@ fn child_network_errors_in_successful_pages_cannot_complete_the_directory() {
         0,
     );
     assert!(
-        matches!(signal.checked_page(&ScanRead::listing(&ListRequest::new(StoragePath::root(), CancellationToken::new()), None), &StoragePath::root(), Some(page), None),
+        matches!(signal.checked_page(&ScanRead::listing(&ListRequest::new(StoragePath::root(), CancellationToken::new()), None), &StoragePath::root(), Some(page)),
         Err(StorageRoleFailure::Session(error)) if error.class() == FailureClass::Timeout)
     );
     assert_eq!(
@@ -311,17 +309,16 @@ fn retained_metadata_network_errors_cannot_be_silently_skipped() {
         transience: Transience::Transient,
     });
     assert!(
-        matches!(signal.checked_metadata(&ScanRead::Metadata(ObservationPlan::default()), &StoragePath::root(), metadata, None, None),
+        matches!(signal.checked_metadata(&ScanRead::Metadata(ObservationPlan::default()), &StoragePath::root(), metadata, None),
         Err(StorageRoleFailure::Session(error)) if error.class() == FailureClass::Connectivity)
     );
     assert!(signal.failure().is_some());
 }
 
 #[tokio::test]
-async fn a_known_target_deadline_continues_while_the_consumer_waits() {
+async fn a_guarded_target_read_obeys_the_recovery_deadline() {
     let signal = ScanFailureSignal::new(BackendKind::Cifs, None);
-    let budget = RecoveryBudget::new(Duration::from_millis(80));
-    budget.reconnecting(false);
+    let budget = RecoveryBudget::new(Instant::now() + Duration::from_millis(80));
     signal.watch_recovery(
         RecoveryTarget {
             read: ScanRead::Stat,
@@ -335,7 +332,6 @@ async fn a_known_target_deadline_continues_while_the_consumer_waits() {
     let started = ready.clone();
     let done = release.clone();
     let guarded = signal.clone();
-    let consumer = budget.consumer_wait();
     let call = tokio::spawn(async move {
         guarded
             .operation(&ScanRead::Stat, &StoragePath::root(), async move {
@@ -352,29 +348,11 @@ async fn a_known_target_deadline_continues_while_the_consumer_waits() {
         signal.failure().unwrap().kind,
         RemoteScanFailureKind::OperationTimedOut
     );
-    drop(consumer);
     release.notify_one();
     assert!(
         matches!(timeout(Duration::from_millis(250), call).await.unwrap().unwrap(),
         Err(StorageRoleFailure::Session(error)) if error.class() == FailureClass::Timeout)
     );
-}
-
-#[tokio::test]
-async fn a_replay_failure_does_not_charge_concurrent_target_wait_twice() {
-    let budget = RecoveryBudget::new(Duration::from_millis(200));
-    budget.reconnecting(false);
-    let clock = budget.clock();
-    let target = budget.target_read();
-    sleep(Duration::from_millis(120)).await;
-    budget.failed_replay(clock);
-    drop(target);
-    assert!(!budget.is_exhausted());
-    budget.reconnecting(true);
-    timeout(Duration::from_millis(250), budget.exhausted())
-        .await
-        .unwrap();
-    assert!(budget.is_exhausted());
 }
 
 #[tokio::test]
@@ -389,7 +367,10 @@ async fn changed_inline_descriptor_recovers_without_reusing_stale_facts() {
         path,
         inline_descriptor: Some(Arc::new(original)),
     };
-    signal.watch_recovery(target.clone(), RecoveryBudget::new(Duration::from_secs(1)));
+    signal.watch_recovery(
+        target.clone(),
+        RecoveryBudget::new(Instant::now() + Duration::from_secs(1)),
+    );
     assert!(
         target
             .probe(&storage, &signal, CancellationToken::new())
@@ -414,7 +395,10 @@ async fn replaced_bound_identity_recovers_with_a_fresh_checkpoint_replay() {
         path,
         inline_descriptor: None,
     };
-    signal.watch_recovery(target.clone(), RecoveryBudget::new(Duration::from_secs(1)));
+    signal.watch_recovery(
+        target.clone(),
+        RecoveryBudget::new(Instant::now() + Duration::from_secs(1)),
+    );
     assert!(
         target
             .probe(&storage, &signal, CancellationToken::new())
@@ -440,7 +424,10 @@ async fn an_unchanged_identity_conflict_does_not_prove_network_recovery() {
         path,
         inline_descriptor: None,
     };
-    signal.watch_recovery(target.clone(), RecoveryBudget::new(Duration::from_secs(1)));
+    signal.watch_recovery(
+        target.clone(),
+        RecoveryBudget::new(Instant::now() + Duration::from_secs(1)),
+    );
     assert!(
         !target
             .probe(&storage, &signal, CancellationToken::new())
@@ -470,7 +457,10 @@ async fn current_descriptor_does_not_prove_a_historical_version_changed() {
         path,
         inline_descriptor: None,
     };
-    signal.watch_recovery(target.clone(), RecoveryBudget::new(Duration::from_secs(1)));
+    signal.watch_recovery(
+        target.clone(),
+        RecoveryBudget::new(Instant::now() + Duration::from_secs(1)),
+    );
     assert!(
         !target
             .probe(&storage, &signal, CancellationToken::new())
