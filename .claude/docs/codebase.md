@@ -34,7 +34,7 @@ Rust 库，Edition 2024；具体依赖版本和固定 Git 提交以 `Cargo.toml`
 ## 公开入口
 
 - `storage::connect_backend(BackendConfig)` 建立连接并返回 `Storage` 角色集合。
-- `storage::connect_scan_backend` 选择扫描连接策略；统一恢复在 `traversal::recoverable_scan`。
+- 扫描与普通操作共用 `storage::connect_backend`；恢复窗口由调用方通过 `traversal::recoverable_traversal` 显式选择。
 - 配置类型和 NFS / S3 发现工具从 `storage` 导出。
 - HDFS 客户端构造辅助入口也从 `storage` 导出，协议实现仍在 HDFS backend。
 - Windows ACL 工具为 `storage::windows_acl`，角色路径使用能力目录内的文件句柄。
@@ -42,18 +42,20 @@ Rust 库，Edition 2024；具体依赖版本和固定 Git 提交以 `Cargo.toml`
 ## 远程扫描
 
 - 原生库负责准确报告类型化断连 / 时限和保留修改结果不确定性；NFS 默认在 500 毫秒内短重试，
-  无需 URL 参数。`connect_scan_backend` 关闭 S3 SDK / 普通分页重发，并将 HDFS
-  默认 failover 次数限制为一次（显式配置优先）。Local 继续普通遍历行为。
+  无需 URL 参数。所有操作共用连接策略，不向 backend 传递扫描身份。HDFS 默认只遍历一轮已配置
+  NameNode（显式 XML / override 优先），网络故障与超时不追加 adapter 重试；S3 同样立即报告网络故障，
+  安全读和幂等分段保留服务端错误重试，结果不确定的写请求禁止 SDK 自动重放。Local 继续普通遍历行为。
 - `crates/traversal/src/traversal/scan.rs` 的 `ScanFailureSignal` 包装 namespace / metadata
   读取，记录首个原始网络故障并提供旁路信号；`operation_timeout=None` 沿用原生有界时限，
   显式时限只限制存储操作，不覆盖消费方等待。持有句柄的原生调用在调用方提前结束等待后仍完成清理。
-- `recovery.rs` / `recovery/probe.rs` 的 `recoverable_scan` 从首次故障识别开始，使用默认 3 秒墙钟窗口，
+- `recovery.rs` / `recovery/probe.rs` 的 `recoverable_traversal` 从首次故障识别开始，使用调用方显式提供的墙钟窗口，
   重连、退避和原故障操作验证共用截止时间，消费方背压不能暂停。单个有界 probe 与旧流安全排空并行；
   `scan/probe.rs` 只验证原路径、读取阶段、plan、identity/version 和列举页序，probe 结果不作为扫描条目输出。
   验证成功即进入 Running，随后在旧流与完整 history 排空后，从安全目录检查点正常重建；活跃目录可重放。
-  因而正常重建可以超过 3 秒，但 Recovering 状态不能靠健康前缀或背压无限延长。
+  普通 list / traversal 不隐式启用恢复；应用可为扫描明确选择 3 秒。正常重建可以超过所选窗口，
+  但 Recovering 状态不能靠健康前缀或背压无限延长。
   原目录 page N 没有跨连接 continuation 时仍须读取前 N 页；无法在窗口内验证时保守失败并保留检查点。
-- `ScanRecoveryStatus` 提供 Running / Recovering / Failed 活动；其 `failure_signal()` 只在恢复
+- `TraversalRecoveryStatus` 提供 Running / Recovering / Failed 活动；其 `failure_signal()` 只在恢复
   最终失败时发布该窗口最早的原始故障，后续重连时限不覆盖明确断连。取消保持 Cancelled，
   不发布最终网络故障；检查点可见性与取消后的排空策略保持调用方选择。
 - 应用负责选择时限 / 恢复窗口以及持久化、CLI / Web 展示；不能把原生库改为全局扫描恢复器。
@@ -68,4 +70,4 @@ Rust 库，Edition 2024；具体依赖版本和固定 Git 提交以 `Cargo.toml`
 `tests/` 包含公开契约与集成测试，backend 内部测试覆盖协议适配行为；真实环境脚本位于
 `tests/lab/` 与 `.claude/skills/e2e-*/`。运行 `make ci` 检查本地门禁；网络验证需要对应环境。
 
-HDFS 扫描连接在根验证、stat、listing 三处将 Connectivity/Timeout 直接交给统一恢复层，避免 250/500/1000/2000ms 的 adapter 退避遮蔽 3 秒恢复窗口。私有 HdfsReadRecovery 策略在构造前选择；普通连接、服务忙重试及单次 RPC 时限保持原策略。
+HDFS 根验证、stat、listing 和安全读取统一直接返回 Connectivity/Timeout，避免 adapter 网络退避叠加。连接不区分扫描与普通操作；服务错误重试、lease 恢复、单次 RPC 时限按操作语义保留。

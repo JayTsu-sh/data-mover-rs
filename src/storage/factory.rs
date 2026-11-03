@@ -1,7 +1,5 @@
 #[allow(unused_imports)]
 use super::backends;
-#[cfg(feature = "backend-hdfs")]
-use super::backends::hdfs::connect_scan_backend as connect_hdfs_scan_backend;
 use super::{BackendConfig, BackendConnectError, Storage};
 #[allow(unused_imports)]
 use crate::model::BackendKind;
@@ -35,23 +33,4 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
         #[cfg(not(feature = "backend-hdfs"))]
         BackendConfig::Hdfs(_) => Err(BackendConnectError::not_compiled(BackendKind::Hdfs)),
     }
-}
-
-/// Connects a source whose caller owns scan restart and checkpoint recovery.
-/// NFS uses its short default disconnect recovery policy; other scan adapters
-/// expose transport loss without additional SDK/page replay delays.
-/// S3 uses one SDK attempt; HDFS allows one standby failover unless explicitly configured.
-///
-/// # Errors
-/// Returns configuration, authentication, connection or role construction failures.
-pub async fn connect_scan_backend(config: BackendConfig) -> Result<Storage, BackendConnectError> {
-    #[cfg(feature = "backend-hdfs")]
-    if let BackendConfig::Hdfs(hdfs) = config {
-        return connect_hdfs_scan_backend(hdfs).await;
-    }
-    #[cfg(feature = "backend-s3")]
-    if let BackendConfig::S3(s3) = config {
-        return backends::s3::connect_scan_backend(s3).await;
-    }
-    connect_backend(config).await
 }

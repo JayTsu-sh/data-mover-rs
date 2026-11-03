@@ -14,7 +14,7 @@ mod listing_tests {
     use hdfs_native::client::FileStatus;
 
     use super::{
-        HDFSStorage, HdfsConfig, HdfsReadRecovery, HdfsStatusListing, HdfsStatuses, RoleFailure, RoleFailureClass,
+        HDFSStorage, HdfsConfig, HdfsStatusListing, HdfsStatuses, RoleFailure, RoleFailureClass,
         RoleHdfsListing as _, RoleStoragePath, build_hdfs_client,
     };
 
@@ -33,7 +33,6 @@ mod listing_tests {
         Ok(HDFSStorage {
             client,
             location,
-            read_recovery: HdfsReadRecovery::Adapter,
             block_size: super::DEFAULT_BLOCK_SIZE,
             transfer_concurrency: crate::transfer_concurrency::TransferConcurrency::defaults(4, 1),
         })
@@ -58,6 +57,10 @@ mod listing_tests {
         range
             .map(|index| Ok(status(&format!("/root/d/f{index:02}"))))
             .collect()
+    }
+
+    fn service_error() -> HdfsError {
+        HdfsError::DataTransferError("safe listing replay".into())
     }
 
     fn reset() -> HdfsError {
@@ -187,7 +190,7 @@ mod listing_tests {
     /// it, without handing out twice what was read.
     #[tokio::test(start_paused = true)]
     async fn a_retryable_failure_before_the_first_page_continues_after_the_last_name() -> Result {
-        let failed = then(children(0..2), reset());
+        let failed = then(children(0..2), service_error());
         let (mut listing, opens) = listing(vec![(failed, ENDS), (children(0..5), ENDS)])?;
         assert_eq!(
             page(&mut listing, 10).await?,
@@ -203,7 +206,7 @@ mod listing_tests {
     /// from the beginning, or end the listing, and this goes red.
     #[tokio::test(start_paused = true)]
     async fn a_retryable_failure_after_the_first_page_continues_after_the_last_name() -> Result {
-        let failed = then(children(0..12), reset());
+        let failed = then(children(0..12), service_error());
         let (mut listing, opens) = listing(vec![(failed, ENDS), (children(0..20), ENDS)])?;
         assert_eq!(page(&mut listing, 10).await?.len(), 10);
         let second = page(&mut listing, 10).await?;
@@ -219,7 +222,7 @@ mod listing_tests {
     /// first name after it in the name node's order.
     #[tokio::test(start_paused = true)]
     async fn a_listing_continues_after_a_last_name_deleted_meanwhile() -> Result {
-        let failed = then(children(0..12), reset());
+        let failed = then(children(0..12), service_error());
         let mut again = children(0..11);
         again.extend(children(12..15));
         let (mut listing, _) = listing(vec![(failed, ENDS), (again, ENDS)])?;
@@ -237,25 +240,27 @@ mod listing_tests {
     async fn continuing_follows_the_name_nodes_signed_byte_order() -> Result {
         let names = ["/root/d/é", "/root/d/a", "/root/d/b"];
         let again = names.iter().map(|name| Ok(status(name))).collect();
-        let failed = then(vec![Ok(status(names[0]))], reset());
+        let failed = then(vec![Ok(status(names[0]))], service_error());
         let (mut listing, _) = listing(vec![(failed, ENDS), (again, ENDS)])?;
         assert_eq!(page(&mut listing, 10).await?, ["d/é", "d/a", "d/b"]);
         Ok(())
     }
 
-    /// A batch that never answers counts as a retryable failure once the adapter's attempt
-    /// deadline passes, at the start as after a page.
+    /// A stalled native operation surfaces its deadline after handing out the observed prefix.
     #[tokio::test(start_paused = true)]
-    async fn a_stalled_listing_continues_after_the_deadline() -> Result {
+    async fn a_stalled_listing_returns_timeout_without_reopening() -> Result {
         let (mut listing, opens) = listing(vec![(Vec::new(), STALLS), (children(0..3), ENDS)])?;
-        assert_eq!(page(&mut listing, 10).await?.len(), 3);
-        assert_eq!(opens.load(Ordering::SeqCst), 2);
+        assert!(matches!(listing.next_page(hint(10)?).await,
+            Err(RoleFailure::Session(error)) if error.class()==RoleFailureClass::Timeout));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
 
         let scripts = vec![(children(0..12), STALLS), (children(0..15), ENDS)];
         let (mut listing, opens) = listing_of("d", "/root/d", scripts)?;
         assert_eq!(page(&mut listing, 10).await?.len(), 10);
-        assert_eq!(page(&mut listing, 10).await?.len(), 5);
-        assert_eq!(opens.load(Ordering::SeqCst), 2);
+        assert_eq!(page(&mut listing, 10).await?.len(), 2);
+        assert!(matches!(listing.next_page(hint(10)?).await,
+            Err(RoleFailure::Session(error)) if error.class()==RoleFailureClass::Timeout));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
@@ -287,7 +292,7 @@ mod listing_tests {
     /// never as a complete listing with the unread children missing.
     #[tokio::test(start_paused = true)]
     async fn a_directory_replaced_by_a_file_while_continuing_is_not_a_directory() -> Result {
-        let failed = then(children(0..2), reset());
+        let failed = then(children(0..2), service_error());
         let replaced = vec![Ok(status("/root/d"))];
         let (mut listing, _) = listing(vec![(failed, ENDS), (replaced, ENDS)])?;
         assert_eq!(page(&mut listing, 10).await?, ["d/f00", "d/f01"]);
@@ -301,7 +306,7 @@ mod listing_tests {
 
     #[tokio::test(start_paused = true)]
     async fn retries_without_progress_are_bounded_by_the_adapter_budget() -> Result {
-        let scripts = (0..10).map(|_| (vec![Err(reset())], ENDS)).collect();
+        let scripts = (0..10).map(|_| (vec![Err(service_error())], ENDS)).collect();
         let (mut listing, opens) = listing(scripts)?;
         assert!(listing.next_page(hint(10)?).await.is_err());
         assert_eq!(
@@ -315,7 +320,7 @@ mod listing_tests {
     #[tokio::test(start_paused = true)]
     async fn progress_renews_the_retry_budget() -> Result {
         let mut scripts: Vec<Script> = (1..=6)
-            .map(|read| (then(children(0..read), reset()), ENDS))
+            .map(|read| (then(children(0..read), service_error()), ENDS))
             .collect();
         scripts.push((children(0..8), ENDS));
         let (mut listing, opens) = listing(scripts)?;
@@ -364,9 +369,8 @@ mod listing_tests {
         Ok(())
     }
     #[tokio::test(start_paused = true)]
-    async fn scan_listing_returns_the_first_network_fault_without_reopening() -> Result {
+    async fn listing_returns_the_first_network_fault_without_reopening() -> Result {
         let (mut listing, opens) = listing(vec![(vec![Err(reset())], ENDS), (children(0..5), ENDS)])?;
-        listing.storage.read_recovery = HdfsReadRecovery::Caller;
         assert!(matches!(listing.next_page(hint(10)?).await,
             Err(RoleFailure::Session(error)) if error.class()==RoleFailureClass::Connectivity));
         assert_eq!(opens.load(Ordering::SeqCst), 1);
@@ -374,9 +378,8 @@ mod listing_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn scan_listing_retains_partial_pages_without_an_adapter_retry() -> Result {
+    async fn listing_retains_partial_pages_without_a_network_retry() -> Result {
         let (mut listing, opens) = listing(vec![(then(children(0..12), reset()), ENDS), (children(0..20), ENDS)])?;
-        listing.storage.read_recovery = HdfsReadRecovery::Caller;
         assert_eq!(page(&mut listing, 10).await?.len(), 10);
         assert_eq!(page(&mut listing, 10).await?, ["d/f10", "d/f11"]);
         assert!(matches!(listing.next_page(hint(10)?).await,

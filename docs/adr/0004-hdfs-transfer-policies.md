@@ -162,3 +162,13 @@ use independent lease recovery and do not incur the old client's 60-second soft 
 file. The complete library suite passed 761 tests with four ignored, the HDFS filter passed 98 tests,
 the upstream dependency contract passed, and all-target/all-feature Clippy passed with warnings
 denied.
+
+## Unified transport recovery (2026-11-03)
+
+HDFS operations use one connection policy. The native client visits each configured NameNode
+once by default, retaining necessary HA failover; explicit XML/override retry settings win.
+The adapter returns typed connection failures and timeouts without another network retry loop.
+Safe non-network read retries, listing position recovery and append lease recovery keep their
+operation-specific limits. Unknown RPC errors and non-network I/O do not imply disconnection.
+Scanning owns its separate three-second recovery window in traversal; ordinary operations do
+not inherit that window or identify themselves as scans to the backend.

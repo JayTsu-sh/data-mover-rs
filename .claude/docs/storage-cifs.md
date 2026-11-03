@@ -24,9 +24,9 @@
 写操作保留 `Protocol` / Unknown，不能据网络原因自动重放。ACL 和 metadata 观察用 Observe，
 元数据应用仍用 Metadata。
 
-`ScanFailureSignal` 是首个原始故障信号；`recoverable_scan` 在 data-mover 层提供默认 3 秒恢复窗口，
+`ScanFailureSignal` 是首个原始故障信号；`recoverable_traversal` 在 data-mover 层按调用方显式策略提供恢复窗口（扫描应用选择 3 秒），
 重建连接并从安全目录检查点续扫，窗口失败才发布最终网络故障。普通连接保留原生有界恢复。
-详见 [扫描恢复分层](codebase.md#远程扫描)。消费者等待不计入操作预算或恢复等待；
+详见 [扫描恢复分层](codebase.md#远程扫描)。消费者等待不计入单次操作预算，但不能暂停恢复窗口的墙钟截止时间；
 超时 / 取消不会直接丢弃持有句柄的原生调用，清理仍由其完成。
 
 ## 连接配置

@@ -87,7 +87,7 @@ async fn healthy_replay_slower_than_recovery_window_reaches_the_failed_target() 
         failure: ReplayFailure::Metadata,
         prefix_delay: Duration::ZERO,
     });
-    let connect: ScanReconnect = Arc::new(|| {
+    let connect: TraversalReconnect = Arc::new(|| {
         async {
             Ok(fixture_storage(ReplayTree {
                 failure: ReplayFailure::None,
@@ -96,11 +96,11 @@ async fn healthy_replay_slower_than_recovery_window_reaches_the_failed_target() 
         }
         .boxed()
     });
-    let (session, status) = recoverable_scan(
+    let (session, status) = recoverable_traversal(
         &initial,
         TraversalRequest::new(StoragePath::root())
             .observation_plan(ObservationPlan::default().with_tags(ObservationMode::BestEffort)),
-        ScanRecoveryPolicy {
+        TraversalRecoveryPolicy {
             operation_timeout: Some(Duration::from_secs(1)),
             ..policy()
         },
@@ -124,8 +124,8 @@ async fn a_successful_first_page_cannot_renew_a_persistent_second_page_fault() {
             prefix_delay: Duration::ZERO,
         })
     };
-    let connect: ScanReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
-    let (session, status) = recoverable_scan(
+    let connect: TraversalReconnect = Arc::new(move || async move { Ok(broken()) }.boxed());
+    let (session, status) = recoverable_traversal(
         &broken(),
         TraversalRequest::new(StoragePath::root()),
         policy(),
@@ -148,7 +148,7 @@ async fn a_listing_target_unverifiable_within_the_window_fails_safely() {
         failure: ReplayFailure::SecondPage,
         prefix_delay: Duration::ZERO,
     });
-    let connect: ScanReconnect = Arc::new(|| {
+    let connect: TraversalReconnect = Arc::new(|| {
         async {
             Ok(fixture_storage(ReplayTree {
                 failure: ReplayFailure::None,
@@ -157,10 +157,10 @@ async fn a_listing_target_unverifiable_within_the_window_fails_safely() {
         }
         .boxed()
     });
-    let (session, status) = recoverable_scan(
+    let (session, status) = recoverable_traversal(
         &initial,
         TraversalRequest::new(StoragePath::root()),
-        ScanRecoveryPolicy {
+        TraversalRecoveryPolicy {
             operation_timeout: Some(Duration::from_secs(1)),
             ..policy()
         },
@@ -185,7 +185,7 @@ async fn a_new_failure_after_verified_recovery_has_its_own_window() {
     });
     let calls = Arc::new(AtomicUsize::new(0));
     let connects = calls.clone();
-    let connect: ScanReconnect = Arc::new(move || {
+    let connect: TraversalReconnect = Arc::new(move || {
         connects.fetch_add(1, Ordering::Relaxed);
         async {
             Ok(fixture_storage(ReplayTree {
@@ -195,11 +195,11 @@ async fn a_new_failure_after_verified_recovery_has_its_own_window() {
         }
         .boxed()
     });
-    let (session, status) = recoverable_scan(
+    let (session, status) = recoverable_traversal(
         &initial,
         TraversalRequest::new(StoragePath::root())
             .observation_plan(ObservationPlan::default().with_tags(ObservationMode::BestEffort)),
-        ScanRecoveryPolicy {
+        TraversalRecoveryPolicy {
             operation_timeout: Some(Duration::from_secs(1)),
             ..policy()
         },
@@ -222,7 +222,7 @@ async fn an_eof_before_the_failed_listing_page_recovers_the_current_tree() {
         failure: ReplayFailure::SecondPage,
         prefix_delay: Duration::ZERO,
     });
-    let connect: ScanReconnect = Arc::new(|| {
+    let connect: TraversalReconnect = Arc::new(|| {
         async {
             Ok(fixture_storage(ReplayTree {
                 failure: ReplayFailure::Empty,
@@ -231,7 +231,7 @@ async fn an_eof_before_the_failed_listing_page_recovers_the_current_tree() {
         }
         .boxed()
     });
-    let (session, status) = recoverable_scan(
+    let (session, status) = recoverable_traversal(
         &initial,
         TraversalRequest::new(StoragePath::root()),
         policy(),
@@ -244,7 +244,7 @@ async fn an_eof_before_the_failed_listing_page_recovers_the_current_tree() {
     assert!(matches!(outcome, Ok(TraversalOutcome::Completed(_))));
     assert!(matches!(
         *status.subscribe().borrow(),
-        ScanRecoveryState::Running { recoveries: 1 }
+        TraversalRecoveryState::Running { recoveries: 1 }
     ));
     assert!(status.failure_signal().failure().is_none());
 }
@@ -255,7 +255,7 @@ async fn verified_target_ends_recovering_before_slow_checkpoint_rebuild() {
         failure: ReplayFailure::Metadata,
         prefix_delay: Duration::ZERO,
     });
-    let connect: ScanReconnect = Arc::new(|| {
+    let connect: TraversalReconnect = Arc::new(|| {
         async {
             Ok(fixture_storage(ReplayTree {
                 failure: ReplayFailure::None,
@@ -264,11 +264,11 @@ async fn verified_target_ends_recovering_before_slow_checkpoint_rebuild() {
         }
         .boxed()
     });
-    let (session, status) = recoverable_scan(
+    let (session, status) = recoverable_traversal(
         &initial,
         TraversalRequest::new(StoragePath::root())
             .observation_plan(ObservationPlan::default().with_tags(ObservationMode::BestEffort)),
-        ScanRecoveryPolicy {
+        TraversalRecoveryPolicy {
             operation_timeout: Some(Duration::from_secs(1)),
             ..policy()
         },
@@ -280,7 +280,7 @@ async fn verified_target_ends_recovering_before_slow_checkpoint_rebuild() {
         loop {
             if matches!(
                 *updates.borrow_and_update(),
-                ScanRecoveryState::Running { recoveries: 1 }
+                TraversalRecoveryState::Running { recoveries: 1 }
             ) {
                 break;
             }
@@ -345,7 +345,7 @@ async fn target_verification_does_not_wait_for_the_old_output_consumer() {
         loop {
             if matches!(
                 *updates.borrow_and_update(),
-                ScanRecoveryState::Running { recoveries: 1 }
+                TraversalRecoveryState::Running { recoveries: 1 }
             ) {
                 break;
             }

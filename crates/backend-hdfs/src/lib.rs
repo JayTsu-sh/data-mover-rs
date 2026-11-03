@@ -5,7 +5,7 @@
 )]
 #[doc(hidden)]
 pub mod backend;
-pub use backend::{connect_backend, connect_scan_backend};
+pub use backend::connect_backend;
 pub use data_mover_storage_core::{
     KB, MB, Result, error, time_util, transfer_concurrency, url_redact,
 };

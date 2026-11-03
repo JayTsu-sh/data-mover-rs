@@ -649,5 +649,6 @@ pub use scan::{RemoteScanFailure, RemoteScanFailureKind, ScanFailureSignal, Scan
 
 mod recovery;
 pub use recovery::{
-    ScanReconnect, ScanRecoveryPolicy, ScanRecoveryState, ScanRecoveryStatus, recoverable_scan,
+    TraversalReconnect, TraversalRecoveryPolicy, TraversalRecoveryState, TraversalRecoveryStatus,
+    recoverable_traversal,
 };

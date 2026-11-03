@@ -9,16 +9,56 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use tokio::time::sleep;
+    use tokio::time::{Instant, sleep};
 
     use hdfs_native::HdfsError;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        HdfsConfig, HdfsEndpointKind, HdfsReadRecovery, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
+        HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
     };
     use crate::error::StorageError;
-    use crate::model::FailureClass;
+    use crate::model::{FailureClass, Transience};
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_reads_surface_network_faults_without_adapter_backoff() {
+        for operation in ["get storage root", "get metadata", "open file", "read range"] {
+            for kind in [ErrorKind::ConnectionReset, ErrorKind::TimedOut] {
+                let attempts = Arc::new(AtomicUsize::new(0));
+                let observed = attempts.clone();
+                let started = Instant::now();
+                let result = super::retry_hdfs_read(operation, None, None, move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async move { Err::<(), _>(HdfsError::IOError(IoError::from(kind))) }
+                }).await;
+                assert!(result.is_err());
+                assert_eq!(attempts.load(Ordering::SeqCst), 1, "{operation}: {kind:?}");
+                assert_eq!(started.elapsed(), Duration::ZERO);
+            }
+        }
+    }
+
+    #[test]
+    fn client_failover_defaults_visit_each_configured_node_once() -> Result<(), StorageError> {
+        let direct = HdfsLocation::parse("hdfs://user@127.0.0.1:9000/root")?;
+        let settings = super::hdfs_client_overrides(&direct, &HdfsConfig::default())?;
+        assert_eq!(settings.get("dfs.client.failover.max.attempts").map(String::as_str), Some("0"));
+        for count in [1, 2, 3] {
+            let mut config = HdfsConfig::default();
+            let members: Vec<_> = (0..count).map(|node| format!("nn{node}")).collect();
+            config.overrides.insert("dfs.ha.namenodes.cluster".into(), members.join(","));
+            for member in &members {
+                config.overrides.insert(format!("dfs.namenode.rpc-address.cluster.{member}"), format!("{member}:9000"));
+            }
+            let location = HdfsLocation::parse_configured("hdfs://user@cluster/root", &config)?;
+            let settings = super::hdfs_client_overrides(&location, &config)?;
+            assert_eq!(settings.get("dfs.client.failover.max.attempts"), Some(&(count - 1).to_string()));
+            config.overrides.insert("dfs.client.failover.max.attempts".into(), "7".into());
+            let settings = super::hdfs_client_overrides(&location, &config)?;
+            assert_eq!(settings.get("dfs.client.failover.max.attempts").map(String::as_str), Some("7"));
+        }
+        Ok(())
+    }
 
     #[test]
     fn append_open_waits_only_for_a_bounded_lease_recovery_window() {
@@ -87,9 +127,7 @@ mod tests {
                 let attempt = observed.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if attempt < 2 {
-                        Err(hdfs_native::HdfsError::IOError(std::io::Error::from(
-                            std::io::ErrorKind::TimedOut,
-                        )))
+                        Err(HdfsError::DataTransferError("safe read recovery".into()))
                     } else {
                         Ok(7_u8)
                     }
@@ -313,12 +351,46 @@ mod tests {
         for (kind, expected) in [
             (ErrorKind::TimedOut, FailureClass::Timeout),
             (ErrorKind::ConnectionReset, FailureClass::Connectivity),
+            (ErrorKind::BrokenPipe, FailureClass::Connectivity),
+            (ErrorKind::NetworkUnreachable, FailureClass::Connectivity),
         ] {
             let error =
                 super::hdfs_operation_error("list", None, &HdfsError::IOError(IoError::from(kind)));
-            let (class, _, session) = super::hdfs_role_classify(&error);
+            let (class, transience, session) = super::hdfs_role_classify(&error);
             assert_eq!(class, expected);
+            assert_eq!(transience, Transience::Transient);
             assert!(session);
+        }
+    }
+
+    #[test]
+    fn nontransport_io_and_unknown_rpc_errors_are_not_network_failures() {
+        for native in [
+            HdfsError::IOError(IoError::from(ErrorKind::InvalidData)),
+            HdfsError::IOError(IoError::from(ErrorKind::Interrupted)),
+            HdfsError::RPCError("vendor.CustomFailure".into(), "ignored".into()),
+        ] {
+            let error = super::hdfs_operation_error("read", None, &native);
+            let (class, _, session) = super::hdfs_role_classify(&error);
+            assert_eq!(class, FailureClass::Protocol);
+            assert!(!session);
+        }
+    }
+
+    #[test]
+    fn known_remote_network_exceptions_preserve_their_typed_cause() {
+        for (exception, expected) in [
+            ("java.net.SocketTimeoutException", FailureClass::Timeout),
+            ("java.net.ConnectException", FailureClass::Connectivity),
+            ("org.apache.hadoop.ipc.StandbyException", FailureClass::Protocol),
+            ("org.apache.hadoop.ipc.ObserverRetryOnActiveException", FailureClass::Protocol),
+        ] {
+            let native = HdfsError::RPCError(exception.into(), "redacted".into());
+            let error = super::hdfs_operation_error("read", None, &native);
+            let (class, transience, session) = super::hdfs_role_classify(&error);
+            assert_eq!(class, expected);
+            assert_eq!(transience, Transience::Transient);
+            assert_eq!(session, expected != FailureClass::Protocol);
         }
     }
 
@@ -473,6 +545,7 @@ mod tests {
         let xml = r"<configuration>
           <property><name>dfs.ha.namenodes.analytics</name><value>old</value></property>
           <property><name>dfs.namenode.rpc-address.analytics.old</name><value>old:8020</value></property>
+          <property><name>dfs.client.failover.max.attempts</name><value>4</value></property>
         </configuration>";
         let Ok(()) = fs::write(directory.join("hdfs-site.xml"), xml) else {
             panic!("failed to write test configuration");
@@ -488,7 +561,16 @@ mod tests {
             ]),
             ..Default::default()
         };
-        assert!(HdfsLocation::parse_configured("hdfs://user@analytics/", &config).is_ok());
+        let location = HdfsLocation::parse_configured("hdfs://user@analytics/", &config)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let settings = super::hdfs_client_overrides(&location, &config)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(settings.get("dfs.client.failover.max.attempts").map(String::as_str), Some("4"));
+        let mut config = config;
+        config.overrides.insert("dfs.client.failover.max.attempts".into(), "2".into());
+        let settings = super::hdfs_client_overrides(&location, &config)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(settings.get("dfs.client.failover.max.attempts").map(String::as_str), Some("2"));
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -638,22 +720,8 @@ mod tests {
         );
     }
     #[tokio::test(start_paused = true)]
-    async fn scan_root_and_stat_delegate_network_retries_to_the_caller() {
-        for operation in ["get storage root", "get metadata"] {
-            let attempts = Arc::new(AtomicUsize::new(0));
-            let called = attempts.clone();
-            let result = HdfsReadRecovery::Caller.read(operation, None, move || {
-                called.fetch_add(1, Ordering::SeqCst);
-                async { Err::<(), _>(HdfsError::IOError(IoError::from(ErrorKind::ConnectionReset))) }
-            }).await;
-            assert!(result.is_err());
-            assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn scan_single_attempt_keeps_a_healthy_slow_rpc() {
-        let result = HdfsReadRecovery::Caller.read("get metadata", None, || async {
+    async fn ordinary_single_attempt_keeps_a_healthy_slow_rpc() {
+        let result = super::retry_hdfs_read("get metadata", None, None, || async {
             sleep(Duration::from_millis(600)).await;
             Ok(7_u8)
         }).await;
@@ -661,10 +729,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn scan_nonnetwork_retryable_failures_keep_the_adapter_policy() {
+    async fn nonnetwork_retryable_reads_keep_the_service_policy() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let called = attempts.clone();
-        let result = HdfsReadRecovery::Caller.read("get metadata", None, move || {
+        let result = super::retry_hdfs_read("get metadata", None, None, move || {
             let attempt = called.fetch_add(1, Ordering::SeqCst);
             async move {
                 if attempt == 0 {

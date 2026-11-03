@@ -547,7 +547,7 @@ async fn a_lookup_failure_of_the_session_or_the_directory_ends_the_read() {
                 || Err(wrapped(nfs_rs::RecoveryAction::Retry, timeout())),
                 no_getattr,
             ),
-            NfsRestart::Resend,
+            NfsRestart::Never,
             FailureClass::Timeout,
         ),
         (
@@ -725,7 +725,7 @@ fn read_failure_cases() -> Vec<(NfsError, NfsRestart, FailureClass)> {
         ),
         (
             wrapped(nfs_rs::RecoveryAction::Retry, timeout()),
-            NfsRestart::Resend,
+            NfsRestart::Never,
             FailureClass::Timeout,
         ),
         (

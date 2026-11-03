@@ -299,12 +299,20 @@ fn slow_down() -> S3ProtocolFailure {
     )
 }
 
-/// What the role protocol maps a 5xx or a lost connection to.
+/// What the role protocol maps a lost connection to.
 fn connection_lost() -> S3ProtocolFailure {
     S3ProtocolFailure::session(
         FailureClass::Connectivity,
         Transience::Transient,
         "S3 ListObjectsV2 request failed",
+    )
+}
+
+fn service_failure() -> S3ProtocolFailure {
+    S3ProtocolFailure::session(
+        FailureClass::Protocol,
+        Transience::Transient,
+        "S3 ListObjectsV2 service failure",
     )
 }
 
@@ -331,7 +339,7 @@ async fn failing_third_page(failure: S3ProtocolFailure, times: usize) -> TestRes
 /// from the first page would send no continuation again; giving up would end the listing.
 #[tokio::test]
 async fn a_throttled_page_mid_listing_is_requested_again_with_the_same_token() -> TestResult {
-    for (failure, times) in [(slow_down(), 3), (connection_lost(), 3)] {
+    for (failure, times) in [(slow_down(), 3), (service_failure(), 3)] {
         let protocol = failing_third_page(failure.clone(), times).await?;
         let namespace = quick(&protocol);
         let mut stream = listing(&namespace, "d", CancellationToken::new())?;
@@ -353,11 +361,12 @@ async fn a_throttled_page_mid_listing_is_requested_again_with_the_same_token() -
     Ok(())
 }
 
-/// Scan policy surfaces a failed continuation once, after preserving earlier pages.
+/// Every listing surfaces a failed continuation once, after preserving earlier pages.
 #[tokio::test]
-async fn scan_listing_surfaces_connection_loss_without_resending_the_page() -> TestResult {
+async fn listing_surfaces_connection_loss_without_resending_the_page() -> TestResult {
     let protocol = failing_third_page(connection_lost(), usize::MAX).await?;
-    let namespace = S3Namespace::new(protocol.clone(), identity()).with_limits(ListingLimits::SCAN);
+    let namespace =
+        S3Namespace::new(protocol.clone(), identity()).with_limits(ListingLimits::PRODUCTION);
     let mut stream = listing(&namespace, "d", CancellationToken::new())?;
     assert_eq!(names(&next_page(&mut stream).await?), ["a"]);
     assert_eq!(names(&next_page(&mut stream).await?), ["b"]);
@@ -385,7 +394,7 @@ async fn the_resends_start_over_after_every_page() -> TestResult {
         let (b, d) = (2, 2 + resends + 2);
         knobs.failing_calls = (b..b + resends)
             .chain(d..d + resends)
-            .map(|call| (call, connection_lost()))
+            .map(|call| (call, service_failure()))
             .collect();
     }
     let namespace = quick(&protocol);
@@ -444,7 +453,7 @@ async fn cancelling_during_a_backoff_ends_the_listing_at_once() -> TestResult {
 #[tokio::test]
 async fn a_transient_failure_past_its_resends_ends_the_listing_after_what_was_handed_over()
 -> TestResult {
-    let protocol = failing_third_page(connection_lost(), usize::MAX).await?;
+    let protocol = failing_third_page(service_failure(), usize::MAX).await?;
     let namespace = quick(&protocol);
     let items: Vec<_> = timeout(
         PATIENCE,
@@ -461,11 +470,7 @@ async fn a_transient_failure_past_its_resends_ends_the_listing_after_what_was_ha
         .collect();
     assert_eq!(
         shape,
-        [
-            Ok(vec!["a"]),
-            Ok(vec!["b"]),
-            Err(FailureClass::Connectivity)
-        ]
+        [Ok(vec!["a"]), Ok(vec!["b"]), Err(FailureClass::Protocol)]
     );
     let resends = QUICK_RESENDS.len();
     let expected = [

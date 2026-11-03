@@ -9,6 +9,7 @@ pub enum HdfsErrorKind {
     Directory,
     ErasureCoding,
     Io,
+    Connectivity,
     Timeout,
     Rpc,
     Authentication,

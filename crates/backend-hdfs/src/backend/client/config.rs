@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -22,29 +23,11 @@ const HDFS_ADAPTER_RETRY_DELAYS: [Duration; 4] = [
 const HDFS_ADAPTER_MAX_ATTEMPTS: usize = HDFS_ADAPTER_RETRY_DELAYS.len() + 1;
 const HDFS_ADAPTER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The scan caller owns network recovery; service retries keep the adapter policy.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum HdfsReadRecovery {
-    Adapter,
-    Caller,
-}
-
-impl HdfsReadRecovery {
-    async fn read<T, F, Fut>(
-        self, operation: &'static str, path: Option<&Path>, mut action: F,
-    ) -> Result<T, StorageError>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T, HdfsError>>,
-    {
-        retry_hdfs_read_indexed_with_recovery(operation, path, None, self, |_| action()).await
-    }
-
-    fn allows_adapter_retry(self, error: &StorageError) -> bool {
-        matches!(self, Self::Adapter)
-            || !matches!(hdfs_role_classify(error).0,
-                RoleFailureClass::Connectivity | RoleFailureClass::Timeout)
-    }
+/// Retry only operation-level service failures; transport recovery belongs to the caller.
+fn hdfs_service_retry(error: &StorageError) -> bool {
+    matches!(error, StorageError::HdfsOperation(details) if details.retryable)
+        && !matches!(hdfs_role_classify(error).0,
+            RoleFailureClass::Connectivity | RoleFailureClass::Timeout)
 }
 
 async fn retry_hdfs_read<T, F, Fut>(
@@ -64,20 +47,6 @@ async fn retry_hdfs_read_indexed<T, F, Fut>(
     operation: &'static str,
     relative_path: Option<&Path>,
     cancel: Option<&CancellationToken>,
-    action: F,
-) -> Result<T, StorageError>
-where
-    F: FnMut(usize) -> Fut,
-    Fut: Future<Output = Result<T, HdfsError>>,
-{
-    retry_hdfs_read_indexed_with_recovery(operation, relative_path, cancel, HdfsReadRecovery::Adapter, action).await
-}
-
-async fn retry_hdfs_read_indexed_with_recovery<T, F, Fut>(
-    operation: &'static str,
-    relative_path: Option<&Path>,
-    cancel: Option<&CancellationToken>,
-    recovery: HdfsReadRecovery,
     mut action: F,
 ) -> Result<T, StorageError>
 where
@@ -93,11 +62,7 @@ where
             Ok(value) => return Ok(value),
             Err(error) => {
                 let mapped = hdfs_operation_error(operation, relative_path, &error);
-                let retryable = matches!(
-                    &mapped,
-                    StorageError::HdfsOperation(details) if details.retryable
-                );
-                if !retryable || !recovery.allows_adapter_retry(&mapped) {
+                if !hdfs_service_retry(&mapped) {
                     return Err(mapped);
                 }
                 let Some(delay) = HDFS_ADAPTER_RETRY_DELAYS.get(attempt).copied() else {
@@ -157,6 +122,24 @@ pub use data_mover_storage_core::storage::config::hdfs::{HdfsConfig, HdfsLocatio
 #[allow(clippy::wildcard_imports)]
 use data_mover_storage_core::storage::config::hdfs::*;
 
+/// One pass through configured `NameNodes` preserves HA without repeated network backoff.
+fn hdfs_client_overrides(
+    location: &HdfsLocation,
+    config: &HdfsConfig,
+) -> Result<HashMap<String, String>, StorageError> {
+    let mut settings = config.settings()?;
+    let failovers = if location.kind() == HdfsEndpointKind::NameService {
+        let service = location.endpoint().trim_start_matches("hdfs://");
+        settings.get(&format!("dfs.ha.namenodes.{service}"))
+            .map_or(0, |members| members.split(',').filter(|member| !member.trim().is_empty()).count().saturating_sub(1))
+    } else {
+        0
+    };
+    settings.entry("dfs.client.failover.max.attempts".into())
+        .or_insert_with(|| failovers.to_string());
+    Ok(settings)
+}
+
 /// Parse an explicit HDFS location and construct its async client.
 ///
 /// # Errors
@@ -177,7 +160,7 @@ pub fn build_hdfs_client(
             ))
         }),
     };
-    let mut overrides = config.overrides.clone();
+    let mut overrides = hdfs_client_overrides(&parsed, config)?;
     let authentication = if config.kerberos_credentials.is_some() {
         "kerberos"
     } else {

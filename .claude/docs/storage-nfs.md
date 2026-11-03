@@ -11,9 +11,13 @@
 NFS 原生连接默认允许短时间恢复明确断连：退避、TCP 重连、会话绑定及安全重发
 共用 500 毫秒总预算，最多四次重连，并受原请求的重放许可和时限进一步约束。
 耗尽后返回首个类型化断连及请求是否已经发送的证据；无需 URL 策略参数。
-`recoverable_scan` 在 data-mover 中提供独立的默认 3 秒故障恢复窗口，
+`recoverable_traversal` 在 data-mover 中按调用方显式策略提供故障恢复窗口（扫描任务选择 3 秒），
 按安全检查点续扫；原生短重试与扫描的生命周期、消费方背压和故障展示分别处理。
 详见 [扫描恢复分层](codebase.md#远程扫描)。
+
+目录列举收到原生库的明确断连或 TimedOut 后直接返回，不再经 `NfsRestart::Resend`
+追加 250ms / 1s / 2s 退避；该规则同时适用于普通列举与扫描。stale handle、坏 cookie
+和明确的服务端繁忙仍按各自的协议恢复规则处理。
 
 `transport_error_kind()` / `is_connection_lost()` 区分明确断连与 TimedOut；
 Retry / Remount 只是恢复指导，不会把畸形 RPC / XDR 自动变成 Connectivity。

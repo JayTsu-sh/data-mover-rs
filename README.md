@@ -351,14 +351,18 @@ and `CIFS_REAL_PASS`.
 Protocol clients report definite connection loss and typed deadlines. The CIFS
 adapter preserves those categories as `Connectivity` and `Timeout`; uncertain
 mutations retain their outcome semantics. NFS uses its short default disconnect
-recovery budget without URL switches. `connect_scan_backend` disables S3
-SDK/page transport resends and bounds HDFS failover attempts (one standby failover
-by default). HDFS scan root checks, metadata and listing return native network failures
-without adapter backoff; normal connections retain their read retry policy. S3 service errors and throttling remain distinct from transport loss.
+recovery budget without URL switches. All callers use `connect_backend` with the same
+network policy. HDFS visits configured NameNodes once by default (explicit retry settings
+win), then surfaces transport failures without adapter backoff. Safe non-network read,
+lease and directory-handle recovery remain operation-specific. S3 returns network failures
+promptly, retains service retries for safe reads/idempotent parts, and disables automatic
+replay of uncertain writes. Service errors and throttling remain distinct from transport loss.
 
-`traversal::recoverable_scan` starts a default three-second wall-clock window at
-first fault detection. One reconnect/probe task verifies the original failed
-read, including its phase, plan, identity/version and listing page, while the old
+`traversal::recoverable_traversal` starts an explicitly selected wall-clock window at
+first fault detection. Ordinary listing and traversal do not enable recovery implicitly;
+applications choose budgets per use case (for example, three seconds for scans).
+One reconnect/probe task verifies the original failed read, including its phase,
+plan, identity/version and listing page, while the old
 attempt drains. Consumer backpressure cannot pause this deadline. A successful
 probe ends recovery before normal checkpoint rebuilding; a failed window reports
 its first typed cause. Active directories can replay under the checkpoint/history
