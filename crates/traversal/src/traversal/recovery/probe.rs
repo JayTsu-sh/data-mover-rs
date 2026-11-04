@@ -1,11 +1,12 @@
 //! One bounded reconnect/target probe runs alongside safe draining of the old attempt.
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{oneshot, watch};
 use tokio::time::sleep;
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
-use super::{StorageTraversalSource, TraversalReconnect, TraversalRecoveryState};
+use super::{RecoveryCounters, StorageTraversalSource, TraversalReconnect, TraversalRecoveryState};
 use crate::storage::Storage;
 use crate::traversal::scan::{RecoveryBudget, RecoveryTarget, RetainedOperation};
 use crate::traversal::{RemoteScanFailure, ScanFailureSignal};
@@ -18,6 +19,7 @@ pub(super) struct Probe {
 }
 
 pub(super) struct ProbeContext {
+    pub(super) counters: Arc<RecoveryCounters>,
     pub(super) first: RemoteScanFailure,
     pub(super) target: Option<RecoveryTarget>,
     pub(super) budget: RecoveryBudget,
@@ -35,6 +37,7 @@ impl ProbeContext {
         let task = tokio::spawn(async move {
             let ready = self.run().await;
             if ready.is_some() && !self.budget.is_exhausted() {
+                self.counters.recovered();
                 self.budget.complete();
                 self.state.send_replace(TraversalRecoveryState::Running {
                     recoveries: self.recoveries,
@@ -71,6 +74,8 @@ impl ProbeContext {
                 () = self.budget.exhausted() => return None,
                 () = sleep(Duration::from_millis(25)) => {},
             }
+            self.counters.attempt();
+            self.state.send_modify(|_| {});
             let mut connect = RetainedOperation::new((self.reconnect)());
             let storage = tokio::select! {
                 biased;

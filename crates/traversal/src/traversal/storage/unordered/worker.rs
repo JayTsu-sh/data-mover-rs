@@ -24,15 +24,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::observe::{Listed, ObservationError};
 use super::super::output::{ChildItem, count_listing, tally_child, terminal_errors};
+use super::super::statistics::DirectoryAccumulator;
 use super::super::stream::{self, Arrival, Batch, Child, Page, Slot};
-use super::super::{Deferred, DirectoryWork, Resolved, Shared, resolve};
+use super::super::{Deferred, DirectoryWork, ResolutionError, Resolved, Shared, resolve};
 use super::page_io::{self, Job};
 use super::pool::Pool;
-use crate::model::{FailureClass, ObservedEntry};
+use crate::model::{EntryKind, EntryOperationFailure, FailureClass, ObservedEntry};
 use crate::storage::{DescentHint, ListRequest, ListingPage, ListingStream, StorageRoleFailure};
 use crate::traversal::channel::ItemSender;
 use crate::traversal::{
-    BlockCounts, ObservationFailure, ScanFailure, ScanTotals, TraversalItem,
+    BlockCounts, ListingOutcome, ObservationFailure, ScanFailure, ScanTotals, TraversalItem,
     TraversalTerminalFailure,
 };
 
@@ -49,6 +50,7 @@ enum Ended {
 struct Listing {
     /// Children the listing returned so far, described or not: a failure's `delivered`.
     listed: u64,
+    statistics: Option<DirectoryAccumulator>,
 }
 
 /// An item of a listing stream.
@@ -110,7 +112,14 @@ impl Worker {
             .shared
             .namespace
             .list_for_traversal(request, work.child_depth == 1);
-        let mut listing = Listing::default();
+        let mut listing = Listing {
+            statistics: self
+                .shared
+                .request
+                .directory_statistics
+                .then(|| DirectoryAccumulator::new(work.path.clone())),
+            ..Listing::default()
+        };
         loop {
             let Some(next) = self.next_item(&mut stream).await else {
                 return Ok(Ended::Halted);
@@ -155,11 +164,19 @@ impl Worker {
         listing: &mut Listing,
     ) -> Result<bool, TraversalTerminalFailure> {
         let Page {
-            batch: Batch { failures, children },
+            batch:
+                Batch {
+                    failures,
+                    children,
+                    statistics,
+                },
             slots,
             facts,
         } = stream::prepare(&self.shared, work, page);
         facts.count_into(&mut self.block);
+        if let Some(counts) = listing.statistics.as_mut() {
+            counts.page(statistics);
+        }
         listing.listed = listing.listed.saturating_add(facts.listed);
         let Some(settled) = self.observe(children).await? else {
             return Ok(false);
@@ -167,14 +184,20 @@ impl Worker {
         let (mut below, hints) = split_slots(slots);
         // The page's undescribable children first, then the rest in listing order.
         let mut batch = Vec::with_capacity(failures.len() + settled.len());
-        for failure in failures {
-            let item = ChildItem::Item(TraversalItem::Failure(Box::new(ScanFailure::child(
-                failure,
-            ))));
-            let segment = self.shared.probe.history_segment();
-            tally_child(&mut self.block, item, None, segment).push_into(&mut batch);
+        self.tally_failures(failures, listing.statistics.as_mut(), &mut batch);
+
+        let settled = self.settle(
+            settled,
+            hints,
+            &mut batch,
+            &mut below,
+            listing.statistics.as_mut(),
+        );
+        if settled.is_ok()
+            && let Some(counts) = listing.statistics.as_mut()
+        {
+            batch.push(counts.snapshot(&work.path, None, false));
         }
-        let settled = self.settle(settled, hints, &mut batch, &mut below);
         if !self.send(batch).await? {
             return Ok(false);
         }
@@ -183,6 +206,24 @@ impl Worker {
         self.pool.push(self.me, below);
         self.checkpoint_if_due().await;
         Ok(true)
+    }
+
+    fn tally_failures(
+        &mut self,
+        failures: Vec<EntryOperationFailure>,
+        mut statistics: Option<&mut DirectoryAccumulator>,
+        batch: &mut Vec<TraversalItem>,
+    ) {
+        for failure in failures {
+            let item = ChildItem::Item(TraversalItem::Failure(Box::new(ScanFailure::child(
+                failure,
+            ))));
+            if let Some(counts) = statistics.as_deref_mut() {
+                counts.child(&item, None, None);
+            }
+            let segment = self.shared.probe.history_segment();
+            tally_child(&mut self.block, item, None, segment).push_into(batch);
+        }
     }
 
     /// Sends a checkpoint when one is due and this worker claims it. Off, this is one branch.
@@ -212,11 +253,12 @@ impl Worker {
         mut hints: Vec<(u64, Option<DescentHint>)>,
         batch: &mut Vec<TraversalItem>,
         below: &mut Vec<DirectoryWork>,
+        mut statistics: Option<&mut DirectoryAccumulator>,
     ) -> Result<(), TraversalTerminalFailure> {
         let mut settled = settled.into_iter();
         while let Some(child) = settled.next() {
-            let (result, deferred) = match child {
-                Settled::Observed(result, deferred) => (result, deferred),
+            let (result, deferred, kind) = match child {
+                Settled::Observed(result, deferred, kind) => (result, deferred, kind),
                 Settled::Filtered(failures) => {
                     tally_child(
                         &mut self.block,
@@ -227,22 +269,11 @@ impl Worker {
                     .push_into(batch);
                     continue;
                 }
-                Settled::Pending(_) => return Err(TraversalTerminalFailure::Internal),
+                Settled::Pending(_, _) => return Err(TraversalTerminalFailure::Internal),
             };
             let resolved = match resolve(&self.shared, result, deferred) {
                 Ok(resolved) => resolved,
-                Err(error) => {
-                    batch.extend(
-                        error
-                            .observations
-                            .into_iter()
-                            .map(|failure| TraversalItem::ObservationFailure(Box::new(failure))),
-                    );
-                    for known in settled {
-                        known.terminal_errors(&self.shared, batch);
-                    }
-                    return Err(error.terminal);
-                }
+                Err(error) => return Err(self.failed_page(error, settled, batch)),
             };
             let Resolved {
                 item,
@@ -255,10 +286,31 @@ impl Worker {
                     .and_then(|ticket| take_hint(&mut hints, ticket));
                 below.push(descend.with_hint(hint));
             }
+            if let Some(counts) = statistics.as_deref_mut() {
+                counts.child(&item, Some(kind), descent);
+            }
             let segment = self.shared.probe.history_segment();
             tally_child(&mut self.block, item, descent, segment).push_into(batch);
         }
         Ok(())
+    }
+
+    fn failed_page(
+        &self,
+        error: ResolutionError,
+        settled: impl Iterator<Item = Settled>,
+        batch: &mut Vec<TraversalItem>,
+    ) -> TraversalTerminalFailure {
+        batch.extend(
+            error
+                .observations
+                .into_iter()
+                .map(|failure| TraversalItem::ObservationFailure(Box::new(failure))),
+        );
+        for known in settled {
+            known.terminal_errors(&self.shared, batch);
+        }
+        error.terminal
     }
 
     /// Every child's observation in listing order: the ones the page already made, and the ones
@@ -275,12 +327,14 @@ impl Worker {
                 Child::Observe {
                     listed: Listed::Observed(result),
                     deferred,
-                } => settled.push(Settled::Observed(result, deferred)),
+                    kind,
+                } => settled.push(Settled::Observed(result, deferred, kind)),
                 Child::Observe {
                     listed: Listed::Unobserved(descriptor),
                     deferred,
+                    kind,
                 } => {
-                    settled.push(Settled::Pending(deferred));
+                    settled.push(Settled::Pending(deferred, kind));
                     jobs.push((place, descriptor));
                 }
             }
@@ -302,10 +356,10 @@ impl Worker {
                 let Some(slot) = settled.get_mut(place) else {
                     return Err(TraversalTerminalFailure::Internal);
                 };
-                let Settled::Pending(deferred) = slot else {
+                let Settled::Pending(deferred, kind) = slot else {
                     return Err(TraversalTerminalFailure::Internal);
                 };
-                *slot = Settled::Observed(result, *deferred);
+                *slot = Settled::Observed(result, *deferred, *kind);
             }
         }
         Ok(Some(settled))
@@ -320,8 +374,13 @@ impl Worker {
         listing: Listing,
         failure: Option<StorageRoleFailure>,
     ) -> Result<Ended, TraversalTerminalFailure> {
-        let Listing { listed } = listing;
+        let Listing {
+            listed,
+            mut statistics,
+        } = listing;
         let mut last = Vec::new();
+        let mut outcome = ListingOutcome::Complete;
+        let mut vanished = false;
         if let Some(failure) = failure {
             match stream::failed(&work.path, failure) {
                 Arrival::Failed(failure)
@@ -329,18 +388,23 @@ impl Worker {
                         && work.child_depth > 1
                         && listed == 0 =>
                 {
+                    vanished = true;
                     self.totals.vanished_listings = self.totals.vanished_listings.saturating_add(1);
                 }
                 Arrival::Failed(failure) => {
                     let failure = ScanFailure::listing(work.path.clone(), failure, listed);
-                    if let Some(outcome) = failure.listing_outcome() {
-                        count_listing(&mut self.totals, outcome);
+                    if let Some(ended) = failure.listing_outcome() {
+                        outcome = ended;
+                        count_listing(&mut self.totals, ended);
                     }
                     last.push(TraversalItem::Failure(Box::new(failure)));
                 }
                 Arrival::Terminal(failure) => return Err(failure),
                 Arrival::Page(_) | Arrival::End => return Err(TraversalTerminalFailure::Internal),
             }
+        }
+        if let Some(counts) = statistics.as_mut() {
+            last.push(counts.snapshot(&work.path, Some(outcome), vanished));
         }
         Ok(if self.send(last).await? {
             Ended::Finished
@@ -376,9 +440,10 @@ enum Settled {
     Observed(
         Result<Box<ObservedEntry>, ObservationError>,
         Option<Deferred>,
+        EntryKind,
     ),
     Filtered(Vec<ObservationFailure>),
-    Pending(Option<Deferred>),
+    Pending(Option<Deferred>, EntryKind),
 }
 
 impl Settled {
@@ -386,12 +451,12 @@ impl Settled {
     /// without running another filter decision or delivering its entry.
     fn terminal_errors(self, shared: &Shared, batch: &mut Vec<TraversalItem>) {
         let result = match self {
-            Self::Observed(result, _) => result,
+            Self::Observed(result, _, _) => result,
             Self::Filtered(failures) => {
                 terminal_errors(ChildItem::ObservationFailures(failures), batch);
                 return;
             }
-            Self::Pending(_) => return,
+            Self::Pending(_, _) => return,
         };
         match resolve(shared, result, None) {
             Ok(resolved) => terminal_errors(resolved.item, batch),

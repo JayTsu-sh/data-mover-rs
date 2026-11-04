@@ -160,7 +160,9 @@ async fn decide_pending(
     observations: &mut Vec<ObservationFailure>,
 ) -> Result<Option<DirectoryWork>, TraversalTerminalFailure> {
     let (listed, deferred) = match child {
-        Child::Observe { listed, deferred } => (listed, deferred),
+        Child::Observe {
+            listed, deferred, ..
+        } => (listed, deferred),
         Child::Filtered(failures) => {
             observations.extend(failures);
             return Ok(None);

@@ -500,3 +500,79 @@ async fn a_deleted_key_with_a_long_history_has_no_current_object_in_any_segment(
     assert_eq!(totals.all_versions_bytes, 2 + 7 * 2 + 3 * 3);
     Ok(())
 }
+
+#[tokio::test]
+async fn directory_statistics_count_each_history_key_once_after_all_segments() -> TestResult {
+    let protocol = bucket(0).await?;
+    for order in ORDERS {
+        let source = source(&protocol, 3)?;
+        let (items, outcome) = run(
+            &source,
+            request().order(order).directory_statistics(true),
+            None,
+        )
+        .await?;
+        assert!(matches!(outcome, Ok(TraversalOutcome::Completed(_))));
+        let mut history_open = false;
+        let mut final_counts = None;
+        for item in &items {
+            match item {
+                TraversalItem::Entry(entry) => {
+                    history_open = entry
+                        .history()
+                        .is_some_and(|history| !history.is_complete());
+                }
+                TraversalItem::DirectoryStatistics(counts) => {
+                    assert!(!history_open, "snapshot split one logical history key");
+                    if counts.path.as_str() == "d" && counts.outcome.is_some() {
+                        final_counts = Some(counts);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let counts = final_counts.ok_or("missing completed directory statistics")?;
+        assert_eq!(counts.scanned.regular_files, 3);
+        assert_eq!(counts.retained.regular_files, 3);
+        assert_eq!(counts.versions, 9);
+        assert_eq!(counts.regular_file_bytes, 4);
+        assert_eq!(counts.all_versions_bytes, 16);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn directory_statistics_do_not_mistake_a_deleted_key_for_unknown_size() -> TestResult {
+    let protocol = bucket(0).await?;
+    protocol
+        .delete_object("d/big")
+        .await
+        .map_err(|failure| format!("{failure:?}"))?;
+    for order in ORDERS {
+        let (items, outcome) = run(
+            &source(&protocol, 3)?,
+            request().order(order).directory_statistics(true),
+            None,
+        )
+        .await?;
+        assert!(matches!(outcome, Ok(TraversalOutcome::Completed(_))));
+        let counts = items
+            .iter()
+            .find_map(|item| match item {
+                TraversalItem::DirectoryStatistics(stats)
+                    if stats.path.as_str() == "d" && stats.outcome.is_some() =>
+                {
+                    Some(stats)
+                }
+                _ => None,
+            })
+            .ok_or("missing directory statistics")?;
+        assert_eq!(counts.retained.regular_files, 3);
+        assert_eq!(counts.regular_file_bytes, 2);
+        assert_eq!(counts.unknown_file_sizes, 0);
+        assert_eq!(counts.versions, 9);
+        assert_eq!(counts.delete_markers, 1);
+        assert_eq!(counts.all_versions_bytes, 16);
+    }
+    Ok(())
+}

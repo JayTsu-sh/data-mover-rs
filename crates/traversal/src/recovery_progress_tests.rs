@@ -330,6 +330,7 @@ async fn target_verification_does_not_wait_for_the_old_output_consumer() {
         }
         .boxed()
     });
+    let counters = recovery.counters.clone();
     let mut updates = recovery.state.subscribe();
     recovery
         .producer
@@ -357,6 +358,7 @@ async fn target_verification_does_not_wait_for_the_old_output_consumer() {
         verified.is_ok(),
         "original fault must recover while the old output queue is blocked"
     );
+    assert_eq!(counters.snapshot().successful_recoveries, 1);
     sleep(Duration::from_millis(160)).await;
     assert!(!waiting.is_finished());
     output.recv().await.unwrap();
@@ -364,4 +366,5 @@ async fn target_verification_does_not_wait_for_the_old_output_consumer() {
     let (recovery, result) = waiting.await.unwrap();
     assert!(result.is_ok());
     assert!(recovery.failure.failure().is_none());
+    assert_eq!(counters.snapshot().successful_recoveries, 1);
 }

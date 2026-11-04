@@ -454,6 +454,7 @@ async fn a_deferred_observation_failure_still_lists_the_directory() {
             TraversalItem::Entry(entry) => emitted.push(entry.path().as_str().to_owned()),
             TraversalItem::Failure(failure) => failed.push((failure.scope, failure.path.as_str())),
             TraversalItem::DirectoryListed(_)
+            | TraversalItem::DirectoryStatistics(_)
             | TraversalItem::Checkpoint(_)
             | TraversalItem::ObservationFailure(_) => {}
         }

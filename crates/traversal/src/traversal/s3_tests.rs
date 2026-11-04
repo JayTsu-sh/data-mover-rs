@@ -122,6 +122,7 @@ pub(super) fn render(item: &TraversalItem) -> String {
             )
         }
         TraversalItem::Checkpoint(_) => "checkpoint".to_owned(),
+        TraversalItem::DirectoryStatistics(_) => "statistics".to_owned(),
         TraversalItem::ObservationFailure(failure) => format!(
             "observation failure {} {:?} {:?}",
             failure.path, failure.family, failure.version

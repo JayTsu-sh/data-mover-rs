@@ -270,6 +270,13 @@ async fn reset_reconnects_without_skipping_paths_or_publishing_a_final_fault() {
     assert!(paths.iter().any(|path| path == "b"));
     assert!(matches!(outcome, Ok(TraversalOutcome::Completed(_))));
     assert!(calls.load(Ordering::Relaxed) >= 1);
+    let counters = status.counters();
+    assert_eq!(counters.network_faults, 1);
+    assert_eq!(
+        counters.reconnect_attempts,
+        calls.load(Ordering::Relaxed) as u64
+    );
+    assert_eq!(counters.successful_recoveries, 1);
     assert!(status.failure_signal().failure().is_none());
     assert!(matches!(
         *status.subscribe().borrow(),
@@ -458,6 +465,7 @@ fn waiting_recovery() -> (Recovery, channel::ItemReceiver, ScanFailureSignal) {
     });
     (
         Recovery {
+            counters: Arc::default(),
             request: TraversalRequest::new(StoragePath::root()),
             policy: policy(),
             reconnect: reconnect(false, Arc::new(AtomicUsize::new(0))),

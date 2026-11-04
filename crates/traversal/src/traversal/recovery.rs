@@ -18,6 +18,9 @@ use crate::model::{BackendSessionFailure, FailureClass, Transience};
 use crate::storage::{BackendConnectError, Storage, StorageRoleFailure};
 
 mod attempt;
+mod counters;
+use counters::RecoveryCounters;
+pub use counters::TraversalRecoveryCounters;
 mod probe;
 use probe::{Probe, ProbeContext};
 #[cfg(test)]
@@ -58,11 +61,18 @@ pub enum TraversalRecoveryState {
 /// Out-of-band recovery activity and the final typed network failure.
 #[derive(Clone)]
 pub struct TraversalRecoveryStatus {
+    counters: Arc<RecoveryCounters>,
     state: watch::Receiver<TraversalRecoveryState>,
     failure: ScanFailureSignal,
 }
 
 impl TraversalRecoveryStatus {
+    /// Producer-owned cumulative facts, independent of coalesced watch notifications.
+    #[must_use]
+    pub fn counters(&self) -> TraversalRecoveryCounters {
+        self.counters.snapshot()
+    }
+
     /// Observes recovery independently of traversal output backpressure.
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<TraversalRecoveryState> {
@@ -106,11 +116,14 @@ pub fn recoverable_traversal(
         items,
         completion: Some(completion),
     };
+    let counters = Arc::new(RecoveryCounters::default());
     let status = TraversalRecoveryStatus {
+        counters: counters.clone(),
         state: receiver,
         failure: failure.clone(),
     };
     let runner = Recovery {
+        counters,
         request,
         policy,
         reconnect,
@@ -132,6 +145,7 @@ struct Window {
 }
 
 struct Recovery {
+    counters: Arc<RecoveryCounters>,
     request: TraversalRequest,
     policy: TraversalRecoveryPolicy,
     reconnect: TraversalReconnect,
@@ -195,9 +209,11 @@ impl Recovery {
         if self.window.is_none()
             && let Some(first) = signal.failure()
         {
+            self.counters.fault();
             let started = signal.failure_detected_at().unwrap_or_else(Instant::now);
             let budget = RecoveryBudget::new(started + self.policy.recovery_window);
             let probe = ProbeContext {
+                counters: self.counters.clone(),
                 first: first.clone(),
                 target: signal.failure_target(),
                 budget: budget.clone(),

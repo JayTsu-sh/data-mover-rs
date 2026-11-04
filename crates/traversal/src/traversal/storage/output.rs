@@ -17,7 +17,8 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::mem;
 
 use super::blocks::Runtime;
-use crate::model::{ObservedEntry, StoragePath};
+use super::statistics::{DirectoryAccumulator, PageStatistics};
+use crate::model::{EntryKind, ObservedEntry, StoragePath};
 use crate::traversal::{
     BlockCounts, DirectoryListed, ListingOutcome, ObservationFailure, ScanFailure, ScanTotals,
     TraversalItem, TraversalTerminalFailure,
@@ -89,6 +90,8 @@ pub(super) enum ChildItem {
     /// A deferred filter decision kept the child out: the slot keeps its sequence so the slots
     /// behind it stay in order, and emits nothing.
     Filtered(Vec<ObservationFailure>),
+    /// 过滤器同时隐藏且剪枝的目录，仅旧 `RawTotals` 将它记为 filtered。
+    ExcludedDirectory(Vec<ObservationFailure>),
     /// A child filtered in page preparation was already counted in the page's facts.
     ObservationFailures(Vec<ObservationFailure>),
     /// The child was gone when it was observed: nothing is emitted, and it is counted as
@@ -103,6 +106,11 @@ pub(super) enum Settled {
         item: ChildItem,
         /// Carried only for a deferred decision; see [`ChildDescent`].
         descent: Option<ChildDescent>,
+        kind: Option<EntryKind>,
+    },
+    PageEnd {
+        path: StoragePath,
+        statistics: PageStatistics,
     },
     /// Every direct child of `path` has been admitted.
     BlockEnd {
@@ -123,6 +131,7 @@ pub(super) struct Output {
     terminal_failures: Vec<ScanFailure>,
     /// The slots seen since the last block end, which are one directory's block.
     block: BlockCounts,
+    statistics: Option<DirectoryAccumulator>,
     /// What the listing failure among those slots, if any, makes of the block's outcome. The
     /// outcome is derived from the failure item itself rather than recorded beside it, so a
     /// listing failure can never close a block reported `Complete` (deletion-safety rule 2).
@@ -148,6 +157,7 @@ impl Output {
             terminal_observations: Vec::new(),
             terminal_failures: Vec::new(),
             block: BlockCounts::new(),
+            statistics: None,
             listing: None,
             totals: ScanTotals::new(),
             delivered: 0,
@@ -280,12 +290,7 @@ impl Output {
         }
         let mut batch = Vec::with_capacity(self.ready.len());
         while let Some(settled) = self.ready.pop_front() {
-            let items = match settled {
-                Settled::Child { item, descent } => {
-                    self.settle_child(item, descent, runtime.shared.probe.history_segment())
-                }
-                Settled::BlockEnd { path, facts } => Tallied::One(self.close_block(path, facts)),
-            };
+            let items = self.release(settled, runtime, &mut batch);
             // Counted as passed as it joins the batch, so the ready queue keeps starting at
             // `next` even when cancellation wins the send and ends the flush.
             self.next += 1;
@@ -294,7 +299,8 @@ impl Output {
         let Some(last) = batch.last() else {
             return Ok(());
         };
-        let closes = matches!(last, TraversalItem::DirectoryListed(_));
+        let closes = matches!(last, TraversalItem::DirectoryListed(_))
+            || matches!(last, TraversalItem::DirectoryStatistics(stats) if stats.outcome.is_some());
         if !emit(runtime, batch).await? {
             self.cut = true;
         } else if !self.cut {
@@ -302,6 +308,46 @@ impl Output {
             self.between_blocks = closes;
         }
         Ok(())
+    }
+
+    fn release(
+        &mut self,
+        settled: Settled,
+        runtime: &Runtime<'_>,
+        batch: &mut Vec<TraversalItem>,
+    ) -> Tallied {
+        match settled {
+            Settled::Child {
+                item,
+                descent,
+                kind,
+            } => {
+                if runtime.request.directory_statistics {
+                    self.statistics
+                        .get_or_insert_with(|| DirectoryAccumulator::new(StoragePath::root()))
+                        .child(&item, kind, descent);
+                }
+                self.settle_child(item, descent, runtime.shared.probe.history_segment())
+            }
+            Settled::PageEnd { path, statistics } => {
+                let counts = self
+                    .statistics
+                    .get_or_insert_with(|| DirectoryAccumulator::new(path.clone()));
+                counts.page(statistics);
+                Tallied::One(counts.snapshot(&path, None, false))
+            }
+            Settled::BlockEnd { path, facts } => {
+                let outcome = self.listing.unwrap_or(ListingOutcome::Complete);
+                let snapshot = runtime.request.directory_statistics.then(|| {
+                    self.statistics
+                        .take()
+                        .unwrap_or_else(|| DirectoryAccumulator::new(path.clone()))
+                        .snapshot(&path, Some(outcome), facts.vanished_listing)
+                });
+                batch.push(self.close_block(path, facts));
+                snapshot.map_or(Tallied::Nothing, Tallied::One)
+            }
+        }
     }
 
     /// Tallies one child against the block it belongs to; a key's history longer than `segment`
@@ -348,7 +394,9 @@ pub(super) fn terminal_errors(item: ChildItem, batch: &mut Vec<TraversalItem>) {
         ) => {
             batch.push(item);
         }
-        ChildItem::Filtered(failures) | ChildItem::ObservationFailures(failures) => {
+        ChildItem::Filtered(failures)
+        | ChildItem::ExcludedDirectory(failures)
+        | ChildItem::ObservationFailures(failures) => {
             observation_items(failures, Tallied::Nothing).push_into(batch);
         }
         ChildItem::ObservedFailure {
@@ -361,7 +409,11 @@ pub(super) fn terminal_errors(item: ChildItem, batch: &mut Vec<TraversalItem>) {
         ChildItem::Vanished(observations) => {
             observation_items(observations, Tallied::Nothing).push_into(batch);
         }
-        ChildItem::Item(TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_)) => {}
+        ChildItem::Item(
+            TraversalItem::DirectoryListed(_)
+            | TraversalItem::DirectoryStatistics(_)
+            | TraversalItem::Checkpoint(_),
+        ) => {}
     }
 }
 
@@ -408,7 +460,7 @@ pub(super) fn tally_child(
     }
     let item = match item {
         ChildItem::Item(item) => item,
-        ChildItem::Filtered(failures) => {
+        ChildItem::Filtered(failures) | ChildItem::ExcludedDirectory(failures) => {
             block.filtered = block.filtered.saturating_add(1);
             return observation_items(failures, Tallied::Nothing);
         }
@@ -441,6 +493,7 @@ pub(super) fn tally_child(
         TraversalItem::Failure(_)
         | TraversalItem::ObservationFailure(_)
         | TraversalItem::DirectoryListed(_)
+        | TraversalItem::DirectoryStatistics(_)
         | TraversalItem::Checkpoint(_) => {}
     }
     Tallied::One(item)
