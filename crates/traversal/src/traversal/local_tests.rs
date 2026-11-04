@@ -87,7 +87,8 @@ fn entry_paths(items: &[TraversalItem]) -> Vec<String> {
             | TraversalItem::ObservationFailure(_)
             | TraversalItem::DirectoryListed(_)
             | TraversalItem::Checkpoint(_)
-            | TraversalItem::DirectoryStatistics(_) => None,
+            | TraversalItem::DirectoryStatistics(_)
+            | TraversalItem::Resumed(_) => None,
         })
         .collect()
 }

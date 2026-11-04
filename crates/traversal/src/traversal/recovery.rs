@@ -11,8 +11,8 @@ use super::channel;
 use super::scan::{RecoveryBudget, ScanFailureSignal};
 use super::{
     Checkpoint, DEFAULT_MAX_BUFFERED_ITEMS, RemoteScanFailure, RemoteScanFailureKind, Resumable,
-    ScanSetupError, StorageTraversalSource, TraversalOutcome, TraversalProducer, TraversalRequest,
-    TraversalSession, TraversalTerminalFailure,
+    ScanSetupError, StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalProducer,
+    TraversalRequest, TraversalResume, TraversalSession, TraversalTerminalFailure,
 };
 use crate::model::{BackendSessionFailure, FailureClass, Transience};
 use crate::storage::{BackendConnectError, Storage, StorageRoleFailure};
@@ -36,12 +36,21 @@ pub type TraversalReconnect =
 /// Ordinary traversals do not enable this policy implicitly.
 #[derive(Clone, Copy, Debug)]
 pub struct TraversalRecoveryPolicy {
+    /// 从检查点继续（允许重放），或从根重新开始并先交付 Resumed。
+    pub resume: TraversalRecoveryResume,
     /// A native operation deadline; `None` preserves native protocol deadlines.
     pub operation_timeout: Option<Duration>,
     /// Wall-clock budget from the first detected fault through reconnection and
     /// verification of the original failed read. Verified recovery ends this
     /// deadline before healthy checkpoint rebuilding or consumer waits continue.
     pub recovery_window: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TraversalRecoveryResume {
+    #[default]
+    Checkpoint,
+    RestartRoot,
 }
 
 /// Recovery activity; only `Failed` represents exhausted network recovery.
@@ -91,7 +100,9 @@ impl TraversalRecoveryStatus {
 ///
 /// Active directories may be replayed. Delivered items keep their order and complete history
 /// groups; completion totals describe the final resumed traversal, as for ordinary resume.
-/// The caller's checkpoint visibility and cancellation-drain policy are preserved.
+/// Checkpoint mode preserves the caller's checkpoint visibility and cancellation draining.
+/// `RestartRoot` disables checkpoints and stops immediately on cancellation; each reconnection
+/// emits Resumed before the restarted root's output so consumers can discard attempt state.
 ///
 /// # Errors
 /// Rejects invalid operation deadlines or unavailable traversal roles before starting.
@@ -110,7 +121,7 @@ pub fn recoverable_traversal(
         output,
         result,
         request.cancel.clone(),
-        request.resumable.every().is_some(),
+        policy.resume == TraversalRecoveryResume::Checkpoint && request.resumable.every().is_some(),
     );
     let producer = TraversalProducer {
         items,
@@ -133,6 +144,7 @@ pub fn recoverable_traversal(
         window: None,
         checkpoint: None,
         recoveries: 0,
+        attempt: 1,
     };
     tokio::spawn(runner.run(source, signal));
     Ok((session, status))
@@ -155,6 +167,7 @@ struct Recovery {
     window: Option<Window>,
     checkpoint: Option<Checkpoint>,
     recoveries: u64,
+    attempt: u64,
 }
 
 type Outcome = Result<TraversalOutcome, TraversalTerminalFailure>;
@@ -172,6 +185,9 @@ impl Recovery {
             match self.reconnect_source().await {
                 Some(next) => {
                     (source, signal) = next;
+                    if !self.begin_reconnected_attempt().await {
+                        break Ok(TraversalOutcome::Cancelled);
+                    }
                 }
                 None if self.request.cancel.is_cancelled() => {
                     break Ok(TraversalOutcome::Cancelled);
@@ -182,9 +198,33 @@ impl Recovery {
         self.producer.finish(outcome);
     }
 
+    async fn begin_reconnected_attempt(&mut self) -> bool {
+        self.attempt = self.attempt.saturating_add(1);
+        let marker = TraversalItem::Resumed(Box::new(TraversalResume {
+            attempt: self.attempt,
+            checkpoint: if self.policy.resume == TraversalRecoveryResume::Checkpoint {
+                self.checkpoint
+                    .clone()
+                    .or_else(|| self.request.resume_from.clone())
+            } else {
+                None
+            },
+        }));
+        tokio::select! {
+            biased;
+            () = self.request.cancel.cancelled() => false,
+            result = self.producer.send(marker) => result.is_ok(),
+        }
+    }
+
     fn request_for_attempt(&self) -> TraversalRequest {
         let mut request = self.request.clone();
         request.cancel = self.request.cancel.child_token();
+        if self.policy.resume == TraversalRecoveryResume::RestartRoot {
+            request.resumable = Resumable::Off;
+            request.resume_from = None;
+            return request;
+        }
         request.resumable = match request.resumable {
             Resumable::Off => Resumable::on(),
             value => value,

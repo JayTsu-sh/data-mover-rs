@@ -13,8 +13,8 @@
 //!   block, that latest one is sent: everything after the position it names comes again from it,
 //!   and everything before it was delivered. A block is never split by a periodic checkpoint.
 //!   Cancellation winning the race drops it; the final one covers it.
-//! - **Final.** A traversal that did not complete sends the latest position before what it
-//!   delivered as its last item, not racing cancellation: a resumable session drains.
+//! - **Final.** 仅在完整块边界发送最终检查点。若已输出部分目录，消费者保留上次检查点，
+//!   恢复时整体重放该检查点之后的所有块，避免检查点混入未完成的目录。
 
 use std::sync::Arc;
 
@@ -139,13 +139,15 @@ pub(crate) async fn checkpoint_if_due(runtime: &Runtime<'_>, cursor: &mut Cursor
     }
 }
 
-/// The last item of a traversal that did not complete: the latest position before what it
-/// delivered, or, when it never got to drive its cursor, the one it resumed from.
+/// 目录中途结束不追加检查点；消费者继续使用此前确认的完整块边界。
 pub(crate) async fn final_checkpoint(
     runtime: &Runtime<'_>,
     positions: Option<&Positions>,
-    delivered: u64,
+    output: &Output,
 ) {
+    if !output.between_blocks() {
+        return;
+    }
     let Some(resume) = runtime
         .shared
         .resume
@@ -155,7 +157,7 @@ pub(crate) async fn final_checkpoint(
         return;
     };
     let chain = match positions {
-        Some(positions) => positions.latest(delivered),
+        Some(positions) => positions.latest(output.delivered()),
         None => resume.start.clone(),
     };
     if let Some(item) = chain.and_then(|chain| resume.checkpoint(&chain)) {

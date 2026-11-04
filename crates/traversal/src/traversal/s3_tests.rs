@@ -72,6 +72,7 @@ pub(super) fn entries(items: &[TraversalItem]) -> Vec<&ObservedEntry> {
     items
         .iter()
         .filter_map(|item| match item {
+            TraversalItem::Resumed(_) => panic!("raw traversal cannot resume an attempt"),
             TraversalItem::Entry(entry) => Some(entry.as_ref()),
             _ => None,
         })
@@ -82,6 +83,7 @@ pub(super) fn entries(items: &[TraversalItem]) -> Vec<&ObservedEntry> {
 /// record), `failure scope path`, `listed path outcome [set counts]`.
 pub(super) fn render(item: &TraversalItem) -> String {
     match item {
+        TraversalItem::Resumed(_) => panic!("raw traversal cannot resume an attempt"),
         TraversalItem::Entry(entry) => {
             let history = entry.history().map_or(String::new(), |history| {
                 let records: Vec<String> = history
@@ -390,6 +392,7 @@ async fn throttling_past_the_budget_fails_one_listing_not_the_traversal() -> Tes
     let failures: Vec<_> = items
         .iter()
         .filter_map(|item| match item {
+            TraversalItem::Resumed(_) => panic!("raw traversal cannot resume an attempt"),
             TraversalItem::Failure(failure) => Some((
                 failure.scope,
                 failure.path.to_string(),

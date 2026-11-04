@@ -373,6 +373,7 @@ async fn an_undescribable_child_is_a_failure_item_without_hiding_its_siblings() 
             TraversalItem::Failure(failure) => failures.push(failure.path.as_str().to_owned()),
             TraversalItem::DirectoryListed(_)
             | TraversalItem::DirectoryStatistics(_)
+            | TraversalItem::Resumed(_)
             | TraversalItem::Checkpoint(_)
             | TraversalItem::ObservationFailure(_) => {}
         }

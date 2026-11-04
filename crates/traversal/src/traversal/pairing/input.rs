@@ -82,7 +82,8 @@ impl<'a, 'd> Reader<'a, 'd> {
                 }
                 TraversalItem::Checkpoint(_)
                 | TraversalItem::ObservationFailure(_)
-                | TraversalItem::DirectoryStatistics(_) => {}
+                | TraversalItem::DirectoryStatistics(_)
+                | TraversalItem::Resumed(_) => {}
             }
         }
         let listed = boundary.ok_or("missing directory boundary")?;

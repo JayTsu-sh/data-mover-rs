@@ -231,9 +231,122 @@ fn fixture_storage(fixture: impl Namespace + Metadata + 'static) -> Storage {
 
 fn policy() -> TraversalRecoveryPolicy {
     TraversalRecoveryPolicy {
+        resume: TraversalRecoveryResume::Checkpoint,
         operation_timeout: Some(Duration::from_millis(100)),
         recovery_window: Duration::from_millis(80),
     }
+}
+
+#[tokio::test]
+async fn restart_root_marks_the_new_attempt_before_repeated_entries() {
+    let selected = TraversalRecoveryPolicy {
+        resume: TraversalRecoveryResume::RestartRoot,
+        ..policy()
+    };
+    let (mut session, status) = recoverable_traversal(
+        &storage(true, true),
+        TraversalRequest::new(StoragePath::root()),
+        selected,
+        reconnect(false, Arc::new(AtomicUsize::new(0))),
+    )
+    .unwrap();
+    let mut events = Vec::new();
+    let mut count = 0;
+    while let Some(item) = session.next_item().await {
+        match item {
+            TraversalItem::Entry(entry) => {
+                count += 1;
+                events.push(entry.path().as_str().to_owned());
+            }
+            TraversalItem::Resumed(restart) => {
+                assert_eq!(restart.attempt, 2);
+                assert!(restart.checkpoint.is_none());
+                count = 0;
+                events.push("restart".into());
+            }
+            TraversalItem::Checkpoint(_) => {
+                panic!("RestartRoot must not publish resumable cursors")
+            }
+            _ => {}
+        }
+    }
+    assert!(matches!(
+        session.finish().await,
+        Ok(TraversalOutcome::Completed(_))
+    ));
+    assert_eq!(events, ["a", "restart", "a", "b"]);
+    assert_eq!(count, 2);
+    let counters = status.counters();
+    assert_eq!(counters.network_faults, 1);
+    assert_eq!(counters.successful_recoveries, 1);
+}
+
+/// `RestartRoot` 的有效请求关闭续扫；调用方原先的 On 不能让取消进入排空模式。
+#[tokio::test]
+async fn root_restart_overrides_resumable_cancellation_draining() {
+    let cancel = CancellationToken::new();
+    let connect: TraversalReconnect = Arc::new(|| pending().boxed());
+    let request = TraversalRequest::new(StoragePath::root())
+        .resumable(Resumable::on())
+        .cancel(cancel.clone());
+    let selected = TraversalRecoveryPolicy {
+        resume: TraversalRecoveryResume::RestartRoot,
+        ..policy()
+    };
+    let (mut session, status) =
+        recoverable_traversal(&storage(true, false), request, selected, connect).unwrap();
+    let mut state = status.subscribe();
+    let draining = tokio::spawn(async move {
+        while let Some(item) = session.next_item().await {
+            assert!(!matches!(item, TraversalItem::Checkpoint(_)));
+        }
+        session.finish().await
+    });
+    while !matches!(*state.borrow(), TraversalRecoveryState::Recovering { .. }) {
+        state.changed().await.unwrap();
+    }
+    cancel.cancel();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), draining)
+            .await
+            .unwrap()
+            .unwrap(),
+        Ok(TraversalOutcome::Cancelled)
+    ));
+    assert!(status.failure_signal().failure().is_none());
+}
+
+#[tokio::test]
+async fn checkpoint_recovery_marks_the_actual_last_cursor_before_the_new_suffix() {
+    let request = TraversalRequest::new(StoragePath::root()).resumable(Resumable::On {
+        every: Duration::ZERO,
+    });
+    let (mut session, _) = recoverable_traversal(
+        &storage(true, true),
+        request,
+        policy(),
+        reconnect(false, Arc::new(AtomicUsize::new(0))),
+    )
+    .unwrap();
+    let (mut last, mut resumed, mut suffix) = (None, false, false);
+    while let Some(item) = session.next_item().await {
+        match item {
+            TraversalItem::Checkpoint(checkpoint) => last = Some(*checkpoint),
+            TraversalItem::Resumed(event) => {
+                assert!(last.is_some());
+                assert_eq!(event.checkpoint, last);
+                assert_eq!(event.attempt, 2);
+                resumed = true;
+            }
+            TraversalItem::Entry(_) if resumed => suffix = true,
+            _ => {}
+        }
+    }
+    assert!(resumed && suffix);
+    assert!(matches!(
+        session.finish().await,
+        Ok(TraversalOutcome::Completed(_))
+    ));
 }
 
 fn reconnect(fails: bool, calls: Arc<AtomicUsize>) -> TraversalReconnect {
@@ -316,6 +429,7 @@ async fn a_hanging_reconnect_uses_the_callers_window_and_keeps_the_original_rese
     for window in [Duration::from_millis(40), Duration::from_millis(140)] {
         let connect: TraversalReconnect = Arc::new(|| pending().boxed());
         let selected = TraversalRecoveryPolicy {
+            resume: TraversalRecoveryResume::Checkpoint,
             recovery_window: window,
             ..policy()
         };
@@ -371,6 +485,7 @@ async fn cancellation_during_recovery_is_cancelled_without_a_final_network_fault
 async fn native_faults_recover_even_without_an_operation_timeout() {
     let calls = Arc::new(AtomicUsize::new(0));
     let selected = TraversalRecoveryPolicy {
+        resume: TraversalRecoveryResume::Checkpoint,
         operation_timeout: None,
         ..policy()
     };
@@ -465,6 +580,7 @@ fn waiting_recovery() -> (Recovery, channel::ItemReceiver, ScanFailureSignal) {
     });
     (
         Recovery {
+            attempt: 1,
             counters: Arc::default(),
             request: TraversalRequest::new(StoragePath::root()),
             policy: policy(),

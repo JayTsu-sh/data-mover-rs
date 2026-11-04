@@ -42,6 +42,10 @@ use crate::model::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TraversalItem {
+    /// 旧 attempt 已结束；后续项从选定检查点（或根）重新交付。
+    /// 扫描统计回到该检查点确认的状态；Blocks 对应完整目录前缀。
+    /// 故障和诊断累计不回退。
+    Resumed(Box<TraversalResume>),
     Entry(Box<ObservedEntry>),
     /// A child that could not be observed, or a directory that could not be listed; see
     /// [`ScanFailure::scope`].
@@ -55,9 +59,18 @@ pub enum TraversalItem {
     DirectoryStatistics(Box<super::DirectoryStatistics>),
     /// A position a later traversal can resume from ([`super::TraversalRequest::resume_from`]).
     /// Only a traversal with checkpoints on ([`super::Resumable::On`]) emits it: about once per
-    /// interval, and as its last item when it ends early (unless its position was too large to
-    /// record). Persist it once everything received before it is committed.
+    /// interval. Under Blocks, periodic and final checkpoints only appear at complete block
+    /// boundaries; an interrupted partial delivery retains the previously confirmed checkpoint.
+    /// Unordered also attempts a final checkpoint when ending early. Oversized positions may
+    /// suppress a checkpoint in either order. Persist it after committing the preceding output.
     Checkpoint(Box<Checkpoint>),
+}
+
+/// 自动恢复实际选择的起点，不能由接收方猜测被重放的条目数。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraversalResume {
+    pub attempt: u64,
+    pub checkpoint: Option<Checkpoint>,
 }
 
 /// A metadata observation failure retained on an entry or one historical version.

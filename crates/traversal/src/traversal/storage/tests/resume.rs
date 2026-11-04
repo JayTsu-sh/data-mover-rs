@@ -485,7 +485,7 @@ async fn cancelling_pauses_and_a_chain_of_resumes_completes_the_tree() {
                 .output_capacity(NonZeroUsize::new(buffered).unwrap_or(NonZeroUsize::MIN));
             let full = setup.tree.all_entries();
             let case = format!("{order:?} c={inflight} b={buffered}");
-            let make = || request(order, inflight).resumable(Resumable::on());
+            let make = || request(order, inflight).resumable(every_chance());
             let mut delivered = Vec::new();
             let mut from: Option<Checkpoint> = None;
             let mut rounds = 0;
@@ -501,17 +501,11 @@ async fn cancelling_pauses_and_a_chain_of_resumes_completes_the_tree() {
                     break;
                 }
                 assert_eq!(outcome, Ok(TraversalOutcome::Cancelled), "{case}");
-                let Some(TraversalItem::Checkpoint(last)) = items.last() else {
-                    panic!(
-                        "{case}: the last item of a cancelled resumable traversal is no checkpoint"
-                    )
-                };
-                assert_eq!(
-                    checkpoints(&items).len(),
-                    1,
-                    "{case}: one checkpoint, the final one"
+                from = checkpoints(&items).pop().map(|(_, checkpoint)| checkpoint);
+                assert!(
+                    from.is_some(),
+                    "{case}: no complete directory boundary was checkpointed"
                 );
-                from = Some((**last).clone());
             }
             assert!(rounds > 2, "{case}: cancelled too late to test anything");
             assert_no_loss(&delivered, &[], &full, &case);
@@ -569,12 +563,13 @@ async fn a_terminal_failure_ends_with_a_checkpoint_to_resume_from() {
             matches!(outcome, Err(TraversalTerminalFailure::Session(_))),
             "{order:?}: {outcome:?}"
         );
-        let Some(TraversalItem::Checkpoint(last)) = items.last() else {
-            panic!("{order:?}: no final checkpoint after the failure")
-        };
+        let saved = checkpoints(&items).pop().map(|(_, checkpoint)| checkpoint);
+        if order == TraversalOrder::Unordered {
+            assert!(saved.is_some());
+        }
         setup.tree.break_at(None);
-        let (resumed, outcome) =
-            run(&setup.source, make().resume_from((**last).clone()), None).await;
+        let selected = saved.map_or_else(make, |checkpoint| make().resume_from(checkpoint));
+        let (resumed, outcome) = run(&setup.source, selected, None).await;
         assert!(matches!(outcome, Ok(TraversalOutcome::Completed(_))));
         assert_no_loss(
             &entry_paths(&items),

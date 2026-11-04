@@ -266,7 +266,11 @@ async fn relisted_child_failure_precedes_a_later_session_failure() {
             matches!(outcome, Err(TraversalTerminalFailure::Session(_))),
             "mode {mode}: {outcome:?}"
         );
-        assert!(matches!(items.last(), Some(TraversalItem::Checkpoint(_))));
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, TraversalItem::Checkpoint(_)))
+        );
     }
 }
 

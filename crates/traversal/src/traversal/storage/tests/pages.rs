@@ -398,6 +398,7 @@ async fn an_observation_failing_in_the_listing_task_still_lists_the_directory_in
             TraversalItem::DirectoryListed(done) => listed.push(done.path.as_str().to_owned()),
             TraversalItem::Checkpoint(_)
             | TraversalItem::DirectoryStatistics(_)
+            | TraversalItem::Resumed(_)
             | TraversalItem::ObservationFailure(_) => {}
         }
     }
