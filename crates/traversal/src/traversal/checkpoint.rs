@@ -56,8 +56,9 @@ pub enum Resumable {
     /// early — cancelled, or failed while it could still send one — unless its position is too
     /// large to record (more than a million directories waiting at once), when the last one sent
     /// stays the one to resume from. Under [`TraversalOrder::Blocks`] a periodic checkpoint only
-    /// comes between two blocks; the final one may follow part of a block, whose rest a
-    /// resumed traversal delivers with the whole block again.
+    /// comes between two blocks. A large flat directory can exceed `every` without a checkpoint.
+    /// 最终检查点也仅在完整块边界产生。目录中途结束时，继续使用此前的检查点，
+    /// 回滚并重放其后的全部输出；首次目录完成前可以没有检查点。
     ///
     /// `every` is a lower bound checked as the traversal goes (after each page, or each flush):
     /// `Duration::ZERO` checkpoints at every chance, which suits tests, not production.
@@ -67,7 +68,7 @@ pub enum Resumable {
     ///
     /// **Cancellation drains.** With checkpoints on, cancelling does not drop what the traversal
     /// already produced: [`TraversalSession::next_item`](super::TraversalSession::next_item)
-    /// keeps returning it, then the final checkpoint, then `None`, and
+    /// keeps returning it, then a final checkpoint when at a valid boundary, then `None`, and
     /// [`TraversalSession::finish`](super::TraversalSession::finish) returns `Cancelled`. The
     /// consumer drains to `None` (or drops the session); cancelling is pausing.
     On {

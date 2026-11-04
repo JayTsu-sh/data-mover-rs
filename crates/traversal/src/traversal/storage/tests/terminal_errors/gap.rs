@@ -139,7 +139,7 @@ fn request() -> TraversalRequest {
         .observation_plan(ObservationPlan::default().with_tags(ObservationMode::BestEffort))
 }
 
-fn assert_terminal_details(items: &[TraversalItem]) -> Checkpoint {
+fn assert_terminal_details(items: &[TraversalItem]) -> Option<Checkpoint> {
     assert!(!items.iter().any(|item| matches!(
         item,
         TraversalItem::Entry(_) | TraversalItem::DirectoryListed(_)
@@ -169,10 +169,10 @@ fn assert_terminal_details(items: &[TraversalItem]) -> Checkpoint {
             ("ready", SourceVersion::Current)
         ]
     );
-    let Some(TraversalItem::Checkpoint(checkpoint)) = items.last() else {
-        panic!("{items:?}")
-    };
-    (**checkpoint).clone()
+    items.iter().find_map(|item| match item {
+        TraversalItem::Checkpoint(checkpoint) => Some((**checkpoint).clone()),
+        _ => None,
+    })
 }
 
 fn assert_root_position(checkpoint: &Checkpoint) {
@@ -210,10 +210,13 @@ async fn terminal_details_cross_a_gap_without_completing_or_skipping_it() {
         "{outcome:?}"
     );
     let checkpoint = assert_terminal_details(&items);
-    assert_root_position(&checkpoint);
+    if let Some(checkpoint) = &checkpoint {
+        assert_root_position(checkpoint);
+    }
     metadata.failing.store(false, Ordering::SeqCst);
     metadata.gate.add_permits(2);
-    let (resumed, outcome) = drain(source.traverse(request().resume_from(checkpoint))).await;
+    let selected = checkpoint.map_or_else(request, |checkpoint| request().resume_from(checkpoint));
+    let (resumed, outcome) = drain(source.traverse(selected)).await;
     assert!(
         matches!(outcome, Ok(TraversalOutcome::Completed(_))),
         "{outcome:?}"

@@ -82,6 +82,88 @@ fn checkpoints(items: &[TraversalItem]) -> Vec<(usize, Checkpoint)> {
         .collect()
 }
 
+/// 小通道会强迫一次 ready flush 处理多个目录块；取消不能让已提交前缀被重放。
+#[tokio::test]
+async fn blocks_checkpoint_matches_the_completed_prefix_under_backpressure() -> io::Result<()> {
+    let root = tempfile::tempdir()?;
+    for directory in ["a", "b", "c"] {
+        std::fs::create_dir(root.path().join(directory))?;
+        for index in 0..17 {
+            std::fs::write(root.path().join(format!("{directory}/{index}")), b"x")?;
+        }
+    }
+    let source = source(root.path())?.output_capacity(NonZeroUsize::MIN);
+    let (all, outcome) = run(&source, request(TraversalOrder::Blocks, 64), None).await?;
+    assert!(matches!(outcome, Ok(TraversalOutcome::Completed(_))));
+    let expected: BTreeSet<_> = entries(&all).into_iter().collect();
+    for stop in [1, 2, 3, 4, 9, 18, 19, 20, 21, 35, 51] {
+        let selected = request(TraversalOrder::Blocks, 64).resumable(Resumable::On {
+            every: Duration::ZERO,
+        });
+        let (items, _) = run(&source, selected, Some(stop)).await?;
+        let (checkpoint, prefix) = confirmed_prefix(&items);
+        let resume = request(TraversalOrder::Blocks, 64);
+        let resume = match checkpoint {
+            Some(checkpoint) => resume.resume_from(checkpoint),
+            None => resume,
+        };
+        let (resumed, outcome) = run(&source, resume, None).await?;
+        assert!(matches!(outcome, Ok(TraversalOutcome::Completed(_))));
+        let suffix: BTreeSet<_> = entries(&resumed).into_iter().collect();
+        assert!(
+            prefix.is_disjoint(&suffix),
+            "completed prefix replayed after cancellation at {stop}"
+        );
+        assert_eq!(
+            prefix.union(&suffix).cloned().collect::<BTreeSet<_>>(),
+            expected
+        );
+    }
+    Ok(())
+}
+
+fn confirmed_prefix(items: &[TraversalItem]) -> (Option<Checkpoint>, BTreeSet<(String, String)>) {
+    let mut prefix = BTreeSet::new();
+    let mut pending = Vec::new();
+    let mut last = (None, BTreeSet::new());
+    for item in items {
+        match item {
+            TraversalItem::Entry(_) => pending.extend(entries(std::slice::from_ref(item))),
+            TraversalItem::DirectoryListed(listed) if listed.outcome.is_complete() => {
+                prefix.extend(pending.drain(..));
+            }
+            TraversalItem::Checkpoint(checkpoint) => {
+                last = (Some((**checkpoint).clone()), prefix.clone());
+            }
+            _ => {}
+        }
+    }
+    last
+}
+
+/// 平铺目录未结束时，即使检查点间隔已到且用户取消，也不提交半个目录。
+#[tokio::test]
+async fn cancelling_inside_the_first_flat_block_retains_no_checkpoint() -> io::Result<()> {
+    let root = tempfile::tempdir()?;
+    for index in 0..128 {
+        std::fs::write(root.path().join(format!("f{index}")), b"x")?;
+    }
+    let source = source(root.path())?.output_capacity(NonZeroUsize::MIN);
+    let selected = request(TraversalOrder::Blocks, 1).resumable(Resumable::On {
+        every: Duration::ZERO,
+    });
+    let (items, outcome) = run(&source, selected, Some(1)).await?;
+    assert!(matches!(outcome, Ok(TraversalOutcome::Cancelled)));
+    assert!(!entries(&items).is_empty());
+    assert!(entries(&items).len() < 128);
+    let first_entry = items
+        .iter()
+        .position(|item| matches!(item, TraversalItem::Entry(_)))
+        .unwrap_or(0);
+    assert!(checkpoints(&items).iter().all(|(at, _)| *at < first_entry));
+    Ok(())
+}
+
 /// A tree with depth (a 30-level chain), a directory of `wide` files (wider than a page by
 /// default), empty directories, a symlink and ordinary nesting.
 fn tree(root: &Path, wide: usize) -> io::Result<()> {
@@ -186,7 +268,11 @@ async fn a_chain_of_cancels_and_resumes_covers_a_real_tree() -> io::Result<()> {
     let (items, _) = run(&source, request(TraversalOrder::Blocks, 4), None).await?;
     let full = set(&entries(&items));
     for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
-        let make = || request(order, 4).resumable(Resumable::on());
+        let make = || {
+            request(order, 4).resumable(Resumable::On {
+                every: Duration::ZERO,
+            })
+        };
         let (mut delivered, mut rounds) = (Vec::new(), 0);
         let mut from: Option<Checkpoint> = None;
         loop {
@@ -200,10 +286,11 @@ async fn a_chain_of_cancels_and_resumes_covers_a_real_tree() -> io::Result<()> {
             if matches!(outcome, Ok(TraversalOutcome::Completed(_))) {
                 break;
             }
-            match items.last() {
-                Some(TraversalItem::Checkpoint(last)) => from = Some((**last).clone()),
-                other => panic!("{order:?}: ended with {other:?}"),
-            }
+            from = checkpoints(&items).pop().map(|(_, checkpoint)| checkpoint);
+            assert!(
+                from.is_some(),
+                "{order:?}: no complete directory block before cancellation"
+            );
         }
         let duplicates = no_loss(&delivered, &full, &format!("{order:?}"));
         eprintln!(
@@ -235,11 +322,15 @@ async fn a_tree_changed_between_runs_resumes_like_a_scan_during_change() -> io::
         let root = tempfile::tempdir()?;
         tree(root.path(), DEFAULT_PAGE_HINT.get() + 50)?;
         let source = source(root.path())?;
-        let make = || request(order, 1).resumable(Resumable::on());
-        let (items, _) = run(&source, make(), Some(25)).await?;
-        let Some(TraversalItem::Checkpoint(last)) = items.last() else {
-            panic!("{order:?}: no final checkpoint")
+        let make = || {
+            request(order, 1).resumable(Resumable::On {
+                every: Duration::ZERO,
+            })
         };
+        let (items, _) = run(&source, make(), Some(25)).await?;
+        let (_, last) = checkpoints(&items)
+            .pop()
+            .ok_or_else(|| io::Error::other("no complete block checkpoint"))?;
         let seen = set(&entries(&items));
         let touched = parents(&seen);
         std::fs::remove_dir_all(root.path().join("chain"))?;
@@ -249,7 +340,7 @@ async fn a_tree_changed_between_runs_resumes_like_a_scan_during_change() -> io::
         if let Some(dir) = &added {
             std::fs::write(root.path().join(dir).join("added"), b"x")?;
         }
-        let (resumed, outcome) = run(&source, make().resume_from((**last).clone()), None).await?;
+        let (resumed, outcome) = run(&source, make().resume_from(last), None).await?;
         assert!(
             matches!(outcome, Ok(TraversalOutcome::Completed(_))),
             "{order:?}"

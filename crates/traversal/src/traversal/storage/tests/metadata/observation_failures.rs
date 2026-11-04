@@ -438,7 +438,10 @@ async fn an_earlier_version_error_is_visible_before_a_later_version_ends_the_ses
             item,
             TraversalItem::Entry(_) | TraversalItem::DirectoryListed(_)
         )));
-        assert!(matches!(items.last(), Some(TraversalItem::Checkpoint(_))));
+        assert_eq!(
+            matches!(items.last(), Some(TraversalItem::Checkpoint(_))),
+            order == TraversalOrder::Unordered
+        );
         assert!(matches!(outcome, Err(TraversalTerminalFailure::Session(_))));
     }
 }

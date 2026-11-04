@@ -155,7 +155,7 @@ async fn page_errors_are_delivered_before_a_later_session_failure() {
         for inline in [true, false] {
             for resumable in [false, true] {
                 let (items, outcome) = drain(session(order, inline, resumable)).await;
-                assert_page_prefix(&items, resumable);
+                assert_page_prefix(&items, resumable && order == TraversalOrder::Unordered);
                 if inline {
                     assert_known_tail_errors(&items);
                 }

@@ -101,6 +101,7 @@ async fn healthy_replay_slower_than_recovery_window_reaches_the_failed_target() 
         TraversalRequest::new(StoragePath::root())
             .observation_plan(ObservationPlan::default().with_tags(ObservationMode::BestEffort)),
         TraversalRecoveryPolicy {
+            resume: TraversalRecoveryResume::Checkpoint,
             operation_timeout: Some(Duration::from_secs(1)),
             ..policy()
         },
@@ -161,6 +162,7 @@ async fn a_listing_target_unverifiable_within_the_window_fails_safely() {
         &initial,
         TraversalRequest::new(StoragePath::root()),
         TraversalRecoveryPolicy {
+            resume: TraversalRecoveryResume::Checkpoint,
             operation_timeout: Some(Duration::from_secs(1)),
             ..policy()
         },
@@ -200,6 +202,7 @@ async fn a_new_failure_after_verified_recovery_has_its_own_window() {
         TraversalRequest::new(StoragePath::root())
             .observation_plan(ObservationPlan::default().with_tags(ObservationMode::BestEffort)),
         TraversalRecoveryPolicy {
+            resume: TraversalRecoveryResume::Checkpoint,
             operation_timeout: Some(Duration::from_secs(1)),
             ..policy()
         },
@@ -269,6 +272,7 @@ async fn verified_target_ends_recovering_before_slow_checkpoint_rebuild() {
         TraversalRequest::new(StoragePath::root())
             .observation_plan(ObservationPlan::default().with_tags(ObservationMode::BestEffort)),
         TraversalRecoveryPolicy {
+            resume: TraversalRecoveryResume::Checkpoint,
             operation_timeout: Some(Duration::from_secs(1)),
             ..policy()
         },

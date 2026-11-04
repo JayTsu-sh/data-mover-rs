@@ -76,6 +76,7 @@ async fn an_undescribable_child_is_a_child_failure_in_a_complete_listing()
             }
             TraversalItem::Checkpoint(_)
             | TraversalItem::DirectoryStatistics(_)
+            | TraversalItem::Resumed(_)
             | TraversalItem::ObservationFailure(_) => {}
         }
     }
@@ -128,6 +129,7 @@ async fn a_listing_failing_after_the_first_page_is_interrupted()
             TraversalItem::DirectoryListed(listed) => outcome = Some(listed.outcome),
             TraversalItem::Checkpoint(_)
             | TraversalItem::DirectoryStatistics(_)
+            | TraversalItem::Resumed(_)
             | TraversalItem::ObservationFailure(_) => {}
         }
     }

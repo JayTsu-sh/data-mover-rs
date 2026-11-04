@@ -168,7 +168,7 @@ impl Output {
 
     /// Whether the last item delivered closed a block.
     pub(super) const fn between_blocks(&self) -> bool {
-        self.between_blocks
+        self.between_blocks && !self.cut
     }
 
     /// Every slot below this one reached the session.
@@ -412,6 +412,7 @@ pub(super) fn terminal_errors(item: ChildItem, batch: &mut Vec<TraversalItem>) {
         ChildItem::Item(
             TraversalItem::DirectoryListed(_)
             | TraversalItem::DirectoryStatistics(_)
+            | TraversalItem::Resumed(_)
             | TraversalItem::Checkpoint(_),
         ) => {}
     }
@@ -494,6 +495,7 @@ pub(super) fn tally_child(
         | TraversalItem::ObservationFailure(_)
         | TraversalItem::DirectoryListed(_)
         | TraversalItem::DirectoryStatistics(_)
+        | TraversalItem::Resumed(_)
         | TraversalItem::Checkpoint(_) => {}
     }
     Tallied::One(item)

@@ -176,8 +176,7 @@ async fn a_checkpoint_is_the_position_before_what_was_delivered() {
     assert_eq!(resumed, full);
 }
 
-/// Cancelled before a first period has passed, the final checkpoint still follows what was
-/// delivered — not the start — and resuming from it loses nothing.
+/// 首次间隔前取消，只有完整块边界可以追加最终检查点；否则从根重扫也不能丢条目。
 #[tokio::test]
 async fn cancelling_before_the_first_period_resumes_from_the_last_position() {
     let setup = setup(Tree::generate(4, 3, 3, 2), false);
@@ -185,15 +184,14 @@ async fn cancelling_before_the_first_period_resumes_from_the_last_position() {
     let make = || request(TraversalOrder::Blocks, 3).resumable(Resumable::on());
     let (items, outcome) = run(&setup.source, make(), Some(40)).await;
     assert_eq!(outcome, Ok(TraversalOutcome::Cancelled));
-    let Some(TraversalItem::Checkpoint(last)) = items.last() else {
-        panic!("no final checkpoint")
+    let resumed = match checkpoints(&items).pop() {
+        Some((at, checkpoint)) => {
+            assert!(at == 0 || matches!(items[at - 1], TraversalItem::DirectoryListed(_)));
+            make().resume_from(checkpoint)
+        }
+        None => make(),
     };
-    let chain = position(&make(), last);
-    assert!(
-        chain.len() > 1,
-        "the position did not follow the output: {chain:?}"
-    );
-    let (resumed, _) = run(&setup.source, make().resume_from((**last).clone()), None).await;
+    let (resumed, _) = run(&setup.source, resumed, None).await;
     let union: BTreeSet<String> = entry_paths(&items)
         .into_iter()
         .chain(entry_paths(&resumed))
@@ -202,7 +200,7 @@ async fn cancelling_before_the_first_period_resumes_from_the_last_position() {
 }
 
 /// A periodic checkpoint never splits a block: each comes right after a `DirectoryListed` (or
-/// before any item); only the final one of a cancelled traversal may follow part of a block.
+/// before any item). 最终检查点也遵守相同边界。
 #[tokio::test]
 async fn periodic_checkpoints_come_between_blocks() {
     for (inflight, buffered) in [(1, 1), (4, 2), (64, 64)] {

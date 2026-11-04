@@ -25,7 +25,7 @@ pub use configuration::TraversalConfigurationError;
 pub use counts::{BlockCounts, ScanTotals};
 pub use events::{
     Checkpoint, DirectoryListed, FailureScope, ListingOutcome, ObservationFailure, ScanFailure,
-    TraversalItem,
+    TraversalItem, TraversalResume,
 };
 pub use statistics::{DirectoryStatistics, EntryKindCounts};
 pub use storage::StorageTraversalSource;
@@ -442,6 +442,7 @@ pub const fn is_marker(item: &TraversalItem) -> bool {
         item,
         TraversalItem::DirectoryListed(_)
             | TraversalItem::DirectoryStatistics(_)
+            | TraversalItem::Resumed(_)
             | TraversalItem::Checkpoint(_)
     )
 }
@@ -663,6 +664,7 @@ pub use scan::{RemoteScanFailure, RemoteScanFailureKind, ScanFailureSignal, Scan
 
 mod recovery;
 pub use recovery::{
-    TraversalReconnect, TraversalRecoveryCounters, TraversalRecoveryPolicy, TraversalRecoveryState,
-    TraversalRecoveryStatus, recoverable_traversal,
+    TraversalReconnect, TraversalRecoveryCounters, TraversalRecoveryPolicy,
+    TraversalRecoveryResume, TraversalRecoveryState, TraversalRecoveryStatus,
+    recoverable_traversal,
 };

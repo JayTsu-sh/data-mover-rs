@@ -45,6 +45,7 @@ pub(super) fn render_counts(counts: &BlockCounts) -> String {
 /// One line per item, so a whole event sequence can be asserted at once.
 pub(super) fn render(item: &TraversalItem) -> String {
     match item {
+        TraversalItem::Resumed(_) => panic!("raw traversal cannot resume an attempt"),
         TraversalItem::Entry(entry) => format!("entry {}", name(entry.path())),
         TraversalItem::Failure(failure) => format!(
             "failure {} {}",
@@ -111,6 +112,7 @@ pub(super) fn assert_well_formed(items: &[TraversalItem], outcome: &TraversalOut
     let mut listing_failure: Option<&str> = None;
     for item in items {
         match item {
+            TraversalItem::Resumed(_) => panic!("raw traversal cannot resume an attempt"),
             TraversalItem::Entry(_) => emitted += 1,
             TraversalItem::Failure(failure) => match failure.scope {
                 FailureScope::Child => failed += 1,
@@ -424,6 +426,7 @@ async fn a_directory_that_cannot_be_listed_is_a_listing_failure_and_not_complete
         ]
     );
     let failure = items.iter().find_map(|item| match item {
+        TraversalItem::Resumed(_) => panic!("raw traversal cannot resume an attempt"),
         TraversalItem::Failure(failure) => Some(failure),
         _ => None,
     });
@@ -438,6 +441,7 @@ async fn a_directory_that_cannot_be_listed_is_a_listing_failure_and_not_complete
         "{failure:?}"
     );
     let sub = items.iter().find_map(|item| match item {
+        TraversalItem::Resumed(_) => panic!("raw traversal cannot resume an attempt"),
         TraversalItem::DirectoryListed(listed) if listed.path.as_str() == "sub" => {
             Some(listed.outcome)
         }

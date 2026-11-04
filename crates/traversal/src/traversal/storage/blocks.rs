@@ -130,8 +130,7 @@ async fn traverse(
     drop(arrivals);
     let terminal = outcome(&runtime, result, &state);
     if !matches!(terminal, Ok(TraversalOutcome::Completed(_))) {
-        let delivered = state.output.delivered();
-        resume::blocks::final_checkpoint(&runtime, positions.as_ref(), delivered).await;
+        resume::blocks::final_checkpoint(&runtime, positions.as_ref(), &state.output).await;
     }
     terminal
 }

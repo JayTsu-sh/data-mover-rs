@@ -5,7 +5,7 @@ use std::{task::Poll, time::Duration};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-use super::{Outcome, Recovery};
+use super::{Outcome, Recovery, TraversalRecoveryResume};
 use crate::model::{FailureClass, StoragePath};
 use crate::traversal::{
     ScanFailureSignal, StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalSession,
@@ -128,7 +128,8 @@ impl Recovery {
     }
 
     fn drains(&self) -> bool {
-        self.request.resumable.every().is_some()
+        self.policy.resume == TraversalRecoveryResume::Checkpoint
+            && self.request.resumable.every().is_some()
     }
 
     pub(super) async fn forward(
