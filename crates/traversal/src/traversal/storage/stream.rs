@@ -30,6 +30,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use super::observe::{Listed, observe_listed};
 use super::output::BlockFacts;
+use super::statistics::PageStatistics;
 use super::{
     Deferred, DescendOutcome, DirectoryWork, Shared, awaits_slot, descend_outcome, entry_candidate,
     entry_name, immediate_decision, throttling_scoped_to,
@@ -96,6 +97,7 @@ impl Slot {
 /// child a decision made then hides never becomes one: it is only counted.
 pub(super) enum Child {
     Observe {
+        kind: EntryKind,
         listed: Listed,
         deferred: Option<Deferred>,
     },
@@ -121,6 +123,7 @@ impl Child {
 pub(super) struct Batch {
     pub(super) failures: Vec<EntryOperationFailure>,
     pub(super) children: VecDeque<Child>,
+    pub(super) statistics: PageStatistics,
 }
 
 /// A prepared page.
@@ -283,6 +286,7 @@ pub(super) fn prepare(shared: &Shared, work: &DirectoryWork, page: ListingPage) 
         batch: Batch {
             failures,
             children: VecDeque::with_capacity(entries.len()),
+            statistics: PageStatistics::default(),
         },
         slots: Vec::new(),
         facts: BlockFacts {
@@ -292,6 +296,7 @@ pub(super) fn prepare(shared: &Shared, work: &DirectoryWork, page: ListingPage) 
             ..BlockFacts::default()
         },
     };
+    prepared.batch.statistics.vanished.unknown = prepared.facts.vanished;
     for (descriptor, hint) in entries {
         prepare_child(shared, work, descriptor, hint, &mut prepared);
     }
@@ -317,8 +322,11 @@ fn prepare_child(
         page.tally(shared, kind, path, work.child_depth, decision, hint);
         if decision.emit {
             let listed = observe_listed(shared.metadata.as_ref(), descriptor, plan);
-            page.keep(listed, None);
+            page.keep(kind, listed, None);
         } else {
+            page.batch
+                .statistics
+                .hide(kind, kind == EntryKind::Directory && !decision.descend);
             page.hide_with_failures(super::output::metadata_failures(
                 &descriptor.path,
                 descriptor.version(),
@@ -336,8 +344,11 @@ fn prepare_child(
         .decide(true, &entry_candidate(&shared.request.root, entry));
     page.tally(shared, kind, entry.path(), work.child_depth, decision, hint);
     if decision.emit {
-        page.keep(listed, None);
+        page.keep(kind, listed, None);
     } else {
+        page.batch
+            .statistics
+            .hide(kind, kind == EntryKind::Directory && !decision.descend);
         page.hide_with_failures(super::output::observation_failures(entry));
     }
 }
@@ -356,10 +367,12 @@ fn listed_path(listed: &Listed) -> Option<&StoragePath> {
 
 impl Page {
     /// Files a child the output will show.
-    fn keep(&mut self, listed: Listed, deferred: Option<Deferred>) {
-        self.batch
-            .children
-            .push_back(Child::Observe { listed, deferred });
+    fn keep(&mut self, kind: EntryKind, listed: Listed, deferred: Option<Deferred>) {
+        self.batch.children.push_back(Child::Observe {
+            kind,
+            listed,
+            deferred,
+        });
     }
 
     /// Counts a child a decision made here keeps out of the output.
@@ -401,7 +414,7 @@ impl Page {
                 hint,
             });
         }
-        self.keep(listed, Some(deferred));
+        self.keep(kind, listed, Some(deferred));
     }
 
     /// Records where a decided child's subtree goes.
@@ -416,9 +429,13 @@ impl Page {
     ) {
         match descend_outcome(&shared.request, kind, path, depth, decision) {
             DescendOutcome::Into(below) => self.slots.push(Slot::Descend(below.with_hint(hint))),
-            DescendOutcome::Pruned => self.facts.pruned = self.facts.pruned.saturating_add(1),
+            DescendOutcome::Pruned => {
+                self.facts.pruned = self.facts.pruned.saturating_add(1);
+                self.batch.statistics.pruned = self.batch.statistics.pruned.saturating_add(1);
+            }
             DescendOutcome::Truncated => {
                 self.facts.truncated = self.facts.truncated.saturating_add(1);
+                self.batch.statistics.truncated = self.batch.statistics.truncated.saturating_add(1);
             }
             DescendOutcome::NotDirectory => {}
         }

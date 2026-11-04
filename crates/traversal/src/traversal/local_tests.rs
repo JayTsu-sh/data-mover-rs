@@ -86,7 +86,8 @@ fn entry_paths(items: &[TraversalItem]) -> Vec<String> {
             TraversalItem::Failure(_)
             | TraversalItem::ObservationFailure(_)
             | TraversalItem::DirectoryListed(_)
-            | TraversalItem::Checkpoint(_) => None,
+            | TraversalItem::Checkpoint(_)
+            | TraversalItem::DirectoryStatistics(_) => None,
         })
         .collect()
 }
@@ -764,3 +765,6 @@ async fn a_directory_read_failing_after_the_first_page_is_interrupted() -> io::R
     assert!(totals.is_balanced());
     Ok(())
 }
+
+#[path = "statistics_local_tests.rs"]
+mod statistics;

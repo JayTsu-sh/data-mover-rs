@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 data-mover-model = { path = "../model" }
 data-mover-storage-core = { path = "../storage-core" }
 async-trait = { workspace = true }
@@ -24,6 +25,7 @@ tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 filetime = { workspace = true }
 data-mover-storage-core = { path = "../storage-core", features = ["test-support"] }
 data-mover-backend-local = { path = "../backend-local", features = ["test-support"] }

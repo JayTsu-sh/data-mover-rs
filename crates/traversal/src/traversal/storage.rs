@@ -31,6 +31,7 @@ mod output;
 #[cfg(test)]
 mod residency;
 mod resume;
+mod statistics;
 mod stream;
 mod unordered;
 
@@ -633,6 +634,8 @@ fn settle_entry(
     });
     let item = if decision.emit {
         ChildItem::Item(TraversalItem::Entry(entry))
+    } else if entry.kind() == EntryKind::Directory && !decision.descend {
+        ChildItem::ExcludedDirectory(output::observation_failures(&entry))
     } else {
         ChildItem::Filtered(output::observation_failures(&entry))
     };

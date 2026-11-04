@@ -500,6 +500,7 @@ pub(super) type Observed = (
     u64,
     Result<Box<ObservedEntry>, ObservationError>,
     Option<Deferred>,
+    EntryKind,
 );
 
 /// A block's line to its observation task. Dropping it tells the task no more children come.
@@ -629,8 +630,9 @@ async fn observe_block(
                 // holds no handle, so it is simply not started.
                 Some(_) if shared.request.cancel.is_cancelled() => {}
                 Some(Job { sequence, descriptor, deferred }) => inflight.push(async move {
+                    let kind = descriptor.kind;
                     let result = observe(namespace, metadata, *descriptor, plan, cancel).await;
-                    (sequence, result.map(Box::new), deferred)
+                    (sequence, result.map(Box::new), deferred, kind)
                 }),
                 None => open = false,
             },

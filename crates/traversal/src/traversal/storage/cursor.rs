@@ -36,10 +36,11 @@ use tokio::sync::Semaphore;
 use super::DirectoryWork;
 use super::blocks::{Runtime, State, admit, queue_block_end, queue_failure};
 use super::observe::{Feed, Observations};
-use super::output::BlockFacts;
+use super::output::{BlockFacts, Settled};
 #[cfg(test)]
 use super::residency::Residency;
 use super::resume::positions::{Level, Positions};
+use super::statistics::PageStatistics;
 use super::stream::{self, Arrival, ArrivalSender, Batch, Child, ListingId, Slot};
 use crate::model::{EntryOperationFailure, FailureClass, StoragePath};
 use crate::storage::DescentHint;
@@ -137,6 +138,7 @@ struct Frame {
     listing: Option<(ListingId, Listing)>,
     /// Children of the page being admitted, in listing order.
     children: VecDeque<Child>,
+    page_statistics: Option<PageStatistics>,
     /// The block's observation task, from its first child that needs I/O until the block closes.
     feed: Option<Feed>,
     /// Whether the block's end has been queued.
@@ -151,6 +153,7 @@ impl Frame {
             work,
             listing: None,
             children: VecDeque::new(),
+            page_statistics: None,
             feed: None,
             closed: false,
             level: None,
@@ -532,7 +535,20 @@ fn next_page_or_close(
     let Some((_, listing)) = frame.listing.as_mut() else {
         return Err(TraversalTerminalFailure::Internal);
     };
+    if let Some(statistics) = frame.page_statistics.take() {
+        let sequence = state.allocate()?;
+        state.output.settle(
+            sequence,
+            Settled::PageEnd {
+                path: frame.work.path.clone(),
+                statistics,
+            },
+        );
+    }
     if let Some(batch) = listing.pages.pop_front() {
+        if runtime.request.directory_statistics {
+            frame.page_statistics = Some(batch.statistics);
+        }
         // Room for the listing's next page, now that this one is the cursor's.
         listing.credit.add_permits(1);
         for failure in batch.failures {

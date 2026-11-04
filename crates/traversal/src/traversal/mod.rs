@@ -18,6 +18,7 @@ mod configuration;
 mod counts;
 mod events;
 pub mod pairing;
+mod statistics;
 mod storage;
 pub use checkpoint::{Resumable, ResumeRefusal};
 pub use configuration::TraversalConfigurationError;
@@ -26,6 +27,7 @@ pub use events::{
     Checkpoint, DirectoryListed, FailureScope, ListingOutcome, ObservationFailure, ScanFailure,
     TraversalItem,
 };
+pub use statistics::{DirectoryStatistics, EntryKindCounts};
 pub use storage::StorageTraversalSource;
 #[cfg(test)]
 mod cifs_tests;
@@ -198,6 +200,8 @@ pub trait TraversalFilter: fmt::Debug + Send + Sync {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct TraversalRequest {
+    /// 交付逐页目录绝对统计；普通遍历默认关闭。
+    pub directory_statistics: bool,
     pub root: StoragePath,
     pub order: TraversalOrder,
     pub max_inflight_operations: NonZeroUsize,
@@ -322,6 +326,7 @@ impl TraversalRequest {
     #[must_use]
     pub fn new(root: StoragePath) -> Self {
         Self {
+            directory_statistics: false,
             root,
             order: TraversalOrder::default(),
             max_inflight_operations: DEFAULT_MAX_INFLIGHT,
@@ -332,6 +337,13 @@ impl TraversalRequest {
             resumable: Resumable::Off,
             resume_from: None,
         }
+    }
+
+    /// 是否交付额外的目录统计快照，不改变列举、过滤或后端请求。
+    #[must_use]
+    pub const fn directory_statistics(mut self, enabled: bool) -> Self {
+        self.directory_statistics = enabled;
+        self
     }
 
     /// The order entries are delivered in.
@@ -428,7 +440,9 @@ impl TraversalCompletion {
 pub const fn is_marker(item: &TraversalItem) -> bool {
     matches!(
         item,
-        TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_)
+        TraversalItem::DirectoryListed(_)
+            | TraversalItem::DirectoryStatistics(_)
+            | TraversalItem::Checkpoint(_)
     )
 }
 

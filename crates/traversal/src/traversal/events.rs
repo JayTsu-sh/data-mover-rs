@@ -2,6 +2,7 @@
 //! directory events, and checkpoints (P7 §4).
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 use super::counts::BlockCounts;
 use crate::model::{
@@ -50,6 +51,8 @@ pub enum TraversalItem {
     ObservationFailure(Box<ObservationFailure>),
     /// Every direct child of one listed directory has been delivered.
     DirectoryListed(Box<DirectoryListed>),
+    /// 目录直属子项的绝对 partial 或结束快照；两种遍历顺序都会交付。
+    DirectoryStatistics(Box<super::DirectoryStatistics>),
     /// A position a later traversal can resume from ([`super::TraversalRequest::resume_from`]).
     /// Only a traversal with checkpoints on ([`super::Resumable::On`]) emits it: about once per
     /// interval, and as its last item when it ends early (unless its position was too large to
@@ -167,7 +170,7 @@ impl ScanFailure {
 }
 
 /// How one directory's listing ended.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum ListingOutcome {
     /// The listing ran to its end. Children that failed individually are counted in

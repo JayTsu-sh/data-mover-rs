@@ -1661,6 +1661,8 @@ dependencies = [
  "glob",
  "num-traits",
  "parking_lot",
+ "serde",
+ "serde_json",
  "smb",
  "tempfile",
  "thiserror 2.0.18",

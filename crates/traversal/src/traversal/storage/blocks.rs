@@ -151,7 +151,7 @@ async fn flush_terminal_errors(
     if let Some(cursor) = cursor {
         cursor.remember_terminal_errors(runtime.shared, output);
     }
-    while let Some((_, result, _)) = observations.ready() {
+    while let Some((_, result, _, _)) = observations.ready() {
         match resolve(runtime.shared, result, None) {
             Ok(resolved) => output.remember_terminal_item(resolved.item),
             Err(error) => output.remember_terminal_observations(error.observations),
@@ -265,21 +265,31 @@ pub(super) fn admit(
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
     let sequence = state.allocate()?;
-    let (listed, deferred) = match child {
-        stream::Child::Observe { listed, deferred } => (listed, deferred),
+    let (listed, deferred, kind) = match child {
+        stream::Child::Observe {
+            kind,
+            listed,
+            deferred,
+        } => (listed, deferred, kind),
         stream::Child::Filtered(failures) => {
             state.output.settle(
                 sequence,
                 Settled::Child {
                     item: ChildItem::ObservationFailures(failures),
                     descent: None,
+                    kind: None,
                 },
             );
             return Ok(());
         }
     };
     match listed {
-        Listed::Observed(result) => settle(runtime, decisions, state, (sequence, result, deferred)),
+        Listed::Observed(result) => settle(
+            runtime,
+            decisions,
+            state,
+            (sequence, result, deferred, kind),
+        ),
         Listed::Unobserved(descriptor) => observations.start(
             runtime.shared,
             feed,
@@ -300,7 +310,7 @@ fn settle(
     state: &mut State,
     observed: Observed,
 ) -> Result<(), TraversalTerminalFailure> {
-    let (sequence, result, deferred) = observed;
+    let (sequence, result, deferred, kind) = observed;
     let resolved = match resolve(runtime.shared, result, deferred) {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -318,9 +328,14 @@ fn settle(
     if let Some(ticket) = deferred.and_then(|deferred| deferred.ticket) {
         decisions.insert(ticket, below);
     }
-    state
-        .output
-        .settle(sequence, Settled::Child { item, descent });
+    state.output.settle(
+        sequence,
+        Settled::Child {
+            item,
+            descent,
+            kind: Some(kind),
+        },
+    );
     Ok(())
 }
 
@@ -336,6 +351,7 @@ pub(super) fn queue_failure(
         Settled::Child {
             item: ChildItem::Item(TraversalItem::Failure(Box::new(failure))),
             descent: None,
+            kind: None,
         },
     );
     Ok(())
