@@ -1,16 +1,23 @@
 //! 真文件系统验证类型统计不依赖测试 descriptor。
 #![allow(clippy::unwrap_used)]
-use super::*;
-use crate::traversal::DirectoryStatistics;
 #[cfg(unix)]
 use std::os::unix::{fs::symlink, net::UnixListener};
+use std::{
+    fs::{create_dir, write},
+    io,
+};
+
+use tokio_util::sync::CancellationToken;
+
+use super::*;
+use crate::traversal::DirectoryStatistics;
 
 #[tokio::test]
 async fn real_local_directory_statistics_match_entries_in_both_orders() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join("file"), b"1234567")?;
-    std::fs::create_dir(dir.path().join("nested"))?;
-    std::fs::write(dir.path().join("nested/child"), b"12")?;
+    write(dir.path().join("file"), b"1234567")?;
+    create_dir(dir.path().join("nested"))?;
+    write(dir.path().join("nested/child"), b"12")?;
     #[cfg(unix)]
     let _socket = {
         symlink("file", dir.path().join("link"))?;

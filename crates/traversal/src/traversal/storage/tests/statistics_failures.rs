@@ -1,9 +1,12 @@
 //! 子项失败、消失和终态失败不能伪装成 retained 或完整目录。
 #![allow(clippy::unwrap_used)]
+use async_trait::async_trait;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+
 use super::*;
 use crate::model::{BackendSessionFailure, SpecialFileKind};
 use crate::traversal::DirectoryStatistics;
-use tokio::sync::Semaphore;
 
 struct ErrorNamespace;
 #[async_trait]
@@ -49,7 +52,7 @@ impl Metadata for ErrorMetadata {
         &self,
         _: &StoragePath,
         _: MetadataMutation,
-        _: tokio_util::sync::CancellationToken,
+        _: CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
         unreachable!("read-only traversal")
     }
@@ -61,7 +64,7 @@ async fn directory_statistics_separate_known_failures_unknown_failures_and_vanis
         let source =
             StorageTraversalSource::with_roles(Arc::new(ErrorNamespace), Arc::new(ErrorMetadata));
         let mut session = source.traverse(
-            request(tokio_util::sync::CancellationToken::new())
+            request(CancellationToken::new())
                 .order(order)
                 .directory_statistics(true),
         );
@@ -127,7 +130,7 @@ async fn directory_statistics_never_publish_complete_after_a_terminal_listing_fa
             Arc::new(FakeMetadata),
         );
         let mut session = source.traverse(
-            request(tokio_util::sync::CancellationToken::new())
+            request(CancellationToken::new())
                 .order(order)
                 .directory_statistics(true),
         );
@@ -173,7 +176,7 @@ async fn directory_statistics_keep_special_kinds_unknown_size_and_json_losslessl
         let source =
             StorageTraversalSource::with_roles(Arc::new(SpecialNamespace), Arc::new(FakeMetadata));
         let mut session = source.traverse(
-            request(tokio_util::sync::CancellationToken::new())
+            request(CancellationToken::new())
                 .order(order)
                 .directory_statistics(true),
         );

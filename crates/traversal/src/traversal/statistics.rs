@@ -1,5 +1,5 @@
 //! 每次目录列举的绝对统计；调用方按目录替换贡献，不能跨重放直接相加。
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeserializeError};
 
 use super::ListingOutcome;
 use crate::model::{EntryKind, SpecialFileKind, StoragePath};
@@ -92,7 +92,10 @@ impl EntryKindCounts {
 /// 这些是绝对贡献；恢复可能重新列举目录，消费者必须按目录替换而非直接累加。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DirectoryStatistics {
-    #[serde(with = "path")]
+    #[serde(
+        serialize_with = "serialize_path",
+        deserialize_with = "deserialize_path"
+    )]
     pub path: StoragePath,
     pub pass_start: bool,
     pub revision: u64,
@@ -114,19 +117,10 @@ pub struct DirectoryStatistics {
     pub vanished_listing: bool,
 }
 
-mod path {
-    use crate::model::StoragePath;
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+fn serialize_path<S: Serializer>(path: &StoragePath, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(path.as_str())
+}
 
-    pub(super) fn serialize<S: Serializer>(
-        path: &StoragePath,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(path.as_str())
-    }
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<StoragePath, D::Error> {
-        StoragePath::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
-    }
+fn deserialize_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<StoragePath, D::Error> {
+    StoragePath::new(String::deserialize(deserializer)?).map_err(DeserializeError::custom)
 }

@@ -1,13 +1,17 @@
 //! 绝对目录贡献与调度无关：过滤、分页和重放都经同一输出合同。
 #![allow(clippy::unwrap_used)]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::StreamExt as _;
+use tokio_util::sync::CancellationToken;
+
 use super::*;
 use crate::model::SpecialFileKind;
 use crate::traversal::{
     Checkpoint, DirectoryStatistics, ListingOutcome, Resumable, ScanTotals, TraversalFilter,
 };
-use futures::StreamExt as _;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 struct PagedNamespace {
     reverse: AtomicBool,
@@ -120,7 +124,7 @@ async fn directory_statistics_exclude_pruned_hidden_entries_and_preserve_typed_k
             );
             let items = collect(
                 &source,
-                request(tokio_util::sync::CancellationToken::new())
+                request(CancellationToken::new())
                     .order(order)
                     .directory_statistics(true)
                     .filter(Arc::new(Filter {
@@ -170,7 +174,7 @@ async fn fully_filtered_pages_still_deliver_partial_statistics() {
         );
         let items = collect(
             &source,
-            request(tokio_util::sync::CancellationToken::new())
+            request(CancellationToken::new())
                 .order(order)
                 .directory_statistics(true)
                 .filter(Arc::new(Filter {
@@ -255,7 +259,7 @@ async fn a_reordered_replay_opens_a_new_absolute_pass_in_both_orders() {
             pause: AtomicBool::new(true),
         });
         let source = StorageTraversalSource::with_roles(namespace.clone(), Arc::new(FakeMetadata));
-        let original = request(tokio_util::sync::CancellationToken::new())
+        let original = request(CancellationToken::new())
             .order(order)
             .directory_statistics(true)
             .filter(Arc::new(Filter {
@@ -273,7 +277,7 @@ async fn a_reordered_replay_opens_a_new_absolute_pass_in_both_orders() {
         let resumed = collect(
             &source,
             original
-                .cancel(tokio_util::sync::CancellationToken::new())
+                .cancel(CancellationToken::new())
                 .resume_from(checkpoint),
         )
         .await;
@@ -296,7 +300,7 @@ async fn a_reordered_replay_opens_a_new_absolute_pass_in_both_orders() {
 
 async fn raw_totals(source: &StorageTraversalSource, enabled: bool) -> (ScanTotals, usize) {
     let mut session = source.traverse(
-        request(tokio_util::sync::CancellationToken::new())
+        request(CancellationToken::new())
             .directory_statistics(enabled)
             .filter(Arc::new(Filter {
                 all: false,
