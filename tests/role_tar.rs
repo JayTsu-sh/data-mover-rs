@@ -2,6 +2,7 @@ use data_mover::model::{ObservationMode, ObservationPlan, ObservedEntry, Storage
 use data_mover::storage::{BackendConfig, LocalBackendConfig, Storage, connect_backend};
 use data_mover::tar_pack::{TarRequest, calculate_tar_size, pack};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -106,7 +107,7 @@ async fn archive_records_a_link_without_reading_its_target() -> Result {
     pack(TarRequest {
         source,
         destination: local(destination_root.path()).await?,
-        entries,
+        entries: entries.into(),
         final_path: StoragePath::new("link.tar")?,
 
         cancel: CancellationToken::new(),
@@ -132,7 +133,7 @@ async fn archive_preserves_long_names_using_pax_headers() -> Result {
     pack(TarRequest {
         source,
         destination: local(destination_root.path()).await?,
-        entries,
+        entries: entries.into(),
         final_path: StoragePath::new("long.tar")?,
 
         cancel: CancellationToken::new(),
@@ -175,7 +176,7 @@ async fn archive_preserves_long_non_utf8_link_targets_in_binary_pax() -> Result 
     pack(TarRequest {
         source,
         destination: local(destination_root.path()).await?,
-        entries,
+        entries: entries.into(),
         final_path: StoragePath::new("binary-link.tar")?,
 
         cancel: CancellationToken::new(),
@@ -226,7 +227,7 @@ async fn archive_preserves_positive_fractional_mtime_in_pax() -> Result {
     pack(TarRequest {
         source,
         destination: local(destination_root.path()).await?,
-        entries,
+        entries: entries.into(),
         final_path: StoragePath::new("fractional.tar")?,
 
         cancel: CancellationToken::new(),
@@ -245,6 +246,35 @@ async fn archive_preserves_positive_fractional_mtime_in_pax() -> Result {
     assert!(
         pax.windows(b"mtime=1700000000.123456789\n".len())
             .any(|w| w == b"mtime=1700000000.123456789\n")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn archive_request_shares_the_manifest_and_each_observation() -> Result {
+    let source_root = tempfile::tempdir()?;
+    let destination_root = tempfile::tempdir()?;
+    std::fs::write(source_root.path().join("file"), b"payload")?;
+    let source = local(source_root.path()).await?;
+    let entries: Arc<[Arc<ObservedEntry>]> = vec![Arc::new(entry(&source, "file").await?)].into();
+    let request = TarRequest {
+        source,
+        destination: local(destination_root.path()).await?,
+        entries: Arc::clone(&entries),
+        final_path: StoragePath::new("shared.tar")?,
+        cancel: CancellationToken::new(),
+        source_qos: None,
+    };
+    let cloned = request.clone();
+    assert!(Arc::ptr_eq(&cloned.entries, &entries));
+    assert_eq!(Arc::strong_count(&entries[0]), 1);
+    drop(cloned);
+    pack(request).await?;
+    assert_eq!(Arc::strong_count(&entries[0]), 1);
+    assert!(
+        std::fs::read(destination_root.path().join("shared.tar"))?
+            .windows(7)
+            .any(|bytes| bytes == b"payload")
     );
     Ok(())
 }

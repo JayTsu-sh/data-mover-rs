@@ -548,6 +548,11 @@ failure, so the application can classify a truncated stream without losing nativ
 cleanup ownership. A successful outcome still requires the existing verification/publication
 step; failure cleanup follows the selected transfer policy.
 
+Tar requests share their immutable manifest as `Arc<[E]>` (`E` borrows an `ObservedEntry`).
+The archive cursor stores indices into that slice, so packaging and later manifest persistence
+can retain the same list without copying a vector or cloning every observation handle. The
+list remains alive until streaming finishes; source reads, headers and publication are unchanged.
+
 For consumers reading an existing basis, `storage::read_current_range` describes the current
 object once, binds its identity and resolved version, and streams the exact ordered range.
 It rejects invalid ranges, unknown sizes, short EOF and excess payload with typed read failures;

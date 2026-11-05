@@ -771,7 +771,7 @@ async fn nightly_lab_role_tar_write() -> TestResult {
     let outcome = data_mover::tar_pack::pack(data_mover::tar_pack::TarRequest {
         source: storage.clone(),
         destination: storage,
-        entries: Vec::<ObservedEntry>::new(),
+        entries: Vec::<ObservedEntry>::new().into(),
         final_path: StoragePath::new("empty.tar")?,
         cancel: CancellationToken::new(),
         source_qos: None,

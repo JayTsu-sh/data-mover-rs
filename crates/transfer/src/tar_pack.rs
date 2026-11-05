@@ -34,13 +34,15 @@ pub enum TarFailure {
 }
 
 /// Archive inputs. Owned observations and shared `Arc<ObservedEntry>` inputs are accepted
-/// without cloning their metadata. Entry paths are also their names in the archive.
+/// without cloning their metadata. The immutable manifest is shared as one Arc slice and retained
+/// until the stream finishes; packaging and later manifest persistence can share it without
+/// cloning each observation handle. Entry paths are also their names in the archive.
 /// Request ownership and timestamps during traversal to preserve them in the tar headers.
 #[derive(Clone)]
 pub struct TarRequest<E = ObservedEntry> {
     pub source: Storage,
     pub destination: Storage,
-    pub entries: Vec<E>,
+    pub entries: Arc<[E]>,
     pub final_path: StoragePath,
     pub cancel: CancellationToken,
     pub source_qos: Option<SourceQosGroup>,
@@ -68,7 +70,7 @@ pub fn calculate_tar_size<E: Borrow<ObservedEntry>>(entries: &[E]) -> Result<u64
 ///
 /// # Errors
 /// Returns invalid input, a source error, or a destination failure retaining cleanup authority.
-pub async fn pack<E: Borrow<ObservedEntry> + Send + 'static>(
+pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
     request: TarRequest<E>,
 ) -> Result<TransferOutcome, TarFailure> {
     let size = calculate_tar_size(&request.entries)?;
@@ -100,7 +102,8 @@ pub async fn pack<E: Borrow<ObservedEntry> + Send + 'static>(
     let state = ArchiveStream {
         source,
         output: None,
-        entries: request.entries.into_iter(),
+        entries: request.entries,
+        next_entry: 0,
         pending: None,
         reading: None,
         remaining: 0,
@@ -161,7 +164,7 @@ fn archive_observation<E: Borrow<ObservedEntry>>(
     manifest.update(b"data-mover/tar/v1\0");
     manifest.update(request.final_path.as_str().as_bytes());
     manifest.update(b"\0");
-    for entry in &request.entries {
+    for entry in request.entries.iter() {
         let entry = entry.borrow();
         manifest.update(entry.identity_key().as_bytes());
         manifest.update(&build_header_for_entry(entry)?);
@@ -186,8 +189,9 @@ fn archive_observation<E: Borrow<ObservedEntry>>(
 struct ArchiveStream<E> {
     output: Option<Bytes>,
     source: Arc<dyn ReadSource>,
-    entries: std::vec::IntoIter<E>,
-    pending: Option<E>,
+    entries: Arc<[E]>,
+    next_entry: usize,
+    pending: Option<usize>,
     reading: Option<ByteStream>,
     remaining: u64,
     padding: Option<Bytes>,
@@ -198,7 +202,7 @@ struct ArchiveStream<E> {
     path: StoragePath,
 }
 
-async fn next_piece<E: Borrow<ObservedEntry> + Send + 'static>(
+async fn next_piece<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
     mut state: ArchiveStream<E>,
 ) -> Result<Option<(Bytes, ArchiveStream<E>)>, StorageRoleFailure> {
     let next = match state.output.take() {
@@ -216,7 +220,7 @@ async fn next_piece<E: Borrow<ObservedEntry> + Send + 'static>(
     Ok(Some((bytes, state)))
 }
 
-async fn next_raw<E: Borrow<ObservedEntry> + Send + 'static>(
+async fn next_raw<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
     mut state: ArchiveStream<E>,
 ) -> Result<Option<(Bytes, ArchiveStream<E>)>, StorageRoleFailure> {
     loop {
@@ -243,8 +247,8 @@ async fn next_raw<E: Borrow<ObservedEntry> + Send + 'static>(
         if let Some(padding) = state.padding.take() {
             return Ok(Some((padding, state)));
         }
-        if let Some(entry) = state.pending.take() {
-            let entry = entry.borrow();
+        if let Some(index) = state.pending.take() {
+            let entry = state.entries[index].borrow();
             let size = entry
                 .size()
                 .ok_or_else(|| stream_failure(entry.path(), FailureClass::InvalidInput))?;
@@ -268,12 +272,14 @@ async fn next_raw<E: Borrow<ObservedEntry> + Send + 'static>(
             );
             continue;
         }
-        if let Some(entry) = state.entries.next() {
+        if let Some(entry) = state.entries.get(state.next_entry) {
+            let index = state.next_entry;
+            state.next_entry += 1;
             let observed = entry.borrow();
             let header = build_header_for_entry(observed)
                 .map_err(|_| stream_failure(observed.path(), FailureClass::InvalidInput))?;
             if observed.kind() == EntryKind::File {
-                state.pending = Some(entry);
+                state.pending = Some(index);
             }
             return Ok(Some((header, state)));
         }
