@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::{TransferPhase, TransferRequest, TransferRoute, transfer};
-use crate::model::{EntryKind, ObservedEntry, SourceVersion, StoragePath};
+use crate::model::{EntryKind, ObservedEntry, SourceVersion, StoragePath, VersionRecord};
 use crate::storage::backends::s3::tests::{
     MemoryS3, Versioning, endpoint_of, native_context, source_storage,
 };
@@ -231,5 +231,179 @@ async fn local_observation_detects_in_place_edits_and_preserves_the_destination(
             _ => return Err("local observation validation did not match source state".into()),
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_observation_pins_one_historical_record_without_cloning_history() -> TestResult {
+    for native in [false, true] {
+        let (protocol, storage, observed) = bucket(true).await?;
+        let observed = Arc::new(observed);
+        let request = TransferRequest::from_shared_observation(
+            storage,
+            Arc::clone(&observed),
+            Some(0),
+            s3::connect(
+                protocol.clone(),
+                endpoint_of(&protocol),
+                native.then(native_context),
+            )?,
+            CancellationToken::new(),
+        )?;
+        assert_eq!(request.source_version(), &SourceVersion::Id("v1".into()));
+        let cloned = request.clone();
+        assert_eq!(Arc::strong_count(&observed), 3);
+        drop(cloned);
+        protocol
+            .put_version("src/source", "v3", Bytes::from_static(b"newest"))
+            .await;
+        transfer(request).await?;
+        assert_eq!(
+            protocol.objects.lock().await.get("source"),
+            Some(&Bytes::from_static(b"first!"))
+        );
+        assert_eq!(
+            observed.history().ok_or("missing history")?.records().len(),
+            2
+        );
+        assert_eq!(Arc::strong_count(&observed), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_current_observation_rejects_replacement_before_destination_writes() -> TestResult {
+    let (protocol, storage, observed) = bucket(false).await?;
+    let observed = Arc::new(observed);
+    let destination = s3::connect(protocol.clone(), endpoint_of(&protocol), None)?;
+    assert!(
+        TransferRequest::from_shared_observation(
+            storage.clone(),
+            Arc::clone(&observed),
+            Some(7),
+            destination.clone(),
+            CancellationToken::new()
+        )
+        .is_err()
+    );
+    let request = TransferRequest::from_shared_observation(
+        storage,
+        observed,
+        None,
+        destination,
+        CancellationToken::new(),
+    )?;
+    protocol
+        .put_version("src/source", "v3", Bytes::from_static(b"newest"))
+        .await;
+    let failure = transfer(request)
+        .await
+        .err()
+        .ok_or("changed source was accepted")?;
+    assert_eq!(failure.phase(), TransferPhase::Describe);
+    assert!(!protocol.objects.lock().await.contains_key("source"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_history_directory_selects_its_real_object_path() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    protocol.answer_at_connect(s3::S3VersioningAtConnect::Enabled);
+    protocol.put_version("src/p/", "old", Bytes::new()).await;
+    protocol.put_version("src/p/", "new", Bytes::new()).await;
+    protocol
+        .put_version("src/p/child", "child", Bytes::from_static(b"child"))
+        .await;
+    let storage = source_storage(&protocol, "src")?;
+    let (children, _) = listed(&*storage.namespace()?, &StoragePath::root()).await?;
+    let descriptor = children
+        .into_iter()
+        .find(|child| child.path.as_str() == "p")
+        .ok_or("missing directory")?;
+    let mut descriptor = descriptor;
+    let (objects, _) = listed(&*storage.namespace()?, &StoragePath::new("p")?).await?;
+    descriptor.listing.history = objects
+        .into_iter()
+        .find(|object| object.path.as_str() == "p/")
+        .ok_or("missing own object")?
+        .listing
+        .history;
+    let observed = Arc::new(observation(descriptor)?);
+    assert_eq!(observed.kind(), EntryKind::Directory);
+    let destination = s3::connect(protocol.clone(), endpoint_of(&protocol), None)?;
+    let request = TransferRequest::from_shared_observation(
+        storage,
+        observed,
+        Some(0),
+        destination,
+        CancellationToken::new(),
+    )?;
+    assert_eq!(request.source_path().as_str(), "p/");
+    transfer(request).await?;
+    assert_eq!(protocol.objects.lock().await.get("p/"), Some(&Bytes::new()));
+    assert!(!protocol.objects.lock().await.contains_key("p"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_selected_null_rejects_overwrite_and_rejects_marker_indices() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    protocol.answer_at_connect(s3::S3VersioningAtConnect::Enabled);
+    protocol
+        .put_version("src/source", "null", Bytes::from_static(b"old-null"))
+        .await;
+    protocol.put_delete_marker("src/source", "marker").await;
+    protocol
+        .put_version("src/source", "current", Bytes::from_static(b"latest"))
+        .await;
+    let storage = source_storage(&protocol, "src")?;
+    let (mut children, _) = listed(&*storage.namespace()?, &StoragePath::root()).await?;
+    let observed = Arc::new(observation(children.remove(0))?);
+    let history = observed.history().ok_or("missing history")?;
+    let null = history
+        .records()
+        .iter()
+        .position(|record| record.version_id().is_none())
+        .ok_or("missing null")?;
+    let marker = history
+        .records()
+        .iter()
+        .position(VersionRecord::is_delete_marker)
+        .ok_or("missing marker")?;
+    let destination = s3::connect(protocol.clone(), endpoint_of(&protocol), None)?;
+    for invalid in [marker, history.records().len()] {
+        assert!(
+            TransferRequest::from_shared_observation(
+                storage.clone(),
+                Arc::clone(&observed),
+                Some(invalid),
+                destination.clone(),
+                CancellationToken::new()
+            )
+            .is_err()
+        );
+    }
+    let request = TransferRequest::from_shared_observation(
+        storage,
+        observed,
+        Some(null),
+        destination,
+        CancellationToken::new(),
+    )?;
+    protocol
+        .put_version(
+            "src/source",
+            "null",
+            Bytes::from_static(b"changed-null-content"),
+        )
+        .await;
+    let failure = transfer(request)
+        .await
+        .err()
+        .ok_or("overwritten null was accepted")?;
+    assert_eq!(failure.phase(), TransferPhase::Describe);
+    assert!(!protocol.objects.lock().await.contains_key("source"));
     Ok(())
 }

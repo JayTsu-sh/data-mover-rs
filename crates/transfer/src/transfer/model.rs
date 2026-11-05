@@ -1,8 +1,10 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{EntryKind, ObservedEntry, SourceVersion, StoragePath};
+use crate::model::{
+    EntryKind, ObservedEntry, SourceIdentity, SourceVersion, StoragePath, StorageTimestamp,
+};
 use crate::storage::{SourceQosGroup, Storage};
 
 use super::TransferIdentity;
@@ -74,9 +76,42 @@ enum SourceInput {
         version: SourceVersion,
     },
     Observed {
-        entry: Box<ObservedEntry>,
+        entry: Arc<ObservedEntry>,
+        version_index: Option<usize>,
+        directory_marker: bool,
+        path_override: Option<StoragePath>,
         version: SourceVersion,
+        version_override: Option<SourceVersion>,
     },
+}
+
+/// The borrowed facts checked before any destination preparation.
+#[derive(Clone, Copy)]
+pub(super) struct ObservationConstraint<'a> {
+    pub(super) path: &'a StoragePath,
+    pub(super) identity: &'a SourceIdentity,
+    pub(super) kind: EntryKind,
+    pub(super) size: Option<u64>,
+    pub(super) modified: Option<StorageTimestamp>,
+}
+impl<'a> ObservationConstraint<'a> {
+    pub(super) fn from_entry(entry: &'a ObservedEntry) -> Self {
+        Self {
+            path: entry.path(),
+            identity: entry.source_identity(),
+            kind: entry.kind(),
+            size: entry.size(),
+            modified: entry.modified(),
+        }
+    }
+}
+
+fn observed_entry(entry: &ObservedEntry, directory_marker: bool) -> &ObservedEntry {
+    if directory_marker {
+        entry.directory_marker_object().unwrap_or(entry)
+    } else {
+        entry
+    }
 }
 
 /// The optional metadata features a copy should carry, beyond the baseline — the "should" of a
@@ -154,12 +189,26 @@ impl TransferRequest {
         destination: Storage,
         cancel: CancellationToken,
     ) -> Self {
-        Self {
-            identity_override: None,
-            input: SourceInput::Path {
+        Self::from_input(
+            source,
+            SourceInput::Path {
                 path: source_path,
                 version: SourceVersion::Current,
             },
+            destination,
+            cancel,
+        )
+    }
+
+    fn from_input(
+        source: Storage,
+        input: SourceInput,
+        destination: Storage,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            identity_override: None,
+            input,
             source,
             destination,
             cancel,
@@ -190,31 +239,76 @@ impl TransferRequest {
         destination: Storage,
         cancel: CancellationToken,
     ) -> Result<Self, TransferValueError> {
-        let observation = if destination.holds_directory_objects() {
-            observation
-                .directory_marker_object()
-                .cloned()
-                .unwrap_or(observation)
+        Self::from_shared_observation(source, Arc::new(observation), None, destination, cancel)
+    }
+
+    /// Borrows one immutable observation through an Arc, optionally selecting one history record.
+    /// Request cloning shares the original observation, including large histories. A directory's
+    /// real current marker is selected without cloning it when the destination holds objects.
+    ///
+    /// # Errors
+    /// Rejects a foreign backend, invalid index, delete marker or non-readable entry before I/O.
+    pub fn from_shared_observation(
+        source: Storage,
+        observation: Arc<ObservedEntry>,
+        version_index: Option<usize>,
+        destination: Storage,
+        cancel: CancellationToken,
+    ) -> Result<Self, TransferValueError> {
+        let directory_marker = version_index.is_none()
+            && destination.holds_directory_objects()
+            && observation.directory_marker_object().is_some();
+        let entry = observed_entry(&observation, directory_marker);
+        let (identity, version) = if let Some(index) = version_index {
+            let record = entry
+                .history()
+                .and_then(|history| history.records().get(index))
+                .ok_or(TransferValueError("invalid observed history index"))?;
+            (
+                record.identity(),
+                record
+                    .source()
+                    .ok_or(TransferValueError("delete markers are not readable"))?,
+            )
         } else {
-            observation
+            if entry.kind() != EntryKind::File {
+                return Err(TransferValueError("an observed transfer requires a file"));
+            }
+            (
+                entry.source_identity(),
+                entry.source_version().ok_or(TransferValueError(
+                    "observation does not identify a current object",
+                ))?,
+            )
         };
-        if observation.source_identity().backend() != source.identity() {
+        if identity.backend() != source.identity() {
             return Err(TransferValueError(
                 "observation belongs to another source storage",
             ));
         }
-        if observation.kind() != EntryKind::File {
-            return Err(TransferValueError("an observed transfer requires a file"));
-        }
-        let version = observation.source_version().ok_or(TransferValueError(
-            "observation does not identify a current object",
-        ))?;
-        let mut request = Self::new(source, observation.path().clone(), destination, cancel);
-        request.input = SourceInput::Observed {
-            entry: Box::new(observation),
-            version,
+        let path_override = if version_index.is_some() && entry.kind() == EntryKind::Directory {
+            Some(
+                entry
+                    .history_source_path()
+                    .map_err(|_| TransferValueError("invalid observed history path"))?
+                    .ok_or(TransferValueError("observed directory has no history"))?,
+            )
+        } else {
+            None
         };
-        Ok(request)
+        Ok(Self::from_input(
+            source,
+            SourceInput::Observed {
+                entry: observation,
+                version_index,
+                directory_marker,
+                path_override,
+                version,
+                version_override: None,
+            },
+            destination,
+            cancel,
+        ))
     }
 
     /// Names the transfer with a caller-chosen identity instead of the derived one. The binding
@@ -237,10 +331,14 @@ impl TransferRequest {
         match &mut self.input {
             SourceInput::Path {
                 version: selected, ..
-            }
-            | SourceInput::Observed {
-                version: selected, ..
             } => *selected = version,
+            SourceInput::Observed {
+                version: expected,
+                version_override,
+                ..
+            } => {
+                *version_override = (version != *expected).then_some(version);
+            }
         }
         self
     }
@@ -250,7 +348,14 @@ impl TransferRequest {
     pub fn source_path(&self) -> &StoragePath {
         match &self.input {
             SourceInput::Path { path, .. } => path,
-            SourceInput::Observed { entry, .. } => entry.path(),
+            SourceInput::Observed {
+                entry,
+                directory_marker,
+                path_override,
+                ..
+            } => path_override
+                .as_ref()
+                .unwrap_or_else(|| observed_entry(entry, *directory_marker).path()),
         }
     }
 
@@ -265,15 +370,49 @@ impl TransferRequest {
     #[must_use]
     pub const fn source_version(&self) -> &SourceVersion {
         match &self.input {
-            SourceInput::Path { version, .. } | SourceInput::Observed { version, .. } => version,
+            SourceInput::Path { version, .. } => version,
+            SourceInput::Observed {
+                version,
+                version_override,
+                ..
+            } => match version_override {
+                Some(selected) => selected,
+                None => version,
+            },
         }
     }
 
-    pub(crate) fn source_observation(&self) -> Option<&ObservedEntry> {
-        match &self.input {
-            SourceInput::Path { .. } => None,
-            SourceInput::Observed { entry, .. } => Some(entry),
+    pub(super) fn source_observation(&self) -> Option<ObservationConstraint<'_>> {
+        let SourceInput::Observed {
+            entry,
+            version_index,
+            directory_marker,
+            ..
+        } = &self.input
+        else {
+            return None;
+        };
+        let entry = observed_entry(entry, *directory_marker);
+        let mut constraint = ObservationConstraint::from_entry(entry);
+        constraint.path = self.source_path();
+        if let Some(index) = version_index {
+            let record = entry.history()?.records().get(*index)?;
+            constraint.identity = record.identity();
+            constraint.kind = EntryKind::File;
+            constraint.size = record.size();
+            constraint.modified = record.modified();
         }
+        Some(constraint)
+    }
+
+    pub(super) const fn observation_selector_matches(&self) -> bool {
+        !matches!(
+            self.input,
+            SourceInput::Observed {
+                version_override: Some(_),
+                ..
+            }
+        )
     }
 
     /// The identity this request transfers under: derived from its current selection, or overridden.
