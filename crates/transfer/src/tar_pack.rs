@@ -18,6 +18,7 @@ use crate::transfer::{
 };
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
+use std::borrow::Borrow;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -32,13 +33,14 @@ pub enum TarFailure {
     Transfer(Box<TransferFailure>),
 }
 
-/// Archive inputs. Entry paths are also their names in the archive.
+/// Archive inputs. Owned observations and shared `Arc<ObservedEntry>` inputs are accepted
+/// without cloning their metadata. Entry paths are also their names in the archive.
 /// Request ownership and timestamps during traversal to preserve them in the tar headers.
 #[derive(Clone)]
-pub struct TarRequest {
+pub struct TarRequest<E = ObservedEntry> {
     pub source: Storage,
     pub destination: Storage,
-    pub entries: Vec<ObservedEntry>,
+    pub entries: Vec<E>,
     pub final_path: StoragePath,
     pub cancel: CancellationToken,
     pub source_qos: Option<SourceQosGroup>,
@@ -48,8 +50,9 @@ pub struct TarRequest {
 ///
 /// # Errors
 /// Refuses unsupported entries, unknown file sizes and arithmetic overflow.
-pub fn calculate_tar_size(entries: &[ObservedEntry]) -> Result<u64, TarFailure> {
+pub fn calculate_tar_size<E: Borrow<ObservedEntry>>(entries: &[E]) -> Result<u64, TarFailure> {
     entries.iter().try_fold(1024_u64, |total, entry| {
+        let entry = entry.borrow();
         let size = entry_size(entry)?;
         let headers = u64::try_from(build_header_for_entry(entry)?.len())
             .map_err(|_| invalid("archive header overflow"))?;
@@ -65,7 +68,9 @@ pub fn calculate_tar_size(entries: &[ObservedEntry]) -> Result<u64, TarFailure> 
 ///
 /// # Errors
 /// Returns invalid input, a source error, or a destination failure retaining cleanup authority.
-pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
+pub async fn pack<E: Borrow<ObservedEntry> + Send + 'static>(
+    request: TarRequest<E>,
+) -> Result<TransferOutcome, TarFailure> {
     let size = calculate_tar_size(&request.entries)?;
     let observed = archive_observation(&request, size)?;
     let identity_key = observed.identity_key();
@@ -148,12 +153,16 @@ pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
         .map_err(transfer_failure)
 }
 
-fn archive_observation(request: &TarRequest, size: u64) -> Result<ObservedEntry, TarFailure> {
+fn archive_observation<E: Borrow<ObservedEntry>>(
+    request: &TarRequest<E>,
+    size: u64,
+) -> Result<ObservedEntry, TarFailure> {
     let mut manifest = blake3::Hasher::new();
     manifest.update(b"data-mover/tar/v1\0");
     manifest.update(request.final_path.as_str().as_bytes());
     manifest.update(b"\0");
     for entry in &request.entries {
+        let entry = entry.borrow();
         manifest.update(entry.identity_key().as_bytes());
         manifest.update(&build_header_for_entry(entry)?);
     }
@@ -174,11 +183,11 @@ fn archive_observation(request: &TarRequest, size: u64) -> Result<ObservedEntry,
     Ok(observed)
 }
 
-struct ArchiveStream {
+struct ArchiveStream<E> {
     output: Option<Bytes>,
     source: Arc<dyn ReadSource>,
-    entries: std::vec::IntoIter<ObservedEntry>,
-    pending: Option<ObservedEntry>,
+    entries: std::vec::IntoIter<E>,
+    pending: Option<E>,
     reading: Option<ByteStream>,
     remaining: u64,
     padding: Option<Bytes>,
@@ -189,9 +198,9 @@ struct ArchiveStream {
     path: StoragePath,
 }
 
-async fn next_piece(
-    mut state: ArchiveStream,
-) -> Result<Option<(Bytes, ArchiveStream)>, StorageRoleFailure> {
+async fn next_piece<E: Borrow<ObservedEntry> + Send + 'static>(
+    mut state: ArchiveStream<E>,
+) -> Result<Option<(Bytes, ArchiveStream<E>)>, StorageRoleFailure> {
     let next = match state.output.take() {
         Some(bytes) => Some((bytes, state)),
         None => next_raw(state).await?,
@@ -207,9 +216,9 @@ async fn next_piece(
     Ok(Some((bytes, state)))
 }
 
-async fn next_raw(
-    mut state: ArchiveStream,
-) -> Result<Option<(Bytes, ArchiveStream)>, StorageRoleFailure> {
+async fn next_raw<E: Borrow<ObservedEntry> + Send + 'static>(
+    mut state: ArchiveStream<E>,
+) -> Result<Option<(Bytes, ArchiveStream<E>)>, StorageRoleFailure> {
     loop {
         if state.cancel.is_cancelled() {
             return Err(stream_failure(&state.path, FailureClass::Cancelled));
@@ -235,6 +244,7 @@ async fn next_raw(
             return Ok(Some((padding, state)));
         }
         if let Some(entry) = state.pending.take() {
+            let entry = entry.borrow();
             let size = entry
                 .size()
                 .ok_or_else(|| stream_failure(entry.path(), FailureClass::InvalidInput))?;
@@ -259,9 +269,10 @@ async fn next_raw(
             continue;
         }
         if let Some(entry) = state.entries.next() {
-            let header = build_header_for_entry(&entry)
-                .map_err(|_| stream_failure(entry.path(), FailureClass::InvalidInput))?;
-            if entry.kind() == EntryKind::File {
+            let observed = entry.borrow();
+            let header = build_header_for_entry(observed)
+                .map_err(|_| stream_failure(observed.path(), FailureClass::InvalidInput))?;
+            if observed.kind() == EntryKind::File {
                 state.pending = Some(entry);
             }
             return Ok(Some((header, state)));

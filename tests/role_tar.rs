@@ -66,7 +66,7 @@ async fn archive_streams_files_headers_and_padding_with_small_chunk_limits() -> 
     let outcome = pack(TarRequest {
         source,
         destination,
-        entries,
+        entries: entries.into_iter().map(std::sync::Arc::new).collect(),
         final_path: StoragePath::new("result.tar")?,
 
         cancel: CancellationToken::new(),
