@@ -13,7 +13,10 @@ use super::{
     ExpertSourceRequest, ExpertSourceSession, TransferPhase, TransferRequest, TransferRoute,
     transfer,
 };
-use crate::model::{EntryKind, ObservedEntry, SourceVersion, StoragePath, VersionRecord};
+use crate::model::{
+    EntryKind, ObservedEntry, SourceVersion, StoragePath, StorageTimestamp, TimePrecision,
+    VersionRecord,
+};
 use crate::storage::backends::s3::tests::{
     MemoryS3, Versioning, endpoint_of, native_context, source_storage,
 };
@@ -560,5 +563,84 @@ async fn shared_expert_source_refuses_delete_marker_and_out_of_range_selection()
             .is_err()
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn expert_source_refuses_mutable_empty_s3_object_when_head_time_changes() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol
+        .put_version("src/empty", "null", Bytes::new())
+        .await;
+    let before = StorageTimestamp::new(1_000_000_000, TimePrecision::Seconds)?;
+    *protocol.last_modified.lock().await = Some(before);
+    let storage = source_storage(&protocol, "src")?;
+    let descriptor = storage
+        .read_source()?
+        .describe(&StoragePath::new("empty")?)
+        .await?;
+    assert_eq!(
+        descriptor
+            .inline_timestamps
+            .and_then(|times| times.modified),
+        Some(before)
+    );
+    let observed = Arc::new(observation(descriptor)?);
+    let request = ExpertSourceRequest::from_shared_observation(
+        storage,
+        observed,
+        None,
+        CancellationToken::new(),
+    )?;
+    *protocol.last_modified.lock().await = Some(StorageTimestamp::new(
+        2_000_000_000,
+        TimePrecision::Seconds,
+    )?);
+    let failure = ExpertSourceSession::open(request)
+        .await
+        .err()
+        .ok_or("changed mutable empty object was admitted")?;
+    assert_eq!(failure.phase(), TransferPhase::Describe);
+    Ok(())
+}
+
+#[tokio::test]
+async fn expert_source_compares_modification_times_at_the_coarser_declared_precision() -> TestResult
+{
+    let protocol = Arc::new(MemoryS3::default());
+    protocol
+        .put_version("src/empty", "null", Bytes::new())
+        .await;
+    *protocol.last_modified.lock().await = Some(StorageTimestamp::new(
+        1_000_000_000,
+        TimePrecision::Seconds,
+    )?);
+    let storage = source_storage(&protocol, "src")?;
+    let descriptor = storage
+        .read_source()?
+        .describe(&StoragePath::new("empty")?)
+        .await?;
+    let observed = Arc::new(ObservedEntry::new(
+        descriptor.path,
+        descriptor.kind,
+        descriptor.size,
+        Some(StorageTimestamp::new(
+            1_250_000_000,
+            TimePrecision::Milliseconds,
+        )?),
+        descriptor.source_identity,
+    )?);
+    let request = ExpertSourceRequest::from_shared_observation(
+        storage,
+        observed,
+        None,
+        CancellationToken::new(),
+    )?;
+    ExpertSourceSession::open(request.clone()).await?;
+    *protocol.last_modified.lock().await = Some(StorageTimestamp::new(
+        2_000_000_000,
+        TimePrecision::Seconds,
+    )?);
+    assert!(ExpertSourceSession::open(request).await.is_err());
     Ok(())
 }

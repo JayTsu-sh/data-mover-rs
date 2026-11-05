@@ -69,7 +69,13 @@ pub(super) fn validate_constraint(
                 .inline_timestamps
                 .and_then(|times| times.modified),
         )
-        .is_some_and(|(observed, described)| observed != described);
+        .is_some_and(|(observed, described)| {
+            let quantum = observed
+                .precision()
+                .quantum_nanos()
+                .max(described.precision().quantum_nanos());
+            observed.unix_nanos().div_euclid(quantum) != described.unix_nanos().div_euclid(quantum)
+        });
     if modified_changed
         || observation.kind != EntryKind::File
         || descriptor.kind != EntryKind::File
