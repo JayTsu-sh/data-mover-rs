@@ -565,7 +565,16 @@ async fn failure_after_atomic_publication_reports_changed_final_not_recoverable_
         std::fs::read(destination_root.path().join("final.bin"))?,
         b"new-final"
     );
-    error.cleanup_published_stage().await?;
+    let error = error
+        .cleanup_for_policy(TransferPolicy::AtomicReplace)
+        .await;
+    assert!(error.cleanup_failure().is_none());
+    assert!(!error.has_pending_cleanup());
+    assert!(error.final_destination_changed());
+    assert_eq!(
+        std::fs::read(destination_root.path().join("final.bin"))?,
+        b"new-final"
+    );
     assert_eq!(staging_entry_count(destination_root.path())?, 0);
     Ok(())
 }

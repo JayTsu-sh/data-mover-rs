@@ -816,6 +816,16 @@ is never duplicated once per entry.
 transience, safe protocol replay, staged-state disposition, and any validated recovery
 identity. A backend performs only safe protocol retries; terrasync owns job retry decisions.
 
+
+`TransferFailure::cleanup_for_policy(policy)` consumes only the failed attempt's cleanup
+ownership and returns the same typed failure. `Checkpointed` keeps unpublished stage state;
+other policies discard it. After possible publication the operation releases only transient
+artifacts through the existing publication cleanup rules and never rolls back final content.
+The original phase, cause, metadata report, source QoS and uncertainty evidence survive without
+cloning a separate diagnostic. A cleanup refusal is available independently through
+`cleanup_failure()` and does not replace the primary cause. Callers that explicitly choose
+unconditional discard or published-artifact cleanup can still use the corresponding methods.
+
 ## 13. Legacy disposition and migration
 
 | Historical surface | Disposition |

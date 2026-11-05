@@ -8,6 +8,7 @@ use super::{TransferPhase, TransferSide};
 use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::checkpoint::CheckpointPhase;
 use crate::storage::{PreparedStage, SourceQosStats, StagedDestination, StorageRoleFailure};
+use crate::transfer::TransferPolicy;
 
 /// Structured failure from the unified transfer lifecycle.
 #[derive(Debug)]
@@ -19,8 +20,8 @@ pub struct TransferFailure {
     metadata: Option<Box<crate::metadata::MetadataApplicationFailure>>,
     /// Why copied metadata was refused while planning, before anything was written.
     pub(super) refusal: Option<Box<crate::metadata::MetadataPlanError>>,
-    failed_stage: Option<Box<FailedStage>>,
-    committed_cleanup: Option<Box<FailedStage>>,
+    stage_cleanup: Option<Box<FailedStage>>,
+    cleanup_failure: Option<Box<StorageRoleFailure>>,
     pub(super) final_destination_changed: bool,
     source_qos: SourceQosStats,
 }
@@ -28,6 +29,13 @@ pub struct TransferFailure {
 struct FailedStage {
     destination: Arc<dyn StagedDestination>,
     stage: PreparedStage,
+    disposition: StageCleanup,
+}
+
+#[derive(Clone, Copy)]
+enum StageCleanup {
+    Unpublished,
+    AfterPublication,
 }
 
 impl fmt::Debug for FailedStage {
@@ -45,8 +53,8 @@ impl TransferFailure {
             role: Some(Box::new(role)),
             metadata: None,
             refusal: None,
-            failed_stage: None,
-            committed_cleanup: None,
+            stage_cleanup: None,
+            cleanup_failure: None,
             final_destination_changed: false,
             source_qos: SourceQosStats::default(),
         }
@@ -60,8 +68,8 @@ impl TransferFailure {
             role: None,
             metadata: None,
             refusal: None,
-            failed_stage: None,
-            committed_cleanup: None,
+            stage_cleanup: None,
+            cleanup_failure: None,
             final_destination_changed: false,
             source_qos: SourceQosStats::default(),
         }
@@ -75,8 +83,8 @@ impl TransferFailure {
             role: None,
             metadata: None,
             refusal: None,
-            failed_stage: None,
-            committed_cleanup: None,
+            stage_cleanup: None,
+            cleanup_failure: None,
             final_destination_changed: false,
             source_qos: SourceQosStats::default(),
         }
@@ -90,8 +98,8 @@ impl TransferFailure {
             role: None,
             metadata: Some(Box::new(error)),
             refusal: None,
-            failed_stage: None,
-            committed_cleanup: None,
+            stage_cleanup: None,
+            cleanup_failure: None,
             final_destination_changed: false,
             source_qos: SourceQosStats::default(),
         }
@@ -106,7 +114,11 @@ impl TransferFailure {
             self.final_destination_changed = true;
             return self;
         }
-        self.failed_stage = Some(Box::new(FailedStage { destination, stage }));
+        self.stage_cleanup = Some(Box::new(FailedStage {
+            destination,
+            stage,
+            disposition: StageCleanup::Unpublished,
+        }));
         self
     }
 
@@ -119,7 +131,11 @@ impl TransferFailure {
             self.final_destination_changed = true;
             return self;
         }
-        self.committed_cleanup = Some(Box::new(FailedStage { destination, stage }));
+        self.stage_cleanup = Some(Box::new(FailedStage {
+            destination,
+            stage,
+            disposition: StageCleanup::AfterPublication,
+        }));
         self
     }
 
@@ -139,25 +155,30 @@ impl TransferFailure {
     /// may still be resumed by the next attempt. Discard it to start over.
     #[must_use]
     pub fn has_recoverable_stage(&self) -> bool {
-        self.failed_stage
-            .as_ref()
-            .is_some_and(|failed| failed.stage.recovery_enabled())
+        self.stage_cleanup.as_ref().is_some_and(|failed| {
+            matches!(failed.disposition, StageCleanup::Unpublished)
+                && failed.stage.recovery_enabled()
+        })
     }
 
     /// Whether the failed attempt retains unpublished state that may be explicitly discarded.
     /// A resumed stage kept at the destination that failed verification is not retained: it was
     /// cleaned up in place, so its pointer cannot resume it again.
     #[must_use]
-    pub const fn has_unpublished_stage(&self) -> bool {
-        self.failed_stage.is_some()
+    pub fn has_unpublished_stage(&self) -> bool {
+        self.stage_cleanup
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.disposition, StageCleanup::Unpublished))
     }
 
     /// Whether publication committed — or may have: an S3 completion that failed without a
     /// definite refusal is reported so (ADR-0006 C15c) — and staged artifacts still require
     /// cleanup. Not proof that the new content is published.
     #[must_use]
-    pub const fn has_pending_cleanup(&self) -> bool {
-        self.committed_cleanup.is_some()
+    pub fn has_pending_cleanup(&self) -> bool {
+        self.stage_cleanup
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.disposition, StageCleanup::AfterPublication))
     }
 
     /// Whether publication committed — or may have (an S3 completion that failed without a
@@ -196,14 +217,42 @@ impl TransferFailure {
         self
     }
 
+    /// Cleans only this failed attempt's owned artifacts, preserving its original typed cause.
+    ///
+    /// Checkpointed attempts retain unpublished recovery state. Other policies discard it;
+    /// after possible publication only transient artifacts are removed. Cleanup never rolls
+    /// back the final path. A cleanup error is retained alongside the original failure.
+    #[must_use]
+    pub async fn cleanup_for_policy(mut self, policy: TransferPolicy) -> Self {
+        if policy == TransferPolicy::Checkpointed && self.has_unpublished_stage() {
+            return self;
+        }
+        let Some(pending) = self.stage_cleanup.take() else {
+            return self;
+        };
+        let result = match pending.disposition {
+            StageCleanup::AfterPublication => cleanup_published(pending).await,
+            StageCleanup::Unpublished => pending.destination.discard(pending.stage).await,
+        };
+        self.cleanup_failure = result.err().map(Box::new);
+        self
+    }
+
+    /// Failure to release owned artifacts, separate from the transfer's original cause.
+    #[must_use]
+    pub fn cleanup_failure(&self) -> Option<&StorageRoleFailure> {
+        self.cleanup_failure.as_deref()
+    }
+
     /// Consumes this failure and discards its unpublished stage, whether recoverable or ephemeral.
     ///
     /// # Errors
     /// Returns a storage-role failure if no unpublished stage exists or cleanup fails.
     pub async fn discard_stage(mut self) -> Result<(), StorageRoleFailure> {
         let failed = self
-            .failed_stage
+            .stage_cleanup
             .take()
+            .filter(|pending| matches!(pending.disposition, StageCleanup::Unpublished))
             .ok_or_else(|| source_failure(&StoragePath::root(), FailureClass::InvalidInput))?;
         failed.destination.discard(failed.stage).await
     }
@@ -219,22 +268,27 @@ impl TransferFailure {
     /// Returns a storage-role failure if no committed cleanup is pending or cleanup fails.
     pub async fn cleanup_published_stage(mut self) -> Result<(), StorageRoleFailure> {
         let pending = self
-            .committed_cleanup
+            .stage_cleanup
             .take()
+            .filter(|pending| matches!(pending.disposition, StageCleanup::AfterPublication))
             .ok_or_else(|| source_failure(&StoragePath::root(), FailureClass::InvalidInput))?;
-        if pending.stage.checkpoint_enabled()
-            && pending.stage.checkpoint_phase() == CheckpointPhase::Published
-        {
-            // The payload already committed: release only the owned transient root. In
-            // particular, an S3 Object Lock retry must not hide retained hash versions behind
-            // another delete marker through the legacy discard path.
-            pending
-                .destination
-                .release_hash_checkpoint(&pending.stage)
-                .await
-        } else {
-            pending.destination.discard(pending.stage).await
-        }
+        cleanup_published(pending).await
+    }
+}
+
+async fn cleanup_published(pending: Box<FailedStage>) -> Result<(), StorageRoleFailure> {
+    if pending.stage.checkpoint_enabled()
+        && pending.stage.checkpoint_phase() == CheckpointPhase::Published
+    {
+        // The payload already committed: release only the owned transient root. In
+        // particular, an S3 Object Lock retry must not hide retained hash versions behind
+        // another delete marker through the legacy discard path.
+        pending
+            .destination
+            .release_hash_checkpoint(&pending.stage)
+            .await
+    } else {
+        pending.destination.discard(pending.stage).await
     }
 }
 
@@ -252,6 +306,9 @@ impl fmt::Display for TransferFailure {
                 self.metadata.as_deref(),
                 self.role.as_deref(),
             )?;
+        }
+        if let Some(cleanup) = &self.cleanup_failure {
+            write!(formatter, "; artifact cleanup failed: {cleanup}")?;
         }
         Ok(())
     }
@@ -304,3 +361,7 @@ pub(super) fn failure_side(error: &StorageRoleFailure) -> TransferSide {
         StorageRoleFailure::Entry(_) | StorageRoleFailure::Session(_) => TransferSide::Destination,
     }
 }
+
+#[cfg(test)]
+#[path = "failure_tests.rs"]
+mod tests;
