@@ -1,9 +1,11 @@
-//! Transport-neutral source half of the unified transfer lifecycle.
+//! Transport-neutral source and destination halves of the unified transfer lifecycle.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::{StreamExt, stream};
+use tokio_util::sync::CancellationToken;
 
 use super::at_destination;
 use super::directory_object::{refuse_unholdable, refuse_unwritable};
@@ -15,12 +17,15 @@ use super::{
 };
 use crate::metadata::MetadataPlan;
 use crate::model::observation::PrivateBackendEntryFacts;
-use crate::model::{EntryIdentityKey, EntryKind, ObservedEntry, SourceVersion, StoragePath};
+use crate::model::{
+    EntryIdentityKey, EntryKind, EntryOperationFailure, FailureClass, ObservedEntry, Operation,
+    SourceVersion, StoragePath, Transience,
+};
 use crate::storage::{
-    CheckpointObservation, FinalDestination, PrepareFact, PrepareRequest, PublicationEvidence,
-    PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosGroup, SourceQosStats,
-    StagedDestination, Storage, VerificationPoint, VerifyRequest, WriteEvidence,
-    WriteProgressObserver,
+    ByteStream, CheckpointObservation, FinalDestination, PrepareFact, PrepareRequest,
+    PublicationEvidence, PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget,
+    SourceQosGroup, SourceQosStats, StagedDestination, Storage, StorageRoleFailure,
+    VerificationPoint, VerifyRequest, WriteEvidence, WriteProgressObserver,
 };
 use crate::transfer::model::ObservedSource;
 use crate::transfer::{TransferIdentity, TransferPolicy, TransferValueError};
@@ -529,8 +534,13 @@ impl ExpertDestinationSession {
     /// Returns a destination/checkpoint failure while preserving cleanup authority.
     pub async fn write(
         self,
-        stream: crate::storage::ByteStream,
+        stream: ByteStream,
     ) -> Result<ExpertDestinationTransferred, TransferFailure> {
+        let stream = cancellable_input(
+            stream,
+            self.cancel.clone(),
+            self.stage.final_destination().path().clone(),
+        );
         let write_result = self.destination.write(&self.stage, stream).await;
         let write = match write_result {
             Ok(write) => write,
@@ -894,4 +904,38 @@ fn descriptor_from_observation(
         Some(fact) => descriptor.with_backend_fact(fact),
         None => descriptor,
     })
+}
+
+// Keep the backend write future alive to settle owned operations after input cancellation.
+fn cancellable_input(
+    input: ByteStream,
+    cancel: CancellationToken,
+    path: StoragePath,
+) -> ByteStream {
+    Box::pin(stream::unfold(
+        Some((input, cancel, path)),
+        |state| async move {
+            let (mut input, cancel, path) = state?;
+            let item = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Some((Err(cancelled_write(path)), None)),
+                item = input.next() => item?,
+            };
+            let next = item.is_ok().then_some((input, cancel, path));
+            Some((item, next))
+        },
+    ))
+}
+
+fn cancelled_write(path: StoragePath) -> StorageRoleFailure {
+    StorageRoleFailure::Entry(
+        EntryOperationFailure::new(
+            path,
+            Operation::Write,
+            FailureClass::Cancelled,
+            Transience::Transient,
+            "expert destination input cancelled",
+        )
+        .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+    )
 }
