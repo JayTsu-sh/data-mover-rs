@@ -6,7 +6,8 @@
 
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, IdentityStrength, ObservedEntry, Operation,
-    SourceIdentity, SourceVersion, StoragePath, Transience, without_unowned_set_id,
+    PrincipalIdentity, SourceIdentity, SourceVersion, StoragePath, Transience,
+    without_unowned_set_id,
 };
 use crate::storage::{
     ByteStream, ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosGroup,
@@ -379,13 +380,7 @@ fn build_header_for_entry(entry: &ObservedEntry) -> Result<Bytes, TarFailure> {
     if path.contains('\0') || target.contains(&0) {
         return Err(invalid("archive names contain NUL"));
     }
-    let owner = entry.metadata().ownership_mode().value();
-    let (mode, uid, gid) = header_ownership(
-        owner.map_or(0, |owner| owner.mode),
-        owner.map(|owner| owner.uid),
-        owner.map(|owner| owner.gid),
-        entry.kind() == EntryKind::Directory,
-    );
+    let (mode, uid, gid) = observed_header_ownership(entry);
     let mtime = entry
         .modified()
         .map(|time| i64::try_from(time.unix_nanos()))
@@ -568,6 +563,29 @@ const TAR_UNKNOWN_ID: u32 = 65534;
 /// name nfs-rs cannot map, see `nfs::owner_id`) is recorded as nobody, never as root (0), and
 /// takes its set-id bit with it (`model::without_unowned_set_id`) — a root extraction that keeps
 /// owners would otherwise create set-id files owned by someone the source never named.
+fn observed_header_ownership(entry: &ObservedEntry) -> (u32, u32, u32) {
+    let (mode, uid, gid) = if let Some(facts) = entry.permissions() {
+        // An unknown facet stays unknown; named principals have no numeric mapping here.
+        let numeric = |principal: Option<&PrincipalIdentity>| match principal {
+            Some(PrincipalIdentity::Numeric(id)) => Some(*id),
+            _ => None,
+        };
+        (
+            facts.mode.unwrap_or(0),
+            numeric(facts.owner.as_ref()),
+            numeric(facts.group.as_ref()),
+        )
+    } else {
+        let owner = entry.metadata().ownership_mode().value();
+        (
+            owner.map_or(0, |owner| owner.mode),
+            owner.map(|owner| owner.uid),
+            owner.map(|owner| owner.gid),
+        )
+    };
+    header_ownership(mode, uid, gid, entry.kind() == EntryKind::Directory)
+}
+
 fn header_ownership(
     mode: u32,
     uid: Option<u32>,
@@ -602,6 +620,10 @@ pub(crate) fn tar_padding(file_size: u64) -> Option<Bytes> {
 pub(crate) fn tar_eof_marker() -> Bytes {
     Bytes::from_static(&[0u8; 1024])
 }
+
+#[cfg(test)]
+#[path = "tar_pack/permission_tests.rs"]
+mod permission_tests;
 
 #[cfg(test)]
 mod tests {

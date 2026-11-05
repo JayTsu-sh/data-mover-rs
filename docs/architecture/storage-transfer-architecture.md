@@ -559,6 +559,10 @@ tree; callers removing archived sources must exclusively control them. Tar phase
 cause, publication status and any separate cleanup failure; published finals are never rolled back.
 Only an unchanged propagated source input failure is attributed to Source; an independent destination
 failure retains its original attribution and publication evidence.
+Headers take mode and principal facts from the observation's independent PermissionFacts when
+present. Unknown facets remain unknown; only explicitly numeric principals become uid/gid, while
+named principals are recorded with the unknown numeric ID. When those facts are absent, numeric
+ownership metadata supplies the header. The shared set-id safety rule applies in either case.
 
 For consumers reading an existing basis, `storage::read_current_range` describes the current
 object once, binds its identity and resolved version, and streams the exact ordered range.
