@@ -13,6 +13,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, stream};
 use std::{
     fs::File as StdFile,
+    future::Future,
     io,
     pin::Pin,
     sync::{Arc, Mutex, PoisonError},
@@ -23,7 +24,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     task::spawn_blocking,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 mod error;
 pub use error::DirectPatchError;
 type PatchResult<T> = std::result::Result<T, DirectPatchError>;
@@ -59,6 +60,8 @@ pub struct DirectPatchProgress {
 }
 
 /// 持有 Direct 增量输入、basis 版本与待提交补丁；不提供事务回滚。
+/// 调用方取消或丢弃会话／complete future 时，所有在途阶段共用的子令牌会取消。
+/// 取消前尚未应用的补丁随会话释放；开始改写后可能留下部分更新，重试须重建 basis。
 pub struct DirectPatchSession {
     storage: Storage,
     path: StoragePath,
@@ -72,6 +75,8 @@ pub struct DirectPatchSession {
     ended: bool,
     failed: bool,
     changed_bytes: u64,
+    cancel: CancellationToken,
+    _cancel_on_drop: DropGuard,
 }
 
 impl DirectPatchSession {
@@ -83,7 +88,11 @@ impl DirectPatchSession {
         storage: Storage,
         source: SourceDescriptor,
         plan: MetadataPlan,
+        cancel: CancellationToken,
     ) -> PatchResult<Self> {
+        let cancel = cancel.child_token();
+        let cancel_on_drop = cancel.clone().drop_guard();
+        check_cancelled(&cancel)?;
         if source.kind != EntryKind::File || source.size.is_none() {
             return Err(operation(
                 "Direct patch requires a regular file with a known size",
@@ -94,8 +103,9 @@ impl DirectPatchSession {
             return Err(DirectPatchError::UnsupportedDestination(storage.kind()));
         }
         let path = source.path.clone();
-        let basis = describe(&storage, &path).await?;
+        let basis = interrupt(&cancel, describe(&storage, &path)).await?;
         let (file, temp) = spawn_blocking(create_spool).await??;
+        check_cancelled(&cancel)?;
         Ok(Self {
             storage,
             path,
@@ -109,6 +119,8 @@ impl DirectPatchSession {
             ended: false,
             failed: false,
             changed_bytes: 0,
+            cancel,
+            _cancel_on_drop: cancel_on_drop,
         })
     }
 
@@ -122,8 +134,14 @@ impl DirectPatchSession {
                 "Direct input previously failed; discard this session",
             ));
         }
-        let result = self.receive_inner(input).await;
+        let cancel = self.cancel.clone();
+        // 中途丢弃 receive future 也会停止在途读取，并禁止随后提交该会话。
+        let receiving = cancel.clone().drop_guard();
+        let result = interrupt(&cancel, self.receive_inner(input)).await;
         self.failed = result.is_err();
+        if result.is_ok() {
+            receiving.disarm();
+        }
         result
     }
 
@@ -200,7 +218,7 @@ impl DirectPatchSession {
                 maximum_chunk_bytes: source.maximum_read_chunk_bytes(),
                 read_inflight: source.read_concurrency(),
                 read_budget: None,
-                cancel: CancellationToken::new(),
+                cancel: self.cancel.clone(),
                 source_qos: None,
                 version: basis.version.clone(),
             })
@@ -233,6 +251,7 @@ impl DirectPatchSession {
                 "Direct patch requires a complete verified payload",
             ));
         }
+        check_cancelled(&self.cancel)?;
         self.validate_basis().await?;
         let destination = self.storage.staged_destination()?;
         let stage = self.prepare_stage(&*destination).await?;
@@ -240,7 +259,7 @@ impl DirectPatchSession {
         let spool_error = Arc::new(Mutex::new(None));
         let input = spool_input(self.spool, spool_error.clone());
         let written = destination
-            .patch_direct(&stage, input, self.bytes, CancellationToken::new())
+            .patch_direct(&stage, input, self.bytes, self.cancel.clone())
             .await;
         if let Some(error) = spool_error
             .lock()
@@ -256,6 +275,7 @@ impl DirectPatchSession {
             &stage,
             self.bytes,
             *self.hash.finalize().as_bytes(),
+            &self.cancel,
         )
         .await?;
         tracing::info!(
@@ -268,7 +288,7 @@ impl DirectPatchSession {
     }
 
     async fn validate_basis(&self) -> PatchResult<()> {
-        let current = describe(&self.storage, &self.path).await?;
+        let current = interrupt(&self.cancel, describe(&self.storage, &self.path)).await?;
         let unchanged = match (&self.basis, &current) {
             (None, None) => true,
             (Some(old), Some(now)) => {
@@ -297,9 +317,29 @@ impl DirectPatchSession {
                     source: self.source.clone(),
                     recovery_binding: [0; 32],
                 },
-                CancellationToken::new(),
+                self.cancel.clone(),
             )
             .await?)
+    }
+}
+
+fn check_cancelled(cancel: &CancellationToken) -> PatchResult<()> {
+    if cancel.is_cancelled() {
+        Err(DirectPatchError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+// 仅中断输入、basis 读取和私有暂存；目标写入及校验等待 backend 响应取消并收尾。
+async fn interrupt<T>(
+    cancel: &CancellationToken,
+    work: impl Future<Output = PatchResult<T>>,
+) -> PatchResult<T> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(DirectPatchError::Cancelled),
+        result = work => result,
     }
 }
 
@@ -371,27 +411,31 @@ async fn finish_patch(
     stage: &PreparedStage,
     size: u64,
     hash: [u8; 32],
+    cancel: &CancellationToken,
 ) -> PatchResult<()> {
+    check_cancelled(cancel)?;
     destination
         .verify(
             stage,
             VerifyRequest {
                 expected_size: size,
                 expected_blake3: hash,
-                cancel: CancellationToken::new(),
+                cancel: cancel.clone(),
                 published: None,
             },
         )
         .await?;
-    plan.apply_to_stage(destination, stage, CancellationToken::new())
+    check_cancelled(cancel)?;
+    plan.apply_to_stage(destination, stage, cancel.clone())
         .await?;
+    check_cancelled(cancel)?;
     destination
         .publish(
             stage,
             PublishRequest {
                 expected_size: size,
                 expected_blake3: Some(hash),
-                cancel: CancellationToken::new(),
+                cancel: cancel.clone(),
             },
         )
         .await?;

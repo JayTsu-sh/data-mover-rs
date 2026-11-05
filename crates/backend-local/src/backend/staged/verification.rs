@@ -31,6 +31,8 @@ pub(super) fn verify_file(
     probe: &WriteProbe,
 ) -> io::Result<VerificationEvidence> {
     #[cfg(any(test, feature = "test-support"))]
+    let _verification = probe.verifying(&request.cancel);
+    #[cfg(any(test, feature = "test-support"))]
     if probe.corrupt_before_verify.swap(false, Ordering::SeqCst) {
         #[cfg(unix)]
         file.write_at(&[0xff], 0)?;

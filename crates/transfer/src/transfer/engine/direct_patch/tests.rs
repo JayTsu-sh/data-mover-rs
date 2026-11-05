@@ -5,16 +5,22 @@ use crate::{
         TimestampTargetCapability, ValueTarget, compile_metadata_plan,
     },
     model::{EntryKind, IdentityStrength, MetadataObservations, SourceIdentity},
-    storage::{LocalBackendConfig, backends::local::connect_backend},
+    storage::{
+        LocalBackendConfig, StorageBuilder,
+        backends::local::{connect_backend, staged::LocalStagedDestination},
+    },
 };
 use std::{
     error::Error,
     fs::{File, metadata, read, write},
     num::NonZeroUsize,
     os::unix::fs::MetadataExt,
+    time::Duration,
 };
 use tempfile::TempDir;
+use tokio::time::{sleep, timeout};
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+mod stages;
 
 fn plan() -> TestResult<MetadataPlan> {
     Ok(compile_metadata_plan(&MetadataPlanRequest {
@@ -43,7 +49,14 @@ fn storage(root: &TempDir) -> TestResult<Storage> {
 }
 
 async fn new_session(root: &TempDir, size: usize) -> TestResult<DirectPatchSession> {
-    let storage = storage(root)?;
+    session_with_cancel(storage(root)?, size, CancellationToken::new()).await
+}
+
+async fn session_with_cancel(
+    storage: Storage,
+    size: usize,
+    cancel: CancellationToken,
+) -> TestResult<DirectPatchSession> {
     let source = SourceDescriptor::new(
         StoragePath::new("file")?,
         EntryKind::File,
@@ -54,7 +67,7 @@ async fn new_session(root: &TempDir, size: usize) -> TestResult<DirectPatchSessi
             b"remote-file",
         )?,
     );
-    Ok(DirectPatchSession::prepare(storage, source, plan()?).await?)
+    Ok(DirectPatchSession::prepare(storage, source, plan()?, cancel).await?)
 }
 
 async fn prepare(root: &TempDir, payload: &[u8]) -> TestResult<DirectPatchSession> {
@@ -200,4 +213,140 @@ fn large_input(size: u64, changed_size: u64) -> TestResult<DirectPatchInput> {
         }
     }));
     Ok(input)
+}
+
+#[tokio::test]
+async fn cancelled_receive_interrupts_idle_input_and_keeps_basis_untouched() -> TestResult {
+    let root = tempfile::tempdir()?;
+    write(root.path().join("file"), b"AAAABBBB")?;
+    let cancel = CancellationToken::new();
+    let mut session = session_with_cancel(storage(&root)?, 8, cancel.clone()).await?;
+    let mut input: DirectPatchInput = Box::pin(stream::pending());
+    let (result, ()) = tokio::join!(
+        timeout(Duration::from_secs(1), session.receive(&mut input)),
+        async {
+            tokio::task::yield_now().await;
+            cancel.cancel();
+        },
+    );
+    assert!(matches!(result?, Err(DirectPatchError::Cancelled)));
+    assert!(session.complete().await.is_err());
+    assert_eq!(read(root.path().join("file"))?, b"AAAABBBB");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_before_commit_never_applies_buffered_patches() -> TestResult {
+    let root = tempfile::tempdir()?;
+    write(root.path().join("file"), b"AAAABBBB")?;
+    let cancel = CancellationToken::new();
+    let mut session = session_with_cancel(storage(&root)?, 8, cancel.clone()).await?;
+    let mut input: DirectPatchInput = Box::pin(stream::iter([DirectPatchChunk {
+        offset: 0,
+        data: Bytes::from_static(b"AAAAXXXX"),
+        unchanged_basis: false,
+    }]));
+    session.receive(&mut input).await?;
+    // receive 已完成；取消不会被误当成完整输入的发布许可。
+    cancel.cancel();
+    assert!(matches!(
+        session.complete().await,
+        Err(DirectPatchError::Cancelled)
+    ));
+    assert_eq!(read(root.path().join("file"))?, b"AAAABBBB");
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_receive_future_prevents_later_commit_without_cancelling_parent() -> TestResult {
+    let root = tempfile::tempdir()?;
+    write(root.path().join("file"), b"AAAABBBB")?;
+    let cancel = CancellationToken::new();
+    let mut session = session_with_cancel(storage(&root)?, 8, cancel.clone()).await?;
+    let mut input: DirectPatchInput = Box::pin(stream::pending());
+    assert!(
+        timeout(Duration::from_millis(20), session.receive(&mut input))
+            .await
+            .is_err()
+    );
+    assert!(session.complete().await.is_err());
+    assert!(!cancel.is_cancelled());
+    assert_eq!(read(root.path().join("file"))?, b"AAAABBBB");
+    Ok(())
+}
+
+fn paused_destination(root: &TempDir) -> TestResult<(Storage, Arc<LocalStagedDestination>)> {
+    let local = storage(root)?;
+    let destination = Arc::new(LocalStagedDestination::new(
+        root.path(),
+        local.identity().clone(),
+        1,
+    )?);
+    destination.pause_verification();
+    let roles = StorageBuilder::new(local.identity().clone(), local.capabilities().clone())
+        .read_source(local.read_source()?)
+        .staged_destination(destination.clone())
+        .namespace(local.namespace()?)
+        .metadata(local.metadata()?)
+        .build()?;
+    Ok((roles, destination))
+}
+
+async fn wait_for(mut condition: impl FnMut() -> bool) -> TestResult {
+    timeout(Duration::from_secs(1), async {
+        while !condition() {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn caller_cancellation_stops_native_verification_before_complete_returns() -> TestResult {
+    let root = tempfile::tempdir()?;
+    write(root.path().join("file"), b"AAAABBBB")?;
+    let (storage, destination) = paused_destination(&root)?;
+    let cancel = CancellationToken::new();
+    let mut session = session_with_cancel(storage, 8, cancel.clone()).await?;
+    let mut input: DirectPatchInput = Box::pin(stream::iter([DirectPatchChunk {
+        offset: 0,
+        data: Bytes::from_static(b"AAAAXXXX"),
+        unchanged_basis: false,
+    }]));
+    session.receive(&mut input).await?;
+    let completion = tokio::spawn(session.complete());
+    wait_for(|| destination.verification_started()).await?;
+    cancel.cancel();
+    let result = timeout(Duration::from_secs(1), completion).await??;
+    assert!(
+        matches!(result, Err(DirectPatchError::Role(StorageRoleFailure::Entry(failure)))
+        if failure.class() == FailureClass::Cancelled)
+    );
+    assert!(destination.verification_finished());
+    assert_eq!(destination.final_sync_counts(), (0, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropped_complete_future_cancels_and_releases_native_verification() -> TestResult {
+    let root = tempfile::tempdir()?;
+    write(root.path().join("file"), b"AAAABBBB")?;
+    let (storage, destination) = paused_destination(&root)?;
+    let cancel = CancellationToken::new();
+    let mut session = session_with_cancel(storage, 8, cancel.clone()).await?;
+    let mut input: DirectPatchInput = Box::pin(stream::iter([DirectPatchChunk {
+        offset: 0,
+        data: Bytes::from_static(b"AAAAXXXX"),
+        unchanged_basis: false,
+    }]));
+    session.receive(&mut input).await?;
+    let completion = tokio::spawn(session.complete());
+    wait_for(|| destination.verification_started()).await?;
+    completion.abort();
+    assert!(completion.await.is_err());
+    wait_for(|| destination.verification_finished()).await?;
+    assert!(!cancel.is_cancelled(), "会话释放不能取消调用方或兄弟操作");
+    assert_eq!(destination.final_sync_counts(), (0, 0));
+    Ok(())
 }
