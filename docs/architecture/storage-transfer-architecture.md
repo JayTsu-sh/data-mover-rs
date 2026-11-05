@@ -548,6 +548,13 @@ failure, so the application can classify a truncated stream without losing nativ
 cleanup ownership. A successful outcome still requires the existing verification/publication
 step; failure cleanup follows the selected transfer policy.
 
+For consumers reading an existing basis, `storage::read_current_range` describes the current
+object once, binds its identity and resolved version, and streams the exact ordered range.
+It rejects invalid ranges, unknown sizes, short EOF and excess payload with typed read failures;
+backend causes stay intact. It moves the backend buffers and creates no worker or channel, so
+caller polling and the backend read window provide backpressure. It retains backend request
+timeout, cancellation and drop semantics.
+
 ## 9. Transfer state machine
 
 ```text

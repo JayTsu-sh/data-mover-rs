@@ -27,7 +27,9 @@ mod handle;
 pub mod listing;
 mod native;
 mod permissions;
+mod read_range;
 pub use permissions::{PermissionFacts, PrincipalIdentity};
+pub use read_range::read_current_range;
 #[doc(hidden)]
 pub mod pointer;
 #[doc(hidden)]
