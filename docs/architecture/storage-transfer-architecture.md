@@ -538,6 +538,16 @@ unchanged, and retains stage cleanup/recovery authority. Prepared destination se
 discard ownership
 for remote cancellation before payload.
 
+
+For reconstructed positioned input, `ExpertDestinationSession::write_positioned` consumes a
+caller-bounded `PositionedByteStream` starting at offset zero. It checks contiguous offsets,
+hashes the complete logical input and advances owned Bytes views past the recovered prefix;
+only the remaining bytes reach the existing destination writer. It does not publish. Its
+`ExpertDestinationWrite` preserves bytes, digest and EOF facts even when the backend returns a
+failure, so the application can classify a truncated stream without losing native failure or
+cleanup ownership. A successful outcome still requires the existing verification/publication
+step; failure cleanup follows the selected transfer policy.
+
 ## 9. Transfer state machine
 
 ```text
@@ -646,6 +656,12 @@ metadata failure leaves the final destination unchanged and returns the partial 
 best-effort/omit behavior is already fixed in the compiled plan. Transfer never exposes a
 post-publication metadata workaround, never deletes its source, and returns only a neutral
 source-deletion-safety fact for terrasync policy.
+
+
+The expert destination's write entry also observes cancellation while waiting for caller-owned
+input. It delivers a typed Cancelled/Write/Transient input failure and ends that stream while
+continuing to await the backend write, allowing owned in-flight operations to settle. This guard
+does not replace backend request timeouts or claim to interrupt an already stalled protocol request.
 
 ## 10. Recovery contract
 

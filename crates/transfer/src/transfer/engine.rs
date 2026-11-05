@@ -27,6 +27,7 @@ mod delete_marker;
 mod direct_patch;
 mod directory_object;
 mod expert;
+mod expert_input;
 pub use direct_patch::{
     DirectPatchChunk, DirectPatchError, DirectPatchInput, DirectPatchProgress, DirectPatchSession,
 };
@@ -53,6 +54,7 @@ pub use expert::{
     ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload, ExpertSourceRequest,
     ExpertSourceSession,
 };
+pub use expert_input::{ExpertDestinationWrite, ExpertInputProgress};
 pub use failure::TransferFailure;
 
 /// Lifecycle stage at which one transfer attempt stopped.
