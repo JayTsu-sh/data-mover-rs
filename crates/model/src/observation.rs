@@ -666,6 +666,30 @@ impl ObservedEntry {
         Ok(self.encode())
     }
 
+    /// Encodes one borrowed history record as a standalone observation snapshot.
+    ///
+    /// This does not clone the history, metadata, identity or tags. Only the final encoded
+    /// bytes are allocated. The snapshot carries the selected record's identity, size,
+    /// timestamp and metadata, with a one-record complete history in the original order.
+    /// Container-only backend facts and rename evidence are omitted.
+    ///
+    /// # Errors
+    /// Returns a typed error if no history exists or `index` is out of bounds.
+    pub fn try_encode_version_snapshot(
+        &self,
+        index: usize,
+    ) -> Result<EntrySnapshot, ModelValueError> {
+        let history = self
+            .history
+            .as_deref()
+            .ok_or_else(|| ModelValueError::new("history", "entry has no history"))?;
+        let record = history
+            .records()
+            .get(index)
+            .ok_or_else(|| ModelValueError::new("history_index", "outside observed history"))?;
+        Ok(self.encode_version(record, history.order()))
+    }
+
     /// Reconstructs an observation from an unchanged snapshot taken on `backend`.
     ///
     /// A snapshot does not store the backend identity (every entry of one scan shares it): the

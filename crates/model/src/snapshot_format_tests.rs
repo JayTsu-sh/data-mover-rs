@@ -294,3 +294,47 @@ fn segments_keep_the_entry_and_split_its_history() {
         assert_eq!(decoded, segment);
     }
 }
+
+#[test]
+fn borrowed_version_snapshots_preserve_record_facts_without_changing_the_observation() {
+    for (_, entry, _) in fixtures() {
+        let before = entry.encode_snapshot();
+        if let Some(history) = entry.history() {
+            for (index, record) in history.records().iter().enumerate() {
+                let snapshot = entry
+                    .try_encode_version_snapshot(index)
+                    .unwrap_or_else(|e| panic!("{e}"));
+                let decoded =
+                    ObservedEntry::decode_snapshot(snapshot.as_bytes(), &backend_of(&entry))
+                        .unwrap_or_else(|e| panic!("{e}"));
+                assert_eq!(decoded.path(), entry.path());
+                assert_eq!(decoded.kind(), entry.kind());
+                assert_eq!(decoded.source_identity(), record.identity());
+                assert_eq!(decoded.size(), record.size());
+                assert_eq!(decoded.modified(), record.modified());
+                assert_eq!(
+                    decoded.metadata(),
+                    record
+                        .metadata()
+                        .unwrap_or(&MetadataObservations::default())
+                );
+                let selected = decoded
+                    .history()
+                    .unwrap_or_else(|| panic!("missing history"));
+                assert_eq!(selected.records(), std::slice::from_ref(record));
+                assert_eq!(selected.order(), history.order());
+                assert!(selected.is_complete());
+                assert_eq!(selected.segment(), 0);
+                assert_eq!(selected.largest_version(), record.size());
+            }
+            assert!(
+                entry
+                    .try_encode_version_snapshot(history.records().len())
+                    .is_err()
+            );
+        } else {
+            assert!(entry.try_encode_version_snapshot(0).is_err());
+        }
+        assert_eq!(entry.encode_snapshot().as_bytes(), before.as_bytes());
+    }
+}

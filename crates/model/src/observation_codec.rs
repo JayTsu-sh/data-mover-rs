@@ -22,11 +22,12 @@
 use super::history_codec;
 use super::{
     BackendIdentity, BackendKind, EntryIdentityKey, EntryKind, EntrySnapshot, IdentityStrength,
-    MAX_MODEL_FIELD_BYTES, ObservedEntry, PrivateBackendEntryFacts, SnapshotDecodeError,
-    SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding,
+    MAX_MODEL_FIELD_BYTES, MetadataObservations, ObservedEntry, PrivateBackendEntryFacts,
+    SnapshotDecodeError, SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget,
+    SymlinkTargetEncoding, VersionRecord,
 };
 use crate::model::metadata_observation;
-use crate::model::{RenameEvidence, RenameScheme, SpecialFileKind, TimePrecision};
+use crate::model::{HistoryOrder, RenameEvidence, RenameScheme, SpecialFileKind, TimePrecision};
 
 const MAGIC: &[u8; 4] = b"DMES";
 /// The current format: v10 retains metadata errors when successful fallback facts replace them.
@@ -51,11 +52,11 @@ impl PrivateBackendEntryFacts {
 impl ObservedEntry {
     pub(super) fn encode(&self) -> EntrySnapshot {
         let mut output = Vec::new();
-        self.encode_fields(&mut output);
+        self.encode_fields(&mut output, None);
         match self.marker.as_deref() {
             Some(marker) => {
                 output.push(1);
-                marker.encode_fields(&mut output);
+                marker.encode_fields(&mut output, None);
                 output.push(0); // A marker is a leaf, never another container.
                 output.extend_from_slice(marker.identity_key.as_bytes());
             }
@@ -65,9 +66,30 @@ impl ObservedEntry {
         EntrySnapshot(output)
     }
 
+    pub(super) fn encode_version(
+        &self,
+        record: &VersionRecord,
+        order: HistoryOrder,
+    ) -> EntrySnapshot {
+        let mut output = Vec::new();
+        self.encode_fields(&mut output, Some((record, order)));
+        output.push(0);
+        output.extend_from_slice(record.identity().identity_key().as_bytes());
+        EntrySnapshot(output)
+    }
+
     /// Fields shared by an outer entry and its nonrecursive marker leaf, before their marker
     /// tag and identity key.
-    fn encode_fields(&self, output: &mut Vec<u8>) {
+    fn encode_fields(
+        &self,
+        output: &mut Vec<u8>,
+        selected: Option<(&VersionRecord, HistoryOrder)>,
+    ) {
+        let identity = selected.map_or(&self.source_identity, |(record, _)| record.identity());
+        let empty_metadata = MetadataObservations::default();
+        let metadata = selected.map_or(&self.metadata, |(record, _)| {
+            record.metadata().unwrap_or(&empty_metadata)
+        });
         output.extend_from_slice(MAGIC);
         output.push(VERSION);
         output.push(backend_tag(self.backend_kind));
@@ -84,13 +106,25 @@ impl ObservedEntry {
             }
             None => output.push(0),
         }
-        encode_size(output, self.size);
-        encode_time(output, self.modified);
-        output.push(self.source_identity.strength.tag());
-        output.extend_from_slice(&endpoint_fingerprint(&self.source_identity.backend));
-        put_bytes(output, self.source_identity.stable_bytes.as_slice());
+        encode_size(
+            output,
+            selected.map_or(self.size, |(record, _)| record.size()),
+        );
+        encode_time(
+            output,
+            selected.map_or(self.modified, |(record, _)| record.modified()),
+        );
+        output.push(identity.strength.tag());
+        output.extend_from_slice(&endpoint_fingerprint(&identity.backend));
+        put_bytes(output, identity.stable_bytes.as_slice());
         output.push(2);
-        metadata_observation::encode(&self.metadata, output);
+        metadata_observation::encode(metadata, output);
+        if let Some((record, order)) = selected {
+            PrivateBackendEntryFacts::None.encode(output);
+            history_codec::encode_single(output, record, order);
+            output.push(0);
+            return;
+        }
         self.backend_fact.encode(output);
         history_codec::encode(output, self.history.as_deref());
         match self.rename_evidence {
