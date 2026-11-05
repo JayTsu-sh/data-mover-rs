@@ -613,6 +613,10 @@ async fn checkpoints_of_another_request_are_refused_before_any_io() {
         ),
         ("order", from(request(TraversalOrder::Blocks, 2))),
         (
+            "root object policy",
+            from(request(TraversalOrder::Unordered, 2).report_root_directory_object(false)),
+        ),
+        (
             "depth",
             from(request(TraversalOrder::Unordered, 2).max_depth(NonZeroUsize::new(2))),
         ),

@@ -182,9 +182,10 @@ async fn read(
     // the traversal is ending then, so what it returns is never used.
     let request = ListRequest::new(work.path.clone(), shared.request.cancel.clone())
         .with_descent_hint(work.hint.clone());
-    let mut stream = shared
-        .namespace
-        .list_for_traversal(request, work.child_depth == 1);
+    let mut stream = shared.namespace.list_for_traversal(
+        request,
+        shared.request.root_object_diagnostics_at(work.child_depth),
+    );
     let mut peeked: Option<Option<Item>> = None;
     loop {
         let next = match peeked.take() {

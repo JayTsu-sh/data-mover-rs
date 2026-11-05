@@ -108,10 +108,12 @@ impl Worker {
         // tears its listings down.
         let request = ListRequest::new(work.path.clone(), self.stop.clone())
             .with_descent_hint(work.hint.clone());
-        let mut stream = self
-            .shared
-            .namespace
-            .list_for_traversal(request, work.child_depth == 1);
+        let mut stream = self.shared.namespace.list_for_traversal(
+            request,
+            self.shared
+                .request
+                .root_object_diagnostics_at(work.child_depth),
+        );
         let mut listing = Listing {
             statistics: self
                 .shared

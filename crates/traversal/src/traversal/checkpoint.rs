@@ -193,6 +193,7 @@ pub(crate) fn fingerprint(
     field(identity.stable_id().as_bytes());
     field(request.root.as_str().as_bytes());
     field(&[order_tag(request.order)]);
+    field(&[u8::from(request.report_root_directory_object)]);
     let depth = request
         .max_depth
         .map_or(0, |depth| u64::try_from(depth.get()).unwrap_or(u64::MAX));
