@@ -34,12 +34,12 @@ AI 工作流程、首版格式策略及外部环境异常约束统一见 [AGENTS
 | storage role 操作、能力与传输 | [传输架构](architecture/storage-transfer-architecture.md)、[能力矩阵](architecture/backend-capability-matrix.yaml)、crates/storage-core/src/storage/roles/ |
 | NFS / CIFS / S3 | [.claude/docs/storage-nfs.md](../.claude/docs/storage-nfs.md)、[storage-cifs.md](../.claude/docs/storage-cifs.md)、[storage-s3.md](../.claude/docs/storage-s3.md) 中对应 backend 的章节及 crates/backend-*/ |
 | Local namespace 与 ACL | [storage-local.md](../.claude/docs/storage-local.md)、crates/backend-local/ |
-| 错误映射、重试与取消 | [错误分类](../.claude/docs/error-taxonomy.md)、本仓库 AGENTS.md 的外部环境约束及当前错误类型 |
+| 错误映射、重试与取消 | [错误分类](../.claude/docs/error-taxonomy.md)、[存储连通性](external-dependency-failures.md) 及当前错误类型 |
 | 遍历、过滤和 checkpoint | [调度资料](../.claude/docs/walk-scheduler.md)、[过滤资料](../.claude/docs/filter-dsl.md)、crates/traversal/src/traversal/ 的当前调度与恢复实现 |
 | 元数据、ACL 和 xattr | [元数据协商](../.claude/docs/metadata-negotiation.md)、crates/metadata/、crates/acl/ 与对应 backend |
 | 校验、QoS、tar 与拷贝 | crates/integrity/、crates/transfer/、crates/storage-core/ 及其当前测试 |
 | 后端真实环境、允许操作范围 | [测试环境](../.claude/docs/test-environments.md)、tests/lab/ 和对应校验脚本的说明 |
-| commit / PR、命名和日志 | [提交与代码约定](../.claude/docs/conventions.md)；AI 工作流程以 AGENTS.md 为准 |
+| commit / PR、命名和日志 | [提交与代码约定](conventions.md)；AI 工作流程以 AGENTS.md 为准 |
 
 ## 验证
 
@@ -57,3 +57,16 @@ AI 工作流程、首版格式策略及外部环境异常约束统一见 [AGENTS
 - 版本号用于识别当前编码并拒绝其他格式；只实现当前格式，不为历史开发版本增加兼容解码器或升级链。
 - 保留当前数据的完整性、安全和恢复校验，包括 magic、版本、校验和、长度上限、身份/计划绑定、所有权和权限检查。
 - S3 等服务端差异、操作系统支持及当前恢复流程是实际功能，按当前需求维护；不能仅因名称含 `compat`、`legacy` 或 `version` 就删除。
+
+## 过滤与存储适配的专项约束
+
+- 修改 should_skip 时，明确当前条目跳过、继续遍历和对子项继续匹配三个分量的独立语义，同步过滤文档和组合测试，覆盖 unordered／blocks 与相关 backend。
+- lexer／parser 新语法增加对应边界与错误测试；glob 复用现有 GLOB_MATCH_OPTIONS，日期默认 UTC，目录剪枝和层级边界以行为测试验证，解析错误使用准确分类。以当前源码核验规则，不沿用旧行号、旧路径或预定拆分方案。
+- backend 不反向依赖遍历／传输引擎或其他具体 backend，通用算法通过 role；不支持操作返回准确 Unsupported，不能静默成功。客户端实现留在适配器，配置和公共角色通过既有 facade 入口使用。
+- 时间字段转换复用当前 time_util，保留单位、epoch 和边界检查；URL 文本本身可判断的错误与外部配置矛盾分别准确分类，URL 解析保持单一入口且错误不泄露凭据。
+- 依赖升级说明来源和精确版本／revision，单独列出受影响契约及实际验收；SMB 升级执行现有 storage-cifs 文档要求的真实设备与恢复矩阵，避免并存不一致 revision。版本事实以 Cargo.toml／Cargo.lock 为准，不在多份规范维护副本。
+- CI 默认套件保持可独立运行；真实环境测试使用当前明确的运行入口／条件，不因环境缺失伪装通过。测试临时文件使用独立临时目录并清理；确定性边界测试与真实故障验收分别报告。
+
+## 提交粒度
+
+完成一个可独立验证且语义完整的小功能或修复，通过适用检查后及时 commit。结构重构与行为变化分开；相互依赖才能成立的跨文件修改作为一个原子提交，避免积累大量无关改动，也不按文件数或机械频率制造半成品提交。推送与合入分别遵守当前 review 和检查要求。

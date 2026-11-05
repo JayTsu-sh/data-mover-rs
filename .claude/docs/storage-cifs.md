@@ -425,7 +425,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
      `skill` 的 `.env` 默认不设 `CIFS_REAL_GUEST_POLICY`，所以 `run.py` 本来就不跑它；
    - `cifs_capability_probe`：对照"真实环境证据"表，`[probe]` 行有变化时更新该表。
    失败时先用 `git bisect`/切回旧 rev 重跑同一用例区分"smb-rs 回归"与"服务端瞬时状态"。
-5. **同步记录**：更新本文件"底层依赖与边界"里的 rev 与内容摘要、`CLAUDE.md` "强制约束" 的 rev、
+5. **同步记录**：更新本文件"底层依赖与边界"里的 rev 与内容摘要、当前 `Cargo.toml`／`Cargo.lock` 中固定的 rev、
    `.claude/docs/codebase.md` 依赖表；smb-rs 公开 API 有增删时同步 `连接配置` / `能力差异` 段和
    `docs/architecture/backend-capability-matrix.yaml`。
 6. **提交**：单独一个 `chore(deps): smb-domain 固定到 smb-rs main <rev>` commit，body 写清 smb-rs
