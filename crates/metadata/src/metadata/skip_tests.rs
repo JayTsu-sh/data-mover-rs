@@ -2,6 +2,7 @@
 //! why, precisely enough for the caller to tell its user which end lacks what.
 
 use super::*;
+use crate::model::EntryKind;
 
 fn recording() -> RecordingMetadata {
     RecordingMetadata {
@@ -227,6 +228,7 @@ async fn the_copied_plan_keeps_the_reasons() {
         Some(0o100_640),
         false,
         false,
+        EntryKind::File,
     )
     .unwrap();
     let expected = [

@@ -8,11 +8,13 @@ use super::{
     RefusalCause, SemanticLoss, SkippedFamily, TimestampTargetCapability, ValueTarget,
 };
 use crate::model::{
-    MetadataObservation, StorageTimestamp, TimePrecision, TimestampMetadata, without_unowned_set_id,
+    EntryKind, MetadataObservation, StorageTimestamp, TimePrecision, TimestampMetadata,
+    without_unowned_set_id,
 };
 use crate::storage::MetadataMutation;
 
-/// Compiles automatic copy facts without fabricating numeric owner/group IDs.
+/// Compiles captured copy facts without fabricating numeric owner/group IDs.
+/// Directory setgid controls inheritance; file set-id requires the corresponding owner.
 ///
 /// # Errors
 /// Returns a planning error when requested metadata cannot be safely mapped to the target.
@@ -21,8 +23,14 @@ pub fn compile_copied_metadata_plan(
     mode_without_ownership: Option<u32>,
     owner_names_unmapped: bool,
     auto_acl_mapping: bool,
+    entry_kind: EntryKind,
 ) -> Result<MetadataPlan, MetadataPlanError> {
-    let mut plan = compile_copied_observations(request, mode_without_ownership, auto_acl_mapping)?;
+    let mut plan = compile_copied_observations(
+        request,
+        mode_without_ownership,
+        auto_acl_mapping,
+        entry_kind,
+    )?;
     if let Some(mode) = mode_without_ownership
         .filter(|_| request.policies.get(MetadataFamily::OwnershipMode) != MetadataPolicy::Omit)
     {
@@ -50,8 +58,10 @@ pub fn compile_copied_metadata_plan(
             // The ownership mutation was just retained away, so every mutation left is one that
             // has to observe the new mode: the ACL is recomputed by it, and the timestamps have
             // to be stamped after it. Front of the queue is the only correct place.
-            plan.mutations
-                .insert(0, (family, MetadataMutation::Mode(mode_only(mode))));
+            plan.mutations.insert(
+                0,
+                (family, MetadataMutation::Mode(mode_only(mode, entry_kind))),
+            );
         }
     }
     Ok(plan)
@@ -64,13 +74,14 @@ pub fn compile_copied_metadata_plan(
 pub fn compile_metadata_plan(
     request: &MetadataPlanRequest<'_>,
 ) -> Result<MetadataPlan, MetadataPlanError> {
-    compile_metadata_plan_inner(request, false, None)
+    compile_metadata_plan_inner(request, false, None, EntryKind::File)
 }
 
 fn compile_metadata_plan_inner(
     request: &MetadataPlanRequest<'_>,
     auto_acl_mapping: bool,
     mode_hint: Option<u32>,
+    entry_kind: EntryKind,
 ) -> Result<MetadataPlan, MetadataPlanError> {
     let mut plan = MetadataPlan {
         mappings: Vec::with_capacity(5),
@@ -85,7 +96,7 @@ fn compile_metadata_plan_inner(
     // first would put it earlier in `mutations`, which is also the order they are applied in, so
     // the copied ACL would be silently overwritten by the mode that follows it and the report
     // would still say it was applied.
-    compile_ownership(request, &mut plan)?;
+    compile_ownership(request, &mut plan, entry_kind)?;
     compile_acl(request, &mut plan, auto_acl_mapping, mode_hint)?;
     compile_value(
         MetadataFamily::Xattrs,
@@ -108,16 +119,22 @@ fn compile_metadata_plan_inner(
 }
 
 /// The mode a copy writes when it does not carry owner and group: the file ends up owned by
-/// whoever writes it, so no set-id bit may go with it (`model::without_unowned_set_id`). The copy
-/// path carries files only, never directories.
-const fn mode_only(mode: u32) -> u32 {
-    without_unowned_set_id(mode & 0o7777, false, false, false)
+/// whoever writes it, so executable set-id bits cannot go with it (`model::without_unowned_set_id`). The copy
+/// path also restores directory metadata: its setgid bit controls group inheritance.
+const fn mode_only(mode: u32, entry_kind: EntryKind) -> u32 {
+    without_unowned_set_id(
+        mode & 0o7777,
+        false,
+        false,
+        matches!(entry_kind, EntryKind::Directory),
+    )
 }
 
 fn compile_copied_observations(
     request: &MetadataPlanRequest<'_>,
     mode_without_ownership: Option<u32>,
     auto_acl_mapping: bool,
+    entry_kind: EntryKind,
 ) -> Result<MetadataPlan, MetadataPlanError> {
     // A copy never fetches object tags that its destination cannot store. Keep that known
     // destination refusal distinct from a source that was simply not observed.
@@ -138,8 +155,12 @@ fn compile_copied_observations(
         },
         principal_mapper: request.principal_mapper,
     };
-    let mut plan =
-        compile_metadata_plan_inner(&projected, auto_acl_mapping, mode_without_ownership)?;
+    let mut plan = compile_metadata_plan_inner(
+        &projected,
+        auto_acl_mapping,
+        mode_without_ownership,
+        entry_kind,
+    )?;
     if tags_unstored {
         plan.mappings
             .retain(|mapping| mapping.family != MetadataFamily::Tags);
@@ -290,6 +311,7 @@ fn compile_value<T>(
 fn compile_ownership(
     request: &MetadataPlanRequest<'_>,
     plan: &mut MetadataPlan,
+    entry_kind: EntryKind,
 ) -> Result<(), MetadataPlanError> {
     let family = MetadataFamily::OwnershipMode;
     let policy = request.policies.get(family);
@@ -332,7 +354,7 @@ fn compile_ownership(
             plan,
             policy,
             SemanticLoss::OwnerAndGroupNotPermitted,
-            mode_only(value.mode),
+            mode_only(value.mode, entry_kind),
         ),
         OwnershipTarget::Unsupported => unavailable(
             plan,

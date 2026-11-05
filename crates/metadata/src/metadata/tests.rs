@@ -1,3 +1,4 @@
+use crate::model::EntryKind;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -197,6 +198,7 @@ fn the_mode_that_replaces_ownership_is_applied_before_the_acl_too() {
         Some(0o640),
         false,
         false,
+        EntryKind::File,
     )
     .unwrap();
     assert!(
@@ -232,6 +234,7 @@ fn owner_names_that_could_not_be_mapped_are_reported_as_such() {
             Some(0o640),
             unmapped,
             false,
+            EntryKind::File,
         )
         .unwrap();
         assert_eq!(
@@ -261,6 +264,7 @@ fn a_mode_carried_without_its_owner_loses_its_set_id_bits() {
             Some(mode),
             true,
             false,
+            EntryKind::File,
         )
         .unwrap();
         assert!(
@@ -773,6 +777,7 @@ fn copied_mode_never_synthesizes_numeric_ownership() {
             Some(0o100_640),
             false,
             false,
+            EntryKind::File,
         )
         .unwrap();
         assert_eq!(

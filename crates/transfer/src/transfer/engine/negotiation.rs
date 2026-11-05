@@ -196,6 +196,7 @@ pub(super) async fn copied_metadata_plan(
         observations.mode_without_ownership,
         observations.owner_names_unmapped,
         requested.acl() && descriptor.kind == EntryKind::File,
+        descriptor.kind,
     )
     .map(|plan| Some(CopiedMetadataPlan { plan }))
     .map_err(TransferFailure::refused_metadata)
@@ -615,6 +616,7 @@ mod tests {
             None,
             false,
             false,
+            EntryKind::File,
         )?;
         assert!(matches!(plan.skipped(), [skipped]
             if skipped.family == MetadataFamily::Timestamps
