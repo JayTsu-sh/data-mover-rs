@@ -306,6 +306,8 @@ impl fmt::Display for TransferFailure {
                 self.metadata.as_deref(),
                 self.role.as_deref(),
             )?;
+        } else if let Some(role) = &self.role {
+            write!(formatter, ": {role}")?;
         }
         if let Some(cleanup) = &self.cleanup_failure {
             write!(formatter, "; artifact cleanup failed: {cleanup}")?;

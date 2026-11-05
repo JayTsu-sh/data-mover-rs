@@ -13,6 +13,7 @@ use crate::model::{
 use crate::storage::StorageRoleFailure;
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
 use crate::storage::backends::local::test_destination_storage;
+use crate::transfer::TransferSide;
 use crate::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, TransferPhase, TransferPolicy,
 };
@@ -102,5 +103,22 @@ async fn cleanup_failure_retains_the_original_cause() -> TestResult {
     ));
     assert!(stage.is_dir());
     assert_eq!(std::fs::read(root.path().join("file"))?, b"old");
+    Ok(())
+}
+
+#[test]
+fn non_metadata_display_keeps_the_underlying_failure_class() -> TestResult {
+    let cause = StorageRoleFailure::Entry(EntryOperationFailure::new(
+        StoragePath::new("file")?,
+        Operation::Publish,
+        FailureClass::PermissionDenied,
+        Transience::Permanent,
+        "scoped publish refusal",
+    )?);
+    let failure = TransferFailure::role(TransferPhase::Publish, TransferSide::Destination, cause);
+    let message = failure.to_string();
+    assert!(message.contains("PermissionDenied"), "{message}");
+    assert!(message.contains("Permanent"), "{message}");
+    assert!(failure.source().is_some());
     Ok(())
 }
