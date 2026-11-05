@@ -108,14 +108,14 @@ delay_backoff)。详见 .claude/docs/error-taxonomy.md。
 ## 测试
 
 - Integration test 放 `tests/`，单测放 `src/*.rs` 内 `#[cfg(test)] mod tests`。
-- 不允许 mock 网络 backend — 用 examples / skill 跑真实环境。
+- 故障预算和边界使用确定性测试或受控服务验证；网络 backend 的真实行为另跑适用环境，不能以 mock 成功替代链路验收。
 - 80% 覆盖率是目标但不强求 (跨 backend 真实环境难全自动化)。
 
 ## 文档
 
 - `.claude/docs/*.md` — 项目知识，按场景路由。改代码同步改 doc。
-- `.claude/rules/*.md` — 可验证规则 (grep / clippy)。
-- `.claude/memory/*` — 学习记录，`/evolve` 升级链。
+- AI 开发流程和通用约束统一维护在根 `AGENTS.md`；编码与验证依据见 `docs/development.md`。
+- 现有 `.claude/rules/*.md` 按开发规范的明确引用读取，不假定工具自动加载；新的通用约束集中更新上述入口和规范。
 - 公开 API 必须有 rustdoc (`pub fn` / `pub struct`)。
 - 内部 helper 不强制 doc，但复杂函数加。
 
