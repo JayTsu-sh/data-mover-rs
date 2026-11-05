@@ -2,9 +2,9 @@
 
 按场景路由的项目知识层。每个 doc ≤400 行，**只写这个项目特有**的事。
 
-> 入口在 `/CLAUDE.md`。本 README 是 `.claude/docs/` 内部目录。
+> 统一开发入口为 [AGENTS.md](../../AGENTS.md)，本目录保留技术资料；规范与任务路由见 [开发规范](../../docs/development.md)。
 
-## 路由表 (镜像 CLAUDE.md)
+## 技术资料路由
 
 | 场景 | 文件 |
 |---|---|
@@ -18,8 +18,7 @@
 | 改 filter DSL | [filter-dsl.md](filter-dsl.md) |
 | 改 walk 调度 | [walk-scheduler.md](walk-scheduler.md) |
 | 改 error / retry | [error-taxonomy.md](error-taxonomy.md) |
-| 写 commit / PR | [conventions.md](conventions.md) |
-| 加 skill / 升级 rule / 加 agent | [claude-onboarding.md](claude-onboarding.md) |
+| 写 commit / PR | [提交规范](../../docs/conventions.md) |
 
 ## 何时新增一个 doc
 
@@ -28,7 +27,7 @@
 1. **某主题在 3 个以上 session 重复被问** → 抽 doc。
 2. **某代码区域 >800 行**，且改它需要"先理解 X 才能改 Y"的隐性知识 → 抽 doc。
 3. **某协议/外部依赖有 ≥3 个非显式约束** (例如 SMB 的 smb2_only / anon / file_id) → 抽 doc。
-4. **某规则需要长说明或图示**，超出 `.claude/rules/` 一行能装的 → 抽 doc。
+4. **某规则需要长说明或图示**，超出 AGENTS.md 简洁入口适合承载的 → 抽 doc。
 
 不抽的判据：
 

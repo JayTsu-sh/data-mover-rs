@@ -22,4 +22,4 @@ description: 测 filter DSL — 跑 cargo test filter::，覆盖 lexer / parser 
 - lexer 测试失败 → token 改了没改测试
 - 三元组测试失败 → should_skip 行为回归，看 `.claude/docs/filter-dsl.md` 三元组组合表
 - glob 测试失败 → `GLOB_MATCH_OPTIONS` 被改 / 散写 MatchOptions 漏了 require_literal_separator
-- dir_matches_date_filter 测试失败 → 递归边界逻辑改了，看 `.claude/rules/filter-dsl-rules.md` F5
+- dir_matches_date_filter 测试失败 → 递归边界逻辑改了，看 `docs/development.md` 中的目录剪枝与层级边界条款，并核对当前过滤测试

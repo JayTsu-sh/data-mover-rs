@@ -6,7 +6,7 @@
 
 项目确实存在历史开发版本的兼容代码，但不能通过删除所有版本号来清理。`ObservedEntry` 快照虽然编号为 v10，实际上只接受当前版本；扫描 Checkpoint、传输 hash checkpoint、RangeHash 和 HDFS stage token 也没有多版本解码链。
 
-本次把“首个版本只维护当前接口和格式”的规则写入根目录 [AGENTS.md](../../AGENTS.md)，并在 [CLAUDE.md](../../CLAUDE.md) 中引用，取消其开头对“兼容 facade”的描述。下列运行时代码和现行文档问题是本次审查发现的待清理项；本次没有修改其行为、清除开发状态或访问、删除任何 backend 数据。
+本次把“首个版本只维护当前接口和格式”的规则写入根目录 [AGENTS.md](../../AGENTS.md)，并在 [CLAUDE.md](https://github.com/JayTsu-sh/data-mover-rs/blob/38d3f8af8a2f293e7b25e70b1983d0fb600ebba3/CLAUDE.md) 中引用，取消其开头对“兼容 facade”的描述。下列运行时代码和现行文档问题是本次审查发现的待清理项；本次没有修改其行为、清除开发状态或访问、删除任何 backend 数据。
 
 ## 已确认的历史兼容实现
 

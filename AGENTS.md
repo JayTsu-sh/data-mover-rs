@@ -1,24 +1,19 @@
-# 项目开发规则
+# Codex 项目指令
 
-## 首个版本：只维护当前接口和数据格式
+本文件是统一 AI 开发入口；按任务阅读 [开发规范](docs/development.md) 中对应的编码、架构、格式与验证约束。
 
-本项目正在开发首个版本，开发期的 crate 版本号不构成已发布版本的兼容承诺。
-
-- 接口、配置、Checkpoint、快照和缓存格式发生变化时，直接采用当前设计；同步删除旧接口、别名、旧格式读写分支、迁移转换和过时测试、文档。
-- 旧开发数据和测试夹具可以清除后重新生成；旧扫描状态重新扫描，旧传输状态从源数据重新开始。清理范围限于已确认归属本项目的历史状态或临时产物，保留用户源文件、已发布的最终文件和无关存储对象。
-- 版本号用于识别当前编码并拒绝其他格式；只实现当前格式，不为历史开发版本增加兼容解码器或升级链。
-- 保留当前数据的完整性、安全和恢复校验，包括 magic、版本、校验和、长度上限、身份/计划绑定、所有权和权限检查。
-- S3 等服务端差异、操作系统支持及当前恢复流程是实际功能，按当前需求维护；不能仅因名称含 `compat`、`legacy` 或 `version` 就删除。
-
-项目架构、代码规范和验证命令见 [CLAUDE.md](CLAUDE.md)。涉及历史兼容取舍时，以本节为准。
+- 首版只维护当前接口和数据格式，不增加历史兼容层；同步更新调用方和测试。保留当前数据的安全／恢复校验，保护源文件、已发布文件及无关对象；详细边界见开发规范。
+- 职责：纯库保持 facade、共享模型／role、通用引擎和 backend 的依赖方向；业务策略显式传入，features 只裁剪编译能力。能力声明必须符合真实行为，协议细节留在对应 adapter；相关变更按开发规范的验收表执行。
+- 修改前检查 git status，明确行为、crate／role 边界和验证目标，保护共享目录中的无关工作，仅提交本次任务文件。
+- 通用流程通过 typed roles 保持 backend 无关；修改能力、错误分类或公开接口须核对声明、调用方和行为测试，结构重构与行为修复分开提交。
+- 涉及 backend 存储连接及其恢复的设计／开发／测试／review，必须读 [故障约束](docs/external-dependency-failures.md)：按实际源／目标存储分析异常，保留有类型原因和未知写结果，恢复预算与取消由相应负责层统一执行；扫描约 3 秒窗口由调用方指定，不把 ClickHouse／产品 callback 引入本库。
+- 运行与影响范围相符的检查和真实环境故障验证；完整运行时改动执行 make ci，纯文档检查内容、链接及 diff。合入前 review 最终改动，如实报告未测／跳过及风险。
+- 技术资料和现有脚本按开发规范显式读取／运行，用当前代码与构建配置核对历史资料。
+- 架构 review：代码 review 必须检查职责归属、模块边界和逻辑内聚性；按 [架构审查](docs/architecture-review.md) 给出具体结论，合入前解决本次引入或加重的结构问题，测试通过不能替代。
+- 提交粒度：完成一个可独立验证、语义完整的小功能或修复并通过对应检查后及时 commit；跨文件的原子改动一起提交，避免积累无关改动或提交不可用的半成品。
 
 <!-- CODEGRAPH_START -->
 ## CodeGraph
 
-In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
-
-- **MCP tool** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
-- **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
-
-If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
+仓库存在 .codegraph/ 时，理解或定位代码先用 codegraph_explore（MCP），或在仓库根执行 `codegraph explore "<符号或问题>"`；需要时再用 rg。未索引则正常使用 rg，不自行建索引。
 <!-- CODEGRAPH_END -->
