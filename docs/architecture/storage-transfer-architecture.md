@@ -551,7 +551,14 @@ step; failure cleanup follows the selected transfer policy.
 Tar requests share their immutable manifest as `Arc<[E]>` (`E` borrows an `ObservedEntry`).
 The archive cursor stores indices into that slice, so packaging and later manifest persistence
 can retain the same list without copying a vector or cloning every observation handle. The
-list remains alive until streaming finishes; source reads, headers and publication are unchanged.
+list remains alive until streaming finishes. Each file is described before and after payload
+reading, using the same observation constraints as ordinary/expert transfers; its resolved version
+and identity pin the read. Detected growth, same-size edits and a formerly empty file gaining
+content fail before archive publication. These checks are not an atomic snapshot of a mutable
+tree; callers removing archived sources must exclusively control them. Tar phases apply Atomic failure cleanup and preserve the original
+cause, publication status and any separate cleanup failure; published finals are never rolled back.
+Only an unchanged propagated source input failure is attributed to Source; an independent destination
+failure retains its original attribution and publication evidence.
 
 For consumers reading an existing basis, `storage::read_current_range` describes the current
 object once, binds its identity and resolved version, and streams the exact ordered range.

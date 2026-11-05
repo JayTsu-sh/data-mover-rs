@@ -2,6 +2,7 @@
 
 #[allow(dead_code)]
 mod engine;
+pub(crate) use engine::validate_observation;
 mod identity;
 mod model;
 mod move_file;

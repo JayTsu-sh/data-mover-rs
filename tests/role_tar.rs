@@ -1,7 +1,20 @@
-use data_mover::model::{ObservationMode, ObservationPlan, ObservedEntry, StoragePath};
-use data_mover::storage::{BackendConfig, LocalBackendConfig, Storage, connect_backend};
-use data_mover::tar_pack::{TarRequest, calculate_tar_size, pack};
+use async_trait::async_trait;
+use data_mover::model::{
+    EntryOperationFailure, FailureClass, ObservationMode, ObservationPlan, ObservedEntry,
+    Operation, StoragePath, Transience,
+};
+use data_mover::storage::{
+    BackendCapabilities, BackendConfig, ByteStream, CapabilityAvailability, LocalBackendConfig,
+    ReadRequest, ReadSource, SourceDescriptor, Storage, StorageBuilder, StorageRoleFailure,
+    UnsupportedReason, connect_backend,
+};
+use data_mover::tar_pack::{TarFailure, TarRequest, calculate_tar_size, pack};
+use data_mover::transfer::{TransferOutcome, TransferSide};
+use futures::StreamExt as _;
+use std::error::Error as _;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -276,5 +289,160 @@ async fn archive_request_shares_the_manifest_and_each_observation() -> Result {
             .windows(7)
             .any(|bytes| bytes == b"payload")
     );
+    Ok(())
+}
+
+async fn stale_archive_source(original: &[u8], changed: &[u8]) -> Result {
+    let source_root = tempfile::tempdir()?;
+    let destination_root = tempfile::tempdir()?;
+    let file = source_root.path().join("file");
+    std::fs::write(&file, original)?;
+    filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_700_000_000, 0))?;
+    std::fs::write(destination_root.path().join("result.tar"), b"published")?;
+    let source = local(source_root.path()).await?;
+    let observed = entry(&source, "file").await?;
+    std::fs::write(&file, changed)?;
+    filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_700_000_010, 0))?;
+    let result = pack(TarRequest {
+        source,
+        destination: local(destination_root.path()).await?,
+        entries: vec![observed].into(),
+        final_path: StoragePath::new("result.tar")?,
+        cancel: CancellationToken::new(),
+        source_qos: None,
+    })
+    .await;
+    assert_refused_archive(result)?;
+    assert_eq!(std::fs::read_dir(destination_root.path())?.count(), 1);
+    assert_eq!(
+        std::fs::read(destination_root.path().join("result.tar"))?,
+        b"published"
+    );
+    assert_eq!(std::fs::read(file)?, changed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn archive_refuses_a_stale_size_after_in_place_growth() -> Result {
+    stale_archive_source(b"old", b"changed after traversal").await
+}
+
+#[tokio::test]
+async fn archive_refuses_a_stale_mtime_after_same_size_change() -> Result {
+    stale_archive_source(b"old", b"new").await
+}
+
+#[tokio::test]
+async fn archive_refuses_an_observed_empty_file_that_gained_content() -> Result {
+    stale_archive_source(b"", b"new").await
+}
+
+struct ChangeAfterFirstChunk {
+    inner: Arc<dyn ReadSource>,
+    path: PathBuf,
+}
+
+#[async_trait]
+impl ReadSource for ChangeAfterFirstChunk {
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        512
+    }
+    async fn describe(
+        &self,
+        path: &StoragePath,
+    ) -> StdResult<SourceDescriptor, StorageRoleFailure> {
+        self.inner.describe(path).await
+    }
+    async fn read(&self, request: ReadRequest) -> StdResult<ByteStream, StorageRoleFailure> {
+        let input = self.inner.read(request).await?;
+        let mut file = Some(self.path.clone());
+        Ok(Box::pin(input.map(move |item| {
+            let bytes = item?;
+            if let Some(file) = file.take() {
+                std::fs::write(&file, vec![b'B'; 1025]).map_err(|_| mutation_failure())?;
+                filetime::set_file_mtime(
+                    &file,
+                    filetime::FileTime::from_unix_time(1_700_000_010, 0),
+                )
+                .map_err(|_| mutation_failure())?;
+            }
+            Ok(bytes)
+        })))
+    }
+}
+
+fn mutation_failure() -> StorageRoleFailure {
+    StorageRoleFailure::Entry(
+        EntryOperationFailure::new(
+            StoragePath::root(),
+            Operation::Read,
+            FailureClass::Internal,
+            Transience::Permanent,
+            "test source mutation failed",
+        )
+        .unwrap_or_else(|_| unreachable!("static diagnostic")),
+    )
+}
+
+#[tokio::test]
+async fn archive_refuses_source_changes_during_payload_reads() -> Result {
+    let source_root = tempfile::tempdir()?;
+    let target_root = tempfile::tempdir()?;
+    let file = source_root.path().join("file");
+    std::fs::write(&file, vec![b'A'; 1025])?;
+    filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1_700_000_000, 0))?;
+    std::fs::write(target_root.path().join("result.tar"), b"published")?;
+    let source = local(source_root.path()).await?;
+    let observed = entry(&source, "file").await?;
+    let absent =
+        CapabilityAvailability::Unsupported(UnsupportedReason::new("read-only mutation probe")?);
+    let capabilities = BackendCapabilities::new(
+        CapabilityAvailability::Supported,
+        absent.clone(),
+        absent.clone(),
+        absent,
+    );
+    let wrapped = StorageBuilder::new(source.identity().clone(), capabilities)
+        .read_source(Arc::new(ChangeAfterFirstChunk {
+            inner: source.read_source()?,
+            path: file.clone(),
+        }))
+        .build()?;
+    let result = pack(TarRequest {
+        source: wrapped,
+        destination: local(target_root.path()).await?,
+        entries: vec![observed].into(),
+        final_path: StoragePath::new("result.tar")?,
+        cancel: CancellationToken::new(),
+        source_qos: None,
+    })
+    .await;
+    assert!(
+        result.is_err(),
+        "source mutation during archive read was published"
+    );
+    assert_refused_archive(result)?;
+    assert_eq!(std::fs::read_dir(target_root.path())?.count(), 1);
+    assert_eq!(
+        std::fs::read(target_root.path().join("result.tar"))?,
+        b"published"
+    );
+    assert_eq!(std::fs::read(file)?, vec![b'B'; 1025]);
+    Ok(())
+}
+
+fn assert_refused_archive(result: StdResult<TransferOutcome, TarFailure>) -> Result {
+    let Err(TarFailure::Transfer(failure)) = result else {
+        return Err("stale source accepted or its typed failure lost".into());
+    };
+    assert!(!failure.final_destination_changed());
+    assert_eq!(failure.side(), TransferSide::Source);
+    assert!(!failure.has_pending_cleanup());
+    assert!(failure.cleanup_failure().is_none());
+    assert!(matches!(
+        failure.source().and_then(|cause| cause.downcast_ref::<StorageRoleFailure>()),
+        Some(StorageRoleFailure::Entry(cause)) if cause.operation() == Operation::Read
+            && cause.class() == FailureClass::Conflict
+    ));
     Ok(())
 }

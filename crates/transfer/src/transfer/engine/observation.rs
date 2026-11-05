@@ -43,7 +43,7 @@ fn refuse_without_current_object(observation: &ObservedEntry) -> Result<(), Tran
     ))
 }
 
-pub(super) fn validate_observation(
+pub(crate) fn validate_observation(
     source: &dyn ReadSource,
     observation: &ObservedEntry,
     descriptor: &SourceDescriptor,

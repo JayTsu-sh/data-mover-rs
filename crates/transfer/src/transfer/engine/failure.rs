@@ -149,6 +149,14 @@ impl TransferFailure {
         self.side
     }
 
+    /// Keep an independent destination error primary; only the original input cause is source-owned.
+    pub(crate) fn attribute_source_input(mut self, cause: &StorageRoleFailure) -> Self {
+        if self.role.as_deref() == Some(cause) {
+            self.side = TransferSide::Source;
+        }
+        self
+    }
+
     /// Whether the failed attempt retains unpublished state eligible for a later resume. `false`
     /// does not mean nothing can be resumed: a destination may keep its pointer from prepare
     /// (S3 since ADR-0006 C16), so an unrecoverable stage that is dropped instead of discarded

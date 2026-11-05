@@ -122,3 +122,37 @@ fn non_metadata_display_keeps_the_underlying_failure_class() -> TestResult {
     assert!(failure.source().is_some());
     Ok(())
 }
+
+#[test]
+fn a_source_input_error_cannot_replace_an_independent_destination_failure() -> TestResult {
+    let destination = StorageRoleFailure::Entry(EntryOperationFailure::new(
+        StoragePath::new("result.tar")?,
+        Operation::Write,
+        FailureClass::PermissionDenied,
+        Transience::Permanent,
+        "destination refused the write",
+    )?);
+    let input = StorageRoleFailure::Entry(EntryOperationFailure::new(
+        StoragePath::new("file")?,
+        Operation::Read,
+        FailureClass::Conflict,
+        Transience::Permanent,
+        "source changed",
+    )?);
+    let mut failure = TransferFailure::role(
+        TransferPhase::Publish,
+        TransferSide::Destination,
+        destination,
+    );
+    failure.final_destination_changed = true;
+    let failure = failure.attribute_source_input(&input);
+    assert_eq!(failure.side(), TransferSide::Destination);
+    assert_eq!(failure.phase(), TransferPhase::Publish);
+    assert!(failure.final_destination_changed());
+    assert!(matches!(
+        failure.source().and_then(|cause| cause.downcast_ref::<StorageRoleFailure>()),
+        Some(StorageRoleFailure::Entry(cause)) if cause.operation() == Operation::Write
+            && cause.class() == FailureClass::PermissionDenied
+    ));
+    Ok(())
+}

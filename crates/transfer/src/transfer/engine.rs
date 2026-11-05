@@ -36,6 +36,7 @@ mod guard;
 mod native;
 mod negotiation;
 mod observation;
+pub(crate) use observation::validate_observation;
 mod payload;
 mod plan;
 mod producer;

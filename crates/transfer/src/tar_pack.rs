@@ -9,12 +9,12 @@ use crate::model::{
     SourceIdentity, SourceVersion, StoragePath, Transience, without_unowned_set_id,
 };
 use crate::storage::{
-    ByteStream, ReadRequest, ReadSource, SourceQosBudget, SourceQosGroup, SourceQosStats, Storage,
-    StorageRoleFailure,
+    ByteStream, ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosGroup,
+    SourceQosStats, Storage, StorageRoleFailure,
 };
 use crate::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, TransferFailure,
-    TransferOutcome, TransferPolicy,
+    TransferOutcome, TransferPolicy, validate_observation,
 };
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
@@ -28,7 +28,7 @@ pub enum TarFailure {
     Invalid(String),
     #[error(transparent)]
     Storage(#[from] StorageRoleFailure),
-    /// Retains the destination's cleanup authority when transfer fails.
+    /// Retains the original transfer failure, publication status, and any failed artifact cleanup.
     #[error(transparent)]
     Transfer(Box<TransferFailure>),
 }
@@ -69,7 +69,9 @@ pub fn calculate_tar_size<E: Borrow<ObservedEntry>>(entries: &[E]) -> Result<u64
 /// Streams an archive and atomically replaces its destination using the shared transfer engine.
 ///
 /// # Errors
-/// Returns invalid input, a source error, or a destination failure retaining cleanup authority.
+/// Returns invalid input or the original transfer error after Atomic artifact cleanup.
+/// Every file is checked against its observation before and after reading; detected changes fail
+/// without publication. Cleanup never removes an already published final object.
 pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
     request: TarRequest<E>,
 ) -> Result<TransferOutcome, TarFailure> {
@@ -81,7 +83,7 @@ pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
         .read_source()
         .map_err(|error| invalid(&error.to_string()))?;
     let maximum = source.maximum_read_chunk_bytes().max(512);
-    let destination = ExpertDestinationSession::prepare(
+    let prepared = ExpertDestinationSession::prepare(
         ExpertDestinationRequest::new(
             observed,
             maximum,
@@ -91,13 +93,13 @@ pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
         )
         .with_transfer_policy(TransferPolicy::AtomicReplace),
     )
-    .await
-    .map_err(transfer_failure)?;
+    .await;
+    let destination = finish_archive_phase(prepared).await?;
     let budget = request
         .source_qos
         .as_ref()
         .map(SourceQosGroup::transfer_budget);
-    let evidence = Arc::new(Mutex::new((blake3::Hasher::new(), 0_u64)));
+    let evidence = Arc::new(Mutex::new(ArchiveEvidence::default()));
     let tally = Arc::clone(&evidence);
     let state = ArchiveStream {
         source,
@@ -115,31 +117,41 @@ pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
         path: request.final_path,
     };
     let stream = futures::stream::try_unfold(state, next_piece).map(move |piece| {
-        if let Ok(bytes) = &piece {
-            let mut tally = tally
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tally.0.update(bytes);
-            tally.1 += bytes.len() as u64;
+        let mut tally = tally
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &piece {
+            Ok(bytes) => {
+                tally.hash.update(bytes);
+                tally.bytes += bytes.len() as u64;
+            }
+            Err(error) => tally.source_failure = Some(Box::new(error.clone())),
         }
         piece
     });
-    let transferred = destination
-        .write(Box::pin(stream))
-        .await
-        .map_err(transfer_failure)?;
+    let written = destination.write(Box::pin(stream)).await;
+    let source_failure = evidence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .source_failure
+        .take();
+    let written = match source_failure {
+        Some(cause) => written.map_err(|failure| failure.attribute_source_input(cause.as_ref())),
+        None => written,
+    };
+    let transferred = finish_archive_phase(written).await?;
     let (digest, actual) = {
         let tally = evidence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (*tally.0.finalize().as_bytes(), tally.1)
+        (*tally.hash.finalize().as_bytes(), tally.bytes)
     };
     // Destination write also checks the complete expected length before returning.
     debug_assert_eq!(actual, size);
     if let Some(budget) = &budget {
         budget.set_logical_bytes(size);
     }
-    transferred
+    let completed = transferred
         .complete(ExpertSourceEvidence {
             source_size: size,
             blake3: digest,
@@ -152,8 +164,8 @@ pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
                 SourceQosBudget::stats,
             ),
         })
-        .await
-        .map_err(transfer_failure)
+        .await;
+    finish_archive_phase(completed).await
 }
 
 fn archive_observation<E: Borrow<ObservedEntry>>(
@@ -186,13 +198,20 @@ fn archive_observation<E: Borrow<ObservedEntry>>(
     Ok(observed)
 }
 
+#[derive(Default)]
+struct ArchiveEvidence {
+    hash: blake3::Hasher,
+    bytes: u64,
+    source_failure: Option<Box<StorageRoleFailure>>,
+}
+
 struct ArchiveStream<E> {
     output: Option<Bytes>,
     source: Arc<dyn ReadSource>,
     entries: Arc<[E]>,
     next_entry: usize,
     pending: Option<usize>,
-    reading: Option<ByteStream>,
+    reading: Option<(ByteStream, usize)>,
     remaining: u64,
     padding: Option<Bytes>,
     eof: bool,
@@ -227,7 +246,7 @@ async fn next_raw<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
         if state.cancel.is_cancelled() {
             return Err(stream_failure(&state.path, FailureClass::Cancelled));
         }
-        if let Some(reading) = &mut state.reading {
+        if let Some((reading, index)) = &mut state.reading {
             if let Some(chunk) = reading.next().await {
                 let bytes = chunk?;
                 state.remaining = state
@@ -242,6 +261,7 @@ async fn next_raw<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
             if state.remaining != 0 {
                 return Err(stream_failure(&state.path, FailureClass::Corruption));
             }
+            describe_archive_source(state.source.as_ref(), state.entries[*index].borrow()).await?;
             state.reading = None;
         }
         if let Some(padding) = state.padding.take() {
@@ -252,24 +272,26 @@ async fn next_raw<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
             let size = entry
                 .size()
                 .ok_or_else(|| stream_failure(entry.path(), FailureClass::InvalidInput))?;
+            let descriptor = describe_archive_source(state.source.as_ref(), entry).await?;
             state.remaining = size;
             state.padding = tar_padding(size);
-            state.reading = Some(
+            state.reading = Some((
                 state
                     .source
                     .read(ReadRequest {
                         path: entry.path().clone(),
                         range: Some(0..size),
-                        expected_source: Some(entry.source_identity().clone()),
+                        expected_source: Some(descriptor.source_identity),
                         maximum_chunk_bytes: state.maximum,
                         read_inflight: state.source.read_concurrency().max(1),
                         read_budget: None,
                         cancel: state.cancel.clone(),
                         source_qos: state.budget.clone(),
-                        version: SourceVersion::Current,
+                        version: descriptor.version,
                     })
                     .await?,
-            );
+                index,
+            ));
             continue;
         }
         if let Some(entry) = state.entries.get(state.next_entry) {
@@ -291,6 +313,18 @@ async fn next_raw<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
     }
 }
 
+async fn describe_archive_source(
+    source: &dyn ReadSource,
+    observation: &ObservedEntry,
+) -> Result<SourceDescriptor, StorageRoleFailure> {
+    let descriptor = source
+        .describe_version(observation.path(), &SourceVersion::Current)
+        .await?;
+    validate_observation(source, observation, &descriptor)
+        .map_err(|_| stream_failure(observation.path(), FailureClass::Conflict))?;
+    Ok(descriptor)
+}
+
 fn stream_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {
     StorageRoleFailure::Entry(
         EntryOperationFailure::new(
@@ -306,8 +340,15 @@ fn stream_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure
 fn invalid(message: &str) -> TarFailure {
     TarFailure::Invalid(message.to_owned())
 }
-fn transfer_failure(failure: TransferFailure) -> TarFailure {
-    TarFailure::Transfer(Box::new(failure))
+async fn finish_archive_phase<T>(result: Result<T, TransferFailure>) -> Result<T, TarFailure> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(failure) => Err(TarFailure::Transfer(Box::new(
+            failure
+                .cleanup_for_policy(TransferPolicy::AtomicReplace)
+                .await,
+        ))),
+    }
 }
 
 fn entry_size(entry: &ObservedEntry) -> Result<u64, TarFailure> {
