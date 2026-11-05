@@ -44,6 +44,7 @@ pub(super) async fn transfer_stage(
     }
     let (sender, receiver) = payload_channel(request.cancel.clone(), descriptor.path.clone());
     let producer = tokio::spawn(produce(ProducerRequest {
+        maximum_chunk_bytes: None,
         source,
         path: descriptor.path.clone(),
         source_identity: descriptor.source_identity.clone(),

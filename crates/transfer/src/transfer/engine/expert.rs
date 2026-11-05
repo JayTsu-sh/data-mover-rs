@@ -1,5 +1,6 @@
 //! Transport-neutral source half of the unified transfer lifecycle.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -21,7 +22,8 @@ use crate::storage::{
     StagedDestination, Storage, VerificationPoint, VerifyRequest, WriteEvidence,
     WriteProgressObserver,
 };
-use crate::transfer::{TransferIdentity, TransferPolicy};
+use crate::transfer::model::ObservedSource;
+use crate::transfer::{TransferIdentity, TransferPolicy, TransferValueError};
 
 use super::observation;
 
@@ -29,9 +31,24 @@ use super::observation;
 #[derive(Clone)]
 pub struct ExpertSourceRequest {
     source: Storage,
-    observation: ObservedEntry,
+    observation: ExpertSourceInput,
+    maximum_chunk_bytes: Option<NonZeroUsize>,
     cancel: tokio_util::sync::CancellationToken,
     source_qos: Option<SourceQosGroup>,
+}
+
+#[derive(Clone)]
+enum ExpertSourceInput {
+    Current(Arc<ObservedEntry>),
+    Selected(ObservedSource),
+}
+impl ExpertSourceInput {
+    fn path(&self) -> &StoragePath {
+        match self {
+            Self::Current(entry) => entry.path(),
+            Self::Selected(source) => source.path(),
+        }
+    }
 }
 
 impl ExpertSourceRequest {
@@ -43,10 +60,43 @@ impl ExpertSourceRequest {
     ) -> Self {
         Self {
             source,
-            observation,
+            observation: ExpertSourceInput::Current(Arc::new(observation)),
+            maximum_chunk_bytes: None,
             cancel,
             source_qos: None,
         }
+    }
+
+    /// Opens exactly the advertised object/version, sharing its immutable scan observation.
+    ///
+    /// # Errors
+    /// Rejects a foreign backend, invalid index, delete marker or unreadable observation.
+    pub fn from_shared_observation(
+        source: Storage,
+        observation: Arc<ObservedEntry>,
+        version_index: Option<usize>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Self, TransferValueError> {
+        let selected = ObservedSource::new(
+            &source,
+            observation,
+            version_index,
+            source.holds_directory_objects(),
+        )?;
+        Ok(Self {
+            source,
+            observation: ExpertSourceInput::Selected(selected),
+            maximum_chunk_bytes: None,
+            cancel,
+            source_qos: None,
+        })
+    }
+
+    /// Bounds source reads and emitted payloads to the caller's transport memory budget.
+    #[must_use]
+    pub const fn with_maximum_chunk_bytes(mut self, maximum: NonZeroUsize) -> Self {
+        self.maximum_chunk_bytes = Some(maximum);
+        self
     }
 
     #[must_use]
@@ -103,11 +153,37 @@ impl ExpertSourceSession {
                 "expert source transfer was cancelled",
             ));
         }
-        let descriptor = observation::describe(source.as_ref(), &request.observation).await?;
+        let (descriptor, identity_key) = match &request.observation {
+            ExpertSourceInput::Current(entry) => (
+                observation::describe(source.as_ref(), entry).await?,
+                entry.identity_key(),
+            ),
+            ExpertSourceInput::Selected(selected) => {
+                let advertised = selected.constraint().ok_or_else(|| {
+                    TransferFailure::orchestration(
+                        TransferPhase::Describe,
+                        "invalid selected source observation",
+                    )
+                })?;
+                let descriptor = source
+                    .describe_version(selected.path(), &selected.version)
+                    .await
+                    .map_err(|error| {
+                        TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
+                    })?;
+                observation::validate_constraint(source.as_ref(), advertised, &descriptor)?;
+                (descriptor, advertised.identity.identity_key())
+            }
+        };
         let source_size = descriptor.size.ok_or_else(|| {
             TransferFailure::orchestration(TransferPhase::Describe, "source has no byte size")
         })?;
-        let maximum_chunk_bytes = source.maximum_read_chunk_bytes().max(1);
+        let maximum_chunk_bytes = request
+            .maximum_chunk_bytes
+            .map_or(source.maximum_read_chunk_bytes(), |maximum| {
+                maximum.get().min(source.maximum_read_chunk_bytes())
+            })
+            .max(1);
         let source_qos = request
             .source_qos
             .as_ref()
@@ -120,7 +196,7 @@ impl ExpertSourceSession {
         let offer = ExpertSourceOffer {
             source_size,
             maximum_chunk_bytes,
-            identity_key: request.observation.identity_key(),
+            identity_key,
         };
         Ok(Self {
             source,
@@ -150,6 +226,7 @@ impl ExpertSourceSession {
         let (sender, receiver) = payload_channel(self.cancel.clone(), self.descriptor.path.clone());
         let producer = tokio::spawn(produce(ProducerRequest {
             hash_content: true,
+            maximum_chunk_bytes: NonZeroUsize::new(self.offer.maximum_chunk_bytes),
             source: self.source,
             path: self.descriptor.path.clone(),
             version: self.descriptor.version,

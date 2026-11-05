@@ -1,11 +1,18 @@
 //! Observed requests use the same transfer lifecycle, with a source constraint and version pin.
 use std::error::Error;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use data_mover_traversal::{
+    StorageTraversalSource, TraversalItem, TraversalRequest, TraversalSource,
+};
 use tokio_util::sync::CancellationToken;
 
-use super::{TransferPhase, TransferRequest, TransferRoute, transfer};
+use super::{
+    ExpertSourceRequest, ExpertSourceSession, TransferPhase, TransferRequest, TransferRoute,
+    transfer,
+};
 use crate::model::{EntryKind, ObservedEntry, SourceVersion, StoragePath, VersionRecord};
 use crate::storage::backends::s3::tests::{
     MemoryS3, Versioning, endpoint_of, native_context, source_storage,
@@ -405,5 +412,153 @@ async fn shared_selected_null_rejects_overwrite_and_rejects_marker_indices() -> 
         .ok_or("overwritten null was accepted")?;
     assert_eq!(failure.phase(), TransferPhase::Describe);
     assert!(!protocol.objects.lock().await.contains_key("source"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_expert_source_pins_old_versions_and_bounds_chunks_without_cloning_history()
+-> TestResult {
+    let (_, storage, observed) = bucket(true).await?;
+    let observed = Arc::new(observed);
+    let index = observed
+        .history()
+        .ok_or("history")?
+        .records()
+        .iter()
+        .position(|record| record.version_id() == Some("v1"))
+        .ok_or("v1")?;
+    let expected_key = observed.history().ok_or("history")?.records()[index]
+        .identity()
+        .identity_key();
+    let request = ExpertSourceRequest::from_shared_observation(
+        storage,
+        Arc::clone(&observed),
+        Some(index),
+        CancellationToken::new(),
+    )?
+    .with_maximum_chunk_bytes(NonZeroUsize::new(3).ok_or("nonzero")?);
+    let cloned = request.clone();
+    assert_eq!(Arc::strong_count(&observed), 3);
+    drop(cloned);
+    let session = ExpertSourceSession::open(request).await?;
+    assert_eq!(session.offer().identity_key, expected_key);
+    assert_eq!(session.offer().maximum_chunk_bytes, 3);
+    assert_eq!(Arc::strong_count(&observed), 1);
+    let mut payload = session.stream_from(0)?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = payload.next_chunk().await? {
+        assert!(chunk.len() <= 3);
+        bytes.extend_from_slice(&chunk);
+    }
+    let evidence = payload.finish().await?;
+    assert_eq!(bytes, b"first!");
+    assert_eq!(evidence.blake3, *blake3::hash(&bytes).as_bytes());
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_expert_source_rejects_replaced_empty_objects_before_producing() -> TestResult {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("empty"), [])?;
+    let (storage, _) = local::test_source_storage(root.path(), &root.path().to_string_lossy())?;
+    let path = StoragePath::new("empty")?;
+    let observed = Arc::new(observation(storage.read_source()?.describe(&path).await?)?);
+    let request = ExpertSourceRequest::from_shared_observation(
+        storage,
+        observed,
+        None,
+        CancellationToken::new(),
+    )?;
+    std::fs::write(root.path().join("replacement"), [])?;
+    std::fs::rename(root.path().join("replacement"), root.path().join("empty"))?;
+    let failure = ExpertSourceSession::open(request)
+        .await
+        .err()
+        .ok_or("stale empty observation was admitted")?;
+    assert_eq!(failure.phase(), TransferPhase::Describe);
+    Ok(())
+}
+
+async fn scanned(storage: &Storage, path: &str) -> TestResult<Arc<ObservedEntry>> {
+    let mut scan =
+        StorageTraversalSource::new(storage)?.traverse(TraversalRequest::new(StoragePath::root()));
+    let mut found = None;
+    while let Some(item) = scan.next_item().await {
+        if let TraversalItem::Entry(entry) = item
+            && entry.path().as_str() == path
+        {
+            found = Some(Arc::from(entry));
+        }
+    }
+    scan.finish().await?;
+    found.ok_or_else(|| "missing native scan observation".into())
+}
+
+#[tokio::test]
+async fn shared_expert_source_reads_marker_leaf_and_selected_directory_history_at_the_real_key()
+-> TestResult {
+    for versioned in [false, true] {
+        let protocol = Arc::new(MemoryS3::default());
+        if versioned {
+            protocol.set_versioning(Versioning::Enabled);
+        }
+        protocol.put_version("src/p/", "old", Bytes::new()).await;
+        if versioned {
+            protocol.put_version("src/p/", "new", Bytes::new()).await;
+        }
+        protocol
+            .put_version("src/p/child", "child", Bytes::from_static(b"child"))
+            .await;
+        let storage = source_storage(&protocol, "src")?;
+        let observed = scanned(&storage, "p").await?;
+        assert_eq!(observed.kind(), EntryKind::Directory);
+        let index = observed.history().and_then(|history| {
+            history
+                .records()
+                .iter()
+                .position(|record| record.version_id() == Some("old"))
+        });
+        if versioned {
+            assert!(index.is_some());
+        } else {
+            assert!(observed.directory_marker_object().is_some());
+        }
+        let session = ExpertSourceSession::open(ExpertSourceRequest::from_shared_observation(
+            storage,
+            observed,
+            index,
+            CancellationToken::new(),
+        )?)
+        .await?;
+        assert_eq!(session.offer().source_size, 0);
+        let mut payload = session.stream_from(0)?;
+        assert!(payload.next_chunk().await?.is_none());
+        let evidence = payload.finish().await?;
+        assert_eq!(evidence.blake3, *blake3::hash(&[]).as_bytes());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_expert_source_refuses_delete_marker_and_out_of_range_selection() -> TestResult {
+    let (protocol, storage, _) = bucket(true).await?;
+    protocol.put_delete_marker("src/source", "deleted").await;
+    let observed = scanned(&storage, "source").await?;
+    let records = observed.history().ok_or("history")?.records();
+    let marker = records
+        .iter()
+        .position(VersionRecord::is_delete_marker)
+        .ok_or("delete marker")?;
+    for index in [marker, records.len()] {
+        assert!(
+            ExpertSourceRequest::from_shared_observation(
+                storage.clone(),
+                Arc::clone(&observed),
+                Some(index),
+                CancellationToken::new()
+            )
+            .is_err()
+        );
+    }
     Ok(())
 }

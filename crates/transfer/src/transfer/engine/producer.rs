@@ -1,4 +1,5 @@
 //! An ordered source stream connected to a writer by a bounded channel.
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -64,6 +65,7 @@ pub(super) fn payload_channel(
 }
 
 pub(super) struct ProducerRequest {
+    pub(super) maximum_chunk_bytes: Option<NonZeroUsize>,
     pub(super) source: Arc<dyn ReadSource>,
     pub(super) path: StoragePath,
     pub(super) source_identity: SourceIdentity,
@@ -102,7 +104,12 @@ async fn produce_inner(request: &ProducerRequest) -> Result<Option<[u8; 32]>, Tr
     } else {
         request.write_start
     };
-    let maximum = request.source.maximum_read_chunk_bytes().max(1);
+    let maximum = request
+        .maximum_chunk_bytes
+        .map_or(request.source.maximum_read_chunk_bytes(), |limit| {
+            limit.get().min(request.source.maximum_read_chunk_bytes())
+        })
+        .max(1);
     let mut stream = tokio::select! {
         biased;
         () = request.cancel.cancelled() => return Err(cancelled()),
