@@ -797,13 +797,14 @@ fn descriptor_from_observation(
             "ordinary expert transfer source must be a file",
         ));
     }
-    let descriptor = SourceDescriptor::new(
+    let mut descriptor = SourceDescriptor::new(
         observation.path().clone(),
         observation.kind(),
         observation.size(),
         observation.source_identity().clone(),
     )
     .with_rename_evidence(observation.rename_evidence().copied());
+    descriptor.permissions = observation.permissions().cloned().map(Box::new);
     let fact = match observation.backend_facts() {
         PrivateBackendEntryFacts::None => None,
         PrivateBackendEntryFacts::Local(bytes)

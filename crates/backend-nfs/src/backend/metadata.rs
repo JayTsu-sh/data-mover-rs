@@ -321,6 +321,9 @@ impl Metadata for NfsMetadataAdapter {
         if !matches!(descriptor.version(), SourceVersion::Current) {
             return Err(unsupported(&descriptor.path));
         }
+        if let Some(facts) = descriptor.permissions.as_deref() {
+            return Ok(facts.clone());
+        }
         if let Some(InlineOwnership::Known(value)) = descriptor.inline_ownership {
             return Ok(PermissionFacts {
                 owner: Some(PrincipalIdentity::Numeric(value.uid)),

@@ -44,7 +44,10 @@ impl Metadata for HdfsMetadata {
         if !matches!(described.version(), SourceVersion::Current) {
             return Err(failure(&described.path, FailureClass::Unsupported));
         }
-        super::source::permissions(described)
+        described
+            .permissions
+            .as_deref()
+            .cloned()
             .ok_or_else(|| failure(&described.path, FailureClass::Protocol))
     }
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {

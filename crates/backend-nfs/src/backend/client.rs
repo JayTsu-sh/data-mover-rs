@@ -415,6 +415,8 @@ impl NfsSourceProtocol for NFSStorage {
         let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
         let kind = role_kind(&attrs);
         Ok(NfsSourceObservation {
+            uid: owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
+            gid: owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
             kind,
             timestamps: Some(attrs_timestamps(&attrs)),
             ownership: Some(inline_ownership(
@@ -527,6 +529,8 @@ impl NfsNamespaceProtocol for NFSStorage {
         let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
         let kind = role_kind(&attrs);
         Ok(NfsNamespaceObservation {
+            uid: owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
+            gid: owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
             path: path.clone(),
             kind,
             size: (kind == crate::model::EntryKind::File).then_some(attrs.filesize),

@@ -43,6 +43,9 @@ pub struct NfsNamespaceObservation {
     pub timestamps: Option<crate::model::TimestampMetadata>,
     /// POSIX permission bits from the same attributes.
     pub mode: Option<u32>,
+    /// Independently mapped principals; one can be known while the other is not.
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
     /// Numeric ownership from the same attributes, mapped the way the NFS metadata role maps a
     /// GETATTR (`nfs::owner_id`), so a plan asking for ownership costs no extra round trip.
     pub ownership: Option<InlineOwnership>,
@@ -394,6 +397,12 @@ pub(super) fn descriptor(
         content_version: None,
         inline_timestamps: entry.timestamps,
         inline_mode: entry.mode,
+        permissions: super::namespace::permission_facts(
+            entry.ownership,
+            entry.mode,
+            entry.uid,
+            entry.gid,
+        ),
         inline_ownership: entry.ownership,
         version: SourceVersion::Current,
         listing: ListingFacts::default(),
@@ -450,6 +459,36 @@ fn invalid_entry(path: &StoragePath) -> EntryOperationFailure {
     .unwrap_or_else(|_| unreachable!("static diagnostic is valid"))
 }
 
+pub(super) fn permission_facts(
+    ownership: Option<InlineOwnership>,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Option<Box<crate::model::PermissionFacts>> {
+    // Complete numeric ownership is already carried by the metadata observation.
+    // Only independent facts need an extra allocation on each observed entry.
+    if matches!(ownership, Some(InlineOwnership::Known(_)))
+        || (ownership.is_none() && mode.is_none())
+    {
+        return None;
+    }
+    let (owner, group) = match ownership {
+        Some(InlineOwnership::Known(value)) => (
+            Some(crate::model::PrincipalIdentity::Numeric(value.uid)),
+            Some(crate::model::PrincipalIdentity::Numeric(value.gid)),
+        ),
+        _ => (
+            uid.map(crate::model::PrincipalIdentity::Numeric),
+            gid.map(crate::model::PrincipalIdentity::Numeric),
+        ),
+    };
+    Some(Box::new(crate::model::PermissionFacts {
+        owner,
+        group,
+        mode: mode.map(|mode| mode & 0o7777),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -467,6 +506,8 @@ mod tests {
 
     fn observed(value: &str) -> NfsNamespaceObservation {
         NfsNamespaceObservation {
+            uid: None,
+            gid: None,
             path: path(value),
             kind: EntryKind::File,
             size: Some(1),

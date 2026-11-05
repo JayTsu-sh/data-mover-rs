@@ -310,6 +310,7 @@ pub struct ObservedEntry {
     source_identity: SourceIdentity,
     rename_evidence: Option<RenameEvidence>,
     metadata: MetadataObservations,
+    permissions: Option<Box<super::PermissionFacts>>,
     backend_fact: PrivateBackendEntryFacts,
     /// The key's history, or one segment of it, when the entry is a key of a versioned bucket
     /// (P7 §10); `None` for every other entry. Boxed: only a versioned bucket's entries have one,
@@ -351,6 +352,7 @@ impl ObservedEntry {
             source_identity,
             rename_evidence: None,
             metadata: MetadataObservations::default(),
+            permissions: None,
             backend_fact: PrivateBackendEntryFacts::None,
             history: None,
             marker: None,
@@ -380,6 +382,7 @@ impl ObservedEntry {
             source_identity,
             rename_evidence: None,
             metadata: MetadataObservations::default(),
+            permissions: None,
             backend_fact: PrivateBackendEntryFacts::None,
             history: None,
             marker: None,
@@ -418,6 +421,27 @@ impl ObservedEntry {
     pub fn with_metadata(mut self, metadata: MetadataObservations) -> Self {
         self.metadata = metadata;
         self
+    }
+
+    /// Attaches backend-confirmed permission facts, independently of numeric ownership support.
+    ///
+    /// # Errors
+    /// Rejects invalid principal names or bits outside POSIX permissions.
+    pub fn with_permissions(
+        mut self,
+        facts: Option<Box<super::PermissionFacts>>,
+    ) -> Result<Self, ModelValueError> {
+        if let Some(facts) = facts.as_deref() {
+            facts.validate()?;
+        }
+        self.permissions = facts;
+        Ok(self)
+    }
+
+    /// Borrows true permission facts. Display-only approximations are never stored here.
+    #[must_use]
+    pub fn permissions(&self) -> Option<&super::PermissionFacts> {
+        self.permissions.as_deref()
     }
 
     /// Attaches a listing's history on this entry's backend. A whole listing can exceed

@@ -52,6 +52,8 @@ impl NfsSourceProtocol for FakeProtocol {
     ) -> Result<NfsSourceObservation, NfsProtocolFailure> {
         self.described.fetch_add(1, Ordering::SeqCst);
         Ok(NfsSourceObservation {
+            uid: None,
+            gid: None,
             timestamps: None,
             ownership: None,
             mode: None,

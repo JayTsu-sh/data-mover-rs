@@ -9,7 +9,7 @@
 //! ```text
 //! "DMES" | version u8 | backend kind u8 | path | kind u8 | symlink target | size | modified |
 //! identity strength u8 | endpoint fingerprint [4] | identity bytes | 2 | metadata |
-//! backend facts | history section (history_codec) | rename evidence | marker section |
+//! backend facts | history section (history_codec) | rename evidence | permissions | marker section |
 //! identity key [32]
 //! ```
 //! The marker section is `0`, or `1` followed by one leaf entry in this same format. A leaf's
@@ -30,9 +30,9 @@ use crate::model::metadata_observation;
 use crate::model::{HistoryOrder, RenameEvidence, RenameScheme, SpecialFileKind, TimePrecision};
 
 const MAGIC: &[u8; 4] = b"DMES";
-/// The current format: v10 retains metadata errors when successful fallback facts replace them.
+/// The current format: v11 retains backend-confirmed permissions independently of numeric ownership.
 /// Bump on **any** layout change and update the golden bytes.
-pub(super) const VERSION: u8 = 10;
+pub(super) const VERSION: u8 = 11;
 
 impl PrivateBackendEntryFacts {
     fn encode(&self, output: &mut Vec<u8>) {
@@ -123,6 +123,7 @@ impl ObservedEntry {
             PrivateBackendEntryFacts::None.encode(output);
             history_codec::encode_single(output, record, order);
             output.push(0);
+            encode_permissions(output, None);
             return;
         }
         self.backend_fact.encode(output);
@@ -134,6 +135,7 @@ impl ObservedEntry {
             }
             None => output.push(0),
         }
+        encode_permissions(output, self.permissions.as_deref());
     }
 }
 
@@ -238,6 +240,7 @@ fn decode_fields(
     let backend_fact = decode_facts(cursor, backend_kind)?;
     let history = history_codec::decode(cursor, backend)?;
     let rename_evidence = decode_rename_evidence(cursor)?;
+    let permissions = decode_permissions(cursor)?;
     Ok(ObservedEntry {
         identity_key: source_identity.identity_key(),
         backend_kind,
@@ -249,6 +252,7 @@ fn decode_fields(
         source_identity,
         rename_evidence,
         metadata,
+        permissions,
         backend_fact,
         history,
         marker: None,
@@ -456,4 +460,67 @@ fn decode_facts(
         (5, BackendKind::Hdfs) => Ok(PrivateBackendEntryFacts::Hdfs(bytes)),
         _ => Err(SnapshotDecodeError::Malformed),
     }
+}
+
+fn encode_permissions(output: &mut Vec<u8>, facts: Option<&crate::PermissionFacts>) {
+    let Some(facts) = facts else {
+        output.push(0);
+        return;
+    };
+    output.push(1);
+    for principal in [&facts.owner, &facts.group] {
+        match principal {
+            None => output.push(0),
+            Some(crate::PrincipalIdentity::Numeric(id)) => {
+                output.push(1);
+                output.extend_from_slice(&id.to_le_bytes());
+            }
+            Some(crate::PrincipalIdentity::Named(name)) => {
+                output.push(2);
+                put_bytes(output, name.as_bytes());
+            }
+        }
+    }
+    match facts.mode {
+        None => output.push(0),
+        Some(mode) => {
+            output.push(1);
+            output.extend_from_slice(&mode.to_le_bytes());
+        }
+    }
+}
+fn decode_permissions(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<Box<crate::PermissionFacts>>, SnapshotDecodeError> {
+    fn principal(
+        cursor: &mut Cursor<'_>,
+    ) -> Result<Option<crate::PrincipalIdentity>, SnapshotDecodeError> {
+        Ok(match cursor.byte()? {
+            0 => None,
+            1 => Some(crate::PrincipalIdentity::Numeric(cursor.u32()?)),
+            2 => Some(crate::PrincipalIdentity::Named(
+                std::str::from_utf8(cursor.bytes()?)
+                    .map_err(|_| SnapshotDecodeError::Malformed)?
+                    .to_owned(),
+            )),
+            _ => return Err(SnapshotDecodeError::Malformed),
+        })
+    }
+    match cursor.byte()? {
+        0 => return Ok(None),
+        1 => {}
+        _ => return Err(SnapshotDecodeError::Malformed),
+    }
+    let owner = principal(cursor)?;
+    let group = principal(cursor)?;
+    let mode = match cursor.byte()? {
+        0 => None,
+        1 => Some(cursor.u32()?),
+        _ => return Err(SnapshotDecodeError::Malformed),
+    };
+    let facts = crate::PermissionFacts { owner, group, mode };
+    facts
+        .validate()
+        .map_err(|_| SnapshotDecodeError::Malformed)?;
+    Ok(Some(Box::new(facts)))
 }

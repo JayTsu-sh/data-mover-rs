@@ -280,6 +280,7 @@ fn assemble_entry(
         source_identity,
         rename_evidence,
         backend_fact,
+        permissions,
         listing,
         ..
     } = descriptor;
@@ -292,6 +293,8 @@ fn assemble_entry(
         None => ObservedEntry::new(path, kind, size, modified, source_identity),
     }
     // Unreachable after the checks above; kept typed rather than asserted.
+    .map_err(|_| internal())?
+    .with_permissions(permissions)
     .map_err(|_| internal())?
     .with_metadata(metadata)
     .with_rename_evidence(rename_evidence)

@@ -232,6 +232,8 @@ impl FakeNfs {
             self.handle(&path)
         };
         NfsNamespaceObservation {
+            uid: None,
+            gid: None,
             file_handle,
             path: StoragePath::new(path).unwrap_or_else(|error| panic!("{error}")),
             kind,

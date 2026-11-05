@@ -100,6 +100,8 @@ fn observation(
     // Then the ownership is `Unmapped` and carries no mode at all.
     let mode = without_unowned_set_id(attrs.file_mode, uid.is_some(), gid.is_some(), is_dir);
     NfsNamespaceObservation {
+        uid,
+        gid,
         path,
         kind,
         size: (kind == EntryKind::File).then_some(attrs.filesize),

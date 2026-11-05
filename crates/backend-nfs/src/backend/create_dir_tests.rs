@@ -75,6 +75,8 @@ impl NfsNamespaceProtocol for AccessFirst {
             return Err(classify_error(NfsError::Nfs3(V3::NFS3ERR_NOENT)));
         }
         Ok(NfsNamespaceObservation {
+            uid: None,
+            gid: None,
             path: path.clone(),
             kind: EntryKind::Directory,
             size: None,

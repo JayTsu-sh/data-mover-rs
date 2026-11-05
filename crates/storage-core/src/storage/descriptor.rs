@@ -61,6 +61,8 @@ pub struct SourceDescriptor {
     /// from `FILE_ATTRIBUTE_READONLY`, which listings carry; the `Stat` verb builds its
     /// descriptor from facts without the attribute and leaves it `None`.
     pub inline_mode: Option<u32>,
+    /// Real backend-confirmed permissions; never a display-only approximation.
+    pub permissions: Option<Box<crate::model::PermissionFacts>>,
     /// Numeric ownership from the same attributes as the timestamps, so a plan that asks for
     /// ownership needs no per-entry metadata round trip either. `None` when the enumerating
     /// operation carried none; only a backend whose metadata role reads ownership from those
@@ -93,6 +95,7 @@ impl SourceDescriptor {
             content_version: None,
             inline_timestamps: None,
             inline_mode: None,
+            permissions: None,
             inline_ownership: None,
             version: SourceVersion::Current,
             listing: ListingFacts::default(),
@@ -123,6 +126,13 @@ impl SourceDescriptor {
         self
     }
 
+    /// Attaches permissions obtained from the same backend attributes, without another read.
+    #[must_use]
+    pub fn with_permissions(mut self, facts: crate::model::PermissionFacts) -> Self {
+        self.permissions = Some(Box::new(facts));
+        self
+    }
+
     /// Attaches timestamps that the enumerating operation already returned.
     #[must_use]
     pub const fn with_inline_timestamps(mut self, timestamps: TimestampMetadata) -> Self {
@@ -146,7 +156,7 @@ impl SourceDescriptor {
     /// Attaches numeric ownership the enumerating operation already returned.
     #[must_use]
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub const fn with_inline_ownership(mut self, ownership: InlineOwnership) -> Self {
+    pub fn with_inline_ownership(mut self, ownership: InlineOwnership) -> Self {
         self.inline_ownership = Some(ownership);
         self
     }
