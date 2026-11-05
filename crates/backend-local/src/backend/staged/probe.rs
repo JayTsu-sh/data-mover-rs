@@ -51,7 +51,42 @@ pub(super) struct WriteProbe {
     #[cfg(any(test, feature = "test-support"))]
     pub(super) slow_discard_before_release: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
+    pause_verification: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    verification_started: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    verification_finished: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) discard_contents_removed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) struct VerificationProbe<'a>(&'a WriteProbe);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for VerificationProbe<'_> {
+    fn drop(&mut self) {
+        self.0.verification_finished.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl WriteProbe {
+    pub(super) fn verifying(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> VerificationProbe<'_> {
+        let guard = VerificationProbe(self);
+        self.verification_started.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while self.pause_verification.load(Ordering::SeqCst)
+            && !cancel.is_cancelled()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        guard
+    }
 }
 
 impl WriteProbe {
@@ -128,6 +163,25 @@ impl WriteProbe {
 
 #[cfg(any(test, feature = "test-support"))]
 impl super::LocalStagedDestination {
+    /// 将真实文件校验暂停到取消或两秒上限，供取消和后台收尾回归使用。
+    pub fn pause_verification(&self) {
+        self.write_probe
+            .pause_verification
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn verification_started(&self) -> bool {
+        self.write_probe.verification_started.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn verification_finished(&self) -> bool {
+        self.write_probe
+            .verification_finished
+            .load(Ordering::SeqCst)
+    }
+
     #[must_use]
     pub fn final_sync_counts(&self) -> (u64, u64) {
         (

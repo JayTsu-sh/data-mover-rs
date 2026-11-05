@@ -1004,6 +1004,11 @@ the operation and persistence contracts in this architecture remain authoritativ
 `transfer::DirectPatchSession` 拥有完整的补丁输入生命周期：固定 basis 描述、仅暂存差异、
 拒绝未完成输入、复核 basis 版本、应用补丁、读回校验、元数据及发布。
 产品层只传递有界 `DirectPatchChunk`、读取 `DirectPatchProgress` 并在验证源端证据后完成会话。
+调用方在 `prepare` 时传入取消令牌；会话持有子令牌，贯穿输入等待、basis 读取、补丁、校验、
+元数据和发布。取消前尚未应用的补丁随会话释放，开始改写后可能留下部分更新，重试须重建
+basis。正常取消等待 backend 的写入／校验返回并收尾；丢弃会话或提交 future 也会取消子令牌，
+使已启动的 Local 后台校验停止，不取消父令牌及兄弟操作。backend 仍负责其原生调用的取消检查
+及资源释放；单次阻塞系统调用需先返回，不能把异步 future 被丢弃等同于阻塞线程已结束。
 同位置未变化提示必须来自已读取的可信 basis 字节；不能直接接受未验证的 wire 跳过指令。
 Unix 输入文件创建后立即 unlink，保留的 fd 在异常或进程结束时自动回收；其他平台依能力拒绝。
 接收中断不会修改原目标，应用补丁期间失败可能留下部分更新，重试必须重新生成 basis 签名。
