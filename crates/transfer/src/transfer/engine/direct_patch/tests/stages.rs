@@ -24,6 +24,7 @@ struct GatedDestination {
     boundary: Boundary,
     reached: Notify,
     calls: Mutex<Vec<Boundary>>,
+    cancel_between_pieces: Option<CancellationToken>,
 }
 
 impl GatedDestination {
@@ -66,6 +67,16 @@ impl StagedDestination for GatedDestination {
         cancel: CancellationToken,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
         self.enter(Boundary::Patch, &cancel).await;
+        let input: PositionedByteStream = if let Some(parent) = self.cancel_between_pieces.clone() {
+            Box::pin(input.enumerate().map(move |(index, piece)| {
+                if index == 1 {
+                    parent.cancel();
+                }
+                piece
+            }))
+        } else {
+            input
+        };
         self.inner.patch_direct(stage, input, size, cancel).await
     }
 
@@ -124,6 +135,7 @@ impl StagedDestination for GatedDestination {
 fn gated_storage(
     root: &TempDir,
     boundary: Boundary,
+    cancel_between_pieces: Option<CancellationToken>,
 ) -> TestResult<(Storage, Arc<GatedDestination>)> {
     let local = storage(root)?;
     let destination = Arc::new(GatedDestination {
@@ -131,6 +143,7 @@ fn gated_storage(
         boundary,
         reached: Notify::new(),
         calls: Mutex::new(Vec::new()),
+        cancel_between_pieces,
     });
     let storage = StorageBuilder::new(local.identity().clone(), local.capabilities().clone())
         .read_source(local.read_source()?)
@@ -186,7 +199,7 @@ async fn cancellation_at_each_commit_boundary_stops_later_phases_and_preserves_a
         let path = root.path().join("file");
         write(&path, b"AAAABBBB")?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        let (storage, destination) = gated_storage(&root, boundary)?;
+        let (storage, destination) = gated_storage(&root, boundary, None)?;
         let cancel = CancellationToken::new();
         let mut session = session_with_cancel(storage, 8, cancel.clone()).await?;
         session.plan = mode_plan(&root)?;
@@ -231,6 +244,42 @@ async fn cancellation_at_each_commit_boundary_stops_later_phases_and_preserves_a
             "不得遗留私有暂存文件"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_after_first_native_patch_preserves_only_the_applied_prefix() -> TestResult {
+    const PIECE: usize = 1024 * 1024;
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("file");
+    write(&path, vec![b'A'; 2 * PIECE])?;
+    let inode = metadata(&path)?.ino();
+    let cancel = CancellationToken::new();
+    let (storage, destination) = gated_storage(&root, Boundary::Verify, Some(cancel.clone()))?;
+    let mut session = session_with_cancel(storage, 2 * PIECE, cancel).await?;
+    let mut input: DirectPatchInput = Box::pin(stream::iter([DirectPatchChunk {
+        offset: 0,
+        data: Bytes::from(vec![b'X'; 2 * PIECE]),
+        unchanged_basis: false,
+    }]));
+    session.receive(&mut input).await?;
+    let error = session
+        .complete()
+        .await
+        .err()
+        .ok_or("中途取消不能成功提交")?;
+    assert!(error.is_cancelled());
+    let after = read(&path)?;
+    assert_eq!(after[..PIECE], vec![b'X'; PIECE]);
+    assert_eq!(after[PIECE..], vec![b'A'; PIECE]);
+    assert_eq!(metadata(&path)?.ino(), inode);
+    assert_eq!(
+        *destination
+            .calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        [Boundary::Prepare, Boundary::Patch]
+    );
     Ok(())
 }
 
