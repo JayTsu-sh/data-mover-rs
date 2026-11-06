@@ -593,7 +593,7 @@ fn header_ownership(
     is_dir: bool,
 ) -> (u32, u32, u32) {
     (
-        without_unowned_set_id(mode, uid.is_some(), gid.is_some(), is_dir),
+        without_unowned_set_id(mode & 0o7777, uid.is_some(), gid.is_some(), is_dir),
         uid.unwrap_or(TAR_UNKNOWN_ID),
         gid.unwrap_or(TAR_UNKNOWN_ID),
     )

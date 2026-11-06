@@ -13,6 +13,8 @@ use data_mover::transfer::{TransferOutcome, TransferSide};
 use futures::StreamExt as _;
 use std::error::Error as _;
 use std::num::NonZeroUsize;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -93,6 +95,18 @@ async fn archive_streams_files_headers_and_padding_with_small_chunk_limits() -> 
     assert_eq!(&archive[..4], b"dir/");
     assert_eq!(archive[156], b'5');
     assert_eq!(&archive[512..520], b"dir/data");
+    #[cfg(unix)]
+    for (offset, name) in [(0, "dir"), (512, "dir/data")] {
+        let mode = std::str::from_utf8(&archive[offset + 100..offset + 107])?;
+        assert_eq!(
+            u32::from_str_radix(mode, 8)?,
+            std::fs::metadata(source_root.path().join(name))?
+                .permissions()
+                .mode()
+                & 0o7777,
+            "tar mode must contain only the actual permission bits"
+        );
+    }
     assert_eq!(&archive[1024..1024 + payload.len()], &payload);
     assert!(
         archive[1024 + payload.len()..]

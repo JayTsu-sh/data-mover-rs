@@ -563,6 +563,7 @@ Headers take mode and principal facts from the observation's independent Permiss
 present. Unknown facets remain unknown; only explicitly numeric principals become uid/gid, while
 named principals are recorded with the unknown numeric ID. When those facts are absent, numeric
 ownership metadata supplies the header. The shared set-id safety rule applies in either case.
+The mode field contains only permission bits; the separate type flag carries the entry kind.
 
 For consumers reading an existing basis, `storage::read_current_range` describes the current
 object once, binds its identity and resolved version, and streams the exact ordered range.

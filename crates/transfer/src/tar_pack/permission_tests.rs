@@ -114,6 +114,26 @@ fn absent_permission_facts_use_numeric_ownership_metadata() {
 }
 
 #[test]
+fn raw_ownership_mode_does_not_encode_file_type_bits_in_the_permission_field() {
+    for (kind, raw, expected) in [
+        (EntryKind::File, 0o106_755, 0o6755),
+        (EntryKind::Directory, 0o042_775, 0o2775),
+    ] {
+        let mut metadata = numeric_metadata();
+        metadata.set_ownership_mode(MetadataObservation::Value {
+            value: OwnershipMode {
+                mode: raw,
+                uid: 1000,
+                gid: 100,
+            },
+            provenance: MetadataProvenance::Inline,
+        });
+        let entry = observed(kind, None).with_metadata(metadata);
+        assert_eq!(fields(&entry), (expected, 1000, 100));
+    }
+}
+
+#[test]
 fn unknown_permission_facets_do_not_fall_back_to_numeric_metadata() {
     let entry = observed(EntryKind::File, Some(PermissionFacts::default()))
         .with_metadata(numeric_metadata());
