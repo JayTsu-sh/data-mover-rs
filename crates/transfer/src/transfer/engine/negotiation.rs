@@ -19,7 +19,7 @@ use crate::storage::{
     CopiedAclTarget, CopiedMetadataTarget, CopiedOwnershipTarget, CopiedTimestampTarget,
     CopiedValueTarget, Metadata, SourceDescriptor, StagedDestination, StorageRoleFailure,
 };
-use crate::transfer::{CopiedMetadataRequest, TransferRequest};
+use crate::transfer::{CopiedMetadataRequest, MetadataTransferMode, TransferRequest};
 
 pub(super) async fn apply_copied_metadata(
     transferred: &Transferred,
@@ -101,6 +101,9 @@ pub(super) async fn copied_metadata_plan(
     request: &TransferRequest,
     descriptor: &SourceDescriptor,
 ) -> Result<Option<CopiedMetadataPlan>, TransferFailure> {
+    if request.metadata_mode == MetadataTransferMode::CallerManaged {
+        return Ok(None);
+    }
     let requested = request.copied_metadata;
     let copy_tags = request.copies_tags();
     let Some(MetadataRoles {

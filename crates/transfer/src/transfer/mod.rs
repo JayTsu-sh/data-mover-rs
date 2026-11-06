@@ -26,8 +26,8 @@ pub use engine::{
 };
 pub use identity::TransferIdentity;
 pub use model::{
-    CopiedMetadataRequest, ReadBackVerification, TransferPolicy, TransferRequest,
-    TransferValueError,
+    CopiedMetadataRequest, MetadataTransferMode, ReadBackVerification, TransferPolicy,
+    TransferRequest, TransferValueError,
 };
 
 #[cfg(test)]
@@ -70,3 +70,7 @@ mod source_version_tests;
 mod tests;
 #[cfg(test)]
 mod write_progress_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod caller_metadata_tests;

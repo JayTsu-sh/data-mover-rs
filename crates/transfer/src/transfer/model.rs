@@ -53,6 +53,15 @@ pub enum ReadBackVerification {
     Disabled,
 }
 
+/// Which layer applies copied metadata. Caller-managed transfers publish data only; the caller
+/// must apply and verify its captured metadata before treating the entry as ready or deleting it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MetadataTransferMode {
+    #[default]
+    Automatic,
+    CallerManaged,
+}
+
 /// Immutable inputs for one transfer attempt.
 #[derive(Clone)]
 pub struct TransferRequest {
@@ -65,6 +74,7 @@ pub struct TransferRequest {
     pub(crate) source_qos: Option<SourceQosGroup>,
     pub(crate) read_back: ReadBackVerification,
     pub(crate) copied_metadata: CopiedMetadataRequest,
+    pub(crate) metadata_mode: MetadataTransferMode,
 }
 
 /// One source selection, optionally constrained by an observation. An observed selection
@@ -296,6 +306,7 @@ impl TransferRequest {
             source_qos: None,
             read_back: ReadBackVerification::default(),
             copied_metadata: CopiedMetadataRequest::default(),
+            metadata_mode: MetadataTransferMode::Automatic,
         }
     }
 
@@ -450,6 +461,14 @@ impl TransferRequest {
     #[must_use]
     pub const fn with_copied_metadata(mut self, request: CopiedMetadataRequest) -> Self {
         self.copied_metadata = request;
+        self
+    }
+
+    /// Selects independent data publication and caller-owned metadata application. In
+    /// `CallerManaged` mode no source metadata is fetched and `outcome.metadata` is `None`.
+    #[must_use]
+    pub const fn with_metadata_mode(mut self, mode: MetadataTransferMode) -> Self {
+        self.metadata_mode = mode;
         self
     }
 
