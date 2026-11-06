@@ -113,26 +113,7 @@ pub(super) async fn copied_metadata_plan(
         target,
     }) = metadata_roles(request)
     else {
-        if !requested.acl() {
-            return Ok(None);
-        }
-        let source_missing = request
-            .source
-            .metadata()
-            .ok()
-            .is_none_or(|metadata| metadata.copied_metadata_observation_plan().is_none());
-        let reason = if source_missing {
-            RefusalCause::SourceCannotObserve
-        } else {
-            RefusalCause::DestinationCannotStore
-        };
-        let policies = MetadataPolicies::default()
-            .with_acl(optional_policy(requested.acl()))
-            .with_xattrs(optional_policy(requested.xattrs()))
-            .with_tags(optional_policy(copy_tags));
-        return Ok(Some(CopiedMetadataPlan {
-            plan: compile_unavailable_plan(policies, reason),
-        }));
+        return Ok(unavailable_roles_plan(request, requested, copy_tags));
     };
     // Unselected optional capabilities must not trigger source metadata I/O.
     let requested_target = CopiedMetadataTarget {
@@ -203,6 +184,33 @@ pub(super) async fn copied_metadata_plan(
     )
     .map(|plan| Some(CopiedMetadataPlan { plan }))
     .map_err(TransferFailure::refused_metadata)
+}
+
+fn unavailable_roles_plan(
+    request: &TransferRequest,
+    requested: CopiedMetadataRequest,
+    copy_tags: bool,
+) -> Option<CopiedMetadataPlan> {
+    if !requested.acl() {
+        return None;
+    }
+    let source_missing = request
+        .source
+        .metadata()
+        .ok()
+        .is_none_or(|metadata| metadata.copied_metadata_observation_plan().is_none());
+    let reason = if source_missing {
+        RefusalCause::SourceCannotObserve
+    } else {
+        RefusalCause::DestinationCannotStore
+    };
+    let policies = MetadataPolicies::default()
+        .with_acl(optional_policy(requested.acl()))
+        .with_xattrs(optional_policy(requested.xattrs()))
+        .with_tags(optional_policy(copy_tags));
+    Some(CopiedMetadataPlan {
+        plan: compile_unavailable_plan(policies, reason),
+    })
 }
 
 /// A destination that keeps nothing a copy carries: nothing the source holds could change the
