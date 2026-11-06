@@ -4,7 +4,8 @@ use thiserror::Error;
 
 use super::{CapabilityUnavailable, SourceDescriptor, Storage, StorageRoleFailure};
 use crate::model::{
-    EntryKind, ModelValueError, ObservationPlan, ObservedEntry, SourceVersion, StoragePath,
+    EntryKind, MetadataCapabilities, ModelValueError, ObservationPlan, ObservedEntry,
+    SourceVersion, StoragePath,
 };
 
 #[derive(Debug, Error)]
@@ -20,7 +21,8 @@ pub enum EntryObservationFailure {
 }
 
 /// 从当前条目的描述捕获事实，不枚举历史或展开目录。
-/// 仅接受 `SourceVersion::Current`，并拒绝包含 `history`、`marker` 或 `listing_only` 的列表描述。
+/// 仅接受 `SourceVersion::Current`，拒绝历史、marker 和不可独立观察的文件描述。
+/// 当前虚拟目录只投影已知内联事实，不对不存在的目录对象发起元数据请求。
 ///
 /// 优先使用描述自带的元数据；缺少时调用 metadata role，软链接再读取精确目标。
 /// 调用方显式选择观察计划，本函数不决定复制或任务策略，也不发起恢复或后台任务。
@@ -37,16 +39,20 @@ pub async fn observe_descriptor(
     if !matches!(descriptor.version, SourceVersion::Current)
         || descriptor.listing.history.is_some()
         || descriptor.listing.directory_marker.is_some()
-        || descriptor.listing.listing_only
+        || (descriptor.listing.listing_only && descriptor.kind != EntryKind::Directory)
     {
         return Err(EntryObservationFailure::UnsupportedDescriptor {
             path: descriptor.path,
         });
     }
-    let metadata_role = storage.metadata()?;
-    let metadata = match metadata_role.observe_listed(&descriptor, plan) {
-        Some(result) => result?,
-        None => metadata_role.observe(&descriptor.path, plan).await?,
+    let metadata = if descriptor.listing.listing_only {
+        descriptor.inline_observations(plan, MetadataCapabilities::default())
+    } else {
+        let metadata_role = storage.metadata()?;
+        match metadata_role.observe_listed(&descriptor, plan) {
+            Some(result) => result?,
+            None => metadata_role.observe(&descriptor.path, plan).await?,
+        }
     };
     let modified = metadata
         .timestamps()

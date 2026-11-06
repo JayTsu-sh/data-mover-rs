@@ -2,6 +2,7 @@
 //! that keeps histories, of one child per key with its history (P7 §10), `stat`, and the verbs S3
 //! cannot serve.
 
+use crate::storage::observe_descriptor;
 use std::num::NonZeroUsize;
 
 use tokio::time::timeout;
@@ -712,5 +713,38 @@ async fn rename_refuses_either_storage_root_before_calling_protocol() -> TestRes
     }
     assert!(protocol.head_versions.lock().await.is_empty());
     assert_eq!(protocol.objects.lock().await.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_virtual_directory_needs_no_object_metadata_rpc() -> TestResult {
+    let protocol = bucket(&[("virtual/child", b"payload")]).await?;
+    let storage = connect_with_tag_support(
+        protocol.clone(),
+        identity(),
+        None,
+        S3TagSupport::Unsupported,
+    )?;
+    let descriptor = storage.namespace()?.stat(&path("virtual")).await?;
+    assert_eq!(descriptor.kind, EntryKind::Directory);
+    assert!(descriptor.listing.listing_only);
+    let observed = observe_descriptor(
+        &storage,
+        descriptor,
+        ObservationPlan::default()
+            .with_tags(ObservationMode::Required)
+            .with_timestamps(ObservationMode::Required),
+    )
+    .await?;
+    assert_eq!(observed.kind(), EntryKind::Directory);
+    assert!(matches!(
+        observed.metadata().tags(),
+        MetadataObservation::NotApplicable
+    ));
+    assert!(matches!(
+        observed.metadata().timestamps(),
+        MetadataObservation::NotApplicable
+    ));
+    assert_eq!(*protocol.tag_reads.lock().await, 0);
     Ok(())
 }
