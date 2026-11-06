@@ -85,3 +85,41 @@ async fn permissions_reject_named_versions_before_using_current_inline_facts()
     assert_eq!(protocol.sets.load(Ordering::SeqCst), 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn unmapped_listing_permissions_need_no_second_stat() -> Result<(), Box<dyn std::error::Error>>
+{
+    let protocol = Arc::new(CancellingProtocol {
+        cancel: tokio_util::sync::CancellationToken::new(),
+        sets: AtomicUsize::new(0),
+        xattrs_supported: false,
+        owner_unmapped: true,
+    });
+    let identity = BackendIdentity::new(BackendKind::Nfs, "unmapped-listing")?;
+    let adapter = NfsMetadataAdapter::new(protocol.clone(), identity.clone());
+    for (uid, gid) in [(None, None), (Some(12345), None), (None, Some(12346))] {
+        let mut descriptor = SourceDescriptor::new(
+            StoragePath::new("file")?,
+            EntryKind::File,
+            Some(4),
+            SourceIdentity::new(
+                identity.clone(),
+                IdentityStrength::StableWithinBackend,
+                b"handle",
+            )?,
+        )
+        .with_inline_ownership(InlineOwnership::Unmapped);
+        descriptor.permissions = crate::backend::namespace::permission_facts(
+            Some(InlineOwnership::Unmapped),
+            Some(0o640),
+            uid,
+            gid,
+        );
+        let facts = adapter.permissions(&descriptor).await?;
+        assert_eq!(facts.mode, Some(0o640));
+        assert_eq!(facts.owner, uid.map(PrincipalIdentity::Numeric));
+        assert_eq!(facts.group, gid.map(PrincipalIdentity::Numeric));
+    }
+    assert_eq!(protocol.sets.load(Ordering::SeqCst), 0);
+    Ok(())
+}

@@ -1,4 +1,4 @@
-//! The current entry snapshot format, byte for byte (P7 §10.4): four v10 golden fixtures under
+//! The current entry snapshot format, byte for byte (P7 §10.4): four v11 golden fixtures under
 //! `tests/data/snapshot/` — a plain NFS file, an S3 key's whole history (versions, delete markers,
 //! the `"null"` version, an inferred order) and a later, incomplete segment whose records carry
 //! metadata, and a directory carrying a current marker object with metadata. Any change to the
@@ -15,10 +15,10 @@ use crate::model::{
     ObjectTag, RecordKind, TimePrecision, TimestampMetadata, VersionRecord,
 };
 
-const NFS_FILE: &str = include_str!("../../../tests/data/snapshot/v10-nfs-file.hex");
-const S3_HISTORY: &str = include_str!("../../../tests/data/snapshot/v10-s3-history.hex");
-const S3_SEGMENT: &str = include_str!("../../../tests/data/snapshot/v10-s3-history-segment.hex");
-const S3_MARKER: &str = include_str!("../../../tests/data/snapshot/v10-s3-directory-marker.hex");
+const NFS_FILE: &str = include_str!("../../../tests/data/snapshot/v11-nfs-file.hex");
+const S3_HISTORY: &str = include_str!("../../../tests/data/snapshot/v11-s3-history.hex");
+const S3_SEGMENT: &str = include_str!("../../../tests/data/snapshot/v11-s3-history-segment.hex");
+const S3_MARKER: &str = include_str!("../../../tests/data/snapshot/v11-s3-directory-marker.hex");
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut hex, byte| {
@@ -151,11 +151,11 @@ fn s3_segment() -> ObservedEntry {
 
 fn fixtures() -> [(&'static str, ObservedEntry, &'static str); 4] {
     [
-        ("v10-nfs-file", nfs_file(), NFS_FILE),
-        ("v10-s3-history", s3_history(), S3_HISTORY),
-        ("v10-s3-history-segment", s3_segment(), S3_SEGMENT),
+        ("v11-nfs-file", nfs_file(), NFS_FILE),
+        ("v11-s3-history", s3_history(), S3_HISTORY),
+        ("v11-s3-history-segment", s3_segment(), S3_SEGMENT),
         (
-            "v10-s3-directory-marker",
+            "v11-s3-directory-marker",
             super::directory_marker_tests::directory_marker_fixture(),
             S3_MARKER,
         ),
@@ -191,7 +191,7 @@ fn the_current_format_is_pinned_byte_for_byte() {
 
 #[test]
 fn another_version_byte_is_unsupported_never_misread() {
-    assert_eq!(VERSION, 10);
+    assert_eq!(VERSION, 11);
     for (name, entry, golden) in fixtures() {
         for version in u8::MIN..=u8::MAX {
             if version == VERSION {
@@ -216,7 +216,7 @@ fn history_at(entry: &ObservedEntry) -> usize {
         .with_history(None)
         .unwrap_or_else(|error| panic!("{error}"))
         .encode_snapshot();
-    bare.as_bytes().len() - 32 - 1 - 1 - 1
+    bare.as_bytes().len() - 32 - 1 - 1 - 1 - 1
 }
 
 #[test]
@@ -292,5 +292,49 @@ fn segments_keep_the_entry_and_split_its_history() {
         )
         .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(decoded, segment);
+    }
+}
+
+#[test]
+fn borrowed_version_snapshots_preserve_record_facts_without_changing_the_observation() {
+    for (_, entry, _) in fixtures() {
+        let before = entry.encode_snapshot();
+        if let Some(history) = entry.history() {
+            for (index, record) in history.records().iter().enumerate() {
+                let snapshot = entry
+                    .try_encode_version_snapshot(index)
+                    .unwrap_or_else(|e| panic!("{e}"));
+                let decoded =
+                    ObservedEntry::decode_snapshot(snapshot.as_bytes(), &backend_of(&entry))
+                        .unwrap_or_else(|e| panic!("{e}"));
+                assert_eq!(decoded.path(), entry.path());
+                assert_eq!(decoded.kind(), entry.kind());
+                assert_eq!(decoded.source_identity(), record.identity());
+                assert_eq!(decoded.size(), record.size());
+                assert_eq!(decoded.modified(), record.modified());
+                assert_eq!(
+                    decoded.metadata(),
+                    record
+                        .metadata()
+                        .unwrap_or(&MetadataObservations::default())
+                );
+                let selected = decoded
+                    .history()
+                    .unwrap_or_else(|| panic!("missing history"));
+                assert_eq!(selected.records(), std::slice::from_ref(record));
+                assert_eq!(selected.order(), history.order());
+                assert!(selected.is_complete());
+                assert_eq!(selected.segment(), 0);
+                assert_eq!(selected.largest_version(), record.size());
+            }
+            assert!(
+                entry
+                    .try_encode_version_snapshot(history.records().len())
+                    .is_err()
+            );
+        } else {
+            assert!(entry.try_encode_version_snapshot(0).is_err());
+        }
+        assert_eq!(entry.encode_snapshot().as_bytes(), before.as_bytes());
     }
 }

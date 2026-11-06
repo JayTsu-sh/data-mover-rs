@@ -13,6 +13,8 @@ mod metadata_requirements;
 #[doc(hidden)]
 pub mod observation;
 mod ownership;
+mod permissions;
+pub use permissions::{PermissionFacts, PrincipalIdentity};
 mod rename;
 mod source_version;
 pub use history::{HistoryOrder, MAX_HISTORY_RECORDS, ObjectHistory, RecordKind, VersionRecord};

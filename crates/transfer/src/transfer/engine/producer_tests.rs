@@ -70,6 +70,7 @@ fn start(source: &Arc<Source>, write_start: u64) -> (PayloadReceiver, ProducerTa
     let cancel = CancellationToken::new();
     let (sender, receiver) = payload_channel(cancel.clone(), source.descriptor.path.clone());
     let task = tokio::spawn(produce(ProducerRequest {
+        maximum_chunk_bytes: None,
         source: source.clone(),
         path: source.descriptor.path.clone(),
         source_identity: source.descriptor.source_identity.clone(),

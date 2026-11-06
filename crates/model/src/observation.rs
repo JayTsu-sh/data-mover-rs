@@ -1,5 +1,7 @@
 use std::fmt;
 
+use bytes::Bytes;
+
 use super::{
     BackendIdentity, BackendKind, EntryKind, MAX_MODEL_FIELD_BYTES, MetadataObservations,
     ModelValueError, ObjectHistory, RenameEvidence, SourceVersion, StoragePath, StorageTimestamp,
@@ -272,11 +274,11 @@ impl SymlinkTarget {
 #[doc(hidden)]
 pub enum PrivateBackendEntryFacts {
     None,
-    Local(Vec<u8>),
-    Nfs(Vec<u8>),
-    Cifs(Vec<u8>),
-    S3(Vec<u8>),
-    Hdfs(Vec<u8>),
+    Local(Bytes),
+    Nfs(Bytes),
+    Cifs(Bytes),
+    S3(Bytes),
+    Hdfs(Bytes),
 }
 
 impl fmt::Debug for PrivateBackendEntryFacts {
@@ -310,6 +312,7 @@ pub struct ObservedEntry {
     source_identity: SourceIdentity,
     rename_evidence: Option<RenameEvidence>,
     metadata: MetadataObservations,
+    permissions: Option<Box<super::PermissionFacts>>,
     backend_fact: PrivateBackendEntryFacts,
     /// The key's history, or one segment of it, when the entry is a key of a versioned bucket
     /// (P7 §10); `None` for every other entry. Boxed: only a versioned bucket's entries have one,
@@ -351,6 +354,7 @@ impl ObservedEntry {
             source_identity,
             rename_evidence: None,
             metadata: MetadataObservations::default(),
+            permissions: None,
             backend_fact: PrivateBackendEntryFacts::None,
             history: None,
             marker: None,
@@ -380,6 +384,7 @@ impl ObservedEntry {
             source_identity,
             rename_evidence: None,
             metadata: MetadataObservations::default(),
+            permissions: None,
             backend_fact: PrivateBackendEntryFacts::None,
             history: None,
             marker: None,
@@ -389,7 +394,11 @@ impl ObservedEntry {
     /// Attaches backend-owned facts without exposing their encoding publicly.
     #[allow(dead_code)]
     #[doc(hidden)]
-    pub fn with_backend_fact_bytes(mut self, bytes: Vec<u8>) -> Result<Self, ModelValueError> {
+    pub fn with_backend_fact_bytes(
+        mut self,
+        bytes: impl Into<Bytes>,
+    ) -> Result<Self, ModelValueError> {
+        let bytes = bytes.into();
         if bytes.len() > MAX_MODEL_FIELD_BYTES {
             return Err(ModelValueError::new(
                 "backend_fact",
@@ -418,6 +427,27 @@ impl ObservedEntry {
     pub fn with_metadata(mut self, metadata: MetadataObservations) -> Self {
         self.metadata = metadata;
         self
+    }
+
+    /// Attaches backend-confirmed permission facts, independently of numeric ownership support.
+    ///
+    /// # Errors
+    /// Rejects invalid principal names or bits outside POSIX permissions.
+    pub fn with_permissions(
+        mut self,
+        facts: Option<Box<super::PermissionFacts>>,
+    ) -> Result<Self, ModelValueError> {
+        if let Some(facts) = facts.as_deref() {
+            facts.validate()?;
+        }
+        self.permissions = facts;
+        Ok(self)
+    }
+
+    /// Borrows true permission facts. Display-only approximations are never stored here.
+    #[must_use]
+    pub fn permissions(&self) -> Option<&super::PermissionFacts> {
+        self.permissions.as_deref()
     }
 
     /// Attaches a listing's history on this entry's backend. A whole listing can exceed
@@ -664,6 +694,30 @@ impl ObservedEntry {
             ));
         }
         Ok(self.encode())
+    }
+
+    /// Encodes one borrowed history record as a standalone observation snapshot.
+    ///
+    /// This does not clone the history, metadata, identity or tags. Only the final encoded
+    /// bytes are allocated. The snapshot carries the selected record's identity, size,
+    /// timestamp and metadata, with a one-record complete history in the original order.
+    /// Container-only backend facts and rename evidence are omitted.
+    ///
+    /// # Errors
+    /// Returns a typed error if no history exists or `index` is out of bounds.
+    pub fn try_encode_version_snapshot(
+        &self,
+        index: usize,
+    ) -> Result<EntrySnapshot, ModelValueError> {
+        let history = self
+            .history
+            .as_deref()
+            .ok_or_else(|| ModelValueError::new("history", "entry has no history"))?;
+        let record = history
+            .records()
+            .get(index)
+            .ok_or_else(|| ModelValueError::new("history_index", "outside observed history"))?;
+        Ok(self.encode_version(record, history.order()))
     }
 
     /// Reconstructs an observation from an unchanged snapshot taken on `backend`.

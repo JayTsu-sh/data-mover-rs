@@ -1,6 +1,6 @@
 //! HDFS contracts exercised through the storage roles. Raw hdfs-native calls seed and verify fixtures.
 use data_mover::DslTraversalFilter;
-use data_mover::model::{EntryKind, FailureClass, StoragePath};
+use data_mover::model::{EntryKind, FailureClass, ObservedEntry, StoragePath};
 use data_mover::storage::{
     BackendConfig, HdfsBackendConfig, Storage, StorageRoleFailure, connect_backend,
 };
@@ -771,7 +771,7 @@ async fn nightly_lab_role_tar_write() -> TestResult {
     let outcome = data_mover::tar_pack::pack(data_mover::tar_pack::TarRequest {
         source: storage.clone(),
         destination: storage,
-        entries: Vec::new(),
+        entries: Vec::<ObservedEntry>::new().into(),
         final_path: StoragePath::new("empty.tar")?,
         cancel: CancellationToken::new(),
         source_qos: None,

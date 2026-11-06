@@ -4,6 +4,7 @@ mod acl;
 mod at_destination;
 mod client;
 pub mod common;
+mod connectivity;
 #[cfg(test)]
 mod create_dir_tests;
 mod listing;

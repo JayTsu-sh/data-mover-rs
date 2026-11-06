@@ -43,9 +43,7 @@ pub(super) async fn describe_source(
         ));
     }
     version::preflight_source_version(request, source)?;
-    if let Some(observed) = request.source_observation()
-        && observed.source_version().as_ref() != Some(request.source_version())
-    {
+    if !request.observation_selector_matches() {
         return Err(TransferFailure::orchestration(
             TransferPhase::Preflight,
             "selected source version differs from the observation",
@@ -59,7 +57,7 @@ pub(super) async fn describe_source(
             TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
         })?;
     if let Some(observed) = request.source_observation() {
-        super::observation::validate_observation(source, observed, &descriptor)?;
+        super::observation::validate_constraint(source, observed, &descriptor)?;
     }
     if let (Some(budget), Some(size)) = (source_qos, descriptor.size) {
         budget.set_logical_bytes(size);

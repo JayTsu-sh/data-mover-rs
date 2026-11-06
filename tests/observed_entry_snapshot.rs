@@ -25,10 +25,10 @@ fn fixture_bytes(hex: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
 }
 
 #[test]
-fn v10_marker_snapshot_exposes_the_exact_copyable_object() -> Result<(), Box<dyn std::error::Error>>
+fn v11_marker_snapshot_exposes_the_exact_copyable_object() -> Result<(), Box<dyn std::error::Error>>
 {
     let backend = BackendIdentity::new(BackendKind::S3, "s3://bucket")?;
-    let bytes = fixture_bytes(include_str!("data/snapshot/v10-s3-directory-marker.hex"))?;
+    let bytes = fixture_bytes(include_str!("data/snapshot/v11-s3-directory-marker.hex"))?;
     let entry = ObservedEntry::decode_snapshot(&bytes, &backend)?;
     assert_eq!(entry.kind(), EntryKind::Directory);
     assert_eq!(entry.path().as_str(), "data");
@@ -150,7 +150,7 @@ fn decoder_rejects_unknown_truncated_tampered_and_trailing_data()
     let valid = observed.encode_snapshot().as_bytes().to_vec();
     let local = backend(BackendKind::Local)?;
 
-    assert_eq!(valid[4], 10, "the current format");
+    assert_eq!(valid[4], 11, "the current format");
     // Refuse every other version without retaining historical encodings as fixtures.
     for version in u8::MIN..=u8::MAX {
         if version == valid[4] {

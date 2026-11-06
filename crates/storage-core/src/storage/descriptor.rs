@@ -4,8 +4,10 @@
 use bytes::Bytes;
 
 use crate::model::{
-    EntryKind, ObjectHistory, OwnershipMode, RenameEvidence, SourceIdentity, SourceVersion,
-    StoragePath, TimestampMetadata,
+    EntryKind, MetadataCapabilities, MetadataFamily, MetadataObservation, MetadataObservationParts,
+    MetadataObservations, MetadataProvenance, ObjectHistory, ObservationMode, ObservationPlan,
+    ObservationSupport, OwnershipMode, RenameEvidence, SourceIdentity, SourceVersion, StoragePath,
+    TimestampMetadata,
 };
 
 /// Numeric ownership the enumerating operation already returned, in the form the backend's own
@@ -61,6 +63,8 @@ pub struct SourceDescriptor {
     /// from `FILE_ATTRIBUTE_READONLY`, which listings carry; the `Stat` verb builds its
     /// descriptor from facts without the attribute and leaves it `None`.
     pub inline_mode: Option<u32>,
+    /// Real backend-confirmed permissions; never a display-only approximation.
+    pub permissions: Option<Box<crate::model::PermissionFacts>>,
     /// Numeric ownership from the same attributes as the timestamps, so a plan that asks for
     /// ownership needs no per-entry metadata round trip either. `None` when the enumerating
     /// operation carried none; only a backend whose metadata role reads ownership from those
@@ -93,6 +97,7 @@ impl SourceDescriptor {
             content_version: None,
             inline_timestamps: None,
             inline_mode: None,
+            permissions: None,
             inline_ownership: None,
             version: SourceVersion::Current,
             listing: ListingFacts::default(),
@@ -123,6 +128,13 @@ impl SourceDescriptor {
         self
     }
 
+    /// Attaches permissions obtained from the same backend attributes, without another read.
+    #[must_use]
+    pub fn with_permissions(mut self, facts: crate::model::PermissionFacts) -> Self {
+        self.permissions = Some(Box::new(facts));
+        self
+    }
+
     /// Attaches timestamps that the enumerating operation already returned.
     #[must_use]
     pub const fn with_inline_timestamps(mut self, timestamps: TimestampMetadata) -> Self {
@@ -146,7 +158,7 @@ impl SourceDescriptor {
     /// Attaches numeric ownership the enumerating operation already returned.
     #[must_use]
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub const fn with_inline_ownership(mut self, ownership: InlineOwnership) -> Self {
+    pub fn with_inline_ownership(mut self, ownership: InlineOwnership) -> Self {
         self.inline_ownership = Some(ownership);
         self
     }
@@ -155,5 +167,62 @@ impl SourceDescriptor {
     #[must_use]
     pub const fn inline_mode(&self) -> Option<u32> {
         self.inline_mode
+    }
+    /// 仅投影描述中已有的元数据；不访问后端，也不决定缺失事实的补取策略。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn inline_observations(
+        &self,
+        plan: ObservationPlan,
+        capabilities: MetadataCapabilities,
+    ) -> MetadataObservations {
+        let support = |family| {
+            if self.listing.listing_only
+                || (self.kind == EntryKind::Symlink
+                    && matches!(family, MetadataFamily::Acl | MetadataFamily::Xattrs))
+            {
+                ObservationSupport::NotApplicable
+            } else {
+                capabilities.support(family)
+            }
+        };
+        let mut metadata = MetadataObservationParts {
+            retained_failures: None,
+            acl: MetadataObservation::unavailable(plan.acl(), support(MetadataFamily::Acl)),
+            xattrs: MetadataObservation::unavailable(
+                plan.xattrs(),
+                support(MetadataFamily::Xattrs),
+            ),
+            tags: MetadataObservation::unavailable(plan.tags(), support(MetadataFamily::Tags)),
+            ownership_mode: MetadataObservation::unavailable(
+                plan.ownership_mode(),
+                support(MetadataFamily::OwnershipMode),
+            ),
+            timestamps: MetadataObservation::unavailable(
+                plan.timestamps(),
+                support(MetadataFamily::Timestamps),
+            ),
+        }
+        .build()
+        .unwrap_or_else(|_| unreachable!("bounded observation projection"));
+
+        if plan.timestamps() != ObservationMode::Omit
+            && let Some(value) = self.inline_timestamps
+        {
+            metadata.set_timestamps(MetadataObservation::Value {
+                value,
+                provenance: MetadataProvenance::Inline,
+            });
+        }
+        if plan.ownership_mode() != ObservationMode::Omit
+            && let Some(InlineOwnership::Known(value)) = self.inline_ownership
+        {
+            metadata.set_ownership_mode(MetadataObservation::Value {
+                value,
+                provenance: MetadataProvenance::Inline,
+            });
+        }
+
+        metadata
     }
 }

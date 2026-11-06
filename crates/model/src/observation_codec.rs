@@ -9,7 +9,7 @@
 //! ```text
 //! "DMES" | version u8 | backend kind u8 | path | kind u8 | symlink target | size | modified |
 //! identity strength u8 | endpoint fingerprint [4] | identity bytes | 2 | metadata |
-//! backend facts | history section (history_codec) | rename evidence | marker section |
+//! backend facts | history section (history_codec) | rename evidence | permissions | marker section |
 //! identity key [32]
 //! ```
 //! The marker section is `0`, or `1` followed by one leaf entry in this same format. A leaf's
@@ -19,29 +19,32 @@
 //! The backend identity is not stored — every entry of one scan shares it, and the caller supplies
 //! it when decoding; the 4-byte endpoint fingerprint tells a wrong endpoint from a corrupted key.
 
+use bytes::Bytes;
+
 use super::history_codec;
 use super::{
     BackendIdentity, BackendKind, EntryIdentityKey, EntryKind, EntrySnapshot, IdentityStrength,
-    MAX_MODEL_FIELD_BYTES, ObservedEntry, PrivateBackendEntryFacts, SnapshotDecodeError,
-    SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding,
+    MAX_MODEL_FIELD_BYTES, MetadataObservations, ObservedEntry, PrivateBackendEntryFacts,
+    SnapshotDecodeError, SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget,
+    SymlinkTargetEncoding, VersionRecord,
 };
 use crate::model::metadata_observation;
-use crate::model::{RenameEvidence, RenameScheme, SpecialFileKind, TimePrecision};
+use crate::model::{HistoryOrder, RenameEvidence, RenameScheme, SpecialFileKind, TimePrecision};
 
 const MAGIC: &[u8; 4] = b"DMES";
-/// The current format: v10 retains metadata errors when successful fallback facts replace them.
+/// The current format: v11 retains backend-confirmed permissions independently of numeric ownership.
 /// Bump on **any** layout change and update the golden bytes.
-pub(super) const VERSION: u8 = 10;
+pub(super) const VERSION: u8 = 11;
 
 impl PrivateBackendEntryFacts {
     fn encode(&self, output: &mut Vec<u8>) {
         let (tag, bytes) = match self {
             Self::None => (0, &[][..]),
-            Self::Local(bytes) => (1, bytes.as_slice()),
-            Self::Nfs(bytes) => (2, bytes.as_slice()),
-            Self::Cifs(bytes) => (3, bytes.as_slice()),
-            Self::S3(bytes) => (4, bytes.as_slice()),
-            Self::Hdfs(bytes) => (5, bytes.as_slice()),
+            Self::Local(bytes) => (1, bytes.as_ref()),
+            Self::Nfs(bytes) => (2, bytes.as_ref()),
+            Self::Cifs(bytes) => (3, bytes.as_ref()),
+            Self::S3(bytes) => (4, bytes.as_ref()),
+            Self::Hdfs(bytes) => (5, bytes.as_ref()),
         };
         output.push(tag);
         put_bytes(output, bytes);
@@ -51,11 +54,11 @@ impl PrivateBackendEntryFacts {
 impl ObservedEntry {
     pub(super) fn encode(&self) -> EntrySnapshot {
         let mut output = Vec::new();
-        self.encode_fields(&mut output);
+        self.encode_fields(&mut output, None);
         match self.marker.as_deref() {
             Some(marker) => {
                 output.push(1);
-                marker.encode_fields(&mut output);
+                marker.encode_fields(&mut output, None);
                 output.push(0); // A marker is a leaf, never another container.
                 output.extend_from_slice(marker.identity_key.as_bytes());
             }
@@ -65,9 +68,30 @@ impl ObservedEntry {
         EntrySnapshot(output)
     }
 
+    pub(super) fn encode_version(
+        &self,
+        record: &VersionRecord,
+        order: HistoryOrder,
+    ) -> EntrySnapshot {
+        let mut output = Vec::new();
+        self.encode_fields(&mut output, Some((record, order)));
+        output.push(0);
+        output.extend_from_slice(record.identity().identity_key().as_bytes());
+        EntrySnapshot(output)
+    }
+
     /// Fields shared by an outer entry and its nonrecursive marker leaf, before their marker
     /// tag and identity key.
-    fn encode_fields(&self, output: &mut Vec<u8>) {
+    fn encode_fields(
+        &self,
+        output: &mut Vec<u8>,
+        selected: Option<(&VersionRecord, HistoryOrder)>,
+    ) {
+        let identity = selected.map_or(&self.source_identity, |(record, _)| record.identity());
+        let empty_metadata = MetadataObservations::default();
+        let metadata = selected.map_or(&self.metadata, |(record, _)| {
+            record.metadata().unwrap_or(&empty_metadata)
+        });
         output.extend_from_slice(MAGIC);
         output.push(VERSION);
         output.push(backend_tag(self.backend_kind));
@@ -84,13 +108,26 @@ impl ObservedEntry {
             }
             None => output.push(0),
         }
-        encode_size(output, self.size);
-        encode_time(output, self.modified);
-        output.push(self.source_identity.strength.tag());
-        output.extend_from_slice(&endpoint_fingerprint(&self.source_identity.backend));
-        put_bytes(output, self.source_identity.stable_bytes.as_slice());
+        encode_size(
+            output,
+            selected.map_or(self.size, |(record, _)| record.size()),
+        );
+        encode_time(
+            output,
+            selected.map_or(self.modified, |(record, _)| record.modified()),
+        );
+        output.push(identity.strength.tag());
+        output.extend_from_slice(&endpoint_fingerprint(&identity.backend));
+        put_bytes(output, identity.stable_bytes.as_slice());
         output.push(2);
-        metadata_observation::encode(&self.metadata, output);
+        metadata_observation::encode(metadata, output);
+        if let Some((record, order)) = selected {
+            PrivateBackendEntryFacts::None.encode(output);
+            history_codec::encode_single(output, record, order);
+            output.push(0);
+            encode_permissions(output, None);
+            return;
+        }
         self.backend_fact.encode(output);
         history_codec::encode(output, self.history.as_deref());
         match self.rename_evidence {
@@ -100,6 +137,7 @@ impl ObservedEntry {
             }
             None => output.push(0),
         }
+        encode_permissions(output, self.permissions.as_deref());
     }
 }
 
@@ -204,6 +242,7 @@ fn decode_fields(
     let backend_fact = decode_facts(cursor, backend_kind)?;
     let history = history_codec::decode(cursor, backend)?;
     let rename_evidence = decode_rename_evidence(cursor)?;
+    let permissions = decode_permissions(cursor)?;
     Ok(ObservedEntry {
         identity_key: source_identity.identity_key(),
         backend_kind,
@@ -215,6 +254,7 @@ fn decode_fields(
         source_identity,
         rename_evidence,
         metadata,
+        permissions,
         backend_fact,
         history,
         marker: None,
@@ -412,7 +452,7 @@ fn decode_facts(
     kind: BackendKind,
 ) -> Result<PrivateBackendEntryFacts, SnapshotDecodeError> {
     let tag = cursor.byte()?;
-    let bytes = cursor.bytes()?.to_vec();
+    let bytes = Bytes::copy_from_slice(cursor.bytes()?);
     match (tag, kind) {
         (0, _) if bytes.is_empty() => Ok(PrivateBackendEntryFacts::None),
         (1, BackendKind::Local) => Ok(PrivateBackendEntryFacts::Local(bytes)),
@@ -422,4 +462,67 @@ fn decode_facts(
         (5, BackendKind::Hdfs) => Ok(PrivateBackendEntryFacts::Hdfs(bytes)),
         _ => Err(SnapshotDecodeError::Malformed),
     }
+}
+
+fn encode_permissions(output: &mut Vec<u8>, facts: Option<&crate::PermissionFacts>) {
+    let Some(facts) = facts else {
+        output.push(0);
+        return;
+    };
+    output.push(1);
+    for principal in [&facts.owner, &facts.group] {
+        match principal {
+            None => output.push(0),
+            Some(crate::PrincipalIdentity::Numeric(id)) => {
+                output.push(1);
+                output.extend_from_slice(&id.to_le_bytes());
+            }
+            Some(crate::PrincipalIdentity::Named(name)) => {
+                output.push(2);
+                put_bytes(output, name.as_bytes());
+            }
+        }
+    }
+    match facts.mode {
+        None => output.push(0),
+        Some(mode) => {
+            output.push(1);
+            output.extend_from_slice(&mode.to_le_bytes());
+        }
+    }
+}
+fn decode_permissions(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<Box<crate::PermissionFacts>>, SnapshotDecodeError> {
+    fn principal(
+        cursor: &mut Cursor<'_>,
+    ) -> Result<Option<crate::PrincipalIdentity>, SnapshotDecodeError> {
+        Ok(match cursor.byte()? {
+            0 => None,
+            1 => Some(crate::PrincipalIdentity::Numeric(cursor.u32()?)),
+            2 => Some(crate::PrincipalIdentity::Named(
+                std::str::from_utf8(cursor.bytes()?)
+                    .map_err(|_| SnapshotDecodeError::Malformed)?
+                    .to_owned(),
+            )),
+            _ => return Err(SnapshotDecodeError::Malformed),
+        })
+    }
+    match cursor.byte()? {
+        0 => return Ok(None),
+        1 => {}
+        _ => return Err(SnapshotDecodeError::Malformed),
+    }
+    let owner = principal(cursor)?;
+    let group = principal(cursor)?;
+    let mode = match cursor.byte()? {
+        0 => None,
+        1 => Some(cursor.u32()?),
+        _ => return Err(SnapshotDecodeError::Malformed),
+    };
+    let facts = crate::PermissionFacts { owner, group, mode };
+    facts
+        .validate()
+        .map_err(|_| SnapshotDecodeError::Malformed)?;
+    Ok(Some(Box::new(facts)))
 }

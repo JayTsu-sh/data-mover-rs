@@ -1,5 +1,6 @@
 //! Strict ACL planning must prove a mapping or refuse before any writes.
 use super::*;
+use crate::model::EntryKind;
 use crate::model::{AclMetadata, MetadataObservation, MetadataProvenance};
 
 fn observations(acl: MetadataObservation<AclMetadata>) -> MetadataObservations {
@@ -65,6 +66,7 @@ fn partial_plan(
         None,
         false,
         true,
+        EntryKind::File,
     )
 }
 
@@ -231,6 +233,7 @@ fn windows_native_acl_is_not_refused_for_absent_unix_ownership()
         None,
         false,
         true,
+        EntryKind::File,
     )?;
     assert!(
         plan.mutations
@@ -306,6 +309,7 @@ fn unsupported_windows_projection_uses_a_protected_empty_dacl()
         None,
         false,
         true,
+        EntryKind::File,
     )?;
     let acl = plan
         .mutations

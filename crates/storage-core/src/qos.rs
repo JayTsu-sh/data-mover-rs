@@ -14,6 +14,10 @@ use tracing::debug;
 // 内部模块
 use crate::error::{Result, StorageError};
 
+mod source_group;
+use source_group::SourceGroups;
+pub use source_group::SourceQosSetupError;
+
 const PEAK_SHAPING_WINDOW: Duration = Duration::from_millis(10);
 type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
@@ -137,6 +141,7 @@ pub struct QosManager {
     iops_limiter: Option<Arc<ArcSwap<IopsController>>>,
     stats: Arc<QosStats>,
     config: Arc<ArcSwap<QosConfig>>,
+    source_groups: Arc<SourceGroups>,
 }
 
 /// 构建软 Token Bucket + 硬 Leaky Bucket。
@@ -342,6 +347,7 @@ impl QosManager {
             bandwidth_limiter,
             iops_limiter,
             stats: Arc::new(QosStats::new()),
+            source_groups: Arc::new(SourceGroups::default()),
             config: Arc::new(ArcSwap::from_pointee(config)),
         })
     }
@@ -403,6 +409,7 @@ impl QosManager {
             bandwidth_limiter,
             iops_limiter,
             stats: Arc::new(QosStats::new()),
+            source_groups: Arc::new(SourceGroups::default()),
             config: Arc::new(ArcSwap::from_pointee(config)),
         })
     }
@@ -444,6 +451,7 @@ impl QosManager {
             bandwidth_limiter: Some(Arc::new(ArcSwap::from_pointee(limiter))),
             iops_limiter,
             stats: Arc::new(QosStats::new()),
+            source_groups: Arc::new(SourceGroups::default()),
             config: Arc::new(ArcSwap::from_pointee(QosConfig {
                 bandwidth: Some(soft_bandwidth.to_string()),
                 hard_bandwidth: Some(hard_bandwidth.to_string()),
@@ -517,6 +525,7 @@ impl QosManager {
             bandwidth_limiter: None,
             iops_limiter: Some(Arc::new(ArcSwap::from_pointee(limiter))),
             stats: Arc::new(QosStats::new()),
+            source_groups: Arc::new(SourceGroups::default()),
             config: Arc::new(ArcSwap::from_pointee(QosConfig {
                 bandwidth: None,
                 hard_bandwidth: None,

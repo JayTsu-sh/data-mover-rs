@@ -28,6 +28,9 @@ pub struct NfsSourceObservation {
     pub timestamps: Option<crate::model::TimestampMetadata>,
     pub ownership: Option<crate::storage::InlineOwnership>,
     pub mode: Option<u32>,
+    /// Independently mapped principals; one can be known while the other is not.
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -138,6 +141,12 @@ impl NfsReadSourceAdapter {
             content_version: Some(observed.content_version),
             inline_timestamps: observed.timestamps,
             inline_mode: observed.mode,
+            permissions: super::namespace::permission_facts(
+                observed.ownership,
+                observed.mode,
+                observed.uid,
+                observed.gid,
+            ),
             inline_ownership: observed.ownership,
             version: SourceVersion::Current,
             listing: ListingFacts::default(),

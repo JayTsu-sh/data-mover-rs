@@ -200,6 +200,8 @@ pub trait TraversalFilter: fmt::Debug + Send + Sync {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct TraversalRequest {
+    /// Whether an unrepresentable object at the traversal root is reported.
+    pub report_root_directory_object: bool,
     /// 交付逐页目录绝对统计；普通遍历默认关闭。
     pub directory_statistics: bool,
     pub root: StoragePath,
@@ -322,10 +324,11 @@ impl TraversalRequest {
     /// is represented by Directory `dir`, retaining its history. Any nonzero version makes
     /// the whole key a File `dir/`. Only actual descendants add a separate Directory for it.
     /// The root itself is not emitted; list its parent to include its own object. Content or
-    /// history at that unrepresentable root key is reported as `Unsupported`, never discarded.
+    /// history at that unrepresentable root key is reported as `Unsupported` by default.
     #[must_use]
     pub fn new(root: StoragePath) -> Self {
         Self {
+            report_root_directory_object: true,
             directory_statistics: false,
             root,
             order: TraversalOrder::default(),
@@ -337,6 +340,20 @@ impl TraversalRequest {
             resumable: Resumable::Off,
             resume_from: None,
         }
+    }
+
+    /// Controls diagnostics for the root's own object, which is never a child of itself.
+    ///
+    /// Keep enabled for an independent scan. A per-directory inventory whose parent already
+    /// accounts for that object can disable it to inspect only the directory's children.
+    #[must_use]
+    pub const fn report_root_directory_object(mut self, enabled: bool) -> Self {
+        self.report_root_directory_object = enabled;
+        self
+    }
+
+    pub(crate) const fn root_object_diagnostics_at(&self, child_depth: usize) -> bool {
+        self.report_root_directory_object && child_depth == 1
     }
 
     /// 是否交付额外的目录统计快照，不改变列举、过滤或后端请求。

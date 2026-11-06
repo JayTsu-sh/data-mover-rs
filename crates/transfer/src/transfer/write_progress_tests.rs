@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     sync::{Arc, Mutex},
+    task::Poll,
     time::Duration,
 };
 
@@ -8,16 +9,22 @@ use bytes::Bytes;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{EntryKind, IdentityStrength, ObservedEntry, SourceIdentity, StoragePath};
+use crate::model::{
+    EntryKind, FailureClass, IdentityStrength, ObservedEntry, Operation, SourceIdentity,
+    StoragePath, Transience,
+};
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
 use crate::storage::backends::local::test_destination_storage;
 use crate::storage::backends::s3::{
     S3Protocol, connect, connect_at_destination,
     tests::{MemoryS3, endpoint_of},
 };
-use crate::storage::{SourceQosStats, Storage, WriteProgress, WriteProgressObserver};
+use crate::storage::{
+    SourceQosStats, Storage, StorageRoleFailure, WriteProgress, WriteProgressObserver,
+};
 use crate::transfer::{
-    ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, TransferPolicy,
+    ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, TransferFailure,
+    TransferPolicy,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -258,5 +265,63 @@ async fn multipart_progress(checkpoint_interval: u64) -> TestResult {
     );
     written.complete(evidence).await?;
     assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_wakes_a_pending_expert_input() -> TestResult {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("final"), b"old")?;
+    let destination = test_destination_storage(root.path(), "pending-cancel")?;
+    let cancel = CancellationToken::new();
+    let session = ExpertDestinationSession::prepare(
+        ExpertDestinationRequest::new(
+            observation(&destination, 12)?,
+            3,
+            destination,
+            StoragePath::new("final")?,
+            cancel.clone(),
+        )
+        .with_transfer_policy(TransferPolicy::AtomicReplace),
+    )
+    .await?;
+    let polled = Arc::new(Notify::new());
+    let signal = Arc::clone(&polled);
+    let input = futures::stream::poll_fn(move |_| {
+        signal.notify_one();
+        Poll::Pending
+    });
+    let writing = tokio::spawn(session.write(Box::pin(input)));
+    tokio::time::timeout(Duration::from_secs(2), polled.notified())
+        .await
+        .map_err(|_| "expert input was never polled")?;
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), writing)
+        .await
+        .map_err(|_| "pending expert input did not cancel")??;
+    let Err(failure) = result else {
+        return Err("cancelled input was accepted".into());
+    };
+    assert_write_cancellation(&failure)?;
+    let failure = failure
+        .cleanup_for_policy(TransferPolicy::AtomicReplace)
+        .await;
+    assert!(failure.cleanup_failure().is_none());
+    assert_eq!(std::fs::read(root.path().join("final"))?, b"old");
+    assert_eq!(std::fs::read_dir(root.path())?.count(), 1);
+    Ok(())
+}
+
+fn assert_write_cancellation(failure: &TransferFailure) -> TestResult {
+    let cause = failure
+        .source()
+        .and_then(|cause| cause.downcast_ref::<StorageRoleFailure>())
+        .ok_or("typed cancellation lost")?;
+    let StorageRoleFailure::Entry(cause) = cause else {
+        return Err("unexpected cancellation scope".into());
+    };
+    assert_eq!(cause.class(), FailureClass::Cancelled);
+    assert_eq!(cause.operation(), Operation::Write);
+    assert_eq!(cause.transience(), Transience::Transient);
     Ok(())
 }

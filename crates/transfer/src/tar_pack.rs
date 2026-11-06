@@ -6,18 +6,20 @@
 
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, IdentityStrength, ObservedEntry, Operation,
-    SourceIdentity, SourceVersion, StoragePath, Transience, without_unowned_set_id,
+    PrincipalIdentity, SourceIdentity, SourceVersion, StoragePath, Transience,
+    without_unowned_set_id,
 };
 use crate::storage::{
-    ByteStream, ReadRequest, ReadSource, SourceQosBudget, SourceQosGroup, SourceQosStats, Storage,
-    StorageRoleFailure,
+    ByteStream, ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosGroup,
+    SourceQosStats, Storage, StorageRoleFailure,
 };
 use crate::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, TransferFailure,
-    TransferOutcome, TransferPolicy,
+    TransferOutcome, TransferPolicy, validate_observation,
 };
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
+use std::borrow::Borrow;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -27,18 +29,21 @@ pub enum TarFailure {
     Invalid(String),
     #[error(transparent)]
     Storage(#[from] StorageRoleFailure),
-    /// Retains the destination's cleanup authority when transfer fails.
+    /// Retains the original transfer failure, publication status, and any failed artifact cleanup.
     #[error(transparent)]
     Transfer(Box<TransferFailure>),
 }
 
-/// Archive inputs. Entry paths are also their names in the archive.
+/// Archive inputs. Owned observations and shared `Arc<ObservedEntry>` inputs are accepted
+/// without cloning their metadata. The immutable manifest is shared as one Arc slice and retained
+/// until the stream finishes; packaging and later manifest persistence can share it without
+/// cloning each observation handle. Entry paths are also their names in the archive.
 /// Request ownership and timestamps during traversal to preserve them in the tar headers.
 #[derive(Clone)]
-pub struct TarRequest {
+pub struct TarRequest<E = ObservedEntry> {
     pub source: Storage,
     pub destination: Storage,
-    pub entries: Vec<ObservedEntry>,
+    pub entries: Arc<[E]>,
     pub final_path: StoragePath,
     pub cancel: CancellationToken,
     pub source_qos: Option<SourceQosGroup>,
@@ -48,8 +53,9 @@ pub struct TarRequest {
 ///
 /// # Errors
 /// Refuses unsupported entries, unknown file sizes and arithmetic overflow.
-pub fn calculate_tar_size(entries: &[ObservedEntry]) -> Result<u64, TarFailure> {
+pub fn calculate_tar_size<E: Borrow<ObservedEntry>>(entries: &[E]) -> Result<u64, TarFailure> {
     entries.iter().try_fold(1024_u64, |total, entry| {
+        let entry = entry.borrow();
         let size = entry_size(entry)?;
         let headers = u64::try_from(build_header_for_entry(entry)?.len())
             .map_err(|_| invalid("archive header overflow"))?;
@@ -64,8 +70,12 @@ pub fn calculate_tar_size(entries: &[ObservedEntry]) -> Result<u64, TarFailure> 
 /// Streams an archive and atomically replaces its destination using the shared transfer engine.
 ///
 /// # Errors
-/// Returns invalid input, a source error, or a destination failure retaining cleanup authority.
-pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
+/// Returns invalid input or the original transfer error after Atomic artifact cleanup.
+/// Every file is checked against its observation before and after reading; detected changes fail
+/// without publication. Cleanup never removes an already published final object.
+pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
+    request: TarRequest<E>,
+) -> Result<TransferOutcome, TarFailure> {
     let size = calculate_tar_size(&request.entries)?;
     let observed = archive_observation(&request, size)?;
     let identity_key = observed.identity_key();
@@ -74,7 +84,7 @@ pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
         .read_source()
         .map_err(|error| invalid(&error.to_string()))?;
     let maximum = source.maximum_read_chunk_bytes().max(512);
-    let destination = ExpertDestinationSession::prepare(
+    let prepared = ExpertDestinationSession::prepare(
         ExpertDestinationRequest::new(
             observed,
             maximum,
@@ -84,18 +94,19 @@ pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
         )
         .with_transfer_policy(TransferPolicy::AtomicReplace),
     )
-    .await
-    .map_err(transfer_failure)?;
+    .await;
+    let destination = finish_archive_phase(prepared).await?;
     let budget = request
         .source_qos
         .as_ref()
         .map(SourceQosGroup::transfer_budget);
-    let evidence = Arc::new(Mutex::new((blake3::Hasher::new(), 0_u64)));
+    let evidence = Arc::new(Mutex::new(ArchiveEvidence::default()));
     let tally = Arc::clone(&evidence);
     let state = ArchiveStream {
         source,
         output: None,
-        entries: request.entries.into_iter(),
+        entries: request.entries,
+        next_entry: 0,
         pending: None,
         reading: None,
         remaining: 0,
@@ -107,31 +118,41 @@ pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
         path: request.final_path,
     };
     let stream = futures::stream::try_unfold(state, next_piece).map(move |piece| {
-        if let Ok(bytes) = &piece {
-            let mut tally = tally
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tally.0.update(bytes);
-            tally.1 += bytes.len() as u64;
+        let mut tally = tally
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &piece {
+            Ok(bytes) => {
+                tally.hash.update(bytes);
+                tally.bytes += bytes.len() as u64;
+            }
+            Err(error) => tally.source_failure = Some(Box::new(error.clone())),
         }
         piece
     });
-    let transferred = destination
-        .write(Box::pin(stream))
-        .await
-        .map_err(transfer_failure)?;
+    let written = destination.write(Box::pin(stream)).await;
+    let source_failure = evidence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .source_failure
+        .take();
+    let written = match source_failure {
+        Some(cause) => written.map_err(|failure| failure.attribute_source_input(cause.as_ref())),
+        None => written,
+    };
+    let transferred = finish_archive_phase(written).await?;
     let (digest, actual) = {
         let tally = evidence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (*tally.0.finalize().as_bytes(), tally.1)
+        (*tally.hash.finalize().as_bytes(), tally.bytes)
     };
     // Destination write also checks the complete expected length before returning.
     debug_assert_eq!(actual, size);
     if let Some(budget) = &budget {
         budget.set_logical_bytes(size);
     }
-    transferred
+    let completed = transferred
         .complete(ExpertSourceEvidence {
             source_size: size,
             blake3: digest,
@@ -144,16 +165,20 @@ pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
                 SourceQosBudget::stats,
             ),
         })
-        .await
-        .map_err(transfer_failure)
+        .await;
+    finish_archive_phase(completed).await
 }
 
-fn archive_observation(request: &TarRequest, size: u64) -> Result<ObservedEntry, TarFailure> {
+fn archive_observation<E: Borrow<ObservedEntry>>(
+    request: &TarRequest<E>,
+    size: u64,
+) -> Result<ObservedEntry, TarFailure> {
     let mut manifest = blake3::Hasher::new();
     manifest.update(b"data-mover/tar/v1\0");
     manifest.update(request.final_path.as_str().as_bytes());
     manifest.update(b"\0");
-    for entry in &request.entries {
+    for entry in request.entries.iter() {
+        let entry = entry.borrow();
         manifest.update(entry.identity_key().as_bytes());
         manifest.update(&build_header_for_entry(entry)?);
     }
@@ -174,12 +199,20 @@ fn archive_observation(request: &TarRequest, size: u64) -> Result<ObservedEntry,
     Ok(observed)
 }
 
-struct ArchiveStream {
+#[derive(Default)]
+struct ArchiveEvidence {
+    hash: blake3::Hasher,
+    bytes: u64,
+    source_failure: Option<Box<StorageRoleFailure>>,
+}
+
+struct ArchiveStream<E> {
     output: Option<Bytes>,
     source: Arc<dyn ReadSource>,
-    entries: std::vec::IntoIter<ObservedEntry>,
-    pending: Option<ObservedEntry>,
-    reading: Option<ByteStream>,
+    entries: Arc<[E]>,
+    next_entry: usize,
+    pending: Option<usize>,
+    reading: Option<(ByteStream, usize)>,
     remaining: u64,
     padding: Option<Bytes>,
     eof: bool,
@@ -189,9 +222,9 @@ struct ArchiveStream {
     path: StoragePath,
 }
 
-async fn next_piece(
-    mut state: ArchiveStream,
-) -> Result<Option<(Bytes, ArchiveStream)>, StorageRoleFailure> {
+async fn next_piece<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
+    mut state: ArchiveStream<E>,
+) -> Result<Option<(Bytes, ArchiveStream<E>)>, StorageRoleFailure> {
     let next = match state.output.take() {
         Some(bytes) => Some((bytes, state)),
         None => next_raw(state).await?,
@@ -207,14 +240,14 @@ async fn next_piece(
     Ok(Some((bytes, state)))
 }
 
-async fn next_raw(
-    mut state: ArchiveStream,
-) -> Result<Option<(Bytes, ArchiveStream)>, StorageRoleFailure> {
+async fn next_raw<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
+    mut state: ArchiveStream<E>,
+) -> Result<Option<(Bytes, ArchiveStream<E>)>, StorageRoleFailure> {
     loop {
         if state.cancel.is_cancelled() {
             return Err(stream_failure(&state.path, FailureClass::Cancelled));
         }
-        if let Some(reading) = &mut state.reading {
+        if let Some((reading, index)) = &mut state.reading {
             if let Some(chunk) = reading.next().await {
                 let bytes = chunk?;
                 state.remaining = state
@@ -229,40 +262,47 @@ async fn next_raw(
             if state.remaining != 0 {
                 return Err(stream_failure(&state.path, FailureClass::Corruption));
             }
+            describe_archive_source(state.source.as_ref(), state.entries[*index].borrow()).await?;
             state.reading = None;
         }
         if let Some(padding) = state.padding.take() {
             return Ok(Some((padding, state)));
         }
-        if let Some(entry) = state.pending.take() {
+        if let Some(index) = state.pending.take() {
+            let entry = state.entries[index].borrow();
             let size = entry
                 .size()
                 .ok_or_else(|| stream_failure(entry.path(), FailureClass::InvalidInput))?;
+            let descriptor = describe_archive_source(state.source.as_ref(), entry).await?;
             state.remaining = size;
             state.padding = tar_padding(size);
-            state.reading = Some(
+            state.reading = Some((
                 state
                     .source
                     .read(ReadRequest {
                         path: entry.path().clone(),
                         range: Some(0..size),
-                        expected_source: Some(entry.source_identity().clone()),
+                        expected_source: Some(descriptor.source_identity),
                         maximum_chunk_bytes: state.maximum,
                         read_inflight: state.source.read_concurrency().max(1),
                         read_budget: None,
                         cancel: state.cancel.clone(),
                         source_qos: state.budget.clone(),
-                        version: SourceVersion::Current,
+                        version: descriptor.version,
                     })
                     .await?,
-            );
+                index,
+            ));
             continue;
         }
-        if let Some(entry) = state.entries.next() {
-            let header = build_header_for_entry(&entry)
-                .map_err(|_| stream_failure(entry.path(), FailureClass::InvalidInput))?;
-            if entry.kind() == EntryKind::File {
-                state.pending = Some(entry);
+        if let Some(entry) = state.entries.get(state.next_entry) {
+            let index = state.next_entry;
+            state.next_entry += 1;
+            let observed = entry.borrow();
+            let header = build_header_for_entry(observed)
+                .map_err(|_| stream_failure(observed.path(), FailureClass::InvalidInput))?;
+            if observed.kind() == EntryKind::File {
+                state.pending = Some(index);
             }
             return Ok(Some((header, state)));
         }
@@ -272,6 +312,18 @@ async fn next_raw(
         }
         return Ok(None);
     }
+}
+
+async fn describe_archive_source(
+    source: &dyn ReadSource,
+    observation: &ObservedEntry,
+) -> Result<SourceDescriptor, StorageRoleFailure> {
+    let descriptor = source
+        .describe_version(observation.path(), &SourceVersion::Current)
+        .await?;
+    validate_observation(source, observation, &descriptor)
+        .map_err(|_| stream_failure(observation.path(), FailureClass::Conflict))?;
+    Ok(descriptor)
 }
 
 fn stream_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {
@@ -289,8 +341,15 @@ fn stream_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure
 fn invalid(message: &str) -> TarFailure {
     TarFailure::Invalid(message.to_owned())
 }
-fn transfer_failure(failure: TransferFailure) -> TarFailure {
-    TarFailure::Transfer(Box::new(failure))
+async fn finish_archive_phase<T>(result: Result<T, TransferFailure>) -> Result<T, TarFailure> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(failure) => Err(TarFailure::Transfer(Box::new(
+            failure
+                .cleanup_for_policy(TransferPolicy::AtomicReplace)
+                .await,
+        ))),
+    }
 }
 
 fn entry_size(entry: &ObservedEntry) -> Result<u64, TarFailure> {
@@ -321,13 +380,7 @@ fn build_header_for_entry(entry: &ObservedEntry) -> Result<Bytes, TarFailure> {
     if path.contains('\0') || target.contains(&0) {
         return Err(invalid("archive names contain NUL"));
     }
-    let owner = entry.metadata().ownership_mode().value();
-    let (mode, uid, gid) = header_ownership(
-        owner.map_or(0, |owner| owner.mode),
-        owner.map(|owner| owner.uid),
-        owner.map(|owner| owner.gid),
-        entry.kind() == EntryKind::Directory,
-    );
+    let (mode, uid, gid) = observed_header_ownership(entry);
     let mtime = entry
         .modified()
         .map(|time| i64::try_from(time.unix_nanos()))
@@ -510,6 +563,29 @@ const TAR_UNKNOWN_ID: u32 = 65534;
 /// name nfs-rs cannot map, see `nfs::owner_id`) is recorded as nobody, never as root (0), and
 /// takes its set-id bit with it (`model::without_unowned_set_id`) — a root extraction that keeps
 /// owners would otherwise create set-id files owned by someone the source never named.
+fn observed_header_ownership(entry: &ObservedEntry) -> (u32, u32, u32) {
+    let (mode, uid, gid) = if let Some(facts) = entry.permissions() {
+        // An unknown facet stays unknown; named principals have no numeric mapping here.
+        let numeric = |principal: Option<&PrincipalIdentity>| match principal {
+            Some(PrincipalIdentity::Numeric(id)) => Some(*id),
+            _ => None,
+        };
+        (
+            facts.mode.unwrap_or(0),
+            numeric(facts.owner.as_ref()),
+            numeric(facts.group.as_ref()),
+        )
+    } else {
+        let owner = entry.metadata().ownership_mode().value();
+        (
+            owner.map_or(0, |owner| owner.mode),
+            owner.map(|owner| owner.uid),
+            owner.map(|owner| owner.gid),
+        )
+    };
+    header_ownership(mode, uid, gid, entry.kind() == EntryKind::Directory)
+}
+
 fn header_ownership(
     mode: u32,
     uid: Option<u32>,
@@ -517,7 +593,7 @@ fn header_ownership(
     is_dir: bool,
 ) -> (u32, u32, u32) {
     (
-        without_unowned_set_id(mode, uid.is_some(), gid.is_some(), is_dir),
+        without_unowned_set_id(mode & 0o7777, uid.is_some(), gid.is_some(), is_dir),
         uid.unwrap_or(TAR_UNKNOWN_ID),
         gid.unwrap_or(TAR_UNKNOWN_ID),
     )
@@ -544,6 +620,10 @@ pub(crate) fn tar_padding(file_size: u64) -> Option<Bytes> {
 pub(crate) fn tar_eof_marker() -> Bytes {
     Bytes::from_static(&[0u8; 1024])
 }
+
+#[cfg(test)]
+#[path = "tar_pack/permission_tests.rs"]
+mod permission_tests;
 
 #[cfg(test)]
 mod tests {

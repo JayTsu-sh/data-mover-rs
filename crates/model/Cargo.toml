@@ -9,4 +9,5 @@ publish = false
 workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 blake3 = { workspace = true }

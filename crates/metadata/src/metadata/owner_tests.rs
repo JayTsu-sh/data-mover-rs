@@ -1,6 +1,7 @@
 //! A writer that may not give a file to its source owner carries the mode alone and says why.
 
 use super::*;
+use crate::model::EntryKind;
 
 fn setuid_source() -> MetadataObservations {
     crate::model::MetadataObservationParts {
@@ -78,6 +79,7 @@ fn a_source_without_an_owner_keeps_its_own_loss() {
         Some(0o100_640),
         false,
         false,
+        EntryKind::File,
     )
     .unwrap();
     assert_eq!(
@@ -89,6 +91,31 @@ fn a_source_without_an_owner_keeps_its_own_loss() {
         &[(
             MetadataFamily::OwnershipMode,
             SemanticLoss::OwnerAndGroupDropped
+        )]
+    );
+}
+
+#[test]
+fn copied_directory_without_numeric_owner_keeps_setgid_inheritance() {
+    let plan = compile_copied_metadata_plan(
+        &MetadataPlanRequest {
+            observations: &MetadataObservations::default(),
+            target: exact_target(),
+            policies: MetadataPolicies::default()
+                .with_ownership_mode(MetadataPolicy::AllowKnownLoss),
+            principal_mapper: None,
+        },
+        Some(0o6775),
+        true,
+        false,
+        EntryKind::Directory,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.mutations,
+        [(
+            MetadataFamily::OwnershipMode,
+            MetadataMutation::Mode(0o2775)
         )]
     );
 }

@@ -1,8 +1,11 @@
-//! Transport-neutral source half of the unified transfer lifecycle.
+//! Transport-neutral source and destination halves of the unified transfer lifecycle.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::{StreamExt, stream};
+use tokio_util::sync::CancellationToken;
 
 use super::at_destination;
 use super::directory_object::{refuse_unholdable, refuse_unwritable};
@@ -14,14 +17,18 @@ use super::{
 };
 use crate::metadata::MetadataPlan;
 use crate::model::observation::PrivateBackendEntryFacts;
-use crate::model::{EntryIdentityKey, EntryKind, ObservedEntry, SourceVersion, StoragePath};
-use crate::storage::{
-    CheckpointObservation, FinalDestination, PrepareFact, PrepareRequest, PublicationEvidence,
-    PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosGroup, SourceQosStats,
-    StagedDestination, Storage, VerificationPoint, VerifyRequest, WriteEvidence,
-    WriteProgressObserver,
+use crate::model::{
+    EntryIdentityKey, EntryKind, EntryOperationFailure, FailureClass, ObservedEntry, Operation,
+    SourceVersion, StoragePath, Transience,
 };
-use crate::transfer::{TransferIdentity, TransferPolicy};
+use crate::storage::{
+    ByteStream, CheckpointObservation, FinalDestination, PrepareFact, PrepareRequest,
+    PublicationEvidence, PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget,
+    SourceQosGroup, SourceQosStats, StagedDestination, Storage, StorageRoleFailure,
+    VerificationPoint, VerifyRequest, WriteEvidence, WriteProgressObserver,
+};
+use crate::transfer::model::ObservedSource;
+use crate::transfer::{TransferIdentity, TransferPolicy, TransferValueError};
 
 use super::observation;
 
@@ -29,9 +36,24 @@ use super::observation;
 #[derive(Clone)]
 pub struct ExpertSourceRequest {
     source: Storage,
-    observation: ObservedEntry,
+    observation: ExpertSourceInput,
+    maximum_chunk_bytes: Option<NonZeroUsize>,
     cancel: tokio_util::sync::CancellationToken,
     source_qos: Option<SourceQosGroup>,
+}
+
+#[derive(Clone)]
+enum ExpertSourceInput {
+    Current(Arc<ObservedEntry>),
+    Selected(ObservedSource),
+}
+impl ExpertSourceInput {
+    fn path(&self) -> &StoragePath {
+        match self {
+            Self::Current(entry) => entry.path(),
+            Self::Selected(source) => source.path(),
+        }
+    }
 }
 
 impl ExpertSourceRequest {
@@ -43,10 +65,43 @@ impl ExpertSourceRequest {
     ) -> Self {
         Self {
             source,
-            observation,
+            observation: ExpertSourceInput::Current(Arc::new(observation)),
+            maximum_chunk_bytes: None,
             cancel,
             source_qos: None,
         }
+    }
+
+    /// Opens exactly the advertised object/version, sharing its immutable scan observation.
+    ///
+    /// # Errors
+    /// Rejects a foreign backend, invalid index, delete marker or unreadable observation.
+    pub fn from_shared_observation(
+        source: Storage,
+        observation: Arc<ObservedEntry>,
+        version_index: Option<usize>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Self, TransferValueError> {
+        let selected = ObservedSource::new(
+            &source,
+            observation,
+            version_index,
+            source.holds_directory_objects(),
+        )?;
+        Ok(Self {
+            source,
+            observation: ExpertSourceInput::Selected(selected),
+            maximum_chunk_bytes: None,
+            cancel,
+            source_qos: None,
+        })
+    }
+
+    /// Bounds source reads and emitted payloads to the caller's transport memory budget.
+    #[must_use]
+    pub const fn with_maximum_chunk_bytes(mut self, maximum: NonZeroUsize) -> Self {
+        self.maximum_chunk_bytes = Some(maximum);
+        self
     }
 
     #[must_use]
@@ -103,11 +158,37 @@ impl ExpertSourceSession {
                 "expert source transfer was cancelled",
             ));
         }
-        let descriptor = observation::describe(source.as_ref(), &request.observation).await?;
+        let (descriptor, identity_key) = match &request.observation {
+            ExpertSourceInput::Current(entry) => (
+                observation::describe(source.as_ref(), entry).await?,
+                entry.identity_key(),
+            ),
+            ExpertSourceInput::Selected(selected) => {
+                let advertised = selected.constraint().ok_or_else(|| {
+                    TransferFailure::orchestration(
+                        TransferPhase::Describe,
+                        "invalid selected source observation",
+                    )
+                })?;
+                let descriptor = source
+                    .describe_version(selected.path(), &selected.version)
+                    .await
+                    .map_err(|error| {
+                        TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
+                    })?;
+                observation::validate_constraint(source.as_ref(), advertised, &descriptor)?;
+                (descriptor, advertised.identity.identity_key())
+            }
+        };
         let source_size = descriptor.size.ok_or_else(|| {
             TransferFailure::orchestration(TransferPhase::Describe, "source has no byte size")
         })?;
-        let maximum_chunk_bytes = source.maximum_read_chunk_bytes().max(1);
+        let maximum_chunk_bytes = request
+            .maximum_chunk_bytes
+            .map_or(source.maximum_read_chunk_bytes(), |maximum| {
+                maximum.get().min(source.maximum_read_chunk_bytes())
+            })
+            .max(1);
         let source_qos = request
             .source_qos
             .as_ref()
@@ -120,7 +201,7 @@ impl ExpertSourceSession {
         let offer = ExpertSourceOffer {
             source_size,
             maximum_chunk_bytes,
-            identity_key: request.observation.identity_key(),
+            identity_key,
         };
         Ok(Self {
             source,
@@ -150,6 +231,7 @@ impl ExpertSourceSession {
         let (sender, receiver) = payload_channel(self.cancel.clone(), self.descriptor.path.clone());
         let producer = tokio::spawn(produce(ProducerRequest {
             hash_content: true,
+            maximum_chunk_bytes: NonZeroUsize::new(self.offer.maximum_chunk_bytes),
             source: self.source,
             path: self.descriptor.path.clone(),
             version: self.descriptor.version,
@@ -452,8 +534,13 @@ impl ExpertDestinationSession {
     /// Returns a destination/checkpoint failure while preserving cleanup authority.
     pub async fn write(
         self,
-        stream: crate::storage::ByteStream,
+        stream: ByteStream,
     ) -> Result<ExpertDestinationTransferred, TransferFailure> {
+        let stream = cancellable_input(
+            stream,
+            self.cancel.clone(),
+            self.stage.final_destination().path().clone(),
+        );
         let write_result = self.destination.write(&self.stage, stream).await;
         let write = match write_result {
             Ok(write) => write,
@@ -797,23 +884,62 @@ fn descriptor_from_observation(
             "ordinary expert transfer source must be a file",
         ));
     }
-    let descriptor = SourceDescriptor::new(
+    let mut descriptor = SourceDescriptor::new(
         observation.path().clone(),
         observation.kind(),
         observation.size(),
         observation.source_identity().clone(),
     )
     .with_rename_evidence(observation.rename_evidence().copied());
+    descriptor.permissions = observation.permissions().cloned().map(Box::new);
     let fact = match observation.backend_facts() {
         PrivateBackendEntryFacts::None => None,
         PrivateBackendEntryFacts::Local(bytes)
         | PrivateBackendEntryFacts::Nfs(bytes)
         | PrivateBackendEntryFacts::Cifs(bytes)
         | PrivateBackendEntryFacts::S3(bytes)
-        | PrivateBackendEntryFacts::Hdfs(bytes) => Some(Bytes::copy_from_slice(bytes)),
+        | PrivateBackendEntryFacts::Hdfs(bytes) => Some(bytes.clone()),
     };
     Ok(match fact {
         Some(fact) => descriptor.with_backend_fact(fact),
         None => descriptor,
     })
 }
+
+// Keep the backend write future alive to settle owned operations after input cancellation.
+fn cancellable_input(
+    input: ByteStream,
+    cancel: CancellationToken,
+    path: StoragePath,
+) -> ByteStream {
+    Box::pin(stream::unfold(
+        Some((input, cancel, path)),
+        |state| async move {
+            let (mut input, cancel, path) = state?;
+            let item = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Some((Err(cancelled_write(path)), None)),
+                item = input.next() => item?,
+            };
+            let next = item.is_ok().then_some((input, cancel, path));
+            Some((item, next))
+        },
+    ))
+}
+
+fn cancelled_write(path: StoragePath) -> StorageRoleFailure {
+    StorageRoleFailure::Entry(
+        EntryOperationFailure::new(
+            path,
+            Operation::Write,
+            FailureClass::Cancelled,
+            Transience::Transient,
+            "expert destination input cancelled",
+        )
+        .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+    )
+}
+
+#[cfg(test)]
+#[path = "expert_fact_tests.rs"]
+mod descriptor_fact_tests;

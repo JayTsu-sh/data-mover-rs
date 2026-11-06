@@ -3,6 +3,7 @@
 use super::{TransferFailure, TransferPhase, TransferSide};
 use crate::model::{EntryKind, ObservedEntry};
 use crate::storage::{ReadSource, SourceDescriptor};
+use crate::transfer::model::ObservationConstraint;
 
 /// Describes the observed path and checks it is the advertised object.
 pub(super) async fn describe(
@@ -42,27 +43,45 @@ fn refuse_without_current_object(observation: &ObservedEntry) -> Result<(), Tran
     ))
 }
 
-pub(super) fn validate_observation(
+pub(crate) fn validate_observation(
     source: &dyn ReadSource,
     observation: &ObservedEntry,
+    descriptor: &SourceDescriptor,
+) -> Result<(), TransferFailure> {
+    validate_constraint(
+        source,
+        ObservationConstraint::from_entry(observation),
+        descriptor,
+    )
+}
+
+pub(super) fn validate_constraint(
+    source: &dyn ReadSource,
+    observation: ObservationConstraint<'_>,
     descriptor: &SourceDescriptor,
 ) -> Result<(), TransferFailure> {
     // Stable file identities survive in-place edits. Compare modification times as well when
     // both operations supplied them; backends such as S3 match content through their identity.
     let modified_changed = observation
-        .modified()
+        .modified
         .zip(
             descriptor
                 .inline_timestamps
                 .and_then(|times| times.modified),
         )
-        .is_some_and(|(observed, described)| observed != described);
+        .is_some_and(|(observed, described)| {
+            let quantum = observed
+                .precision()
+                .quantum_nanos()
+                .max(described.precision().quantum_nanos());
+            observed.unix_nanos().div_euclid(quantum) != described.unix_nanos().div_euclid(quantum)
+        });
     if modified_changed
-        || observation.kind() != EntryKind::File
+        || observation.kind != EntryKind::File
         || descriptor.kind != EntryKind::File
-        || observation.path() != &descriptor.path
-        || observation.size() != descriptor.size
-        || !source.observation_matches(observation.source_identity(), descriptor)
+        || observation.path != &descriptor.path
+        || observation.size != descriptor.size
+        || !source.observation_matches(observation.identity, descriptor)
     {
         return Err(TransferFailure::orchestration(
             TransferPhase::Describe,

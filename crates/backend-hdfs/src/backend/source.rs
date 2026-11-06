@@ -312,7 +312,12 @@ pub(super) fn descriptor(
         SourceDescriptor::new(path, facts.kind, facts.size, source_identity)
             .with_backend_fact(backend_fact(facts))
             .with_inline_timestamps(super::metadata::timestamps(facts.atime, facts.mtime))
-            .with_inline_mode(facts.mode),
+            .with_inline_mode(facts.mode)
+            .with_permissions(crate::model::PermissionFacts {
+                owner: Some(crate::model::PrincipalIdentity::Named(facts.owner.clone())),
+                group: Some(crate::model::PrincipalIdentity::Named(facts.group.clone())),
+                mode: Some(facts.mode & 0o7777),
+            }),
     )
 }
 
@@ -332,12 +337,7 @@ fn identity_for(
 
 fn backend_fact(facts: &HdfsEntryFacts) -> Bytes {
     let mut value = BytesMut::new();
-    value.extend_from_slice(b"data-mover:hdfs-entry-facts:v1\0");
-    value.put_u32(facts.mode);
-    value.put_i64(facts.atime);
-    value.put_i64(facts.mtime);
-    put_text(&mut value, &facts.owner);
-    put_text(&mut value, &facts.group);
+    value.extend_from_slice(b"data-mover:hdfs-entry-facts:v2\0");
     value.put_u32(facts.replication.unwrap_or_default());
     value.put_u64(facts.block_size.unwrap_or_default());
     value.freeze()
@@ -346,36 +346,6 @@ fn backend_fact(facts: &HdfsEntryFacts) -> Bytes {
 fn put_text(output: &mut BytesMut, value: &str) {
     output.put_u32(u32::try_from(value.len()).unwrap_or(u32::MAX));
     output.extend_from_slice(value.as_bytes());
-}
-
-pub(super) fn permissions(
-    descriptor: &SourceDescriptor,
-) -> Option<crate::storage::PermissionFacts> {
-    fn principal(facts: &mut &[u8]) -> Option<crate::storage::PrincipalIdentity> {
-        use bytes::Buf as _;
-        if facts.len() < 4 {
-            return None;
-        }
-        let len = usize::try_from(facts.get_u32()).ok()?;
-        let name = std::str::from_utf8(facts.get(..len)?).ok()?.to_owned();
-        facts.advance(len);
-        Some(crate::storage::PrincipalIdentity::Named(name))
-    }
-    use bytes::Buf as _;
-    let mut facts = descriptor
-        .backend_fact
-        .as_deref()?
-        .strip_prefix(b"data-mover:hdfs-entry-facts:v1\0")?;
-    if facts.len() < 20 {
-        return None;
-    }
-    let mode = facts.get_u32() & 0o7777;
-    facts.advance(16);
-    Some(crate::storage::PermissionFacts {
-        owner: Some(principal(&mut facts)?),
-        group: Some(principal(&mut facts)?),
-        mode: Some(mode),
-    })
 }
 
 fn failure(path: &StoragePath, operation: Operation, class: FailureClass) -> StorageRoleFailure {
@@ -402,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_permission_facts_preserve_named_principals_and_reject_truncation()
+    fn named_permissions_are_typed_and_independent_of_backend_hints()
     -> Result<(), Box<dyn std::error::Error>> {
         let backend = BackendIdentity::new(crate::model::BackendKind::Hdfs, "cluster")?;
         let mut described = descriptor(&backend, StoragePath::new("file")?, &sample(4, 10))?;
@@ -411,16 +381,9 @@ mod tests {
             group: Some(crate::storage::PrincipalIdentity::Named("users".into())),
             mode: Some(0o640),
         };
-        assert_eq!(permissions(&described), Some(expected));
-        let original = described.backend_fact.take().ok_or("missing facts")?;
-        // All required fields must be present; trailing replication/block-size are unrelated.
-        for end in 0..original.len() - 12 {
-            described.backend_fact = Some(original.slice(..end));
-            assert!(
-                permissions(&described).is_none(),
-                "accepted truncated facts at {end}"
-            );
-        }
+        assert_eq!(described.permissions.as_deref(), Some(&expected));
+        described.backend_fact = None;
+        assert_eq!(described.permissions.as_deref(), Some(&expected));
         Ok(())
     }
 

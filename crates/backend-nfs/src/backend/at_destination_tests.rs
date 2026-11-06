@@ -87,6 +87,7 @@ fn request(
             content_version: None,
             inline_timestamps: None,
             inline_mode: None,
+            permissions: None,
             inline_ownership: None,
             version: SourceVersion::Current,
             listing: ListingFacts::default(),

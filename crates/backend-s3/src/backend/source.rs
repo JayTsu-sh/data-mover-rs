@@ -6,7 +6,7 @@ use futures::{StreamExt as _, future::BoxFuture, stream::FuturesOrdered};
 
 use crate::model::{
     BackendIdentity, EntryKind, FailureClass, IdentityStrength, ModelValueError, Operation,
-    SourceIdentity, SourceVersion, StoragePath, Transience,
+    SourceIdentity, SourceVersion, StoragePath, TimestampMetadata, Transience,
 };
 use crate::storage::ListingFacts;
 use crate::storage::{
@@ -200,8 +200,13 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             backend_fact: None,
             content_version: (!facts.etag.is_empty())
                 .then(|| Bytes::copy_from_slice(facts.etag.as_bytes())),
-            inline_timestamps: None,
+            inline_timestamps: facts.last_modified.map(|modified| TimestampMetadata {
+                accessed: None,
+                modified: Some(modified),
+                created: None,
+            }),
             inline_mode: None,
+            permissions: None,
             inline_ownership: None,
             version: pinned_version(&facts, version),
             listing: ListingFacts::default(),

@@ -64,6 +64,26 @@ pub(super) fn encode(output: &mut Vec<u8>, history: Option<&ObjectHistory>) {
     }
 }
 
+pub(super) fn encode_single(output: &mut Vec<u8>, record: &VersionRecord, order: HistoryOrder) {
+    output.push(1);
+    let largest = record.size();
+    output.push(
+        COMPLETE
+            | if order == HistoryOrder::Server {
+                ORDER_SERVER
+            } else {
+                0
+            }
+            | if largest.is_some() { HAS_LARGEST } else { 0 },
+    );
+    output.extend_from_slice(&0u32.to_le_bytes());
+    output.extend_from_slice(&1u32.to_le_bytes());
+    if let Some(largest) = largest {
+        output.extend_from_slice(&largest.to_le_bytes());
+    }
+    encode_record(output, record);
+}
+
 fn encode_record(output: &mut Vec<u8>, record: &VersionRecord) {
     let mut flags = 0;
     if record.is_latest() {

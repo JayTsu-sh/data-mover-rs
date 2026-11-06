@@ -225,3 +225,85 @@ fn direct_inline_integer_pair_preserves_legacy_identity_bytes_and_key() {
         StableBytes::Inline { len: 16, .. }
     ));
 }
+
+#[test]
+fn permissions_survive_snapshots_and_distinguish_absent_from_zero()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{PermissionFacts, PrincipalIdentity};
+    for facts in [
+        None,
+        Some(PermissionFacts {
+            owner: None,
+            group: None,
+            mode: None,
+        }),
+        Some(PermissionFacts {
+            owner: None,
+            group: None,
+            mode: Some(0),
+        }),
+        Some(PermissionFacts {
+            owner: Some(PrincipalIdentity::Named("alice".into())),
+            group: Some(PrincipalIdentity::Named("users".into())),
+            mode: Some(0o640),
+        }),
+    ] {
+        let entry = nfs_entry("permission-facts").with_permissions(facts.map(Box::new))?;
+        let bytes = entry.encode_snapshot();
+        let decoded =
+            ObservedEntry::decode_snapshot(bytes.as_bytes(), entry.source_identity().backend())?;
+        assert_eq!(entry.permissions(), decoded.permissions());
+        // Truncated permission bytes must never be silently replaced by an empty fact.
+        assert!(
+            ObservedEntry::decode_snapshot(
+                &bytes.as_bytes()[..bytes.as_bytes().len() - 34],
+                entry.source_identity().backend()
+            )
+            .is_err()
+        );
+    }
+    for name in ["", "bad\0name"] {
+        assert!(
+            nfs_entry("invalid-permissions")
+                .with_permissions(Some(Box::new(PermissionFacts {
+                    owner: Some(PrincipalIdentity::Named(name.into())),
+                    group: None,
+                    mode: None,
+                })))
+                .is_err()
+        );
+    }
+    assert!(
+        nfs_entry("invalid-mode")
+            .with_permissions(Some(Box::new(PermissionFacts {
+                owner: None,
+                group: None,
+                mode: Some(0o100_000),
+            })))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn backend_fact_payload_is_shared_from_capture_through_observation_clones() {
+    let bytes = bytes::Bytes::from(vec![42u8; 128]);
+    let pointer = bytes.as_ptr();
+    let entry = nfs_entry("shared-facts")
+        .with_backend_fact_bytes(bytes)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let cloned = entry.clone();
+    for value in [&entry, &cloned] {
+        let PrivateBackendEntryFacts::Nfs(facts) = value.backend_facts() else {
+            panic!("expected NFS facts")
+        };
+        assert_eq!(facts.as_ptr(), pointer);
+        assert_eq!(facts.as_ref(), &[42u8; 128]);
+    }
+    let rebuilt = ObservedEntry::decode_snapshot(
+        entry.encode_snapshot().as_bytes(),
+        entry.source_identity().backend(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(rebuilt, entry);
+}

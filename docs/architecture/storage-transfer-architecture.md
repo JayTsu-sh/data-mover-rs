@@ -538,6 +538,40 @@ unchanged, and retains stage cleanup/recovery authority. Prepared destination se
 discard ownership
 for remote cancellation before payload.
 
+
+For reconstructed positioned input, `ExpertDestinationSession::write_positioned` consumes a
+caller-bounded `PositionedByteStream` starting at offset zero. It checks contiguous offsets,
+hashes the complete logical input and advances owned Bytes views past the recovered prefix;
+only the remaining bytes reach the existing destination writer. It does not publish. Its
+`ExpertDestinationWrite` preserves bytes, digest and EOF facts even when the backend returns a
+failure, so the application can classify a truncated stream without losing native failure or
+cleanup ownership. A successful outcome still requires the existing verification/publication
+step; failure cleanup follows the selected transfer policy.
+
+Tar requests share their immutable manifest as `Arc<[E]>` (`E` borrows an `ObservedEntry`).
+The archive cursor stores indices into that slice, so packaging and later manifest persistence
+can retain the same list without copying a vector or cloning every observation handle. The
+list remains alive until streaming finishes. Each file is described before and after payload
+reading, using the same observation constraints as ordinary/expert transfers; its resolved version
+and identity pin the read. Detected growth, same-size edits and a formerly empty file gaining
+content fail before archive publication. These checks are not an atomic snapshot of a mutable
+tree; callers removing archived sources must exclusively control them. Tar phases apply Atomic failure cleanup and preserve the original
+cause, publication status and any separate cleanup failure; published finals are never rolled back.
+Only an unchanged propagated source input failure is attributed to Source; an independent destination
+failure retains its original attribution and publication evidence.
+Headers take mode and principal facts from the observation's independent PermissionFacts when
+present. Unknown facets remain unknown; only explicitly numeric principals become uid/gid, while
+named principals are recorded with the unknown numeric ID. When those facts are absent, numeric
+ownership metadata supplies the header. The shared set-id safety rule applies in either case.
+The mode field contains only permission bits; the separate type flag carries the entry kind.
+
+For consumers reading an existing basis, `storage::read_current_range` describes the current
+object once, binds its identity and resolved version, and streams the exact ordered range.
+It rejects invalid ranges, unknown sizes, short EOF and excess payload with typed read failures;
+backend causes stay intact. It moves the backend buffers and creates no worker or channel, so
+caller polling and the backend read window provide backpressure. It retains backend request
+timeout, cancellation and drop semantics.
+
 ## 9. Transfer state machine
 
 ```text
@@ -646,6 +680,12 @@ metadata failure leaves the final destination unchanged and returns the partial 
 best-effort/omit behavior is already fixed in the compiled plan. Transfer never exposes a
 post-publication metadata workaround, never deletes its source, and returns only a neutral
 source-deletion-safety fact for terrasync policy.
+
+
+The expert destination's write entry also observes cancellation while waiting for caller-owned
+input. It delivers a typed Cancelled/Write/Transient input failure and ends that stream while
+continuing to await the backend write, allowing owned in-flight operations to settle. This guard
+does not replace backend request timeouts or claim to interrupt an already stalled protocol request.
 
 ## 10. Recovery contract
 
@@ -815,6 +855,16 @@ is never duplicated once per entry.
 `TransferFailure` additionally records lifecycle phase, source/destination attribution,
 transience, safe protocol replay, staged-state disposition, and any validated recovery
 identity. A backend performs only safe protocol retries; terrasync owns job retry decisions.
+
+
+`TransferFailure::cleanup_for_policy(policy)` consumes only the failed attempt's cleanup
+ownership and returns the same typed failure. `Checkpointed` keeps unpublished stage state;
+other policies discard it. After possible publication the operation releases only transient
+artifacts through the existing publication cleanup rules and never rolls back final content.
+The original phase, cause, metadata report, source QoS and uncertainty evidence survive without
+cloning a separate diagnostic. A cleanup refusal is available independently through
+`cleanup_failure()` and does not replace the primary cause. Callers that explicitly choose
+unconditional discard or published-artifact cleanup can still use the corresponding methods.
 
 ## 13. Legacy disposition and migration
 

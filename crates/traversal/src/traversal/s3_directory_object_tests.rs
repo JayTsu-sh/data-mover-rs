@@ -9,12 +9,13 @@
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    FailureScope, ScanTotals, StorageTraversalSource, TraversalItem, TraversalOrder,
+    FailureScope, Resumable, ScanTotals, StorageTraversalSource, TraversalItem, TraversalOrder,
     TraversalOutcome, TraversalRequest, TraversalSource,
 };
 use crate::model::{
@@ -630,7 +631,7 @@ async fn directory_object_entries_survive_a_snapshot() -> TestResult {
             assert_eq!(own.kind(), EntryKind::File);
             for entry in &named {
                 let snapshot = entry.encode_snapshot();
-                assert_eq!(snapshot.as_bytes()[4], 10);
+                assert_eq!(snapshot.as_bytes()[4], 11);
                 let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes(), &identity())?;
                 assert_eq!(&rebuilt, *entry);
             }
@@ -667,6 +668,70 @@ async fn a_vanished_directory_object_is_counted_vanished() -> TestResult {
             "{listed:?}"
         );
         assert_eq!(totals(&outcome).vanished, 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_directory_inventory_can_omit_its_already_accounted_root_object() -> TestResult {
+    for order in ORDERS {
+        let protocol = marker_with_null_history().await?;
+        put(&protocol, "d/child", b"x").await?;
+        let (ordinary, outcome) = traverse(&protocol, request("d", order)?).await?;
+        assert_eq!(totals(&outcome).failed_children, 1);
+        assert!(
+            rows(&ordinary)
+                .iter()
+                .any(|row| row == "failure Child d/ Unsupported")
+        );
+        let (inventory, outcome) = traverse(
+            &protocol,
+            request("d", order)?
+                .report_root_directory_object(false)
+                .observation_plan(ObservationPlan::default().with_tags(ObservationMode::Required)),
+        )
+        .await?;
+        assert_eq!(rows(&inventory), ["d/child File Some(1)"]);
+        assert_eq!(totals(&outcome).failed_children, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn directory_inventory_root_policy_survives_checkpoint_relisting() -> TestResult {
+    for order in ORDERS {
+        let protocol = marker_with_null_history().await?;
+        put(&protocol, "d/a/one", b"a").await?;
+        put(&protocol, "d/b/two", b"b").await?;
+        let make = || -> TestResult<TraversalRequest> {
+            Ok(request("d", order)?
+                .report_root_directory_object(false)
+                .resumable(Resumable::On {
+                    every: Duration::from_nanos(1),
+                }))
+        };
+        let (items, _) = traverse(&protocol, make()?).await?;
+        let checkpoints = items
+            .iter()
+            .filter_map(|item| match item {
+                TraversalItem::Checkpoint(saved) => Some(saved.as_ref().clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            checkpoints.len() > 1,
+            "must resume intermediate directory boundaries"
+        );
+        for saved in checkpoints {
+            let (resumed, outcome) = traverse(&protocol, make()?.resume_from(saved)).await?;
+            assert_eq!(
+                totals(&outcome).failed_children,
+                0,
+                "{order:?}: {:?}",
+                rows(&resumed)
+            );
+            assert!(!rows(&resumed).iter().any(|row| row.starts_with("failure")));
+        }
     }
     Ok(())
 }

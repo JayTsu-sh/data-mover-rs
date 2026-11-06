@@ -222,6 +222,7 @@ impl ReadSource for LocalReadSource {
             backend_fact: None,
             content_version: Some(version),
             inline_timestamps: observed.metadata().timestamps().value().copied(),
+            permissions: None,
             inline_mode: observed
                 .metadata()
                 .ownership_mode()

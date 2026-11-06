@@ -43,9 +43,10 @@ pub(crate) struct Relisted {
 pub(crate) async fn remaining(shared: &Shared, work: &DirectoryWork, after: &str) -> Relisted {
     let request = ListRequest::new(work.path.clone(), shared.request.cancel.clone())
         .with_descent_hint(work.hint.clone());
-    let mut stream = shared
-        .namespace
-        .list_for_traversal(request, work.child_depth == 1);
+    let mut stream = shared.namespace.list_for_traversal(
+        request,
+        shared.request.root_object_diagnostics_at(work.child_depth),
+    );
     let mut relisted = Relisted::default();
     let mut listed: u64 = 0;
     while let Some(item) = stream.next().await {

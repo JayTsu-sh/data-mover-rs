@@ -280,6 +280,7 @@ fn assemble_entry(
         source_identity,
         rename_evidence,
         backend_fact,
+        permissions,
         listing,
         ..
     } = descriptor;
@@ -293,14 +294,14 @@ fn assemble_entry(
     }
     // Unreachable after the checks above; kept typed rather than asserted.
     .map_err(|_| internal())?
+    .with_permissions(permissions)
+    .map_err(|_| internal())?
     .with_metadata(metadata)
     .with_rename_evidence(rename_evidence)
     .with_history(listing.history)
     .map_err(|_| internal())?;
     match backend_fact {
-        Some(fact) => entry
-            .with_backend_fact_bytes(fact.to_vec())
-            .map_err(|_| internal()),
+        Some(fact) => entry.with_backend_fact_bytes(fact).map_err(|_| internal()),
         None => Ok(entry),
     }
 }
@@ -644,3 +645,8 @@ async fn observe_block(
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "observe_fact_tests.rs"]
+mod fact_ownership_tests;

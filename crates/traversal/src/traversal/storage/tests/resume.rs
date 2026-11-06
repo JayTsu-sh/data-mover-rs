@@ -475,10 +475,10 @@ async fn checkpoints_come_once_per_period_and_never_when_off() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_pauses_and_a_chain_of_resumes_completes_the_tree() {
     for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
-        // Each round delivers more than one directory's children (7 here) before it is cancelled:
-        // a resumed traversal lists its directories again whole, so a round cancelled before it
-        // finishes any would start over where the last one did (resuming is not exact, §9.2).
-        for (inflight, buffered, cancel_after) in [(1, 1, 15), (4, 1, 20), (8, 16, 40)] {
+        // Unordered workers may interleave every active directory. Leave enough entries for
+        // at least one whole directory across that window; cancelling after only two
+        // directories' worth with four workers can replay partial blocks forever (§9.2).
+        for (inflight, buffered, cancel_after) in [(1, 1, 15), (4, 1, 60), (8, 16, 100)] {
             let mut setup = setup(Tree::generate(3, 3, 4, 3), false);
             setup.source = setup
                 .source
@@ -612,6 +612,10 @@ async fn checkpoints_of_another_request_are_refused_before_any_io() {
             from(rooted(request(TraversalOrder::Unordered, 2), "d0")),
         ),
         ("order", from(request(TraversalOrder::Blocks, 2))),
+        (
+            "root object policy",
+            from(request(TraversalOrder::Unordered, 2).report_root_directory_object(false)),
+        ),
         (
             "depth",
             from(request(TraversalOrder::Unordered, 2).max_depth(NonZeroUsize::new(2))),

@@ -95,7 +95,7 @@ async fn listed_identity_and_facts_match_the_observation_role() -> Result {
     };
     assert_eq!(
         listed[0].backend_fact.as_deref(),
-        Some(observed_fact.as_slice())
+        Some(observed_fact.as_ref())
     );
     assert_eq!(listed[0].content_version.as_ref(), Some(&version));
     Ok(())
