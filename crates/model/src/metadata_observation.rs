@@ -1,8 +1,8 @@
-use super::MetadataFamily;
 #[cfg(test)]
 use super::TimePrecision;
 use super::observation::{Cursor, SnapshotDecodeError, decode_time, encode_time, put_bytes};
 use super::{FailureClass, MAX_MODEL_FIELD_BYTES, ModelValueError, StorageTimestamp, Transience};
+use super::{MetadataFamily, ObservationSupport};
 
 mod compact;
 mod failures;
@@ -129,6 +129,16 @@ pub enum MetadataObservation<T> {
 }
 
 impl<T> MetadataObservation<T> {
+    /// 从计划与能力投影尚无内联事实的状态；是否补取由执行层决定。
+    #[must_use]
+    pub const fn unavailable(mode: ObservationMode, support: ObservationSupport) -> Self {
+        match (mode, support) {
+            (ObservationMode::Omit, _) => Self::NotRequested,
+            (_, ObservationSupport::NotApplicable) => Self::NotApplicable,
+            _ => Self::Unsupported,
+        }
+    }
+
     #[must_use]
     pub const fn value(&self) -> Option<&T> {
         match self {

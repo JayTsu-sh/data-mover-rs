@@ -3,20 +3,12 @@
 use super::entry_failure;
 
 use crate::model::{
-    EntryKind, EntryOperationFailure, FailureClass, MetadataCapabilities, MetadataFamily as F,
+    EntryOperationFailure, FailureClass, MetadataCapabilities, MetadataFamily as F,
     MetadataObservation as O, MetadataObservationParts, MetadataObservations, MetadataProvenance,
     ObservationMode as M, ObservationPlan, ObservationSupport as S, Operation, StorageTimestamp,
     TimestampMetadata, Transience,
 };
-use crate::storage::{InlineOwnership, Metadata, SourceDescriptor, StorageRoleFailure};
-
-fn unavailable<T>(mode: M, support: S) -> O<T> {
-    match (mode, support) {
-        (M::Omit, _) => O::NotRequested,
-        (_, S::NotApplicable) => O::NotApplicable,
-        _ => O::Unsupported,
-    }
-}
+use crate::storage::{Metadata, SourceDescriptor, StorageRoleFailure};
 
 fn known<T>(mode: M, support: S, value: O<T>) -> O<T> {
     if mode == M::Omit {
@@ -24,7 +16,7 @@ fn known<T>(mode: M, support: S, value: O<T>) -> O<T> {
     } else if matches!(value, O::Value { .. } | O::NotApplicable | O::Failed { .. }) {
         value
     } else {
-        unavailable(mode, support)
+        O::unavailable(mode, support)
     }
 }
 
@@ -78,10 +70,10 @@ pub(super) fn record_inline(
     };
     MetadataObservationParts {
         retained_failures: None,
-        acl: unavailable(plan.acl(), capabilities.support(F::Acl)),
-        xattrs: unavailable(plan.xattrs(), capabilities.support(F::Xattrs)),
-        tags: unavailable(plan.tags(), capabilities.support(F::Tags)),
-        ownership_mode: unavailable(
+        acl: O::unavailable(plan.acl(), capabilities.support(F::Acl)),
+        xattrs: O::unavailable(plan.xattrs(), capabilities.support(F::Xattrs)),
+        tags: O::unavailable(plan.tags(), capabilities.support(F::Tags)),
+        ownership_mode: O::unavailable(
             plan.ownership_mode(),
             capabilities.support(F::OwnershipMode),
         ),
@@ -115,58 +107,7 @@ pub(super) fn inline(
             return answer.map(|metadata| apply_support(metadata, plan, capabilities));
         }
     }
-    let mut metadata = descriptor_fallback(descriptor, plan, capabilities);
-    apply_descriptor_fields(&mut metadata, descriptor, plan);
-    Ok(metadata)
-}
-
-fn descriptor_fallback(
-    descriptor: &SourceDescriptor,
-    plan: ObservationPlan,
-    capabilities: MetadataCapabilities,
-) -> MetadataObservations {
-    let support = |family| {
-        if descriptor.listing.listing_only
-            || (descriptor.kind == EntryKind::Symlink && matches!(family, F::Acl | F::Xattrs))
-        {
-            S::NotApplicable
-        } else {
-            capabilities.support(family)
-        }
-    };
-    MetadataObservationParts {
-        retained_failures: None,
-        acl: unavailable(plan.acl(), support(F::Acl)),
-        xattrs: unavailable(plan.xattrs(), support(F::Xattrs)),
-        tags: unavailable(plan.tags(), support(F::Tags)),
-        ownership_mode: unavailable(plan.ownership_mode(), support(F::OwnershipMode)),
-        timestamps: unavailable(plan.timestamps(), support(F::Timestamps)),
-    }
-    .build()
-    .unwrap_or_else(|_| unreachable!("bounded observation projection"))
-}
-
-fn apply_descriptor_fields(
-    metadata: &mut MetadataObservations,
-    descriptor: &SourceDescriptor,
-    plan: ObservationPlan,
-) {
-    if plan.timestamps() != M::Omit
-        && let Some(value) = descriptor.inline_timestamps
-    {
-        metadata.set_timestamps(O::Value {
-            value,
-            provenance: MetadataProvenance::Inline,
-        });
-    }
-    if plan.ownership_mode() != M::Omit
-        && let Some(InlineOwnership::Known(value)) = descriptor.inline_ownership
-    {
-        metadata.set_ownership_mode(O::Value {
-            value,
-            provenance: MetadataProvenance::Inline,
-        });
-    }
+    Ok(descriptor.inline_observations(plan, capabilities))
 }
 
 fn reusable<T>(value: &O<T>) -> bool {

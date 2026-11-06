@@ -4,8 +4,10 @@
 use bytes::Bytes;
 
 use crate::model::{
-    EntryKind, ObjectHistory, OwnershipMode, RenameEvidence, SourceIdentity, SourceVersion,
-    StoragePath, TimestampMetadata,
+    EntryKind, MetadataCapabilities, MetadataFamily, MetadataObservation, MetadataObservationParts,
+    MetadataObservations, MetadataProvenance, ObjectHistory, ObservationMode, ObservationPlan,
+    ObservationSupport, OwnershipMode, RenameEvidence, SourceIdentity, SourceVersion, StoragePath,
+    TimestampMetadata,
 };
 
 /// Numeric ownership the enumerating operation already returned, in the form the backend's own
@@ -165,5 +167,62 @@ impl SourceDescriptor {
     #[must_use]
     pub const fn inline_mode(&self) -> Option<u32> {
         self.inline_mode
+    }
+    /// 仅投影描述中已有的元数据；不访问后端，也不决定缺失事实的补取策略。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn inline_observations(
+        &self,
+        plan: ObservationPlan,
+        capabilities: MetadataCapabilities,
+    ) -> MetadataObservations {
+        let support = |family| {
+            if self.listing.listing_only
+                || (self.kind == EntryKind::Symlink
+                    && matches!(family, MetadataFamily::Acl | MetadataFamily::Xattrs))
+            {
+                ObservationSupport::NotApplicable
+            } else {
+                capabilities.support(family)
+            }
+        };
+        let mut metadata = MetadataObservationParts {
+            retained_failures: None,
+            acl: MetadataObservation::unavailable(plan.acl(), support(MetadataFamily::Acl)),
+            xattrs: MetadataObservation::unavailable(
+                plan.xattrs(),
+                support(MetadataFamily::Xattrs),
+            ),
+            tags: MetadataObservation::unavailable(plan.tags(), support(MetadataFamily::Tags)),
+            ownership_mode: MetadataObservation::unavailable(
+                plan.ownership_mode(),
+                support(MetadataFamily::OwnershipMode),
+            ),
+            timestamps: MetadataObservation::unavailable(
+                plan.timestamps(),
+                support(MetadataFamily::Timestamps),
+            ),
+        }
+        .build()
+        .unwrap_or_else(|_| unreachable!("bounded observation projection"));
+
+        if plan.timestamps() != ObservationMode::Omit
+            && let Some(value) = self.inline_timestamps
+        {
+            metadata.set_timestamps(MetadataObservation::Value {
+                value,
+                provenance: MetadataProvenance::Inline,
+            });
+        }
+        if plan.ownership_mode() != ObservationMode::Omit
+            && let Some(InlineOwnership::Known(value)) = self.inline_ownership
+        {
+            metadata.set_ownership_mode(MetadataObservation::Value {
+                value,
+                provenance: MetadataProvenance::Inline,
+            });
+        }
+
+        metadata
     }
 }
