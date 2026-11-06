@@ -20,6 +20,10 @@ mod acl_policy_tests;
 mod checkpoint_binding;
 mod compile;
 mod errors;
+mod verify;
+#[cfg(test)]
+mod verify_tests;
+pub use verify::MetadataVerificationError;
 
 pub use compile::compile_metadata_plan;
 pub use compile::{
