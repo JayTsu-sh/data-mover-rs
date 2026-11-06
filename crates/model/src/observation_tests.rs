@@ -284,3 +284,26 @@ fn permissions_survive_snapshots_and_distinguish_absent_from_zero()
     );
     Ok(())
 }
+
+#[test]
+fn backend_fact_payload_is_shared_from_capture_through_observation_clones() {
+    let bytes = bytes::Bytes::from(vec![42u8; 128]);
+    let pointer = bytes.as_ptr();
+    let entry = nfs_entry("shared-facts")
+        .with_backend_fact_bytes(bytes)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let cloned = entry.clone();
+    for value in [&entry, &cloned] {
+        let PrivateBackendEntryFacts::Nfs(facts) = value.backend_facts() else {
+            panic!("expected NFS facts")
+        };
+        assert_eq!(facts.as_ptr(), pointer);
+        assert_eq!(facts.as_ref(), &[42u8; 128]);
+    }
+    let rebuilt = ObservedEntry::decode_snapshot(
+        entry.encode_snapshot().as_bytes(),
+        entry.source_identity().backend(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(rebuilt, entry);
+}

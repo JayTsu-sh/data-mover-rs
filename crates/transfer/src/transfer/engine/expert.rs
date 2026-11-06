@@ -898,7 +898,7 @@ fn descriptor_from_observation(
         | PrivateBackendEntryFacts::Nfs(bytes)
         | PrivateBackendEntryFacts::Cifs(bytes)
         | PrivateBackendEntryFacts::S3(bytes)
-        | PrivateBackendEntryFacts::Hdfs(bytes) => Some(Bytes::copy_from_slice(bytes)),
+        | PrivateBackendEntryFacts::Hdfs(bytes) => Some(bytes.clone()),
     };
     Ok(match fact {
         Some(fact) => descriptor.with_backend_fact(fact),
@@ -939,3 +939,7 @@ fn cancelled_write(path: StoragePath) -> StorageRoleFailure {
         .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
     )
 }
+
+#[cfg(test)]
+#[path = "expert_fact_tests.rs"]
+mod descriptor_fact_tests;

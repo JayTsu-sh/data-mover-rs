@@ -301,9 +301,7 @@ fn assemble_entry(
     .with_history(listing.history)
     .map_err(|_| internal())?;
     match backend_fact {
-        Some(fact) => entry
-            .with_backend_fact_bytes(fact.to_vec())
-            .map_err(|_| internal()),
+        Some(fact) => entry.with_backend_fact_bytes(fact).map_err(|_| internal()),
         None => Ok(entry),
     }
 }
@@ -647,3 +645,8 @@ async fn observe_block(
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "observe_fact_tests.rs"]
+mod fact_ownership_tests;

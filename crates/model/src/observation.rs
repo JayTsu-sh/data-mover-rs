@@ -1,5 +1,7 @@
 use std::fmt;
 
+use bytes::Bytes;
+
 use super::{
     BackendIdentity, BackendKind, EntryKind, MAX_MODEL_FIELD_BYTES, MetadataObservations,
     ModelValueError, ObjectHistory, RenameEvidence, SourceVersion, StoragePath, StorageTimestamp,
@@ -272,11 +274,11 @@ impl SymlinkTarget {
 #[doc(hidden)]
 pub enum PrivateBackendEntryFacts {
     None,
-    Local(Vec<u8>),
-    Nfs(Vec<u8>),
-    Cifs(Vec<u8>),
-    S3(Vec<u8>),
-    Hdfs(Vec<u8>),
+    Local(Bytes),
+    Nfs(Bytes),
+    Cifs(Bytes),
+    S3(Bytes),
+    Hdfs(Bytes),
 }
 
 impl fmt::Debug for PrivateBackendEntryFacts {
@@ -392,7 +394,11 @@ impl ObservedEntry {
     /// Attaches backend-owned facts without exposing their encoding publicly.
     #[allow(dead_code)]
     #[doc(hidden)]
-    pub fn with_backend_fact_bytes(mut self, bytes: Vec<u8>) -> Result<Self, ModelValueError> {
+    pub fn with_backend_fact_bytes(
+        mut self,
+        bytes: impl Into<Bytes>,
+    ) -> Result<Self, ModelValueError> {
+        let bytes = bytes.into();
         if bytes.len() > MAX_MODEL_FIELD_BYTES {
             return Err(ModelValueError::new(
                 "backend_fact",

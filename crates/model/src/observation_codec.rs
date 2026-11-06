@@ -19,6 +19,8 @@
 //! The backend identity is not stored — every entry of one scan shares it, and the caller supplies
 //! it when decoding; the 4-byte endpoint fingerprint tells a wrong endpoint from a corrupted key.
 
+use bytes::Bytes;
+
 use super::history_codec;
 use super::{
     BackendIdentity, BackendKind, EntryIdentityKey, EntryKind, EntrySnapshot, IdentityStrength,
@@ -38,11 +40,11 @@ impl PrivateBackendEntryFacts {
     fn encode(&self, output: &mut Vec<u8>) {
         let (tag, bytes) = match self {
             Self::None => (0, &[][..]),
-            Self::Local(bytes) => (1, bytes.as_slice()),
-            Self::Nfs(bytes) => (2, bytes.as_slice()),
-            Self::Cifs(bytes) => (3, bytes.as_slice()),
-            Self::S3(bytes) => (4, bytes.as_slice()),
-            Self::Hdfs(bytes) => (5, bytes.as_slice()),
+            Self::Local(bytes) => (1, bytes.as_ref()),
+            Self::Nfs(bytes) => (2, bytes.as_ref()),
+            Self::Cifs(bytes) => (3, bytes.as_ref()),
+            Self::S3(bytes) => (4, bytes.as_ref()),
+            Self::Hdfs(bytes) => (5, bytes.as_ref()),
         };
         output.push(tag);
         put_bytes(output, bytes);
@@ -450,7 +452,7 @@ fn decode_facts(
     kind: BackendKind,
 ) -> Result<PrivateBackendEntryFacts, SnapshotDecodeError> {
     let tag = cursor.byte()?;
-    let bytes = cursor.bytes()?.to_vec();
+    let bytes = Bytes::copy_from_slice(cursor.bytes()?);
     match (tag, kind) {
         (0, _) if bytes.is_empty() => Ok(PrivateBackendEntryFacts::None),
         (1, BackendKind::Local) => Ok(PrivateBackendEntryFacts::Local(bytes)),
