@@ -64,6 +64,7 @@ async fn run(
     results: oneshot::Sender<Vec<Done>>,
 ) {
     let plan = shared.policy.observation_plan;
+    let latest_only = shared.request.latest_metadata_only;
     let namespace = shared.namespace.as_ref();
     let metadata = shared.metadata.as_ref();
     let (budget, halt) = (&budget, &halt);
@@ -75,7 +76,7 @@ async fn run(
             if halt.is_cancelled() {
                 return None;
             }
-            let result = observe(namespace, metadata, *descriptor, plan, halt).await;
+            let result = observe(namespace, metadata, *descriptor, plan, latest_only, halt).await;
             drop(permit);
             Some((place, result.map(Box::new)))
         })

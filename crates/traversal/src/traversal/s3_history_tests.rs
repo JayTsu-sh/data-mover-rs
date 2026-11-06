@@ -23,6 +23,39 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const ORDERS: [TraversalOrder; 2] = [TraversalOrder::Blocks, TraversalOrder::Unordered];
 
+#[tokio::test]
+async fn latest_only_metadata_does_not_fetch_historical_tags() -> TestResult {
+    for order in ORDERS {
+        let protocol = history().await?;
+        let (items, outcome) = traverse(
+            &protocol,
+            request()
+                .order(order)
+                .latest_metadata_only(true)
+                .observation_plan(
+                    ObservationPlan::default().with_tags(ObservationMode::BestEffort),
+                ),
+        )
+        .await?;
+        assert!(matches!(outcome, TraversalOutcome::Completed(_)));
+        assert_eq!(*protocol.tag_versions.lock().await, [Some("v0004".into())]);
+        let found = entries(&items);
+        let k = found
+            .iter()
+            .find(|entry| entry.path().as_str() == "k")
+            .ok_or("key missing")?;
+        let records = k.history().ok_or("history missing")?.records();
+        assert_eq!(records.len(), 4);
+        assert!(
+            records
+                .iter()
+                .filter(|record| !record.is_latest())
+                .all(|record| record.metadata().is_none())
+        );
+    }
+    Ok(())
+}
+
 /// `k`: v1, v2, a delete marker, v3; `gone`: written, then deleted; an artifact.
 pub(super) async fn history() -> TestResult<Arc<MemoryS3>> {
     let protocol = Arc::new(MemoryS3::default());

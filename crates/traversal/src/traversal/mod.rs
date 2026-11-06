@@ -210,6 +210,9 @@ pub struct TraversalRequest {
     /// Observations requested by the caller. A filter dependency must be enabled here;
     /// `InlineOnly` uses listed information without additional metadata I/O.
     pub observation_plan: ObservationPlan,
+    /// Observe additional metadata only for each key's latest version; history identities and
+    /// ordering are still delivered unchanged. Delete markers never trigger metadata requests.
+    pub latest_metadata_only: bool,
     pub cancel: CancellationToken,
     /// Optional admission / pruning policy. `None` admits every entry and descends into every
     /// directory.
@@ -334,6 +337,7 @@ impl TraversalRequest {
             order: TraversalOrder::default(),
             max_inflight_operations: DEFAULT_MAX_INFLIGHT,
             observation_plan: ObservationPlan::default(),
+            latest_metadata_only: false,
             cancel: CancellationToken::new(),
             filter: None,
             max_depth: None,
@@ -384,6 +388,12 @@ impl TraversalRequest {
     #[must_use]
     pub const fn observation_plan(mut self, plan: ObservationPlan) -> Self {
         self.observation_plan = plan;
+        self
+    }
+
+    #[must_use]
+    pub const fn latest_metadata_only(mut self, latest_only: bool) -> Self {
+        self.latest_metadata_only = latest_only;
         self
     }
 

@@ -185,6 +185,7 @@ async fn decide_pending(
                 shared.metadata.as_ref(),
                 *descriptor,
                 plan,
+                shared.request.latest_metadata_only,
                 &shared.request.cancel,
             )
             .await

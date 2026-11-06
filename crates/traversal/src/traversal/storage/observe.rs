@@ -106,6 +106,7 @@ async fn observe_history(
     mut descriptor: SourceDescriptor,
     mut history: Box<ObjectHistory>,
     plan: ObservationPlan,
+    latest_only: bool,
     cancel: &CancellationToken,
 ) -> Result<ObservedEntry, ObservationError> {
     let history_path =
@@ -119,7 +120,7 @@ async fn observe_history(
     let capabilities = metadata_role.observation_capabilities();
     let mut observations = Vec::new();
     for record in history.records_mut() {
-        if record.is_delete_marker() {
+        if record.is_delete_marker() || (latest_only && !record.is_latest()) {
             continue;
         }
         let inline = metadata::record_inline(record.modified(), plan, capabilities);
@@ -373,13 +374,22 @@ pub(super) async fn observe(
     metadata_role: &dyn Metadata,
     mut descriptor: SourceDescriptor,
     plan: ObservationPlan,
+    latest_only: bool,
     cancel: &CancellationToken,
 ) -> Result<ObservedEntry, ObservationError> {
     if let Some(marker) = descriptor.listing.directory_marker.take() {
         return marker::observe(namespace, metadata_role, descriptor, *marker, plan).await;
     }
     if let Some(history) = descriptor.listing.history.take() {
-        return observe_history(metadata_role, descriptor, history, plan, cancel).await;
+        return observe_history(
+            metadata_role,
+            descriptor,
+            history,
+            plan,
+            latest_only,
+            cancel,
+        )
+        .await;
     }
     match observe_io(namespace, metadata_role, &descriptor, plan).await {
         Ok((metadata, target)) => assemble(descriptor, metadata, target),
@@ -619,6 +629,7 @@ async fn observe_block(
     results: mpsc::UnboundedSender<Observed>,
 ) {
     let plan = shared.policy.observation_plan;
+    let latest_only = shared.request.latest_metadata_only;
     let namespace = shared.namespace.as_ref();
     let metadata = shared.metadata.as_ref();
     let cancel = &shared.request.cancel;
@@ -632,7 +643,7 @@ async fn observe_block(
                 Some(_) if shared.request.cancel.is_cancelled() => {}
                 Some(Job { sequence, descriptor, deferred }) => inflight.push(async move {
                     let kind = descriptor.kind;
-                    let result = observe(namespace, metadata, *descriptor, plan, cancel).await;
+                    let result = observe(namespace, metadata, *descriptor, plan, latest_only, cancel).await;
                     (sequence, result.map(Box::new), deferred, kind)
                 }),
                 None => open = false,
