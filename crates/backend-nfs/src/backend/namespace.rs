@@ -290,6 +290,10 @@ pub(super) fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
 
 #[async_trait]
 impl Namespace for NfsNamespaceAdapter {
+    async fn check_connectivity(&self) -> Result<(), StorageRoleFailure> {
+        super::connectivity::check_root_listing(self).await
+    }
+
     async fn create_symlink(
         &self,
         request: crate::storage::CreateSymlinkRequest,
