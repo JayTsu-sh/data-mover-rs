@@ -166,9 +166,11 @@ pub(super) async fn run_until_transferred(
         recovery_binding,
         plan,
         lease,
-        copied_metadata_plan
-            .as_ref()
-            .is_some_and(CopiedMetadataPlan::carries_mode),
+        request.metadata_mode.private_creation(
+            copied_metadata_plan
+                .as_ref()
+                .is_some_and(CopiedMetadataPlan::carries_mode),
+        ),
     )
     .await?;
     if super::checkpointed::eligible(request, destination.as_ref(), &stage, plan) {

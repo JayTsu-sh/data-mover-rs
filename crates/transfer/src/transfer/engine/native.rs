@@ -44,10 +44,12 @@ async fn prepare_native_stage(
     let prepare = PrepareRequest {
         final_destination: FinalDestination::new(request.final_path().clone())
             .with_private_creation(
-                input
-                    .copied_metadata_plan
-                    .as_ref()
-                    .is_some_and(CopiedMetadataPlan::carries_mode),
+                request.metadata_mode.private_creation(
+                    input
+                        .copied_metadata_plan
+                        .as_ref()
+                        .is_some_and(CopiedMetadataPlan::carries_mode),
+                ),
             ),
         source: input.descriptor.clone(),
         recovery_binding: input.recovery_binding,

@@ -56,7 +56,6 @@ async fn caller_managed_copy_publishes_data_without_source_metadata_calls()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = tempfile::tempdir()?;
     let target_root = tempfile::tempdir()?;
-    std::fs::write(source_root.path().join("file"), b"readable data")?;
     let original = test_source_storage(source_root.path(), "caller-source")?.0;
     let reads = Arc::new(AtomicUsize::new(0));
     let source = StorageBuilder::new(original.identity().clone(), original.capabilities().clone())
@@ -64,23 +63,46 @@ async fn caller_managed_copy_publishes_data_without_source_metadata_calls()
         .metadata(Arc::new(FailingMetadata(Arc::clone(&reads))))
         .build()?;
     let target = test_destination_storage(target_root.path(), "caller-target")?;
-    let outcome = transfer(
-        TransferRequest::new(
-            source,
-            StoragePath::new("file")?,
-            target,
-            CancellationToken::new(),
+    let policies = [TransferPolicy::AtomicReplace, TransferPolicy::Checkpointed]
+        .into_iter()
+        .chain(
+            target
+                .staged_destination()?
+                .supports_direct()
+                .then_some(TransferPolicy::Direct),
+        );
+    for policy in policies {
+        let path = format!("file-{policy:?}");
+        std::fs::write(source_root.path().join(&path), b"readable data")?;
+        let outcome = transfer(
+            TransferRequest::new(
+                source.clone(),
+                StoragePath::new(&path)?,
+                target.clone(),
+                CancellationToken::new(),
+            )
+            .with_transfer_policy(policy)
+            .with_metadata_mode(MetadataTransferMode::CallerManaged),
         )
-        .with_transfer_policy(TransferPolicy::Checkpointed)
-        .with_metadata_mode(MetadataTransferMode::CallerManaged),
-    )
-    .await?;
-    assert_eq!(reads.load(Ordering::Relaxed), 0);
-    assert!(outcome.metadata.is_none());
-    assert_eq!(
-        std::fs::read(target_root.path().join(Path::new("file")))?,
-        b"readable data"
-    );
-    assert!(source_root.path().join("file").exists());
+        .await?;
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        assert!(outcome.metadata.is_none());
+        assert_eq!(
+            std::fs::read(target_root.path().join(Path::new(&path)))?,
+            b"readable data"
+        );
+        assert!(source_root.path().join(&path).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(target_root.path().join(path))?
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+    }
     Ok(())
 }

@@ -59,7 +59,14 @@ pub enum ReadBackVerification {
 pub enum MetadataTransferMode {
     #[default]
     Automatic,
+    /// 调用方另行应用元数据；新建文件使用私有权限，直到调用方确认最终权限。
     CallerManaged,
+}
+
+impl MetadataTransferMode {
+    pub(crate) const fn private_creation(self, carries_mode: bool) -> bool {
+        matches!(self, Self::CallerManaged) || carries_mode
+    }
 }
 
 /// Immutable inputs for one transfer attempt.
