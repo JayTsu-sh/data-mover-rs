@@ -1,6 +1,6 @@
 //! 有界、只读的路径确认；调用方决定是否据此修改任何存储。
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use thiserror::Error;
 use tokio::time::{Instant, sleep_until, timeout_at};
@@ -71,6 +71,32 @@ pub async fn read_namespace_entry(
         return Err(NamespaceReadFailure::InvalidPolicy);
     }
     let namespace = storage.namespace()?;
+    let (descriptor, attempts) = read_recovered(path, policy, cancel, || async {
+        match namespace.stat(path).await {
+            Ok(descriptor) => Ok(Some(descriptor)),
+            Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(NamespaceReadCause::Role(error)),
+        }
+    })
+    .await?;
+    Ok(NamespaceReadOutcome {
+        descriptor,
+        attempts,
+    })
+}
+
+async fn read_recovered<T, F, Fut>(
+    path: &StoragePath,
+    policy: NamespaceReadPolicy,
+    cancel: &CancellationToken,
+    mut operation: F,
+) -> Result<(T, u32), NamespaceReadFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, NamespaceReadCause>>,
+{
     let mut recovery = ReadRecovery::default();
     loop {
         if cancel.is_cancelled() {
@@ -81,16 +107,11 @@ pub async fn read_namespace_entry(
         let result = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(recovery.cancelled(path)),
-            result = timeout_at(deadline, namespace.stat(path)) => result,
+            result = timeout_at(deadline, operation()) => result,
         };
         let cause = match result {
-            Ok(Ok(descriptor)) => return Ok(recovery.success(Some(descriptor))),
-            Ok(Err(StorageRoleFailure::Entry(error)))
-                if error.class() == FailureClass::NotFound =>
-            {
-                return Ok(recovery.success(None));
-            }
-            Ok(Err(error)) => NamespaceReadCause::Role(error),
+            Ok(Ok(value)) => return Ok(recovery.success(value)),
+            Ok(Err(cause)) => cause,
             Err(_) => NamespaceReadCause::Timeout,
         };
         recovery.record(path, cause, policy.recovery_window);
@@ -125,14 +146,11 @@ impl ReadRecovery {
         self.last = Some(cause);
     }
 
-    fn success(&self, descriptor: Option<SourceDescriptor>) -> NamespaceReadOutcome {
+    fn success<T>(&self, value: T) -> (T, u32) {
         if self.attempts > 1 {
             tracing::info!(attempts = self.attempts, "namespace stat recovered");
         }
-        NamespaceReadOutcome {
-            descriptor,
-            attempts: self.attempts,
-        }
+        (value, self.attempts)
     }
 
     fn cancelled(&self, path: &StoragePath) -> NamespaceReadFailure {
