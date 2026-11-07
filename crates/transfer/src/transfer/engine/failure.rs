@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use super::negotiation;
 use super::{TransferPhase, TransferSide};
+use crate::metadata::role_failure_text;
 use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::checkpoint::CheckpointPhase;
 use crate::storage::{PreparedStage, SourceQosStats, StagedDestination, StorageRoleFailure};
@@ -315,10 +316,14 @@ impl fmt::Display for TransferFailure {
                 self.role.as_deref(),
             )?;
         } else if let Some(role) = &self.role {
-            write!(formatter, ": {role}")?;
+            write!(formatter, ": {}", role_failure_text(role))?;
         }
         if let Some(cleanup) = &self.cleanup_failure {
-            write!(formatter, "; artifact cleanup failed: {cleanup}")?;
+            write!(
+                formatter,
+                "; artifact cleanup failed: {}",
+                role_failure_text(cleanup)
+            )?;
         }
         Ok(())
     }
