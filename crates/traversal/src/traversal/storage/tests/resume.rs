@@ -479,7 +479,9 @@ async fn cancelling_pauses_and_a_chain_of_resumes_completes_the_tree() {
         // at least one whole directory across that window; cancelling after only two
         // directories' worth with four workers can replay partial blocks forever (§9.2).
         for (inflight, buffered, cancel_after) in [(1, 1, 15), (4, 1, 60), (8, 16, 100)] {
-            let mut setup = setup(Tree::generate(3, 3, 4, 3), false);
+            // 三层树只有 199 项，高并发下两轮即可合法完成，无法保证多次取消。
+            // 增大到四层，确保取消后排空在途工作仍留有足够条目供连续恢复。
+            let mut setup = setup(Tree::generate(3, 4, 4, 3), false);
             setup.source = setup
                 .source
                 .output_capacity(NonZeroUsize::new(buffered).unwrap_or(NonZeroUsize::MIN));
