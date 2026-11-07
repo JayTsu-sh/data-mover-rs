@@ -80,6 +80,17 @@ pub enum MetadataTransferMode {
     CallerManaged,
 }
 
+/// 已复制数据遇到元数据应用错误时的发布策略；两种策略都返回失败并保留错误。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MetadataFailurePolicy {
+    /// 保持严格顺序，元数据失败时不继续发布暂存内容。
+    #[default]
+    StopBeforePublication,
+    /// 非取消错误时继续校验和发布数据，返回失败及单独的数据完成事实。
+    /// 这不能证明元数据成功，也不能授权删除源端。
+    PublishData,
+}
+
 impl MetadataTransferMode {
     pub(crate) const fn private_creation(self, carries_mode: bool) -> bool {
         matches!(self, Self::CallerManaged) || carries_mode
@@ -101,6 +112,7 @@ pub struct TransferRequest {
     pub(crate) copied_metadata: CopiedMetadataRequest,
     pub(crate) metadata_mode: MetadataTransferMode,
     pub(crate) metadata_plan: Option<Arc<MetadataPlan>>,
+    pub(crate) metadata_failure_policy: MetadataFailurePolicy,
 }
 
 /// One source selection, optionally constrained by an observation. An observed selection
@@ -335,6 +347,7 @@ impl TransferRequest {
             copied_metadata: CopiedMetadataRequest::default(),
             metadata_mode: MetadataTransferMode::Automatic,
             metadata_plan: None,
+            metadata_failure_policy: MetadataFailurePolicy::default(),
         }
     }
 
@@ -508,6 +521,13 @@ impl TransferRequest {
     pub fn with_metadata_plan(mut self, plan: impl Into<Arc<MetadataPlan>>) -> Self {
         self.metadata_mode = MetadataTransferMode::Automatic;
         self.metadata_plan = Some(plan.into());
+        self
+    }
+
+    /// 显式允许元数据应用失败后发布已复制数据；失败仍通过 Err 返回。
+    #[must_use]
+    pub const fn with_metadata_failure_policy(mut self, policy: MetadataFailurePolicy) -> Self {
+        self.metadata_failure_policy = policy;
         self
     }
 

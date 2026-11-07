@@ -138,11 +138,27 @@ clears the supplied plan and restores the selected mode's behavior.
 
 This preserves the library's existing strict metadata-failure behavior: a failed
 staged metadata operation does not publish that stage, while a Direct target may
-already contain copied data. Callers that require data publication despite a
-metadata failure must handle that separately; supplying a plan alone does not
-change that policy or authorize source deletion. Real-file tests cover all three
-transfer policies, source-metadata refusal, shared-plan release and a failed
-metadata persistence barrier.
+already contain copied data. Supplying a plan alone does not authorize source
+deletion. Real-file tests cover all three transfer policies, source-metadata refusal,
+shared-plan release and a failed metadata persistence barrier.
+
+An ordinary request can explicitly select
+`with_metadata_failure_policy(MetadataFailurePolicy::PublishData)` to retain
+successfully copied data at the final path after a metadata application failure.
+The result remains `Err`: `metadata_failure()` retains every failed family, and
+`published_data()` exposes only the completed data publication and selected data
+verification, with no successful metadata report. It cannot authorize source
+deletion. Cancellation stops publication; data verification/publication/cleanup
+failures remain primary and retain the metadata failure alongside them.
+
+Data-only checkpoint publication clears the complete metadata-plan binding before
+arming publication. A crash cannot make that final recover as a fully successful
+copy: it is rejected until the owned incomplete recovery artifacts are released
+and the caller retries. A surviving unpublished stage can still reapply the current
+plan. Completed data-only publication releases its checkpoints normally. This
+policy handles metadata application failures; a backend failure reported during
+publication still has its own publication semantics and does not by itself prove
+data completion. Expert sessions retain their strict behavior.
 
 ### Publication durability
 

@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use super::negotiation;
-use super::{TransferPhase, TransferSide};
+use super::{TransferOutcome, TransferPhase, TransferSide};
 use crate::metadata::role_failure_text;
 use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::checkpoint::CheckpointPhase;
@@ -18,13 +18,20 @@ pub struct TransferFailure {
     pub(super) side: TransferSide,
     pub(super) message: &'static str,
     pub(super) role: Option<Box<StorageRoleFailure>>,
-    metadata: Option<Box<crate::metadata::MetadataApplicationFailure>>,
+    metadata: Option<Box<FailedMetadata>>,
     /// Why copied metadata was refused while planning, before anything was written.
     pub(super) refusal: Option<Box<crate::metadata::MetadataPlanError>>,
     stage_cleanup: Option<Box<FailedStage>>,
     cleanup_failure: Option<Box<StorageRoleFailure>>,
     pub(super) final_destination_changed: bool,
     source_qos: SourceQosStats,
+}
+
+/// 数据完成事实只属于元数据失败，避免扩大每种普通失败的栈内状态。
+#[derive(Debug)]
+struct FailedMetadata {
+    error: crate::metadata::MetadataApplicationFailure,
+    published_data: Option<Box<TransferOutcome>>,
 }
 
 struct FailedStage {
@@ -97,7 +104,10 @@ impl TransferFailure {
             side: TransferSide::Destination,
             message: "staged metadata application failed",
             role: None,
-            metadata: Some(Box::new(error)),
+            metadata: Some(Box::new(FailedMetadata {
+                error,
+                published_data: None,
+            })),
             refusal: None,
             stage_cleanup: None,
             cleanup_failure: None,
@@ -208,7 +218,48 @@ impl TransferFailure {
     /// Returns the metadata application failure, every failed family with it, and its partial family report.
     #[must_use]
     pub fn metadata_failure(&self) -> Option<&crate::metadata::MetadataApplicationFailure> {
-        self.metadata.as_deref()
+        self.metadata.as_ref().map(|failure| &failure.error)
+    }
+
+    /// 元数据失败后已完成所选数据校验和发布的事实。存在此值仍是失败，不能删源；
+    /// `metadata` 为 None，具体失败类别和部分结果由 `metadata_failure()` 提供。
+    #[must_use]
+    pub fn published_data(&self) -> Option<&TransferOutcome> {
+        self.metadata
+            .as_ref()
+            .and_then(|failure| failure.published_data.as_deref())
+    }
+
+    pub(super) fn metadata_published(
+        error: crate::metadata::MetadataApplicationFailure,
+        outcome: TransferOutcome,
+    ) -> Self {
+        Self {
+            side: TransferSide::Destination,
+            source_qos: outcome.source_qos,
+            final_destination_changed: true,
+            metadata: Some(Box::new(FailedMetadata {
+                error,
+                published_data: Some(Box::new(outcome)),
+            })),
+            ..Self::orchestration(
+                TransferPhase::Metadata,
+                "data published but metadata application failed",
+            )
+        }
+    }
+
+    pub(super) fn with_metadata_failure(
+        mut self,
+        error: Option<crate::metadata::MetadataApplicationFailure>,
+    ) -> Self {
+        if let Some(error) = error {
+            self.metadata = Some(Box::new(FailedMetadata {
+                error,
+                published_data: None,
+            }));
+        }
+        self
     }
 
     /// Why copied metadata was refused while planning — which family, under which policy, and
@@ -312,11 +363,15 @@ impl fmt::Display for TransferFailure {
             negotiation::write_metadata_detail(
                 formatter,
                 self.metadata_refusal(),
-                self.metadata.as_deref(),
+                self.metadata_failure(),
                 self.role.as_deref(),
             )?;
         } else if let Some(role) = &self.role {
             write!(formatter, ": {}", role_failure_text(role))?;
+        }
+        if self.phase != TransferPhase::Metadata && self.metadata.is_some() {
+            write!(formatter, "; metadata application also failed")?;
+            negotiation::write_metadata_detail(formatter, None, self.metadata_failure(), None)?;
         }
         if let Some(cleanup) = &self.cleanup_failure {
             write!(
@@ -343,7 +398,7 @@ impl std::error::Error for TransferFailure {
             .or_else(|| {
                 self.metadata
                     .as_ref()
-                    .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
+                    .map(|failure| &failure.error as &(dyn std::error::Error + 'static))
             })
     }
 }

@@ -6,13 +6,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::negotiation::apply_copied_metadata;
 use super::{ReadBackVerification, TransferFailure, TransferPhase, TransferSide, Transferred};
-use crate::metadata::MetadataApplicationReport;
+use crate::metadata::{
+    ApplicationFailureKind, MetadataApplicationFailure, MetadataApplicationReport,
+};
 use crate::model::{EntryOperationFailure, FailureClass, Operation, Transience};
 use crate::storage::checkpoint::CheckpointPhase;
 use crate::storage::{
     PrepareFact, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest,
     SourceQosStats, StagedDestination, StorageRoleFailure, VerificationPoint, VerifyRequest,
 };
+use crate::transfer::MetadataFailurePolicy;
 
 /// Recovered finals are checked before acceptance. Staged metadata finishes before publication;
 /// deferred publication metadata is checked without mutating the recovered final. Fresh stages
@@ -22,6 +25,7 @@ pub(super) async fn complete_transfer(
     read_back: ReadBackVerification,
     cancel: CancellationToken,
     source_qos: SourceQosStats,
+    metadata_failure_policy: MetadataFailurePolicy,
 ) -> Result<CompletedTransfer, TransferFailure> {
     let recovered = transferred.stage.recovered_publication().is_some();
     let verify_after = !recovered
@@ -32,8 +36,33 @@ pub(super) async fn complete_transfer(
             == VerificationPoint::AfterPublish;
     let transferred =
         verify_before_metadata(transferred, read_back, cancel.clone(), source_qos).await?;
-    let (transferred, metadata) = apply_metadata(transferred, cancel.clone(), source_qos).await?;
-    if verify_after && (cancel.is_cancelled() || transferred.source_blake3.is_none()) {
+    let (transferred, metadata, mut metadata_failure) = apply_metadata(
+        transferred,
+        cancel.clone(),
+        source_qos,
+        metadata_failure_policy,
+    )
+    .await?;
+    let (evidence, transferred) = complete_publication(
+        transferred,
+        verify_after,
+        cancel,
+        source_qos,
+        metadata_failure.is_some(),
+    )
+    .await
+    .map_err(|failure| failure.with_metadata_failure(metadata_failure.take()))?;
+    Ok((evidence, transferred, metadata, metadata_failure))
+}
+
+async fn complete_publication(
+    transferred: Transferred,
+    verify_after: bool,
+    cancel: CancellationToken,
+    source_qos: SourceQosStats,
+    metadata_incomplete: bool,
+) -> Result<(PublicationEvidence, Transferred), TransferFailure> {
+    if (verify_after && transferred.source_blake3.is_none()) || cancel.is_cancelled() {
         return Err(retain_unpublished_failure(
             transferred,
             TransferFailure::orchestration(
@@ -51,6 +80,7 @@ pub(super) async fn complete_transfer(
         source_digest,
         cancel.clone(),
         source_qos,
+        metadata_incomplete,
     )
     .await?;
     let transferred = if verify_after {
@@ -59,13 +89,14 @@ pub(super) async fn complete_transfer(
         transferred
     };
     let transferred = release_transferred(transferred, source_qos).await?;
-    Ok((evidence, transferred, metadata))
+    Ok((evidence, transferred))
 }
 
 type CompletedTransfer = (
     PublicationEvidence,
     Transferred,
     Option<MetadataApplicationReport>,
+    Option<MetadataApplicationFailure>,
 );
 
 pub(super) fn bind_prepared_checkpoint_metadata(
@@ -125,41 +156,73 @@ async fn apply_metadata(
     transferred: Transferred,
     cancel: CancellationToken,
     source_qos: SourceQosStats,
-) -> Result<(Transferred, Option<MetadataApplicationReport>), TransferFailure> {
+    policy: MetadataFailurePolicy,
+) -> Result<
+    (
+        Transferred,
+        Option<MetadataApplicationReport>,
+        Option<MetadataApplicationFailure>,
+    ),
+    TransferFailure,
+> {
     if transferred.stage.recovered_publication().is_some() {
-        // Rename-based metadata was applied before ReadyToPublish. A backend with deferred
-        // publication metadata must still prove it committed; never replay writes on the final.
-        if let Some(copied) = &transferred.copied_metadata_plan
-            && let Err(error) = copied.validate_recovered(&transferred, cancel).await
-        {
-            return Err(retain_published_failure(
-                transferred,
-                TransferFailure::role(TransferPhase::Metadata, TransferSide::Destination, error),
-                source_qos,
-            ));
-        }
-        // The bound plan is reconstructed from the current source and the published final has
-        // been validated. Its ACL omissions remain useful, but outcomes must say recovery.
-        let report = transferred
-            .copied_metadata_plan
-            .as_ref()
-            .and_then(super::negotiation::CopiedMetadataPlan::recovered_acl_report);
-        return Ok((transferred, report));
+        return recovered_metadata(transferred, cancel, source_qos).await;
     }
     match apply_copied_metadata(
         &transferred,
         transferred.copied_metadata_plan.as_ref(),
-        cancel,
+        cancel.clone(),
     )
     .await
     {
-        Ok(report) => Ok((transferred, report)),
+        Ok(report) => Ok((transferred, report, None)),
+        Err(error)
+            if policy == MetadataFailurePolicy::PublishData
+                && !cancel.is_cancelled()
+                && error.kind() != ApplicationFailureKind::Cancelled =>
+        {
+            // 失去完整元数据绑定的最终内容不能在崩溃恢复中被接受为整项成功。
+            transferred.stage.checkpoint_clear_metadata_binding();
+            Ok((transferred, None, Some(error)))
+        }
         Err(error) => Err(retain_unpublished_failure(
             transferred,
             TransferFailure::metadata(error),
             source_qos,
         )),
     }
+}
+
+async fn recovered_metadata(
+    transferred: Transferred,
+    cancel: CancellationToken,
+    source_qos: SourceQosStats,
+) -> Result<
+    (
+        Transferred,
+        Option<MetadataApplicationReport>,
+        Option<MetadataApplicationFailure>,
+    ),
+    TransferFailure,
+> {
+    // Rename-based metadata was applied before ReadyToPublish. A backend with deferred
+    // publication metadata must still prove it committed; never replay writes on the final.
+    if let Some(copied) = &transferred.copied_metadata_plan
+        && let Err(error) = copied.validate_recovered(&transferred, cancel).await
+    {
+        return Err(retain_published_failure(
+            transferred,
+            TransferFailure::role(TransferPhase::Metadata, TransferSide::Destination, error),
+            source_qos,
+        ));
+    }
+    // The bound plan is reconstructed from the current source and the published final has
+    // been validated. Its ACL omissions remain useful, but outcomes must say recovery.
+    let report = transferred
+        .copied_metadata_plan
+        .as_ref()
+        .and_then(super::negotiation::CopiedMetadataPlan::recovered_acl_report);
+    Ok((transferred, report, None))
 }
 
 /// A recovered stage already names the published final and cannot be retained as unpublished.
@@ -268,11 +331,19 @@ pub(super) async fn publish_transferred(
     source_digest: Option<[u8; 32]>,
     cancel: tokio_util::sync::CancellationToken,
     source_qos: SourceQosStats,
+    metadata_incomplete: bool,
 ) -> Result<(PublicationEvidence, Transferred), TransferFailure> {
     let publication = if let Some(published) = transferred.stage.recovered_publication().clone() {
         Ok(published)
     } else {
-        publish_ready_stage(&transferred, expected_size, source_digest, cancel).await
+        publish_ready_stage(
+            &transferred,
+            expected_size,
+            source_digest,
+            cancel,
+            metadata_incomplete,
+        )
+        .await
     };
     let evidence = match publication {
         Ok(evidence) => evidence,
@@ -302,9 +373,12 @@ async fn publish_ready_stage(
     expected_size: u64,
     source_digest: Option<[u8; 32]>,
     cancel: CancellationToken,
+    metadata_incomplete: bool,
 ) -> Result<PublicationEvidence, PublicationFailure> {
     if transferred.stage.checkpoint_enabled() {
-        if source_digest.is_none() || transferred.stage.checkpoint_metadata_binding().is_none() {
+        if source_digest.is_none()
+            || (!metadata_incomplete && transferred.stage.checkpoint_metadata_binding().is_none())
+        {
             return Err(PublicationFailure {
                 error: StorageRoleFailure::Entry(
                     EntryOperationFailure::new(
