@@ -23,6 +23,8 @@ mod errors;
 mod verify;
 #[cfg(test)]
 mod verify_tests;
+#[cfg(test)]
+mod version_tests;
 pub use verify::MetadataVerificationError;
 
 pub use compile::compile_metadata_plan;
@@ -331,6 +333,28 @@ impl MetadataPlan {
             .await
     }
 
+    /// 将计划应用到精确的既有目标版本；不会创建版本或回退修改当前对象。
+    ///
+    /// # Errors
+    /// 返回所有失败类别及部分应用报告；不支持版本写入时明确失败。
+    pub async fn apply_to_version(
+        &self,
+        target: &dyn Metadata,
+        path: &StoragePath,
+        version_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
+        self.apply_to(
+            ApplicationTarget::Version {
+                target,
+                path,
+                version_id,
+            },
+            cancel,
+        )
+        .await
+    }
+
     /// Checks that recovered staged metadata still satisfies this plan.
     ///
     /// # Errors
@@ -571,6 +595,11 @@ const fn cancelled_at(family: MetadataFamily) -> FamilyFailure {
 }
 
 enum ApplicationTarget<'a> {
+    Version {
+        target: &'a dyn Metadata,
+        path: &'a StoragePath,
+        version_id: &'a str,
+    },
     Published {
         target: &'a dyn Metadata,
         path: &'a StoragePath,
@@ -584,6 +613,15 @@ impl ApplicationTarget<'_> {
         cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
         match self {
+            Self::Version {
+                target,
+                path,
+                version_id,
+            } => {
+                target
+                    .apply_to_version(path, version_id, mutation, cancel)
+                    .await
+            }
             Self::Published { target, path } => target.apply(path, mutation, cancel).await,
         }
     }

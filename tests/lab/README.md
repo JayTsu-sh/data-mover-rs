@@ -40,6 +40,15 @@ this does not establish a product-wide fault budget or whole-job performance.
 Large-object native Direct and slash-ended source native copies are not enabled.
 The container/network namespace is isolated and removed on exit; no firewall edits.
 
+`python3 tests/lab/run-version-metadata-local.py` checks exact historical metadata
+updates against an owned versioned RustFS service: two different data versions per
+case, only the old version's tags updated/cleared, the current body/tags unchanged, and zero
+payload GET/PUT, new versions, markers or uploads. Controlled permission refusal,
+disconnect, timeout, cancellation, flash recovery and lost-response retry preserve
+the same version selection. The runner independently reads both versions and tags.
+It verifies the metadata API; task-level catalogue mapping and aggregate callback
+semantics require separate terrasync tests. The owned container is removed on exit.
+
 `python3 tests/lab/run-source-purge-local.py` runs the exact-version source-purge contract in
 an isolated local RustFS container, using a cached image (override `SOURCE_PURGE_S3_IMAGE`),
 `docker`, `nsenter`, `boto3`, and cached Rust dependencies. It creates only its own bucket and

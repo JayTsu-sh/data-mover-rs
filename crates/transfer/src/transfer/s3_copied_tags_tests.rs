@@ -116,7 +116,7 @@ async fn tags_follow_the_selected_version_on_every_payload_and_write_path() -> R
             .await
             .insert(("src/file".into(), "v1".into()), old_tags.clone());
         protocol
-            .put_tags("src/file", &[ObjectTag::new("generation", "new")?])
+            .put_tags("src/file", None, &[ObjectTag::new("generation", "new")?])
             .await
             .map_err(|e| format!("{e:?}"))?;
         let outcome = transfer(
@@ -395,7 +395,7 @@ async fn an_empty_source_tag_set_clears_old_destination_tags() -> Result {
         .await
         .insert("src/file".into(), Bytes::from_static(b"payload"));
     protocol
-        .put_tags("file", &[ObjectTag::new("stale", "value")?])
+        .put_tags("file", None, &[ObjectTag::new("stale", "value")?])
         .await
         .map_err(|e| format!("{e:?}"))?;
     transfer(request(&protocol, TransferPolicy::Checkpointed, false)?).await?;

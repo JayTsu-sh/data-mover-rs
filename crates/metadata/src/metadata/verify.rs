@@ -102,6 +102,42 @@ impl MetadataPlan {
         {
             return Err(MetadataVerificationError::VersionChanged { path: path.clone() });
         }
+        self.verify_descriptor(target, descriptor, cancel).await
+    }
+
+    /// 核验指定的既有历史版本；与发布校验不同，不要求它仍是当前版本。
+    ///
+    /// # Errors
+    /// 保留精确版本读取、身份不匹配及元数据不一致的有类型错误。
+    pub async fn verify_version(
+        &self,
+        target: &Storage,
+        path: &StoragePath,
+        version_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<SourceDescriptor, MetadataVerificationError> {
+        if cancel.is_cancelled() {
+            return Err(MetadataVerificationError::Cancelled);
+        }
+        let version = SourceVersion::Id(version_id.to_owned());
+        let descriptor = target
+            .read_source()
+            .map_err(MetadataVerificationError::Capability)?
+            .describe_version(path, &version)
+            .await
+            .map_err(MetadataVerificationError::Read)?;
+        if descriptor.version != version {
+            return Err(MetadataVerificationError::VersionChanged { path: path.clone() });
+        }
+        self.verify_descriptor(target, descriptor, cancel).await
+    }
+
+    async fn verify_descriptor(
+        &self,
+        target: &Storage,
+        descriptor: SourceDescriptor,
+        cancel: CancellationToken,
+    ) -> Result<SourceDescriptor, MetadataVerificationError> {
         if self.mutations.is_empty() {
             return Ok(descriptor);
         }
@@ -119,7 +155,7 @@ impl MetadataPlan {
             Ok(descriptor)
         } else {
             Err(MetadataVerificationError::Mismatch {
-                path: path.clone(),
+                path: descriptor.path.clone(),
                 families,
                 observation_failures: facts.failures().collect(),
             })

@@ -846,14 +846,35 @@ impl S3Protocol for MemoryS3 {
         }
         Ok(self.tags.lock().await.get(key).cloned().unwrap_or_default())
     }
-    async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()> {
+    async fn put_tags(
+        &self,
+        key: &str,
+        version_id: Option<&str>,
+        tags: &[ObjectTag],
+    ) -> S3Result<()> {
         if let Some(failure) = self.tag_write_failure.lock().await.clone() {
             return Err(failure);
         }
-        self.tags
-            .lock()
-            .await
-            .insert(key.to_string(), tags.to_vec());
+        let full_key = self.full_key(key);
+        if let Some(version) = version_id {
+            if !matches!(
+                self.versions
+                    .lock()
+                    .await
+                    .get(&(full_key.clone(), version.to_owned())),
+                Some(Some(_))
+            ) {
+                return Err(not_found());
+            }
+            self.tagged_versions
+                .lock()
+                .await
+                .insert((full_key.clone(), version.to_owned()), tags.to_vec());
+            if self.head(key).await?.version_id.as_deref() != Some(version) {
+                return Ok(());
+            }
+        }
+        self.tags.lock().await.insert(full_key, tags.to_vec());
         Ok(())
     }
 }

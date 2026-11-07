@@ -44,7 +44,7 @@ async fn direct_native_copies_tags_without_client_payload_or_recovery_state() ->
             .insert("src/file".into(), payload.clone());
         let tags = vec![ObjectTag::new("generation", "latest")?];
         protocol
-            .put_tags("src/file", &tags)
+            .put_tags("src/file", None, &tags)
             .await
             .map_err(|e| format!("{e:?}"))?;
         let outcome = transfer(request(&protocol, verify)?).await?;

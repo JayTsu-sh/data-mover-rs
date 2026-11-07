@@ -19,6 +19,8 @@ mod direct_native;
 mod namespace_read;
 #[path = "s3_architecture_contract/source_purge.rs"]
 mod source_purge;
+#[path = "s3_architecture_contract/version_metadata.rs"]
+mod version_metadata;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const PART_SIZE: usize = 8 * 1024 * 1024;

@@ -164,6 +164,16 @@ policy handles metadata application failures; a backend failure reported during
 publication still has its own publication semantics and does not by itself prove
 data completion. Expert sessions retain their strict behavior.
 
+For an existing historical target, `MetadataPlan::apply_to_version` applies captured
+values to the **actual destination version ID** and `verify_version` checks that same
+historical version. `verify_published` retains its current-publication identity check. `Metadata::apply_to_version` refuses unsupported adapters before any current
+object mutation. S3 writes tags using `PutObjectTagging?versionId=...`; this creates no
+data version and does not change another version's tags. The caller must retain the
+source-to-target version mapping from transfer outcomes; source and target version
+IDs are different. Missing mappings must not be repaired by silently publishing old
+data over the current object. Metadata writes remain fallible and can have an unknown
+result after timeout/cancellation; retry only the same explicit version and mutation.
+
 ### Publication durability
 
 `TransferRequest` and `ExpertDestinationRequest` accept

@@ -540,6 +540,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
     async fn put_tags(
         &self,
         key: &str,
+        version_id: Option<&str>,
         tags: &[crate::model::ObjectTag],
     ) -> crate::storage::backends::s3::S3Result<()> {
         let tag_set = tags
@@ -564,6 +565,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .put_object_tagging()
             .bucket(&self.bucket_name)
             .key(self.build_full_key(key))
+            .set_version_id(version_id.map(str::to_owned))
             .tagging(tagging)
             .send()
             .await

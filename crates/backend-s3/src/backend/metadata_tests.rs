@@ -299,3 +299,75 @@ async fn tag_session_failures_remain_terminal_even_for_best_effort_observations(
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn updating_historical_tags_does_not_publish_or_change_the_current_version() -> Result {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol
+        .put_version(PATH, "old", Bytes::from_static(b"old payload"))
+        .await;
+    protocol
+        .put_version(PATH, "current", Bytes::from_static(b"current payload"))
+        .await;
+    let current = vec![ObjectTag::new("generation", "current")?];
+    protocol
+        .put_tags(PATH, None, &current)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let metadata = S3Metadata::new(
+        protocol.clone(),
+        BackendIdentity::new(BackendKind::S3, "versions")?,
+        S3TagSupport::Supported,
+    );
+    let changed = vec![ObjectTag::new("generation", "old changed")?];
+    metadata
+        .apply_to_version(
+            &StoragePath::new(PATH)?,
+            "old",
+            MetadataMutation::Tags(changed.clone()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        protocol
+            .get_tags(PATH, Some("old"))
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        changed
+    );
+    assert_eq!(
+        protocol
+            .get_tags(PATH, None)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        current
+    );
+    assert_eq!(
+        protocol.objects.lock().await.get(PATH),
+        Some(&Bytes::from_static(b"current payload"))
+    );
+    assert_eq!(protocol.versions.lock().await.len(), 2);
+    assert_eq!(*protocol.puts.lock().await, 0);
+    assert_eq!(*protocol.native_copies.lock().await, 0);
+    for version in ["", "missing"] {
+        assert!(
+            metadata
+                .apply_to_version(
+                    &StoragePath::new(PATH)?,
+                    version,
+                    MetadataMutation::Tags(Vec::new()),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(
+        protocol
+            .get_tags(PATH, None)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        current
+    );
+    Ok(())
+}

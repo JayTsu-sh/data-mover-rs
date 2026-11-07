@@ -603,7 +603,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     ) -> Result<(), PublicationFailure> {
         if let Some(tags) = tags {
             self.protocol
-                .put_tags(path.as_str(), &tags)
+                .put_tags(path.as_str(), None, &tags)
                 .await
                 .map_err(|error| changed(role_failure(path, Operation::Publish, error)))?;
         }

@@ -495,5 +495,10 @@ pub trait S3Protocol: Send + Sync {
     ) -> S3Result<S3VersionPage>;
     /// Tags of the current object, or of one stored version.
     async fn get_tags(&self, key: &str, version_id: Option<&str>) -> S3Result<Vec<ObjectTag>>;
-    async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()>;
+    async fn put_tags(
+        &self,
+        key: &str,
+        version_id: Option<&str>,
+        tags: &[ObjectTag],
+    ) -> S3Result<()>;
 }

@@ -404,7 +404,7 @@ pub(super) async fn send<P: S3Protocol>(
     if let Some(tags) = tags {
         adapter
             .protocol
-            .put_tags(path.as_str(), &tags)
+            .put_tags(path.as_str(), None, &tags)
             .await
             .map_err(|failure| changed(role_failure(path, Operation::Publish, failure)))?;
     }

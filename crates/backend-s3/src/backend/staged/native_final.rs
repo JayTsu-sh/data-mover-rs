@@ -410,7 +410,7 @@ pub(super) async fn send_copy<P: S3Protocol>(
     if let Some(tags) = single.pending() {
         adapter
             .protocol
-            .put_tags(path.as_str(), &tags)
+            .put_tags(path.as_str(), None, &tags)
             .await
             .map_err(|failure| changed(role_failure(path, Operation::Publish, failure)))?;
     }
