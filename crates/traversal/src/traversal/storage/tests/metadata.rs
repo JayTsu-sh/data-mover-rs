@@ -552,4 +552,5 @@ async fn a_required_dependency_failure_on_a_directory_still_visits_its_subtree()
     }
 }
 
+mod directory_objects;
 mod observation_failures;

@@ -79,6 +79,14 @@ an unrelated call. Required failures are child failures; a directory whose defer
 fails remains eligible for descent. Object histories retain their existing per-version failure
 records. Symlink targets remain mandatory entry data read through `Namespace::read_link`.
 
+`TraversalRequest.directory_object_metadata(false)` lets a consumer omit output metadata
+for known nonempty trailing-slash file objects it will not transfer. The default is true.
+The traversal keeps the entry, history, marker handling and descendants; metadata needed
+by `TraversalFilter::required_metadata` retains its explicitly requested mode. Both immediate
+and deferred observation paths use the same per-entry policy. Unknown size and empty
+objects keep the original observation plan. `latest_metadata_only` still selects how many
+history records need observation, independently of whether output metadata is omitted.
+
 ### Completion and deletion safety are explicit
 
 The session emits `TraversalItem::{Entry, Failure, DirectoryListed, Checkpoint}` and has a
@@ -104,6 +112,7 @@ directories. Resume re-lists the necessary directories and preserves failure exc
 root, filter, depth, order and the connected history capability form the fingerprint. The
 filter's metadata dependencies and their observation modes also form the fingerprint. Modes for
 unrelated metadata families, concurrency, buffering and checkpoint interval remain tunable.
+The latest-history metadata scope and directory-object output-metadata policy also bind the fingerprint.
 A mismatch refuses resume. Oversized frontiers suppress checkpoint emission rather than
 dropping pending work. The initial checkpoint format is v1, including these fingerprint rules.
 The version field identifies the persisted format independently of the crate's release version;

@@ -182,6 +182,16 @@ pub trait TraversalFilter: fmt::Debug + Send + Sync {
     }
 }
 
+/// 已知非空尾斜杠文件的输出元数据范围；零字节及未知大小仍遵循原观察计划。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DirectoryObjectMetadata {
+    /// 保留调用方选择的全部输出观察。
+    #[default]
+    Requested,
+    /// 只获取过滤依赖，不为即将跳过的对象读取其他输出属性。
+    FilterOnly,
+}
+
 /// A bounded traversal request, built with [`TraversalRequest::new`] and its setters:
 ///
 /// ```
@@ -213,6 +223,8 @@ pub struct TraversalRequest {
     /// Observe additional metadata only for each key's latest version; history identities and
     /// ordering are still delivered unchanged. Delete markers never trigger metadata requests.
     pub latest_metadata_only: bool,
+    /// 已知非空尾斜杠文件的输出元数据策略，始终保留条目和过滤依赖。
+    pub directory_object_metadata: DirectoryObjectMetadata,
     pub cancel: CancellationToken,
     /// Optional admission / pruning policy. `None` admits every entry and descends into every
     /// directory.
@@ -338,6 +350,7 @@ impl TraversalRequest {
             max_inflight_operations: DEFAULT_MAX_INFLIGHT,
             observation_plan: ObservationPlan::default(),
             latest_metadata_only: false,
+            directory_object_metadata: DirectoryObjectMetadata::Requested,
             cancel: CancellationToken::new(),
             filter: None,
             max_depth: None,
@@ -394,6 +407,17 @@ impl TraversalRequest {
     #[must_use]
     pub const fn latest_metadata_only(mut self, latest_only: bool) -> Self {
         self.latest_metadata_only = latest_only;
+        self
+    }
+
+    /// 调用方已确定不迁移这些对象时，省略与过滤无关的元数据读取；不剪枝子项。
+    #[must_use]
+    pub const fn directory_object_metadata(mut self, enabled: bool) -> Self {
+        self.directory_object_metadata = if enabled {
+            DirectoryObjectMetadata::Requested
+        } else {
+            DirectoryObjectMetadata::FilterOnly
+        };
         self
     }
 

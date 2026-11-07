@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::{Checkpoint, TraversalOrder, TraversalRequest, within};
+use super::{Checkpoint, DirectoryObjectMetadata, TraversalOrder, TraversalRequest, within};
 use crate::model::{BackendIdentity, ObservationMode, StoragePath};
 
 /// Whether a traversal emits checkpoints (P7 §9.1). Off by default.
@@ -195,6 +195,9 @@ pub(crate) fn fingerprint(
     field(&[order_tag(request.order)]);
     field(&[u8::from(request.report_root_directory_object)]);
     field(&[u8::from(request.latest_metadata_only)]);
+    field(&[u8::from(
+        request.directory_object_metadata == DirectoryObjectMetadata::Requested,
+    )]);
     let depth = request
         .max_depth
         .map_or(0, |depth| u64::try_from(depth.get()).unwrap_or(u64::MAX));

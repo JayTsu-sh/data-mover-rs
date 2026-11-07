@@ -10,9 +10,9 @@ use tokio::sync::oneshot;
 use super::channel;
 
 use super::{
-    ScanFailure, TraversalCandidate, TraversalDecision, TraversalFilter, TraversalItem,
-    TraversalOrder, TraversalRequest, TraversalSession, TraversalSource, TraversalTerminalFailure,
-    relative_to,
+    DirectoryObjectMetadata, ScanFailure, TraversalCandidate, TraversalDecision, TraversalFilter,
+    TraversalItem, TraversalOrder, TraversalRequest, TraversalSession, TraversalSource,
+    TraversalTerminalFailure, relative_to,
 };
 use crate::model::{
     BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, MAX_HISTORY_RECORDS,
@@ -315,6 +315,7 @@ struct Policy {
     /// Families that must settle before a filtered child's decision.
     requirements: MetadataRequirements,
     observation_plan: ObservationPlan,
+    directory_object_metadata: DirectoryObjectMetadata,
 }
 
 impl Policy {
@@ -345,7 +346,34 @@ impl Policy {
             filter: request.filter.clone(),
             requirements,
             observation_plan,
+            directory_object_metadata: request.directory_object_metadata,
         }
+    }
+
+    fn observation_plan_for(&self, descriptor: &SourceDescriptor) -> ObservationPlan {
+        if self.directory_object_metadata == DirectoryObjectMetadata::Requested
+            || descriptor.kind != EntryKind::File
+            || !descriptor.path.names_directory_object()
+        {
+            return self.observation_plan;
+        }
+        let size = descriptor
+            .listing
+            .history
+            .as_ref()
+            .map_or(descriptor.size, |history| history.largest_version());
+        if size.is_none_or(|size| size == 0) {
+            return self.observation_plan;
+        }
+        MetadataFamily::ALL
+            .into_iter()
+            .fold(self.observation_plan, |plan, family| {
+                if self.requirements.contains(family) {
+                    plan
+                } else {
+                    plan.with(family, ObservationMode::Omit)
+                }
+            })
     }
 
     fn decide(

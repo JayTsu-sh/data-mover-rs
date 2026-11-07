@@ -628,7 +628,6 @@ async fn observe_block(
     mut jobs: mpsc::UnboundedReceiver<Job>,
     results: mpsc::UnboundedSender<Observed>,
 ) {
-    let plan = shared.policy.observation_plan;
     let latest_only = shared.request.latest_metadata_only;
     let namespace = shared.namespace.as_ref();
     let metadata = shared.metadata.as_ref();
@@ -641,11 +640,14 @@ async fn observe_block(
                 // The traversal is ending and discards every result: a child not started yet
                 // holds no handle, so it is simply not started.
                 Some(_) if shared.request.cancel.is_cancelled() => {}
-                Some(Job { sequence, descriptor, deferred }) => inflight.push(async move {
+                Some(Job { sequence, descriptor, deferred }) => {
+                    let plan = shared.policy.observation_plan_for(&descriptor);
+                    inflight.push(async move {
                     let kind = descriptor.kind;
                     let result = observe(namespace, metadata, *descriptor, plan, latest_only, cancel).await;
                     (sequence, result.map(Box::new), deferred, kind)
-                }),
+                    });
+                },
                 None => open = false,
             },
             Some(observed) = inflight.next(), if !inflight.is_empty() => {
