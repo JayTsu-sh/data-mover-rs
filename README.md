@@ -189,6 +189,21 @@ These verify the executed barriers and failure propagation, not device power-cut
 behavior or whole-job throughput/RSS. NFS/CIFS Direct and application integration
 remain separate work.
 
+### Direct native S3 copy
+
+Direct S3-to-S3 transfers use one server-side `CopyObject` when both endpoints have
+matching native affinity and a regular source fits both the destination's single-PUT
+threshold (8 MiB by default) and native single-copy limit. The copy completes during
+data transfer, before metadata application; metadata failures can therefore report
+completed data under `PublishData`. Quick verification avoids client payload GETs;
+full verification still hashes the selected source and reads the published target.
+This route creates no checkpoint, upload or temporary key. Larger and slash-ended
+sources retain the streamed Direct route. Cancellation or an unresolved copy result
+can leave the final key changed; neither proves successful publication or authorizes
+source deletion. Exact final-data cleanup and task-level network recovery remain
+separate caller/backend contracts. See the owned real-service runner in
+[tests/lab/README.md](tests/lab/README.md).
+
 ### Archive transfer policy
 
 `TarRequest.transfer_policy` explicitly selects `Direct` or `AtomicReplace`.

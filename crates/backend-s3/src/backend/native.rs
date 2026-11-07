@@ -90,6 +90,10 @@ impl<P> S3NativeEndpoint<P> {
 
 #[async_trait]
 impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
+    fn supports_direct_native(&self, source: &SourceDescriptor) -> bool {
+        self.staged.direct_native_eligible(source)
+    }
+
     fn supports_hash_checkpoint(&self, source: &SourceDescriptor) -> bool {
         self.staged.native_hash_checkpoint_eligible(source)
     }
@@ -152,6 +156,25 @@ impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
             .map_err(|()| stage_failure(stage, "invalid native source binding"))?;
         if native.size != source.size {
             return Err(stage_failure(stage, "native source size changed"));
+        }
+        if stage.direct()
+            && native.bucket == self.context.bucket
+            && native.key
+                == self
+                    .context
+                    .full_key(stage.final_destination().path().as_str())
+        {
+            return Err(NativeStageFailure {
+                error: classified_entry(
+                    stage.final_destination().path(),
+                    Operation::Write,
+                    FailureClass::Conflict,
+                    Transience::Permanent,
+                    "a Direct native copy cannot replace its own S3 source",
+                ),
+                native_bytes: 0,
+                native_requests: 0,
+            });
         }
         self.staged.fill_native(stage, native, cancel).await
     }

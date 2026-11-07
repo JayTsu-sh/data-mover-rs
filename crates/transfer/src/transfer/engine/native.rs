@@ -7,7 +7,7 @@ use super::{
 };
 use crate::storage::{
     DestinationPrepareRequest, FinalDestination, NativeSourceBinding, NativeStageEvidence,
-    PrepareRequest, PreparedStage, ResumeMode, WriteEvidence,
+    PrepareRequest, PreparedStage, ResumeMode, StorageRoleFailure, WriteEvidence,
 };
 
 pub(super) fn eligible_native_pair(request: &TransferRequest) -> Option<NativePair> {
@@ -25,22 +25,13 @@ pub(super) struct NativeTransferInput {
     pub copied_metadata_plan: Option<CopiedMetadataPlan>,
 }
 
-/// The native route's stage (ADR-0006 C18): the destination's native endpoint prepares it at the
-/// final file, looking at what an earlier attempt — native or streamed — left there: a
-/// `Checkpointed` copy resumes an equal binding, any other policy cleans up and starts from zero.
-/// Nothing is recorded where data-mover runs; the stage carries the per-file lease.
+/// Direct 使用普通 Direct 准备路径；其他原生策略复用目标侧恢复状态。
+/// stage 始终持有文件级租约，所需发布持久性不由原生路线隐式降低。
 async fn prepare_native_stage(
     request: &TransferRequest,
     input: &NativeTransferInput,
     lease: DestinationLease,
 ) -> Result<PreparedStage, TransferFailure> {
-    let resume = if request.transfer_policy == TransferPolicy::Checkpointed
-        && input.destination.resumable_at_destination()
-    {
-        ResumeMode::Discover
-    } else {
-        ResumeMode::Restart
-    };
     let prepare = PrepareRequest {
         final_destination: FinalDestination::new(request.final_path().clone())
             .with_private_creation(
@@ -54,14 +45,7 @@ async fn prepare_native_stage(
         source: input.descriptor.clone(),
         recovery_binding: input.recovery_binding,
     };
-    let mut stage = input
-        .pair
-        .prepare_native(
-            DestinationPrepareRequest::new(prepare, *request.identity().as_bytes())
-                .with_resume(resume)
-                .with_recoverable(false)
-                .with_checkpoint_hash(defer_source_hash(request, input)),
-        )
+    let mut stage = prepare_native_destination(request, input, prepare)
         .await
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Prepare, TransferSide::Destination, error)
@@ -78,6 +62,36 @@ async fn prepare_native_stage(
         stage.set_durable_publication(true);
     }
     Ok(stage)
+}
+
+async fn prepare_native_destination(
+    request: &TransferRequest,
+    input: &NativeTransferInput,
+    prepare: PrepareRequest,
+) -> Result<PreparedStage, StorageRoleFailure> {
+    let resume = if request.transfer_policy == TransferPolicy::Checkpointed
+        && input.destination.resumable_at_destination()
+    {
+        ResumeMode::Discover
+    } else {
+        ResumeMode::Restart
+    };
+    if request.transfer_policy == TransferPolicy::Direct {
+        input
+            .destination
+            .prepare_direct(prepare, request.cancel.clone())
+            .await
+    } else {
+        input
+            .pair
+            .prepare_native(
+                DestinationPrepareRequest::new(prepare, *request.identity().as_bytes())
+                    .with_resume(resume)
+                    .with_recoverable(false)
+                    .with_checkpoint_hash(defer_source_hash(request, input)),
+            )
+            .await
+    }
 }
 
 pub(super) async fn transfer_native(

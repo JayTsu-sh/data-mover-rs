@@ -291,3 +291,48 @@ fn a_streamed_resume_of_larger_parts_keeps_fewer_in_flight() -> TestResult {
     assert_eq!(upload(10_000 * 64 * MIB, 64 * MIB)?, 4);
     Ok(())
 }
+
+#[tokio::test]
+async fn refused_direct_native_copy_reports_no_confirmed_bytes_or_publication() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    let destination = destination(&protocol);
+    let (payload, source) = seeded(&protocol, 1024).await?;
+    let stage = destination
+        .prepare_direct(
+            request(1024, ResumeMode::Restart)?.prepare,
+            CancellationToken::new(),
+        )
+        .await?;
+    *protocol.native_failure.lock().await = Some(S3ProtocolFailure::entry(
+        FailureClass::PermissionDenied,
+        Transience::Permanent,
+        "injected CopyObject refusal",
+    ));
+    let failure = destination
+        .fill_native(&stage, source.clone(), CancellationToken::new())
+        .await
+        .err()
+        .ok_or("native copy unexpectedly succeeded")?;
+    assert_eq!((failure.native_bytes, failure.native_requests), (0, 1));
+    assert_eq!(
+        S3StagedDestination::<MemoryS3>::direct_durable_bytes(&stage),
+        0
+    );
+    assert!(
+        single::of(&stage)
+            .ok_or("missing single stage")?
+            .published()
+            .is_none()
+    );
+    *protocol.native_failure.lock().await = None;
+    destination
+        .fill_native(&stage, source, CancellationToken::new())
+        .await
+        .map_err(|failure| failure.error)?;
+    assert_eq!(
+        S3StagedDestination::<MemoryS3>::direct_durable_bytes(&stage),
+        1024
+    );
+    assert_eq!(protocol.objects.lock().await.get(FINAL), Some(&payload));
+    Ok(())
+}

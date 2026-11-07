@@ -29,6 +29,17 @@ before target access. This does not certify NFS/CIFS generated Direct, cancellat
 unknown-write reconciliation, final-data cleanup or whole-job performance. The owned
 container and volumes are removed on exit.
 
+`python3 tests/lab/run-direct-native-local.py` checks small Direct S3-to-S3 native
+copies against an owned versioned RustFS service. It verifies quick/full data paths,
+failed target tags retaining data, permission refusal, persistent disconnect, silent
+timeout, in-flight cancellation, recovered disconnect, and lost successful-copy
+response. The proxy records CopyObject versus payload PUT/GET; independent boto3
+reads require one target version per completed attempt, the complete source and no
+uploads, staging keys or delete markers. Functional request timeouts are 1/2 seconds;
+this does not establish a product-wide fault budget or whole-job performance.
+Large-object native Direct and slash-ended source native copies are not enabled.
+The container/network namespace is isolated and removed on exit; no firewall edits.
+
 `python3 tests/lab/run-source-purge-local.py` runs the exact-version source-purge contract in
 an isolated local RustFS container, using a cached image (override `SOURCE_PURGE_S3_IMAGE`),
 `docker`, `nsenter`, `boto3`, and cached Rust dependencies. It creates only its own bucket and

@@ -13,6 +13,8 @@ use data_mover::transfer::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "s3_architecture_contract/direct_native.rs"]
+mod direct_native;
 #[path = "s3_architecture_contract/namespace_read.rs"]
 mod namespace_read;
 #[path = "s3_architecture_contract/source_purge.rs"]

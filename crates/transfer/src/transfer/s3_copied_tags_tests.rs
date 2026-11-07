@@ -54,7 +54,7 @@ fn tag_outcome(report: &crate::metadata::MetadataApplicationReport) -> Option<Ap
         .map(|outcome| outcome.outcome)
 }
 
-const PAYLOAD_AND_WRITE_PATHS: [(usize, TransferPolicy, bool, TransferRoute); 6] = [
+const PAYLOAD_AND_WRITE_PATHS: [(usize, TransferPolicy, bool, TransferRoute); 8] = [
     (
         1024,
         TransferPolicy::Checkpointed,
@@ -77,6 +77,13 @@ const PAYLOAD_AND_WRITE_PATHS: [(usize, TransferPolicy, bool, TransferRoute); 6]
         9 * MIB,
         TransferPolicy::Direct,
         false,
+        TransferRoute::Streaming,
+    ),
+    (1024, TransferPolicy::Direct, true, TransferRoute::Native),
+    (
+        9 * MIB,
+        TransferPolicy::Direct,
+        true,
         TransferRoute::Streaming,
     ),
     (
