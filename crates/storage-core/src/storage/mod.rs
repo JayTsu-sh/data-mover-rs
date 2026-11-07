@@ -25,8 +25,13 @@ pub mod endpoint;
 mod factory;
 mod handle;
 pub mod listing;
+mod namespace_read;
 mod native;
 mod observation;
+pub use namespace_read::{
+    NamespaceReadCause, NamespaceReadFailure, NamespaceReadOutcome, NamespaceReadPolicy,
+    read_namespace_entry,
+};
 mod permissions;
 mod read_range;
 pub use observation::{EntryObservationFailure, observe_descriptor};

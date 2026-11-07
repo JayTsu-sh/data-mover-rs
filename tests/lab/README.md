@@ -24,6 +24,15 @@ Cases cover normal permanent deletion, read-only refusal, disconnect, silent tim
 cancellation, a recovered disconnect and a lost deletion response followed by an exact-ID retry.
 This is a storage-role contract; task-level ClickHouse/callback and other backends use their
 separate integration gates.
+
+`python3 tests/lab/run-source-purge-local.py --namespace-read` reuses the isolated fixture for
+`read_namespace_entry`, a bounded read-only stat with caller-selected detection/recovery
+deadlines and cancellation. It covers a present path, typed absence, permission refusal,
+disconnect, silent timeout, cancellation, recovered disconnect and recovered timeout.
+Independent S3 inspection requires all three versions and the sentinel to remain in every
+case. It proves current-path stat semantics only, not absence of historical versions or an
+atomic absence-and-delete transaction. Local/NFS/CIFS/HDFS and task-level target mutation
+protection require their own evidence.
 The runner must resolve the canonical Kerberos HDFS hostnames to their lab
 management/data addresses. `health-check.sh` verifies the NameNode and both
 DataNode mappings (plus the second NameNode when HA is configured) before any

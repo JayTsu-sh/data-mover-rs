@@ -38,7 +38,8 @@ def isolated_run():
     try:
         print(f"isolated source-purge image={docker('inspect', container, '--format', '{{.Image}}')}", flush=True)
         pid = docker("inspect", container, "--format", "{{.State.Pid}}")
-        subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside"], check=True)
+        arguments = ["--namespace-read"] if "--namespace-read" in sys.argv else []
+        subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *arguments], check=True)
     finally:
         docker("rm", "-f", "-v", container)
 
@@ -64,6 +65,7 @@ def inside_run():
     client.create_bucket(Bucket=bucket)
     client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     stopped = threading.Event()
+    reading = "--namespace-read" in sys.argv
     with tempfile.TemporaryDirectory(prefix="source-purge-") as directory:
         control = Path(directory) / "fault"
         control.write_text("normal")
@@ -75,15 +77,17 @@ def inside_run():
             def handle_request(self):
                 mode = control.read_text().strip()
                 deleting = self.command == "DELETE" and "versionId=" in self.path
-                if deleting and mode == "readonly":
+                probing = reading and self.command == "HEAD" and self.path.endswith("/payload")
+                affected = deleting or probing
+                if affected and mode == "readonly":
                     body = b"<Error><Code>AccessDenied</Code><Message>injected read-only source</Message></Error>"
                     self.send_response(403)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
                     return
-                if deleting and mode in ("disconnect", "stall", "cancel", "flash"):
-                    if mode == "flash":
+                if affected and mode in ("disconnect", "stall", "cancel", "flash", "recover_stall"):
+                    if mode in ("flash", "recover_stall"):
                         control.write_text("normal")
                     if mode != "disconnect":
                         if mode != "flash":
@@ -106,7 +110,7 @@ def inside_run():
                     for key, value in response.getheaders():
                         if key.lower() not in ("connection", "transfer-encoding", "content-length"):
                             self.send_header(key, value)
-                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Content-Length", response.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
                 finally:
@@ -118,7 +122,8 @@ def inside_run():
         server.daemon_threads = True
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
-            for mode in ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "lost_ack"):
+            modes = ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "recover_stall") if reading else ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "lost_ack")
+            for mode in modes:
                 prefix = f"nightly-local-{mode}"
                 for _ in range(3):
                     client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
@@ -130,12 +135,12 @@ def inside_run():
                 )
                 subprocess.run([
                     "cargo", "test", "--offline", "--locked", "--test", "s3_architecture_contract",
-                    "source_purge::permanent_source_purge_with_real_requests", "--", "--ignored", "--exact", "--nocapture",
+                    "namespace_read::bounded_namespace_read_with_real_requests" if reading else "source_purge::permanent_source_purge_with_real_requests", "--", "--ignored", "--exact", "--nocapture",
                 ], env=environment, check=True)
                 remaining = client.list_object_versions(Bucket=bucket, Prefix=f"{prefix}/")
                 records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
                 payload_records = [record for record in records if record["Key"] == f"{prefix}/payload"]
-                assert len(payload_records) == (0 if mode in ("normal", "flash", "lost_ack") else 3), (mode, payload_records)
+                assert len(payload_records) == (0 if not reading and mode in ("normal", "flash", "lost_ack") else 3), (mode, payload_records)
                 assert any(record["Key"] == f"{prefix}/sentinel" for record in records)
                 print(f"independent S3 inspection fault={mode} source_records={len(payload_records)} sentinel=retained", flush=True)
         finally:
