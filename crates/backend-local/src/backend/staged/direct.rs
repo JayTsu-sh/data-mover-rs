@@ -12,9 +12,12 @@ use super::{
 };
 
 #[cfg(unix)]
+use super::direct_durability::sync as sync_direct_publication;
+#[cfg(unix)]
 use super::{Arc, AtomicBool, Bytes, LocalStageState, OpenOptions, Path};
 #[cfg(unix)]
 use crate::model::{BackendKind, IdentityStrength, SourceIdentity};
+use crate::model::{EntryOperationFailure, StoragePath};
 use crate::storage::SourceDescriptor;
 
 impl LocalStagedDestination {
@@ -218,6 +221,15 @@ impl LocalStagedDestination {
         #[cfg(unix)]
         let name = self.stage_name(target, Operation::Publish).map_err(map)?;
         let path = target.final_destination().path().clone();
+        #[cfg(unix)]
+        let durability = target.durable_publication().then(|| {
+            (
+                Arc::clone(&self.root_dir),
+                Self::stage_relative(target, Operation::Publish),
+                Arc::clone(&self.directory_sync),
+                Arc::clone(&self.write_probe),
+            )
+        });
         tokio::task::spawn_blocking(move || {
             if request.cancel.is_cancelled() {
                 return Err(io::Error::new(
@@ -246,16 +258,44 @@ impl LocalStagedDestination {
                         "direct target was replaced",
                     ));
                 }
+                if let Some((root, relative, sync, probe)) = durability {
+                    sync_direct_publication(
+                        &root,
+                        &file,
+                        &directory,
+                        &relative.map_err(io::Error::other)?,
+                        &sync,
+                        &probe,
+                        &request.cancel,
+                    )?;
+                }
             }
             Ok(())
         })
         .await
         .map_err(|_| map(failure(&path, Operation::Publish, FailureClass::Internal)))?
-        .map_err(|e| map(io_failure(&path, Operation::Publish, &e)))?;
+        .map_err(|e| map(publication_io_failure(&path, &e)))?;
         Ok(PublicationEvidence::new(
             path,
             crate::storage::PublicationDisposition::Published,
             None,
         ))
     }
+}
+
+fn publication_io_failure(path: &StoragePath, error: &io::Error) -> StorageRoleFailure {
+    let original = io_failure(path, Operation::Publish, error);
+    let StorageRoleFailure::Entry(cause) = &original else {
+        return original;
+    };
+    // 角色边界保留操作分类和具体阶段原因；模型拒绝不合法诊断时仍返回原始分类。
+    EntryOperationFailure::new(
+        path.clone(),
+        Operation::Publish,
+        cause.class(),
+        cause.transience(),
+        format!("Direct target publication failed: {error}"),
+    )
+    .map(StorageRoleFailure::Entry)
+    .unwrap_or(original)
 }

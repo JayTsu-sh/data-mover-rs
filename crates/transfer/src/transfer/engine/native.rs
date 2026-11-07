@@ -71,6 +71,12 @@ async fn prepare_native_stage(
         stage.mark_at_destination(fact);
     }
     stage.set_exclusive(Some(Box::new(lease)));
+    if request
+        .publication_durability
+        .required(request.transfer_policy)
+    {
+        stage.set_durable_publication(true);
+    }
     Ok(stage)
 }
 

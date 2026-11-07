@@ -127,6 +127,31 @@ backend settings shared by transfers, while each transfer retains its own bounde
 Default tuning and its workload limitations are documented in
 [the backend defaults research](docs/research/backend-transfer-defaults.md).
 
+### Publication durability
+
+`TransferRequest` and `ExpertDestinationRequest` accept
+`with_publication_durability(PublicationDurability::Required)`. This requires the
+backend's final persistence barriers without enabling checkpoints or changing
+Direct/Atomic visibility. `PolicyDefault` retains existing behavior; Checkpointed
+still requires durable progress and publication. Ordinary Direct adds no sync calls.
+
+Unix Local Required Direct keeps the opened inode, applies metadata through it and
+coalesces data and metadata into one final `sync_all`. It then confirms the held
+parent still matches the path and synchronizes the directory chain inside the
+configured root, deepest first. A persistence failure returns a typed publication
+failure with the specific I/O phase; it cannot return a successful outcome. Existing
+staged and checkpoint behavior stays unchanged. This does not prove the durability
+of endpoint-root preparation or metadata the caller writes after completion:
+`CallerManaged` callers still own those steps before source cleanup. Source deletion
+is an application decision, separate from this library's successful transfer result.
+
+Deterministic real-file tests check zero/default versus one/required final file
+barrier, readonly metadata, nested parent barriers, failed file/directory barriers,
+parent replacement, and explicit expert metadata durability without checkpoints.
+These verify the executed barriers and failure propagation, not device power-cut
+behavior or whole-job throughput/RSS. NFS/CIFS Direct and application integration
+remain separate work.
+
 ### Archive transfer policy
 
 `TarRequest.transfer_policy` explicitly selects `Direct` or `AtomicReplace`.

@@ -37,6 +37,8 @@ mod at_destination;
 mod checkpoint;
 mod direct;
 #[cfg(unix)]
+mod direct_durability;
+#[cfg(unix)]
 mod direct_patch;
 mod directory_sync;
 mod hash_checkpoint;
@@ -268,6 +270,11 @@ impl LocalStagedDestination {
             transfer_identity,
         })));
         Ok(())
+    }
+
+    // Direct 把数据和元数据合并到最终发布屏障；续传仍逐确认点持久化。
+    fn needs_stage_barrier(stage: &PreparedStage) -> bool {
+        stage.durable_publication() && !stage.direct()
     }
 
     fn take_fresh_write(stage: &PreparedStage) -> bool {
@@ -960,7 +967,7 @@ impl StagedDestination for LocalStagedDestination {
             .await?;
         let fresh = Self::take_fresh_write(stage);
         let probe = Arc::clone(&self.write_probe);
-        let durable = stage.durable_publication();
+        let durable = Self::needs_stage_barrier(stage);
         let direct = stage.direct();
         let written = tokio::task::spawn_blocking(move || {
             if direct {
@@ -1053,10 +1060,10 @@ impl StagedDestination for LocalStagedDestination {
                     issued,
                     stage.final_destination().path(),
                     !stage.checkpoint_enabled(),
-                    stage.durable_publication(),
+                    Self::needs_stage_barrier(stage),
                 )
                 .await?;
-                if stage.durable_publication() {
+                if Self::needs_stage_barrier(stage) {
                     hash_checkpoint::barrier(stage, persisted).await?;
                 }
                 if stage.recovery_enabled() {
@@ -1072,9 +1079,9 @@ impl StagedDestination for LocalStagedDestination {
                 FailureClass::Corruption,
             ));
         }
-        if stage.durable_publication() || !fresh {
+        if Self::needs_stage_barrier(stage) || !fresh {
             #[cfg(any(test, feature = "test-support"))]
-            if stage.durable_publication() {
+            if Self::needs_stage_barrier(stage) {
                 self.write_probe
                     .final_data_sync_calls
                     .fetch_add(1, Ordering::SeqCst);
@@ -1084,11 +1091,11 @@ impl StagedDestination for LocalStagedDestination {
                 issued,
                 stage.final_destination().path(),
                 !fresh,
-                stage.durable_publication(),
+                Self::needs_stage_barrier(stage),
             )
             .await?;
         }
-        if stage.durable_publication() {
+        if Self::needs_stage_barrier(stage) {
             hash_checkpoint::barrier(stage, persisted).await?;
         }
         if stage.recovery_enabled() {
@@ -1201,7 +1208,7 @@ impl StagedDestination for LocalStagedDestination {
             )
             .await?;
         let path = stage.final_destination().path().clone();
-        let durable = stage.durable_publication();
+        let durable = Self::needs_stage_barrier(stage);
         tokio::task::spawn_blocking(move || {
             apply_local_metadata(&file, mutation)?;
             if durable {
@@ -1244,7 +1251,7 @@ impl StagedDestination for LocalStagedDestination {
                 StagedMetadataApplicationFailure::whole_batch(mutations.len(), 0, Some(error))
             })?;
         let path = stage.final_destination().path().clone();
-        let durable = stage.durable_publication();
+        let durable = Self::needs_stage_barrier(stage);
         let count = mutations.len();
         #[cfg(any(test, feature = "test-support"))]
         let fail_sync = self.write_probe.fail_metadata_sync.load(Ordering::SeqCst);
@@ -1326,7 +1333,7 @@ impl StagedDestination for LocalStagedDestination {
             .parent()
             == final_relative.parent();
         let directory_sync = Arc::clone(&self.directory_sync);
-        let durable = stage.durable_publication();
+        let durable = Self::needs_stage_barrier(stage);
         let retain_checkpoint = stage.checkpoint_enabled();
         let result = tokio::task::spawn_blocking(move || {
             publication::publish_local(

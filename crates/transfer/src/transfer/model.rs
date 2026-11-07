@@ -45,6 +45,22 @@ pub enum TransferPolicy {
     Direct,
 }
 
+/// 发布持久性独立于写入可见性及续传；调用方删除源端前可显式要求持久化。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PublicationDurability {
+    /// 保持所选传输策略的默认保证，不增加同步调用。
+    #[default]
+    PolicyDefault,
+    /// 成功前完成数据、已应用元数据及发布目录项所需的持久化屏障。
+    Required,
+}
+
+impl PublicationDurability {
+    pub(crate) fn required(self, policy: TransferPolicy) -> bool {
+        self == Self::Required || policy == TransferPolicy::Checkpointed
+    }
+}
+
 /// Whether copied content is independently read back before publication.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReadBackVerification {
@@ -78,6 +94,7 @@ pub struct TransferRequest {
     pub(crate) destination: Storage,
     pub(crate) cancel: CancellationToken,
     pub(crate) transfer_policy: TransferPolicy,
+    pub(crate) publication_durability: PublicationDurability,
     pub(crate) source_qos: Option<SourceQosGroup>,
     pub(crate) read_back: ReadBackVerification,
     pub(crate) copied_metadata: CopiedMetadataRequest,
@@ -310,6 +327,7 @@ impl TransferRequest {
             destination,
             cancel,
             transfer_policy: TransferPolicy::default(),
+            publication_durability: PublicationDurability::default(),
             source_qos: None,
             read_back: ReadBackVerification::default(),
             copied_metadata: CopiedMetadataRequest::default(),
@@ -483,6 +501,13 @@ impl TransferRequest {
     #[must_use]
     pub const fn with_transfer_policy(mut self, policy: TransferPolicy) -> Self {
         self.transfer_policy = policy;
+        self
+    }
+
+    /// 显式要求最终发布持久化，不启用续传或改变目标写入方式。
+    #[must_use]
+    pub const fn with_publication_durability(mut self, durability: PublicationDurability) -> Self {
+        self.publication_durability = durability;
         self
     }
 

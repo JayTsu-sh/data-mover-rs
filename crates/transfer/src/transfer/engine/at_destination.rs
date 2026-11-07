@@ -179,7 +179,11 @@ pub(super) async fn run_until_transferred(
         stage =
             super::publication::bind_prepared_checkpoint_metadata(stage, &destination, binding)?;
     }
-    stage.set_durable_publication(request.transfer_policy == TransferPolicy::Checkpointed);
+    stage.set_durable_publication(
+        request
+            .publication_durability
+            .required(request.transfer_policy),
+    );
     if let Some(interval_bytes) = plan.automatic_interval {
         // The destination writes its own pointer at the deferred checkpoint.
         stage.set_deferred_checkpoint(Some(crate::storage::DeferredCheckpoint {

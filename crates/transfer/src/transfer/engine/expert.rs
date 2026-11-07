@@ -1,5 +1,6 @@
 //! Transport-neutral source and destination halves of the unified transfer lifecycle.
 
+use crate::transfer::PublicationDurability;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -331,6 +332,7 @@ pub struct ExpertDestinationRequest {
     final_path: StoragePath,
     cancel: tokio_util::sync::CancellationToken,
     transfer_policy: TransferPolicy,
+    publication_durability: PublicationDurability,
     metadata_plan: Option<MetadataPlan>,
     write_observer: Option<WriteProgressObserver>,
 }
@@ -363,6 +365,7 @@ impl ExpertDestinationRequest {
             final_path,
             cancel,
             transfer_policy: TransferPolicy::default(),
+            publication_durability: PublicationDurability::default(),
             metadata_plan: None,
             write_observer: None,
         }
@@ -371,6 +374,13 @@ impl ExpertDestinationRequest {
     #[must_use]
     pub const fn with_transfer_policy(mut self, policy: TransferPolicy) -> Self {
         self.transfer_policy = policy;
+        self
+    }
+
+    /// 发布持久性独立于是否续传。
+    #[must_use]
+    pub const fn with_publication_durability(mut self, durability: PublicationDurability) -> Self {
+        self.publication_durability = durability;
         self
     }
 
@@ -492,7 +502,11 @@ impl ExpertDestinationSession {
             }
             effective_recovery => effective_recovery,
         };
-        stage.set_durable_publication(request.transfer_policy == TransferPolicy::Checkpointed);
+        stage.set_durable_publication(
+            request
+                .publication_durability
+                .required(request.transfer_policy),
+        );
         stage.set_write_observer(request.write_observer);
         if stage.write_offset() > 0 && stage.recovery_enabled() {
             stage.checkpoint_recorded(stage.write_offset());

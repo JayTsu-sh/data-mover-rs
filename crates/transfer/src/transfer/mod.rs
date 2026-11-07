@@ -24,8 +24,8 @@ pub use engine::{
 };
 pub use identity::TransferIdentity;
 pub use model::{
-    CopiedMetadataRequest, MetadataTransferMode, ReadBackVerification, TransferPolicy,
-    TransferRequest, TransferValueError,
+    CopiedMetadataRequest, MetadataTransferMode, PublicationDurability, ReadBackVerification,
+    TransferPolicy, TransferRequest, TransferValueError,
 };
 
 #[cfg(test)]
