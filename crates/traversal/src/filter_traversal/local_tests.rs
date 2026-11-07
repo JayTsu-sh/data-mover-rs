@@ -201,6 +201,52 @@ async fn modified_conditions_are_applied_to_each_descendant() -> io::Result<()> 
     Ok(())
 }
 
+fn anchored_request(order: TraversalOrder, epoch: i64) -> TraversalRequest {
+    request(order, "modified < 7d", None)
+        .filter(Arc::new(
+            DslTraversalFilter::parse(Some("modified < 7d"), None)
+                .assert_value("filter")
+                .with_time_anchor(epoch),
+        ))
+        .observation_plan(ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly))
+        .resumable(Resumable::On {
+            every: Duration::ZERO,
+        })
+}
+
+#[tokio::test]
+async fn fixed_windows_select_real_files_and_refuse_checkpoints_from_another_window()
+-> io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("payload"), b"window-bound")?;
+    set_file_mtime(
+        root.path().join("payload"),
+        FileTime::from_unix_time(10 * 86_400, 0),
+    )?;
+    for order in [TraversalOrder::Blocks, TraversalOrder::Unordered] {
+        let first = scan(root.path(), anchored_request(order, 16 * 86_400)).await?;
+        assert_completed(&first);
+        assert_eq!(first.paths, ["payload"]);
+        assert!(!first.saved.is_empty());
+        let later = scan(root.path(), anchored_request(order, 18 * 86_400)).await?;
+        assert_completed(&later);
+        assert!(later.paths.is_empty());
+        for (_, checkpoint) in first.saved {
+            let resumed = scan(
+                root.path(),
+                anchored_request(order, 18 * 86_400).resume_from(checkpoint),
+            )
+            .await?;
+            assert!(resumed.paths.is_empty());
+            assert_eq!(
+                resumed.outcome,
+                Err(TraversalTerminalFailure::Resume(ResumeRefusal::Mismatch))
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Replays the old adapter's key and path-admission behavior to create pre-fix checkpoints.
 #[derive(Debug)]
 struct LegacyDslFilter {

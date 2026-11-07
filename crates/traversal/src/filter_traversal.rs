@@ -19,10 +19,16 @@
 //! settle, not for a timestamp to exist. A final missing time retains the DSL's `LazyMatch`
 //! semantics; an observation still pending must never be mistaken for a final missing value.
 
-use crate::filter::{FilterExpression, FilterInput, parse_filter_expression, should_skip};
+use crate::filter::{
+    FilterExpression, FilterInput, parse_filter_expression, should_skip, should_skip_at,
+};
 use crate::model::{EntryKind, MetadataFamily, MetadataRequirements};
+use crate::time_util::unix_nanos_to_secs;
 use crate::traversal::{TraversalCandidate, TraversalDecision, TraversalFilter};
 
+#[cfg(test)]
+#[path = "filter_traversal/anchor_tests.rs"]
+mod anchor_tests;
 #[cfg(test)]
 mod local_tests;
 
@@ -32,21 +38,22 @@ pub struct DslTraversalFilter {
     match_expressions: Option<FilterExpression>,
     exclude_expressions: Option<FilterExpression>,
     requirements: MetadataRequirements,
-    /// What a resumable traversal binds its checkpoints to: see [`resume_key`].
-    resume_key: [u8; 32],
+    /// 有序遍历策略指纹；checkpoint 在有固定时钟时还须绑定时间基准。
+    selection_key: [u8; 32],
+    time_anchor: Option<i64>,
 }
 
-/// A key of the DSL semantics version and both parsed expressions: equal keys decide alike.
+/// 有序表达式及 DSL 语义版本的指纹；相同输入和评估时间下，相同指纹产生相同决策。
 /// Their derived `Debug` form spells out every condition, operator, value and glob, and keeps
 /// a relative time such as `modified < 7d` relative. A new DSL version may spell a tree differently;
 /// a checkpoint then refuses to resume, which is the safe direction.
 ///
-/// A relative time is evaluated against the moment of each decision, so a traversal resumed a day
-/// later keeps the same key under a window a day later.
+/// 此指纹不包含时钟；固定时钟模式的 checkpoint 在此基础上另绑定本轮时间。
+/// 实时模式继续在每次决策时读取时钟。
 ///
 /// Version 2 gates unfiltered subtree admission. Old checkpoints may contain unsafe
 /// `filter_children = false` frontiers and must be refused even when their expressions are identical.
-fn resume_key(
+fn selection_key(
     match_expressions: Option<&FilterExpression>,
     exclude_expressions: Option<&FilterExpression>,
 ) -> [u8; 32] {
@@ -74,11 +81,27 @@ impl DslTraversalFilter {
             MetadataRequirements::NONE
         };
         Self {
-            resume_key: resume_key(match_expressions.as_ref(), exclude_expressions.as_ref()),
+            selection_key: selection_key(match_expressions.as_ref(), exclude_expressions.as_ref()),
             match_expressions,
             exclude_expressions,
             requirements,
+            time_anchor: None,
         }
+    }
+
+    /// 固定本轮相对时间过滤的基准；调用方重试同一轮时须复用该值。
+    /// checkpoint 同时绑定此时间，不能在不同窗口下重用旧前缀。
+    #[must_use]
+    pub const fn with_time_anchor(mut self, unix_seconds: i64) -> Self {
+        self.time_anchor = Some(unix_seconds);
+        self
+    }
+
+    /// 不含本轮时间的有序遍历策略指纹；包含 DSL 版本及包含／排除两棵语法树。
+    /// 保留表达式顺序与目录剪枝语义，不把布尔等价当作遍历等价。
+    #[must_use]
+    pub const fn selection_key(&self) -> &[u8; 32] {
+        &self.selection_key
     }
 
     /// Parses optional `match` / `exclude` expression strings.
@@ -128,40 +151,59 @@ fn extension(name: &str) -> &str {
     }
 }
 
+fn filter_input<'a>(candidate: &TraversalCandidate<'a>) -> FilterInput<'a> {
+    let is_directory = candidate.kind == EntryKind::Directory;
+    FilterInput {
+        file_name: Some(candidate.name),
+        file_path: Some(candidate.path),
+        file_type: Some(file_type(candidate.kind)),
+        modified_epoch: candidate
+            .modified
+            .map(|value| unix_nanos_to_secs(value.unix_nanos())),
+        // Directories carried `end_of_file = 0` on every legacy backend; keep that so a
+        // `size` condition never turns into a permissive `LazyMatch` for them.
+        size: if is_directory {
+            Some(candidate.size.unwrap_or(0))
+        } else {
+            candidate.size
+        },
+        extension: Some(extension(candidate.name)),
+    }
+}
+
 impl TraversalFilter for DslTraversalFilter {
     fn required_metadata(&self) -> MetadataRequirements {
         self.requirements
     }
 
     fn resume_key(&self) -> Option<Vec<u8>> {
-        Some(self.resume_key.to_vec())
+        let Some(epoch) = self.time_anchor else {
+            return Some(self.selection_key.to_vec());
+        };
+        let mut hash = blake3::Hasher::new_derive_key("data-mover anchored DSL traversal v1");
+        hash.update(&self.selection_key);
+        hash.update(&epoch.to_le_bytes());
+        Some(hash.finalize().as_bytes().to_vec())
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
         if self.is_empty() {
             return TraversalDecision::unfiltered(candidate.kind);
         }
-        let is_directory = candidate.kind == EntryKind::Directory;
-        let (skip, continue_scan, check_children) = should_skip(
-            self.match_expressions.as_ref(),
-            self.exclude_expressions.as_ref(),
-            FilterInput {
-                file_name: Some(candidate.name),
-                file_path: Some(candidate.path),
-                file_type: Some(file_type(candidate.kind)),
-                modified_epoch: candidate
-                    .modified
-                    .map(|value| crate::time_util::unix_nanos_to_secs(value.unix_nanos())),
-                // Directories carried `end_of_file = 0` on every legacy backend; keep that so a
-                // `size` condition never turns into a permissive `LazyMatch` for them.
-                size: if is_directory {
-                    Some(candidate.size.unwrap_or(0))
-                } else {
-                    candidate.size
-                },
-                extension: Some(extension(candidate.name)),
-            },
-        );
+        let input = filter_input(candidate);
+        let (skip, continue_scan, check_children) = match self.time_anchor {
+            Some(epoch) => should_skip_at(
+                self.match_expressions.as_ref(),
+                self.exclude_expressions.as_ref(),
+                input,
+                epoch,
+            ),
+            None => should_skip(
+                self.match_expressions.as_ref(),
+                self.exclude_expressions.as_ref(),
+                input,
+            ),
+        };
         TraversalDecision {
             emit: !skip,
             descend: continue_scan,

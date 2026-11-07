@@ -106,6 +106,19 @@ pub fn should_skip(
     selection::decide(match_expressions, exclude_expressions, input, now_secs())
 }
 
+/// 按调用方固定的 Unix 秒时间评估；包含、排除和目录剪枝使用同一时间基准。
+/// 不读取系统时钟，也不重写相对时间表达式。
+#[must_use]
+pub fn should_skip_at(
+    match_expressions: Option<&FilterExpression>,
+    exclude_expressions: Option<&FilterExpression>,
+    input: FilterInput<'_>,
+    now_epoch: i64,
+) -> (bool, bool, bool) {
+    selection::trace_input(match_expressions, exclude_expressions, input);
+    selection::decide(match_expressions, exclude_expressions, input, now_epoch)
+}
+
 /// 解析过滤表达式的辅助函数
 ///
 /// # Errors
@@ -1252,7 +1265,8 @@ impl FilterExpression {
                 } else {
                     f64::MIN
                 };
-                let file_days = (now_epoch - file_epoch).to_f64().unwrap_or(fallback) / 86_400.0;
+                let elapsed = i128::from(now_epoch) - i128::from(file_epoch);
+                let file_days = elapsed.to_f64().unwrap_or(fallback) / 86_400.0;
                 MatchResult::from_bool(match operator {
                     CompareOp::Lt => file_days < *days,
                     CompareOp::Gt => file_days > *days,
