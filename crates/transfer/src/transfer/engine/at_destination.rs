@@ -166,7 +166,7 @@ pub(super) async fn run_until_transferred(
         recovery_binding,
         plan,
         lease,
-        request.metadata_mode.private_creation(
+        request.private_creation(
             copied_metadata_plan
                 .as_ref()
                 .is_some_and(CopiedMetadataPlan::carries_mode),

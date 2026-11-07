@@ -44,7 +44,7 @@ async fn prepare_native_stage(
     let prepare = PrepareRequest {
         final_destination: FinalDestination::new(request.final_path().clone())
             .with_private_creation(
-                request.metadata_mode.private_creation(
+                request.private_creation(
                     input
                         .copied_metadata_plan
                         .as_ref()

@@ -135,6 +135,10 @@ without observing source metadata again. A cloned request shares the plan's raw
 values; the transfer releases its reference on success and failure. Checkpoint
 recovery remains bound to the plan's values. Selecting `with_metadata_mode` later
 clears the supplied plan and restores the selected mode's behavior.
+New captured-plan files start with private permissions even when the plan carries
+only xattrs or tags; an existing Direct file keeps its current permissions unless
+the plan explicitly changes them. Backend-default automatic metadata selection is
+unchanged.
 
 This preserves the library's existing strict metadata-failure behavior: a failed
 staged metadata operation does not publish that stage, while a Direct target may

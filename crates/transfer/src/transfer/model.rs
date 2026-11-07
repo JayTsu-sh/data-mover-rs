@@ -517,11 +517,16 @@ impl TransferRequest {
 
     /// 使用扫描时已捕获并编译的计划，发布前执行，不再次查询源元数据。
     /// 后续显式选择元数据模式会清除此计划；计划通过 Arc 共享，不复制原值。
+    /// 新建目标从私有权限开始，没有 mode 的计划也不会扩大访问权限。
     #[must_use]
     pub fn with_metadata_plan(mut self, plan: impl Into<Arc<MetadataPlan>>) -> Self {
         self.metadata_mode = MetadataTransferMode::Automatic;
         self.metadata_plan = Some(plan.into());
         self
+    }
+
+    pub(crate) fn private_creation(&self, carries_mode: bool) -> bool {
+        self.metadata_plan.is_some() || self.metadata_mode.private_creation(carries_mode)
     }
 
     /// 显式允许元数据应用失败后发布已复制数据；失败仍通过 Err 返回。

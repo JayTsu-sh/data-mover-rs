@@ -1,5 +1,7 @@
 //! 数据发布与调用方元数据阶段分离时，不得重新观察源端元数据。
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -201,6 +203,14 @@ async fn a_shared_captured_plan_applies_values_without_any_later_source_metadata
             b"readable payload"
         );
         assert_eq!(
+            std::fs::metadata(target_root.path().join(&name))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "只有 xattr 的捕获计划也必须保持新建文件的私有权限"
+        );
+        assert_eq!(
             xattr::get(target_root.path().join(&name), "user.captured-plan")?.as_deref(),
             Some(b"captured value".as_slice())
         );
@@ -309,5 +319,49 @@ async fn a_failed_captured_metadata_barrier_releases_the_plan_and_preserves_sour
         b"old target"
     );
     failure.discard_stage().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_captured_plan_without_mode_preserves_existing_direct_permissions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = tempfile::tempdir()?;
+    let target_root = tempfile::tempdir()?;
+    std::fs::write(source_root.path().join("file"), b"new payload")?;
+    std::fs::write(target_root.path().join("file"), b"old payload")?;
+    std::fs::set_permissions(
+        target_root.path().join("file"),
+        std::fs::Permissions::from_mode(0o640),
+    )?;
+    let source = test_source_storage(source_root.path(), "captured-mode-source")?.0;
+    let path = StoragePath::new("file")?;
+    let plan = capture_xattrs(&source, &path).await?;
+    transfer(
+        TransferRequest::new(
+            source,
+            path,
+            test_destination_storage(target_root.path(), "captured-mode-target")?,
+            CancellationToken::new(),
+        )
+        .with_transfer_policy(TransferPolicy::Direct)
+        .with_metadata_plan(plan),
+    )
+    .await?;
+    assert_eq!(
+        std::fs::metadata(target_root.path().join("file"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+    assert_eq!(
+        std::fs::read(target_root.path().join("file"))?,
+        b"new payload"
+    );
+    assert_eq!(
+        std::fs::read(source_root.path().join("file"))?,
+        b"new payload"
+    );
     Ok(())
 }
