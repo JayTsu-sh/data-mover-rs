@@ -127,6 +127,23 @@ backend settings shared by transfers, while each transfer retains its own bounde
 Default tuning and its workload limitations are documented in
 [the backend defaults research](docs/research/backend-transfer-defaults.md).
 
+### Captured metadata plans
+
+Ordinary `TransferRequest::with_metadata_plan` accepts a compiled `MetadataPlan`
+or its shared `Arc`. The transfer applies those captured values before publication
+without observing source metadata again. A cloned request shares the plan's raw
+values; the transfer releases its reference on success and failure. Checkpoint
+recovery remains bound to the plan's values. Selecting `with_metadata_mode` later
+clears the supplied plan and restores the selected mode's behavior.
+
+This preserves the library's existing strict metadata-failure behavior: a failed
+staged metadata operation does not publish that stage, while a Direct target may
+already contain copied data. Callers that require data publication despite a
+metadata failure must handle that separately; supplying a plan alone does not
+change that policy or authorize source deletion. Real-file tests cover all three
+transfer policies, source-metadata refusal, shared-plan release and a failed
+metadata persistence barrier.
+
 ### Publication durability
 
 `TransferRequest` and `ExpertDestinationRequest` accept

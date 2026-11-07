@@ -33,19 +33,27 @@ pub(super) async fn apply_copied_metadata(
         return Ok(None);
     };
     copied
-        .plan
+        .plan()
         .apply_to_stage(transferred.destination.as_ref(), &transferred.stage, cancel)
         .await
         .map(Some)
 }
 
-pub(super) struct CopiedMetadataPlan {
-    plan: MetadataPlan,
+pub(super) enum CopiedMetadataPlan {
+    Automatic(MetadataPlan),
+    Captured(Arc<MetadataPlan>),
 }
 
 impl CopiedMetadataPlan {
+    fn plan(&self) -> &MetadataPlan {
+        match self {
+            Self::Automatic(plan) => plan,
+            Self::Captured(plan) => plan.as_ref(),
+        }
+    }
+
     pub(super) fn carries_mode(&self) -> bool {
-        self.plan.carries_mode()
+        self.plan().carries_mode()
     }
 
     pub(super) async fn validate_recovered(
@@ -53,7 +61,7 @@ impl CopiedMetadataPlan {
         transferred: &Transferred,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
-        self.plan
+        self.plan()
             .validate_recovered_stage(transferred.destination.as_ref(), &transferred.stage, cancel)
             .await
     }
@@ -61,11 +69,11 @@ impl CopiedMetadataPlan {
     pub(super) fn recovered_acl_report(
         &self,
     ) -> Option<crate::metadata::MetadataApplicationReport> {
-        self.plan.recovered_acl_report()
+        self.plan().recovered_acl_report()
     }
 
     pub(super) fn checkpoint_binding(&self) -> [u8; 32] {
-        self.plan.checkpoint_binding()
+        self.plan().checkpoint_binding()
     }
 }
 
@@ -101,6 +109,9 @@ pub(super) async fn copied_metadata_plan(
     request: &TransferRequest,
     descriptor: &SourceDescriptor,
 ) -> Result<Option<CopiedMetadataPlan>, TransferFailure> {
+    if let Some(plan) = &request.metadata_plan {
+        return Ok(Some(CopiedMetadataPlan::Captured(Arc::clone(plan))));
+    }
     if request.metadata_mode == MetadataTransferMode::CallerManaged {
         return Ok(None);
     }
@@ -182,7 +193,7 @@ pub(super) async fn copied_metadata_plan(
         requested.acl() && descriptor.kind == EntryKind::File,
         descriptor.kind,
     )
-    .map(|plan| Some(CopiedMetadataPlan { plan }))
+    .map(|plan| Some(CopiedMetadataPlan::Automatic(plan)))
     .map_err(TransferFailure::refused_metadata)
 }
 
@@ -208,9 +219,9 @@ fn unavailable_roles_plan(
         .with_acl(optional_policy(requested.acl()))
         .with_xattrs(optional_policy(requested.xattrs()))
         .with_tags(optional_policy(copy_tags));
-    Some(CopiedMetadataPlan {
-        plan: compile_unavailable_plan(policies, reason),
-    })
+    Some(CopiedMetadataPlan::Automatic(compile_unavailable_plan(
+        policies, reason,
+    )))
 }
 
 /// A destination that keeps nothing a copy carries: nothing the source holds could change the
@@ -224,9 +235,7 @@ fn nothing_stored(requested: CopiedMetadataRequest, copy_tags: bool) -> CopiedMe
         .with_acl(optional_policy(requested.acl()))
         .with_xattrs(optional_policy(requested.xattrs()))
         .with_tags(optional_policy(copy_tags));
-    CopiedMetadataPlan {
-        plan: compile_nothing_stored_plan(policies),
-    }
+    CopiedMetadataPlan::Automatic(compile_nothing_stored_plan(policies))
 }
 
 /// The source's metadata role with the baseline it observes for a copy, and what the destination
@@ -517,7 +526,7 @@ mod tests {
             let copied = copied_metadata_plan(&request, &descriptor)
                 .await?
                 .ok_or("metadata plan missing")?;
-            assert_eq!(copied.plan.acl_copy_report().is_some(), name == "file");
+            assert_eq!(copied.plan().acl_copy_report().is_some(), name == "file");
         }
         Ok(())
     }

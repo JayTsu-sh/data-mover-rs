@@ -2,6 +2,7 @@ use std::{fmt, sync::Arc};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::metadata::MetadataPlan;
 use crate::model::{
     EntryKind, ObservedEntry, SourceIdentity, SourceVersion, StoragePath, StorageTimestamp,
 };
@@ -99,6 +100,7 @@ pub struct TransferRequest {
     pub(crate) read_back: ReadBackVerification,
     pub(crate) copied_metadata: CopiedMetadataRequest,
     pub(crate) metadata_mode: MetadataTransferMode,
+    pub(crate) metadata_plan: Option<Arc<MetadataPlan>>,
 }
 
 /// One source selection, optionally constrained by an observation. An observed selection
@@ -332,6 +334,7 @@ impl TransferRequest {
             read_back: ReadBackVerification::default(),
             copied_metadata: CopiedMetadataRequest::default(),
             metadata_mode: MetadataTransferMode::Automatic,
+            metadata_plan: None,
         }
     }
 
@@ -491,9 +494,20 @@ impl TransferRequest {
 
     /// Selects independent data publication and caller-owned metadata application. In
     /// `CallerManaged` mode no source metadata is fetched and `outcome.metadata` is `None`.
+    /// Any explicitly selected mode clears a previously captured metadata plan.
     #[must_use]
-    pub const fn with_metadata_mode(mut self, mode: MetadataTransferMode) -> Self {
+    pub fn with_metadata_mode(mut self, mode: MetadataTransferMode) -> Self {
         self.metadata_mode = mode;
+        self.metadata_plan = None;
+        self
+    }
+
+    /// 使用扫描时已捕获并编译的计划，发布前执行，不再次查询源元数据。
+    /// 后续显式选择元数据模式会清除此计划；计划通过 Arc 共享，不复制原值。
+    #[must_use]
+    pub fn with_metadata_plan(mut self, plan: impl Into<Arc<MetadataPlan>>) -> Self {
+        self.metadata_mode = MetadataTransferMode::Automatic;
+        self.metadata_plan = Some(plan.into());
         self
     }
 
