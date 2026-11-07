@@ -15,6 +15,20 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
 
+`python3 tests/lab/run-archive-policy-local.py` checks Direct tar output in an owned
+RustFS network namespace. It uses cached Docker/Rust dependencies, `nsenter` and
+`boto3`; `ARCHIVE_S3_IMAGE` can override the cached image. It independently opens
+single-PUT and multipart archives, checks all payload bytes and exactly four final
+versions, no staging keys/delete markers/uploads, and rejects a cross-prefix source
+alias before writing. A local proxy injects write permission refusal, disconnect and
+silent timeout without modifying firewall rules. The source remains intact and
+subsequent normal writes succeed. The functional timeout profile is 1-second read /
+2-second operation, not a production network recovery budget. Local tests additionally
+check actual inode behavior, cross-root hardlink protection, and Checkpointed refusal
+before target access. This does not certify NFS/CIFS generated Direct, cancellation,
+unknown-write reconciliation, final-data cleanup or whole-job performance. The owned
+container and volumes are removed on exit.
+
 `python3 tests/lab/run-source-purge-local.py` runs the exact-version source-purge contract in
 an isolated local RustFS container, using a cached image (override `SOURCE_PURGE_S3_IMAGE`),
 `docker`, `nsenter`, `boto3`, and cached Rust dependencies. It creates only its own bucket and

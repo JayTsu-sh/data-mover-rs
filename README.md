@@ -127,6 +127,25 @@ backend settings shared by transfers, while each transfer retains its own bounde
 Default tuning and its workload limitations are documented in
 [the backend defaults research](docs/research/backend-transfer-defaults.md).
 
+### Archive transfer policy
+
+`TarRequest.transfer_policy` explicitly selects `Direct` or `AtomicReplace`.
+`Checkpointed` is rejected before destination preparation: generated tar streams
+cannot resume within an archive. Direct archive output is supported by Unix Local
+and S3; other destination adapters must implement `validate_direct_inputs` before
+this generated stream can write. The destination checks every manifest input before
+any data is written. Unix Local compares the opened target inode with input identities,
+including hardlinks in other roots; S3 compares canonical full object locations,
+including different prefixes that reach the same key. The manifest is borrowed through
+an iterator, without another complete manifest buffer. Public expert sessions still
+refuse Direct without this input-protection lifecycle.
+
+Direct may expose partial final content on failure; artifact cleanup does not roll back
+an already written final object. Applications own the decision to clean failed target
+data through protected backend operations. Atomic archive behavior is unchanged.
+The owned real-S3 publication and fault runner is documented in
+[the integration lab](tests/lab/README.md).
+
 ### QoS semantics
 
 `QosManager` limits source-side migration traffic. Payload bytes are charged

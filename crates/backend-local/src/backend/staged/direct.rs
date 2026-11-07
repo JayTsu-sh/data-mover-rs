@@ -13,8 +13,52 @@ use super::{
 
 #[cfg(unix)]
 use super::{Arc, AtomicBool, Bytes, LocalStageState, OpenOptions, Path};
+#[cfg(unix)]
+use crate::model::{BackendKind, IdentityStrength, SourceIdentity};
+use crate::storage::SourceDescriptor;
 
 impl LocalStagedDestination {
+    pub(super) async fn check_direct_inputs(
+        &self,
+        stage: &PreparedStage,
+        inputs: Box<dyn Iterator<Item = SourceDescriptor> + Send + '_>,
+    ) -> Result<(), StorageRoleFailure> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let path = stage.final_destination().path();
+            let file = self
+                .open_stage_file_for(stage, Operation::Prepare, false)
+                .await?;
+            let metadata = tokio::task::spawn_blocking(move || file.metadata())
+                .await
+                .map_err(|_| failure(path, Operation::Prepare, FailureClass::Internal))?
+                .map_err(|error| io_failure(path, Operation::Prepare, &error))?;
+            for source in inputs {
+                if source.source_identity.backend().kind() == BackendKind::Local
+                    && source.source_identity
+                        == SourceIdentity::from_u64_pair_le(
+                            source.source_identity.backend().clone(),
+                            IdentityStrength::StableWithinBackend,
+                            metadata.dev(),
+                            metadata.ino(),
+                        )
+                {
+                    return Err(failure(path, Operation::Prepare, FailureClass::Conflict));
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = inputs;
+            Err(failure(
+                stage.final_destination().path(),
+                Operation::Prepare,
+                FailureClass::Unsupported,
+            ))
+        }
+    }
     #[cfg(unix)]
     fn is_held_elsewhere(error: &StorageRoleFailure) -> bool {
         matches!(

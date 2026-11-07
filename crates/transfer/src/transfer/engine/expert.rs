@@ -420,13 +420,20 @@ impl ExpertDestinationSession {
     /// # Errors
     /// Returns a phase-attributed preflight or destination failure.
     pub async fn prepare(request: ExpertDestinationRequest) -> Result<Self, TransferFailure> {
+        Self::prepare_generated(request, None).await
+    }
+
+    pub(crate) async fn prepare_generated(
+        request: ExpertDestinationRequest,
+        inputs: Option<Box<dyn Iterator<Item = SourceDescriptor> + Send + '_>>,
+    ) -> Result<Self, TransferFailure> {
         if request.source_maximum_chunk_bytes == 0 {
             return Err(TransferFailure::orchestration(
                 TransferPhase::Preflight,
                 "expert source chunk ceiling must be non-zero",
             ));
         }
-        if request.transfer_policy == TransferPolicy::Direct {
+        if request.transfer_policy == TransferPolicy::Direct && inputs.is_none() {
             return Err(TransferFailure::capability(
                 TransferSide::Destination,
                 "Direct requires the ordinary transfer entry with source identity validation",
@@ -466,6 +473,17 @@ impl ExpertDestinationSession {
         }
         let mut stage =
             prepare_destination_stage(&request, &destination, &source, recovery_enabled).await?;
+        if request.transfer_policy == TransferPolicy::Direct
+            && let Some(inputs) = inputs
+            && let Err(error) = destination.validate_direct_inputs(&stage, inputs).await
+        {
+            return Err(TransferFailure::role(
+                TransferPhase::Preflight,
+                TransferSide::Destination,
+                error,
+            )
+            .with_stage(destination, stage));
+        }
         // The destination may decline recovery for this stage (a single S3 PUT).
         let recovery_enabled = recovery_enabled && stage.recovery_enabled();
         let effective_recovery = match effective_recovery {

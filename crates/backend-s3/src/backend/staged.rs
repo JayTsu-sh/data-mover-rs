@@ -18,9 +18,9 @@ use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transi
 use crate::storage::{
     ByteStream, CheckpointObservation, DestinationPrepareRequest, Metadata, MetadataMutation,
     PositionedByteStream, PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure,
-    PublishRequest, ReadBackMethod, StagedDestination, StorageRoleFailure, UnpinnedReadReason,
-    UploadDigest, UploadDigestGap, VerificationEvidence, VerificationPoint, VerifyRequest,
-    WriteEvidence,
+    PublishRequest, ReadBackMethod, SourceDescriptor, StagedDestination, StorageRoleFailure,
+    UnpinnedReadReason, UploadDigest, UploadDigestGap, VerificationEvidence, VerificationPoint,
+    VerifyRequest, WriteEvidence,
 };
 
 use super::source::{classified_entry, entry, role_failure};
@@ -246,6 +246,13 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
     /// `Direct` writes the object at its final key (ADR-0006 C14c).
     fn supports_direct(&self) -> bool {
         true
+    }
+    async fn validate_direct_inputs<'inputs>(
+        &self,
+        stage: &PreparedStage,
+        inputs: Box<dyn Iterator<Item = SourceDescriptor> + Send + 'inputs>,
+    ) -> Result<(), StorageRoleFailure> {
+        self.check_direct_inputs(stage, inputs)
     }
 
     /// The 64 MiB interval (D3: a checkpointed object up to it never writes a pointer); none on a

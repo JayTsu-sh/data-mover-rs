@@ -20,10 +20,11 @@ use super::super::{S3Protocol, S3ProtocolFailure, S3WriteFacts, composite_etag};
 use super::completion::completed_object;
 use super::parts::{PartTarget, UploadedParts};
 use super::{S3StagedDestination, cleanup_result, limits, planned_part_size, single, streaming};
-use crate::model::{FailureClass, Operation, StoragePath, Transience};
+use crate::model::{BackendKind, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
     ByteStream, PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
-    PublicationFailure, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    PublicationFailure, SourceDescriptor, StorageRoleFailure, VerificationEvidence, VerifyRequest,
+    WriteEvidence,
 };
 
 /// The upload-id half of a multipart `Direct` stage's token; a real upload id is printable.
@@ -79,6 +80,30 @@ fn not_written(path: &StoragePath, operation: Operation) -> StorageRoleFailure {
 }
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
+    pub(super) fn check_direct_inputs(
+        &self,
+        stage: &PreparedStage,
+        inputs: Box<dyn Iterator<Item = SourceDescriptor> + Send + '_>,
+    ) -> Result<(), StorageRoleFailure> {
+        self.validate(stage)?;
+        let path = stage.final_destination().path();
+        let target = format!("{}/{path}", self.identity.stable_id());
+        for source in inputs {
+            let backend = source.source_identity.backend();
+            if backend.kind() == BackendKind::S3
+                && format!("{}/{}", backend.stable_id(), source.path) == target
+            {
+                return Err(classified_entry(
+                    path,
+                    Operation::Prepare,
+                    FailureClass::Conflict,
+                    Transience::Permanent,
+                    "Direct archive would replace one of its source objects",
+                ));
+            }
+        }
+        Ok(())
+    }
     /// A `Direct` stage: a single stage for a known size up to T, and for a directory object one
     /// request carries (P7 D13); on a bucket without multipart uploads, one streamed `PutObject`
     /// committing inside `write` (P7 §14.2); otherwise a multipart one whose upload `write`

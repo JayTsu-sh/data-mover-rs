@@ -451,6 +451,24 @@ pub trait StagedDestination: Send + Sync {
             .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
         ))
     }
+    /// 在首次写入前，确认已打开的 Direct 目标不与生成流的任一源项别名。
+    /// 输入迭代器仅借用清单，不要求缓存所有描述；失败不得修改输入或目标内容。
+    async fn validate_direct_inputs<'inputs>(
+        &self,
+        stage: &PreparedStage,
+        _inputs: Box<dyn Iterator<Item = SourceDescriptor> + Send + 'inputs>,
+    ) -> Result<(), StorageRoleFailure> {
+        Err(StorageRoleFailure::Entry(
+            EntryOperationFailure::new(
+                stage.final_destination().path().clone(),
+                Operation::Prepare,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "generated Direct input protection is unsupported",
+            )
+            .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+        ))
+    }
     /// 是否支持保留未触及区间的原地补丁；不能用会截断文件的 positioned writer 替代。
     fn supports_sparse_patch(&self) -> bool {
         false

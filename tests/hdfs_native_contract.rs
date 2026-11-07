@@ -5,6 +5,7 @@ use data_mover::storage::{
     BackendConfig, HdfsBackendConfig, Storage, StorageRoleFailure, connect_backend,
 };
 use data_mover::storage::{HdfsConfig, build_hdfs_client};
+use data_mover::transfer::TransferPolicy;
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSource,
 };
@@ -775,6 +776,7 @@ async fn nightly_lab_role_tar_write() -> TestResult {
         final_path: StoragePath::new("empty.tar")?,
         cancel: CancellationToken::new(),
         source_qos: None,
+        transfer_policy: TransferPolicy::AtomicReplace,
     })
     .await?;
     assert_eq!(outcome.transferred_bytes, 1024);

@@ -9,7 +9,7 @@ use data_mover::storage::{
     UnsupportedReason, connect_backend,
 };
 use data_mover::tar_pack::{TarFailure, TarRequest, calculate_tar_size, pack};
-use data_mover::transfer::{TransferOutcome, TransferSide};
+use data_mover::transfer::{TransferOutcome, TransferPolicy, TransferSide};
 use futures::StreamExt as _;
 use std::error::Error as _;
 use std::num::NonZeroUsize;
@@ -21,6 +21,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[path = "role_tar/policy.rs"]
+mod policy;
 
 async fn local(path: &std::path::Path) -> Result<Storage> {
     let slots = NonZeroUsize::new(2).ok_or("nonzero")?;
@@ -87,6 +90,7 @@ async fn archive_streams_files_headers_and_padding_with_small_chunk_limits() -> 
 
         cancel: CancellationToken::new(),
         source_qos: None,
+        transfer_policy: TransferPolicy::AtomicReplace,
     })
     .await?;
     let archive = std::fs::read(destination_root.path().join("result.tar"))?;
@@ -139,6 +143,7 @@ async fn archive_records_a_link_without_reading_its_target() -> Result {
 
         cancel: CancellationToken::new(),
         source_qos: None,
+        transfer_policy: TransferPolicy::AtomicReplace,
     })
     .await?;
     let archive = std::fs::read(destination_root.path().join("link.tar"))?;
@@ -165,6 +170,7 @@ async fn archive_preserves_long_names_using_pax_headers() -> Result {
 
         cancel: CancellationToken::new(),
         source_qos: None,
+        transfer_policy: TransferPolicy::AtomicReplace,
     })
     .await?;
     let archive = std::fs::read(destination_root.path().join("long.tar"))?;
@@ -208,6 +214,7 @@ async fn archive_preserves_long_non_utf8_link_targets_in_binary_pax() -> Result 
 
         cancel: CancellationToken::new(),
         source_qos: None,
+        transfer_policy: TransferPolicy::AtomicReplace,
     })
     .await?;
 
@@ -259,6 +266,7 @@ async fn archive_preserves_positive_fractional_mtime_in_pax() -> Result {
 
         cancel: CancellationToken::new(),
         source_qos: None,
+        transfer_policy: TransferPolicy::AtomicReplace,
     })
     .await?;
 
@@ -291,6 +299,7 @@ async fn archive_request_shares_the_manifest_and_each_observation() -> Result {
         final_path: StoragePath::new("shared.tar")?,
         cancel: CancellationToken::new(),
         source_qos: None,
+        transfer_policy: TransferPolicy::AtomicReplace,
     };
     let cloned = request.clone();
     assert!(Arc::ptr_eq(&cloned.entries, &entries));
@@ -324,6 +333,7 @@ async fn stale_archive_source(original: &[u8], changed: &[u8]) -> Result {
         final_path: StoragePath::new("result.tar")?,
         cancel: CancellationToken::new(),
         source_qos: None,
+        transfer_policy: TransferPolicy::AtomicReplace,
     })
     .await;
     assert_refused_archive(result)?;
@@ -429,6 +439,7 @@ async fn archive_refuses_source_changes_during_payload_reads() -> Result {
         final_path: StoragePath::new("result.tar")?,
         cancel: CancellationToken::new(),
         source_qos: None,
+        transfer_policy: TransferPolicy::AtomicReplace,
     })
     .await;
     assert!(

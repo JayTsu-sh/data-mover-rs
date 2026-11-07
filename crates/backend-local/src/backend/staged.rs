@@ -29,8 +29,8 @@ use crate::storage::durability::sync_directory;
 use crate::storage::{
     ByteStream, CheckpointObservation, DestinationPrepareRequest, MetadataMutation,
     PositionedByteStream, PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure,
-    PublishRequest, StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure,
-    VerificationEvidence, VerifyRequest, WriteEvidence,
+    PublishRequest, SourceDescriptor, StagedDestination, StagedMetadataApplicationFailure,
+    StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 mod at_destination;
@@ -859,6 +859,13 @@ impl StagedDestination for LocalStagedDestination {
         cancel: CancellationToken,
     ) -> Result<PreparedStage, StorageRoleFailure> {
         self.open_direct(request, cancel).await
+    }
+    async fn validate_direct_inputs<'inputs>(
+        &self,
+        stage: &PreparedStage,
+        inputs: Box<dyn Iterator<Item = SourceDescriptor> + Send + 'inputs>,
+    ) -> Result<(), StorageRoleFailure> {
+        self.check_direct_inputs(stage, inputs).await
     }
     fn supports_sparse_patch(&self) -> bool {
         cfg!(unix)
