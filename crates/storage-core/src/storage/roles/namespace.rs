@@ -3,14 +3,18 @@
 use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use super::StorageRoleFailure;
 use crate::model::{
-    EntryOperationFailure, FailureClass, Operation, RenameContext, StoragePath, SymlinkTarget,
-    Transience,
+    EntryOperationFailure, FailureClass, ObservedEntry, Operation, RenameContext, StoragePath,
+    SymlinkTarget, Transience,
 };
 use crate::storage::SourceDescriptor;
 use crate::storage::listing::{ListRequest, ListingStream};
+
+mod purge;
+pub use purge::PurgeOutcome;
 
 /// Creates a link itself; the target is stored verbatim, never traversed during creation.
 /// Parents must exist. Ownership and times may be sent with creation in one protocol operation.
@@ -126,6 +130,22 @@ pub trait Namespace: Send + Sync {
     /// nothing is deleted.
     async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
         Err(unsupported(path, Operation::Namespace, NO_MUTATIONS))
+    }
+
+    /// Permanently removes the observed entry after rechecking its source identity. Filesystem
+    /// directories must be empty; object stores override this to remove all versions and markers
+    /// of the exact key, retaining the latest record until the other records have been removed.
+    ///
+    /// The caller authorizes deletion only after its own publication, verification and external
+    /// commits succeed. It must exclude concurrent writers: protocols do not universally offer
+    /// atomic compare-and-unlink. A failure may follow partial historical cleanup; re-observe
+    /// before retrying. Missing entries are idempotent. This never recursively deletes children.
+    async fn purge_observed(
+        &self,
+        entry: &ObservedEntry,
+        cancel: CancellationToken,
+    ) -> Result<PurgeOutcome, StorageRoleFailure> {
+        purge::current(self, entry, &cancel).await
     }
 
     /// Deletes listed non-directory entries. Results correspond one-for-one, in input order;

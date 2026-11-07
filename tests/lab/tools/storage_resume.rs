@@ -9,7 +9,8 @@ use clap::{Parser, ValueEnum};
 use data_mover::model::{FailureClass, StoragePath};
 use data_mover::storage::{Storage, StorageRoleFailure};
 use data_mover::transfer::{
-    SourceQosGroup, SourceQosPolicy, TransferFailure, TransferRequest, move_file, transfer,
+    ReadBackVerification, SourceQosGroup, SourceQosPolicy, TransferFailure, TransferRequest,
+    transfer,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -157,25 +158,35 @@ async fn resume(
     state: &mut ResumeState,
 ) -> Result {
     validate_prior_state(args.prior_state_file.as_deref(), state)?;
-    let outcome = if args.delete_source {
-        move_file(request).await?
+    if args.delete_source && source.identity() == destination.identity() {
+        return Err("source deletion requires distinct storage roots".into());
+    }
+    let source_to_remove = if args.delete_source {
+        Some(copy_support::observe(source, path).await?)
     } else {
-        transfer(request).await?
+        None
     };
+    let outcome = transfer(if args.delete_source {
+        request.with_read_back_verification(ReadBackVerification::Enabled)
+    } else {
+        request
+    })
+    .await?;
     if outcome.reused_bytes == 0 || outcome.reused_bytes >= state.size {
         return Err(format!(
             "resume did not reuse a partial transfer from the destination: reused={} size={} prepare={:?}",
             outcome.reused_bytes, state.size, outcome.prepare,
         ).into());
     }
-    let verified = if args.delete_source {
-        // The move verified content and metadata before deleting its bound source.
-        outcome.transferred_bytes
-    } else {
-        copy_support::verify(source, destination, path).await?
-    };
+    let verified = copy_support::verify(source, destination, path).await?;
     if verified != state.size {
         return Err("resumed verification size mismatch".into());
+    }
+    if let Some(entry) = source_to_remove {
+        source
+            .namespace()?
+            .purge_observed(&entry, CancellationToken::new())
+            .await?;
     }
     state.reused_bytes = Some(outcome.reused_bytes);
     state.source_streamed_bytes = outcome.source_qos.client_streamed_shaped_bytes;

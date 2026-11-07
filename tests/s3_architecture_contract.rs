@@ -13,6 +13,9 @@ use data_mover::transfer::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "s3_architecture_contract/source_purge.rs"]
+mod source_purge;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const PART_SIZE: usize = 8 * 1024 * 1024;
 /// Over the 64 MiB automatic interval: only such a checkpointed object keeps a resume pointer

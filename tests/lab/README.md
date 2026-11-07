@@ -14,6 +14,16 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
+
+`python3 tests/lab/run-source-purge-local.py` runs the exact-version source-purge contract in
+an isolated local RustFS container, using a cached image (override `SOURCE_PURGE_S3_IMAGE`),
+`docker`, `nsenter`, `boto3`, and cached Rust dependencies. It creates only its own bucket and
+container, injects failures through a process-local proxy without changing firewall rules,
+independently inspects remaining versions, and removes its container and volumes on exit.
+Cases cover normal permanent deletion, read-only refusal, disconnect, silent timeout, in-flight
+cancellation, a recovered disconnect and a lost deletion response followed by an exact-ID retry.
+This is a storage-role contract; task-level ClickHouse/callback and other backends use their
+separate integration gates.
 The runner must resolve the canonical Kerberos HDFS hostnames to their lab
 management/data addresses. `health-check.sh` verifies the NameNode and both
 DataNode mappings (plus the second NameNode when HA is configured) before any

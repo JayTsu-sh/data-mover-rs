@@ -2,6 +2,9 @@
 //! directory blocks and the generic traversal all run against a real filesystem, with no external
 //! dependency.
 
+#[path = "local_namespace_contract/purge.rs"]
+mod purge;
+
 use std::num::NonZeroUsize;
 use std::path::Path;
 

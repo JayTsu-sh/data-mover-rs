@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -79,6 +80,8 @@ pub struct MemoryS3State {
     /// Deleting this key — by version or not — fails with this failure (every time, until
     /// cleared), deleting nothing.
     pub delete_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
+    /// 受控模拟服务端确认删除但列表始终不推进；永久清理必须保留当前记录并报错。
+    pub ignore_version_deletes: AtomicBool,
     pub copy_commits_then_fails: Mutex<bool>,
     pub native_copies: Mutex<u64>,
     pub native_failure: Mutex<Option<S3ProtocolFailure>>,
@@ -766,6 +769,9 @@ impl S3Protocol for MemoryS3 {
     }
     async fn delete_version(&self, key: &str, version_id: &str) -> S3Result<()> {
         self.injected_delete_failure(key).await?;
+        if self.ignore_version_deletes.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         self.delete_one_version(key, version_id).await
     }
     async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>> {

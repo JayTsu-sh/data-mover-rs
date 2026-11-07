@@ -266,7 +266,7 @@ fn history_descriptor(
 
 /// One listed version or delete marker, with the identity that names exactly it: the one a
 /// `describe_version` of it gives (`VersionScoped(id)`, `PathScoped(path, ETag)` for `"null"`).
-fn record(
+pub(super) fn record(
     backend: &BackendIdentity,
     path: &StoragePath,
     entry: S3ListedVersion,

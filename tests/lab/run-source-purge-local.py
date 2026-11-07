@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Run exact-version source purge and controlled faults against an isolated RustFS container.
+
+Requires cached rustfs/rustfs image, docker, nsenter, boto3 and the Rust dependencies.
+Uses the container network namespace so host firewall/NAT rules need no changes.
+"""
+
+import http.client
+import http.server
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import uuid
+
+import boto3
+from botocore.config import Config
+
+
+def docker(*args):
+    return subprocess.check_output(["docker", *args], text=True).strip()
+
+
+def isolated_run():
+    name = f"dm-nightly-source-purge-{uuid.uuid4().hex[:12]}"
+    image = os.environ.get("SOURCE_PURGE_S3_IMAGE", "rustfs/rustfs:latest")
+    container = docker(
+        "run", "-d", "--name", name, "--network", "none", "--memory=768m", "--cpus=1",
+        "--tmpfs", "/data:rw,size=128m,mode=1777", "--label", "codex.task=source-purge-test",
+        "-e", "RUSTFS_ADDRESS=0.0.0.0:9000", "-e", "RUSTFS_ACCESS_KEY=purge-test",
+        "-e", "RUSTFS_SECRET_KEY=purge-test-isolated-only", image, "/data",
+    )
+    try:
+        print(f"isolated source-purge image={docker('inspect', container, '--format', '{{.Image}}')}", flush=True)
+        pid = docker("inspect", container, "--format", "{{.State.Pid}}")
+        subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside"], check=True)
+    finally:
+        docker("rm", "-f", "-v", container)
+
+
+def inside_run():
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for attempt in range(60):
+        try:
+            with opener.open("http://127.0.0.1:9000/health/ready", timeout=1) as response:
+                if response.status == 200:
+                    break
+        except OSError:
+            pass
+        time.sleep(0.25)
+    else:
+        raise RuntimeError("isolated RustFS readiness timed out")
+    client = boto3.client(
+        "s3", endpoint_url="http://127.0.0.1:9000", aws_access_key_id="purge-test",
+        aws_secret_access_key="purge-test-isolated-only", region_name="us-east-1",
+        config=Config(s3={"addressing_style": "path"}, proxies={}, connect_timeout=2, read_timeout=3),
+    )
+    bucket = f"source-purge-{uuid.uuid4().hex[:12]}"
+    client.create_bucket(Bucket=bucket)
+    client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    stopped = threading.Event()
+    with tempfile.TemporaryDirectory(prefix="source-purge-") as directory:
+        control = Path(directory) / "fault"
+        control.write_text("normal")
+
+        class Proxy(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def handle_request(self):
+                mode = control.read_text().strip()
+                deleting = self.command == "DELETE" and "versionId=" in self.path
+                if deleting and mode == "readonly":
+                    body = b"<Error><Code>AccessDenied</Code><Message>injected read-only source</Message></Error>"
+                    self.send_response(403)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if deleting and mode in ("disconnect", "stall", "cancel", "flash"):
+                    if mode == "flash":
+                        control.write_text("normal")
+                    if mode != "disconnect":
+                        if mode != "flash":
+                            stopped.wait(30)
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    return
+                upstream = http.client.HTTPConnection("127.0.0.1", 9000, timeout=5)
+                try:
+                    body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                    upstream.request(self.command, self.path, body=body, headers=dict(self.headers))
+                    response = upstream.getresponse()
+                    payload = response.read()
+                    if deleting and mode == "lost_ack":
+                        control.write_text("normal")
+                        self.close_connection = True
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        return
+                    self.send_response(response.status)
+                    for key, value in response.getheaders():
+                        if key.lower() not in ("connection", "transfer-encoding", "content-length"):
+                            self.send_header(key, value)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                finally:
+                    upstream.close()
+
+            do_GET = do_HEAD = do_DELETE = handle_request
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            for mode in ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "lost_ack"):
+                prefix = f"nightly-local-{mode}"
+                for _ in range(3):
+                    client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
+                client.put_object(Bucket=bucket, Key=f"{prefix}/sentinel", Body=b"retain")
+                environment = dict(os.environ, S3_CONNECT_TIMEOUT="1", S3_OPERATION_TIMEOUT="2", S3_READ_TIMEOUT="1")
+                environment.update(
+                    LAB_S3_PURGE_URL=f"s3://purge-test:purge-test-isolated-only@{bucket}.127.0.0.1:{server.server_port}/{prefix}",
+                    LAB_S3_PURGE_KEY="payload", LAB_S3_PURGE_FAULT=mode, LAB_S3_PURGE_CONTROL=str(control),
+                )
+                subprocess.run([
+                    "cargo", "test", "--offline", "--locked", "--test", "s3_architecture_contract",
+                    "source_purge::permanent_source_purge_with_real_requests", "--", "--ignored", "--exact", "--nocapture",
+                ], env=environment, check=True)
+                remaining = client.list_object_versions(Bucket=bucket, Prefix=f"{prefix}/")
+                records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
+                payload_records = [record for record in records if record["Key"] == f"{prefix}/payload"]
+                assert len(payload_records) == (0 if mode in ("normal", "flash", "lost_ack") else 3), (mode, payload_records)
+                assert any(record["Key"] == f"{prefix}/sentinel" for record in records)
+                print(f"independent S3 inspection fault={mode} source_records={len(payload_records)} sentinel=retained", flush=True)
+        finally:
+            control.write_text("normal")
+            stopped.set()
+            server.shutdown()
+            server.server_close()
+
+
+if __name__ == "__main__":
+    if "--inside" in sys.argv:
+        inside_run()
+    else:
+        isolated_run()

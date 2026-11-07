@@ -5,8 +5,6 @@ mod engine;
 pub(crate) use engine::validate_observation;
 mod identity;
 mod model;
-mod move_file;
-pub use move_file::{MoveError, MoveFailure, move_file};
 
 pub use crate::model::SourceVersion;
 pub use crate::storage::{

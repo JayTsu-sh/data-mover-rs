@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use super::current::produce_current;
 use super::histories::produce_histories;
@@ -16,14 +17,16 @@ use super::source::role_failure;
 use super::traversal_listing::produce as produce_traversal;
 use super::{S3Protocol, S3ProtocolFailure};
 use crate::model::{
-    BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath, SymlinkTarget,
-    Transience,
+    BackendIdentity, EntryOperationFailure, FailureClass, ObservedEntry, Operation, StoragePath,
+    SymlinkTarget, Transience,
 };
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::{
-    ListRequest, ListingStream, NameSemantics, Namespace, NamespaceCapabilities, SourceDescriptor,
-    StorageRoleFailure,
+    ListRequest, ListingStream, NameSemantics, Namespace, NamespaceCapabilities, PurgeOutcome,
+    SourceDescriptor, StorageRoleFailure,
 };
+
+mod purge;
 
 const NO_DIRECTORIES: &str = "S3 prefixes are virtual; creating a directory is unsupported";
 
@@ -204,6 +207,14 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
             }
             Err(e) => Err(role_failure(path, Operation::Namespace, e)),
         }
+    }
+
+    async fn purge_observed(
+        &self,
+        entry: &ObservedEntry,
+        cancel: CancellationToken,
+    ) -> Result<PurgeOutcome, StorageRoleFailure> {
+        self.purge_entry(entry, &cancel).await
     }
 
     async fn cleanup_transfer_artifacts(

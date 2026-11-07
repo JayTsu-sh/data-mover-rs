@@ -82,7 +82,7 @@ pub use roles::{
     ByteStream, CaseSensitivity, CheckpointObservation, CreateSymlinkRequest, DeleteMarkerOutcome,
     FinalDestination, Metadata, MetadataMutation, NameNormalization, NameSemantics, Namespace,
     NamespaceCapabilities, PositionedByteStream, PositionedChunk, PrepareRequest, PreparedStage,
-    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
+    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest, PurgeOutcome,
     ReadBackMethod, ReadRequest, ReadSource, StagedDestination, StagedMetadataApplicationFailure,
     StorageRoleFailure, UnpinnedReadReason, UploadDigest, UploadDigestGap, VerificationEvidence,
     VerificationPoint, VerifyRequest, WriteEvidence,

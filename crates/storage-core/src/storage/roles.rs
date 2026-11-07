@@ -19,7 +19,7 @@ mod version;
 pub use metadata::{Metadata, MetadataMutation};
 pub use namespace::{
     CaseSensitivity, CreateSymlinkRequest, NameNormalization, NameSemantics, Namespace,
-    NamespaceCapabilities,
+    NamespaceCapabilities, PurgeOutcome,
 };
 pub use stage::DeferredCheckpoint;
 pub use stage::PreparedStage;
