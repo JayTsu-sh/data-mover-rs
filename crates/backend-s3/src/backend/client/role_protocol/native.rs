@@ -292,7 +292,7 @@ pub(super) mod tests {
             S3ProtocolFailure::entry(
                 crate::model::FailureClass::Conflict,
                 crate::model::Transience::Permanent,
-                "copy",
+                "copy (HTTP=416, code=InvalidRange)",
             )
         );
     }

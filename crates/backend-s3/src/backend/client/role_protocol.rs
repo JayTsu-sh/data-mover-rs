@@ -617,7 +617,7 @@ pub(super) fn s3_role_remote_failure(
     diagnostic: &'static str,
 ) -> crate::storage::backends::s3::S3ProtocolFailure {
     use crate::model::{FailureClass, Transience};
-    match (status, code) {
+    let failure = match (status, code) {
         (Some(401), _) | (_, Some("InvalidAccessKeyId" | "SignatureDoesNotMatch")) => {
             crate::storage::backends::s3::S3ProtocolFailure::session(
                 FailureClass::Authentication,
@@ -691,7 +691,32 @@ pub(super) fn s3_role_remote_failure(
             Transience::Unknown,
             diagnostic,
         ),
-    }
+    };
+    with_response_diagnostic(failure, status, code)
+}
+
+// 仅保留状态码和有界错误码；SDK 的完整错误可能包含请求 URL、头或凭据。
+fn with_response_diagnostic(
+    mut failure: S3ProtocolFailure,
+    status: Option<u16>,
+    code: Option<&str>,
+) -> S3ProtocolFailure {
+    let diagnostic = match &mut failure {
+        S3ProtocolFailure::Entry { diagnostic, .. }
+        | S3ProtocolFailure::Session { diagnostic, .. } => diagnostic,
+    };
+    let code = code
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 128
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+        .unwrap_or("unknown");
+    let status = status.map_or_else(|| "unknown".to_owned(), |status| status.to_string());
+    *diagnostic = format!("{diagnostic} (HTTP={status}, code={code})");
+    failure
 }
 
 /// Error codes S3 and S3-compatible stores (and the AWS SDK's own throttling list) use to ask for
@@ -721,6 +746,42 @@ fn throttled(diagnostic: &'static str) -> S3ProtocolFailure {
 mod tests {
     use super::*;
     use crate::storage::backends::s3::S3ProtocolFailure;
+
+    #[test]
+    fn remote_diagnostics_keep_status_and_bounded_provider_code_without_raw_sdk_context() {
+        for (status, code, expected) in [
+            (403, "AccessDenied", FailureClass::PermissionDenied),
+            (500, "InternalError", FailureClass::Protocol),
+        ] {
+            let failure =
+                s3_role_remote_failure(Some(status), Some(code), "specific request failed");
+            let (class, diagnostic) = match failure {
+                S3ProtocolFailure::Entry {
+                    class, diagnostic, ..
+                }
+                | S3ProtocolFailure::Session {
+                    class, diagnostic, ..
+                } => (class, diagnostic),
+            };
+            assert_eq!(class, expected);
+            assert!(diagnostic.contains("specific request failed"));
+            assert!(diagnostic.contains(&format!("HTTP={status}")));
+            assert!(diagnostic.contains(&format!("code={code}")));
+        }
+        for code in [
+            "s3://user:secret@host".to_owned(),
+            "secret\nheader".to_owned(),
+            "A".repeat(129),
+        ] {
+            let failure = s3_role_remote_failure(Some(403), Some(&code), "request failed");
+            let diagnostic = match failure {
+                S3ProtocolFailure::Entry { diagnostic, .. }
+                | S3ProtocolFailure::Session { diagnostic, .. } => diagnostic,
+            };
+            assert!(!diagnostic.contains(&code));
+            assert!(diagnostic.ends_with("(HTTP=403, code=unknown)"));
+        }
+    }
 
     /// A request that named a version: 405 is a delete marker and 400 `InvalidArgument` a
     /// malformed version id, both about this one entry. A 400 without that code (an expired token,
@@ -804,17 +865,29 @@ mod tests {
     #[test]
     fn not_implemented_is_a_permanent_unsupported() {
         use crate::model::{FailureClass, Transience};
-        for (status, code) in [
-            (Some(501), Some("NotImplemented")),
-            (Some(501), None),
-            (Some(400), Some("NotImplemented")),
+        for (status, code, expected) in [
+            (
+                Some(501),
+                Some("NotImplemented"),
+                "create multipart upload (HTTP=501, code=NotImplemented)",
+            ),
+            (
+                Some(501),
+                None,
+                "create multipart upload (HTTP=501, code=unknown)",
+            ),
+            (
+                Some(400),
+                Some("NotImplemented"),
+                "create multipart upload (HTTP=400, code=NotImplemented)",
+            ),
         ] {
             assert_eq!(
                 s3_role_remote_failure(status, code, "create multipart upload"),
                 S3ProtocolFailure::entry(
                     FailureClass::Unsupported,
                     Transience::Permanent,
-                    "create multipart upload"
+                    expected
                 ),
                 "{status:?} {code:?}"
             );
@@ -844,7 +917,7 @@ mod tests {
                 S3ProtocolFailure::entry(
                     FailureClass::NotFound,
                     Transience::Permanent,
-                    "list parts"
+                    format!("list parts (HTTP=404, code={code})")
                 ),
                 "{code}"
             );
