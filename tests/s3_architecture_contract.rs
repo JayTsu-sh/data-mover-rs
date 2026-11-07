@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 mod direct_native;
 #[path = "s3_architecture_contract/namespace_read.rs"]
 mod namespace_read;
+#[path = "s3_architecture_contract/source_observation.rs"]
+mod source_observation;
 #[path = "s3_architecture_contract/source_purge.rs"]
 mod source_purge;
 #[path = "s3_architecture_contract/version_metadata.rs"]

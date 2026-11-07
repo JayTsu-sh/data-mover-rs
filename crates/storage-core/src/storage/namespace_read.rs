@@ -1,13 +1,19 @@
 //! 有界、只读的路径确认；调用方决定是否据此修改任何存储。
 
-use std::{future::Future, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-use super::{CapabilityUnavailable, SourceDescriptor, Storage, StorageRoleFailure};
-use crate::model::{FailureClass, StoragePath, Transience};
+use super::{
+    CapabilityUnavailable, EntryObservationFailure, SourceDescriptor, Storage, StorageRoleFailure,
+    observe_descriptor,
+};
+use crate::model::{
+    FailureClass, MetadataFamily, MetadataObservation, MetadataObservationFailure, ObservationMode,
+    ObservationPlan, ObservedEntry, StoragePath, Transience,
+};
 
 /// 单次检测与识别故障后的恢复分别计时；不隐式采用扫描策略。
 #[derive(Clone, Copy, Debug)]
@@ -23,22 +29,26 @@ pub enum NamespaceReadCause {
     Role(#[from] StorageRoleFailure),
     #[error("namespace stat response deadline elapsed")]
     Timeout,
+    #[error("source observation failed: {0}; {diagnostic}", diagnostic = observation_diagnostic(.0))]
+    Observation(Arc<EntryObservationFailure>),
+    #[error("required source metadata was not observed: {0:?}")]
+    MissingMetadata(Vec<MetadataObservationFailure>),
+    #[error("source observation response deadline elapsed")]
+    ObservationTimeout,
 }
 
 #[derive(Debug, Error)]
 pub enum NamespaceReadFailure {
-    #[error("namespace read requires positive operation timeout and retry interval")]
+    #[error("source read requires positive operation timeout and retry interval")]
     InvalidPolicy,
     #[error(transparent)]
     Capability(#[from] CapabilityUnavailable),
-    #[error("namespace stat cancelled at {path}; last failure: {last:?}")]
+    #[error("source read cancelled at {path}; last failure: {last:?}")]
     Cancelled {
         path: StoragePath,
         last: Option<Box<NamespaceReadCause>>,
     },
-    #[error(
-        "namespace stat failed at {path} after {attempts} attempts: first={first}; last={last}"
-    )]
+    #[error("source read failed at {path} after {attempts} attempts: first={first}; last={last}")]
     Operation {
         path: StoragePath,
         attempts: u32,
@@ -52,6 +62,13 @@ pub enum NamespaceReadFailure {
 #[derive(Debug)]
 pub struct NamespaceReadOutcome {
     pub descriptor: Option<SourceDescriptor>,
+    pub attempts: u32,
+}
+
+/// 当前路径与显式请求属性的一次只读观察；None 仅来自初始 stat 的准确 `NotFound`。
+#[derive(Debug)]
+pub struct SourceObservationReadOutcome {
+    pub entry: Option<ObservedEntry>,
     pub attempts: u32,
 }
 
@@ -71,19 +88,121 @@ pub async fn read_namespace_entry(
         return Err(NamespaceReadFailure::InvalidPolicy);
     }
     let namespace = storage.namespace()?;
-    let (descriptor, attempts) = read_recovered(path, policy, cancel, || async {
-        match namespace.stat(path).await {
-            Ok(descriptor) => Ok(Some(descriptor)),
-            Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
-                Ok(None)
+    let (descriptor, attempts) = read_recovered(
+        path,
+        policy,
+        cancel,
+        || async {
+            match namespace.stat(path).await {
+                Ok(descriptor) => Ok(Some(descriptor)),
+                Err(StorageRoleFailure::Entry(error))
+                    if error.class() == FailureClass::NotFound =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(NamespaceReadCause::Role(error)),
             }
-            Err(error) => Err(NamespaceReadCause::Role(error)),
-        }
-    })
+        },
+        NamespaceReadCause::Timeout,
+    )
     .await?;
     Ok(NamespaceReadOutcome {
         descriptor,
         attempts,
+    })
+}
+
+/// 在同一检测／恢复窗口内捕获当前路径及所需属性；不读文件数据，不枚举历史。
+/// Required 属性缺失或失败不会变成成功观察，BestEffort 仍保留失败事实。
+/// 只有 stat 的 `NotFound` 返回 None；后续属性或链接读取的 `NotFound` 明确失败。
+/// 不发出写入或后台任务；调用方自行决定是否以及如何授权源清理。
+///
+/// # Errors
+/// 首末原因、超时及取消保持有类型，权限／认证等明确错误不重试；恢复不重置整个窗口。
+pub async fn read_source_observation(
+    storage: &Storage,
+    path: &StoragePath,
+    plan: ObservationPlan,
+    policy: NamespaceReadPolicy,
+    cancel: &CancellationToken,
+) -> Result<SourceObservationReadOutcome, NamespaceReadFailure> {
+    if policy.operation_timeout.is_zero() || policy.retry_interval.is_zero() {
+        return Err(NamespaceReadFailure::InvalidPolicy);
+    }
+    storage.namespace()?;
+    let (entry, attempts) = read_recovered(
+        path,
+        policy,
+        cancel,
+        || observe_current(storage, path, plan),
+        NamespaceReadCause::ObservationTimeout,
+    )
+    .await?;
+    Ok(SourceObservationReadOutcome { entry, attempts })
+}
+
+async fn observe_current(
+    storage: &Storage,
+    path: &StoragePath,
+    plan: ObservationPlan,
+) -> Result<Option<ObservedEntry>, NamespaceReadCause> {
+    let namespace = storage
+        .namespace()
+        .map_err(|error| NamespaceReadCause::Observation(Arc::new(error.into())))?;
+    let descriptor = match namespace.stat(path).await {
+        Ok(descriptor) => descriptor,
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(NamespaceReadCause::Role(error)),
+    };
+    let entry = observe_descriptor(storage, descriptor, plan)
+        .await
+        .map_err(|error| NamespaceReadCause::Observation(Arc::new(error)))?;
+    let facts = entry.metadata();
+    let failures: Vec<_> = [
+        required_failure(facts.acl(), MetadataFamily::Acl, plan.acl()),
+        required_failure(facts.xattrs(), MetadataFamily::Xattrs, plan.xattrs()),
+        required_failure(facts.tags(), MetadataFamily::Tags, plan.tags()),
+        required_failure(
+            facts.ownership_mode(),
+            MetadataFamily::OwnershipMode,
+            plan.ownership_mode(),
+        ),
+        required_failure(
+            facts.timestamps(),
+            MetadataFamily::Timestamps,
+            plan.timestamps(),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if failures.is_empty() {
+        Ok(Some(entry))
+    } else {
+        Err(NamespaceReadCause::MissingMetadata(failures))
+    }
+}
+
+fn required_failure<T>(
+    fact: &MetadataObservation<T>,
+    family: MetadataFamily,
+    mode: ObservationMode,
+) -> Option<MetadataObservationFailure> {
+    if mode != ObservationMode::Required {
+        return None;
+    }
+    let (class, transience) = match fact {
+        MetadataObservation::Failed { class, transience } => (*class, *transience),
+        MetadataObservation::Unsupported => (FailureClass::Unsupported, Transience::Permanent),
+        MetadataObservation::NotRequested => (FailureClass::InvalidInput, Transience::Permanent),
+        _ => return None,
+    };
+    Some(MetadataObservationFailure {
+        family,
+        class,
+        transience,
     })
 }
 
@@ -92,6 +211,7 @@ async fn read_recovered<T, F, Fut>(
     policy: NamespaceReadPolicy,
     cancel: &CancellationToken,
     mut operation: F,
+    timeout_cause: NamespaceReadCause,
 ) -> Result<(T, u32), NamespaceReadFailure>
 where
     F: FnMut() -> Fut,
@@ -112,13 +232,16 @@ where
         let cause = match result {
             Ok(Ok(value)) => return Ok(recovery.success(value)),
             Ok(Err(cause)) => cause,
-            Err(_) => NamespaceReadCause::Timeout,
+            Err(_) => timeout_cause.clone(),
         };
         recovery.record(path, cause, policy.recovery_window);
         recovery.wait(path, policy.retry_interval, cancel).await?;
     }
 }
 
+#[cfg(test)]
+#[path = "source_observation_read_tests.rs"]
+mod source_observation_tests;
 #[cfg(test)]
 #[path = "namespace_read_tests.rs"]
 mod tests;
@@ -142,13 +265,13 @@ impl ReadRecovery {
             self.until = Some(Instant::now() + window);
             self.first = Some(cause.clone());
         }
-        tracing::warn!(path = %path, attempt = self.attempts, cause = %cause, "namespace stat attempt failed");
+        tracing::warn!(path = %path, attempt = self.attempts, cause = %cause, "source read attempt failed");
         self.last = Some(cause);
     }
 
     fn success<T>(&self, value: T) -> (T, u32) {
         if self.attempts > 1 {
-            tracing::info!(attempts = self.attempts, "namespace stat recovered");
+            tracing::info!(attempts = self.attempts, "source read recovered");
         }
         (value, self.attempts)
     }
@@ -195,15 +318,31 @@ impl ReadRecovery {
 }
 
 fn retryable(cause: &NamespaceReadCause) -> bool {
-    let (class, transience) = match cause {
-        NamespaceReadCause::Timeout => return true,
-        NamespaceReadCause::Role(StorageRoleFailure::Entry(error)) => {
-            (error.class(), error.transience())
+    match cause {
+        NamespaceReadCause::Timeout | NamespaceReadCause::ObservationTimeout => true,
+        NamespaceReadCause::Role(error) => role_retryable(error),
+        NamespaceReadCause::Observation(error) => match error.as_ref() {
+            EntryObservationFailure::Role(error) => role_retryable(error),
+            _ => false,
+        },
+        NamespaceReadCause::MissingMetadata(failures) => {
+            !failures.is_empty()
+                && failures
+                    .iter()
+                    .all(|failure| transient_read(failure.class, failure.transience))
         }
-        NamespaceReadCause::Role(StorageRoleFailure::Session(error)) => {
-            (error.class(), error.transience())
-        }
+    }
+}
+
+fn role_retryable(error: &StorageRoleFailure) -> bool {
+    let (class, transience) = match error {
+        StorageRoleFailure::Entry(error) => (error.class(), error.transience()),
+        StorageRoleFailure::Session(error) => (error.class(), error.transience()),
     };
+    transient_read(class, transience)
+}
+
+fn transient_read(class: FailureClass, transience: Transience) -> bool {
     transience != Transience::Permanent
         && matches!(
             class,
@@ -215,5 +354,12 @@ fn role_diagnostic(error: &StorageRoleFailure) -> &str {
     match error {
         StorageRoleFailure::Entry(error) => error.diagnostic(),
         StorageRoleFailure::Session(error) => error.diagnostic(),
+    }
+}
+
+fn observation_diagnostic(error: &EntryObservationFailure) -> &str {
+    match error {
+        EntryObservationFailure::Role(error) => role_diagnostic(error),
+        _ => "source observation could not be captured",
     }
 }

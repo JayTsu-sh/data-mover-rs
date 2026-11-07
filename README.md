@@ -174,6 +174,19 @@ IDs are different. Missing mappings must not be repaired by silently publishing 
 data over the current object. Metadata writes remain fallible and can have an unknown
 result after timeout/cancellation; retry only the same explicit version and mutation.
 
+### Bounded current-source observations
+
+`storage::read_source_observation` captures the current namespace descriptor and an
+explicit `ObservationPlan` under one caller-selected `NamespaceReadPolicy` and
+cancellation token. Detection deadlines and the first-failure recovery window
+cover stat, required attributes and link observation together; each retry observes
+the current path again. Only the initial stat's typed NotFound returns `entry=None`.
+An attribute/link NotFound stays an error, and unobserved Required attributes fail
+with their family and typed reason. BestEffort still returns readable entry facts
+with failed observations. Recovered failures are logged; no data read, write or
+background task is added. This is a current-path observation, not an atomic
+snapshot, historical inventory or authorization to remove a source.
+
 ### Publication durability
 
 `TransferRequest` and `ExpertDestinationRequest` accept

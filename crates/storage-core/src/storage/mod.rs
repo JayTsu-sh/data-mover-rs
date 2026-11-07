@@ -30,7 +30,7 @@ mod native;
 mod observation;
 pub use namespace_read::{
     NamespaceReadCause, NamespaceReadFailure, NamespaceReadOutcome, NamespaceReadPolicy,
-    read_namespace_entry,
+    SourceObservationReadOutcome, read_namespace_entry, read_source_observation,
 };
 mod permissions;
 mod read_range;

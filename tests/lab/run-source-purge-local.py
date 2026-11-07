@@ -38,7 +38,7 @@ def isolated_run():
     try:
         print(f"isolated source-purge image={docker('inspect', container, '--format', '{{.Image}}')}", flush=True)
         pid = docker("inspect", container, "--format", "{{.State.Pid}}")
-        arguments = ["--namespace-read"] if "--namespace-read" in sys.argv else []
+        arguments = [flag for flag in ("--namespace-read", "--source-observation") if flag in sys.argv]
         subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *arguments], check=True)
     finally:
         docker("rm", "-f", "-v", container)
@@ -65,7 +65,10 @@ def inside_run():
     client.create_bucket(Bucket=bucket)
     client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     stopped = threading.Event()
-    reading = "--namespace-read" in sys.argv
+    observing = "--source-observation" in sys.argv
+    reading = "--namespace-read" in sys.argv or observing
+    alternating = [0]
+    requests = {"data_get": 0, "writes": 0}
     with tempfile.TemporaryDirectory(prefix="source-purge-") as directory:
         control = Path(directory) / "fault"
         control.write_text("normal")
@@ -77,8 +80,29 @@ def inside_run():
             def handle_request(self):
                 mode = control.read_text().strip()
                 deleting = self.command == "DELETE" and "versionId=" in self.path
-                probing = reading and self.command == "HEAD" and self.path.endswith("/payload")
+                payload = self.path.partition("?")[0].endswith("/payload")
+                tagging = self.command == "GET" and "tagging" in self.path
+                probing = reading and payload and (tagging if observing else self.command == "HEAD")
                 affected = deleting or probing
+                if observing:
+                    if self.command == "GET" and payload and not tagging:
+                        requests["data_get"] += 1
+                    if self.command in ("PUT", "POST", "DELETE"):
+                        requests["writes"] += 1
+                if observing and payload and mode == "alternate":
+                    if self.command == "HEAD":
+                        alternating[0] += 1
+                    if tagging or (self.command == "HEAD" and alternating[0] % 2):
+                        self.close_connection = True
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        return
+                if affected and mode == "missing_metadata":
+                    body = b"<Error><Code>NoSuchKey</Code><Message>injected attribute read missing</Message></Error>"
+                    self.send_response(404)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if affected and mode == "readonly":
                     body = b"<Error><Code>AccessDenied</Code><Message>injected read-only source</Message></Error>"
                     self.send_response(403)
@@ -116,13 +140,13 @@ def inside_run():
                 finally:
                     upstream.close()
 
-            do_GET = do_HEAD = do_DELETE = handle_request
+            do_GET = do_HEAD = do_DELETE = do_PUT = do_POST = handle_request
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
         server.daemon_threads = True
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
-            modes = ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "recover_stall") if reading else ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "lost_ack")
+            modes = ("normal", "readonly", "missing_metadata", "disconnect", "stall", "cancel", "flash", "recover_stall", "alternate") if observing else (("normal", "readonly", "disconnect", "stall", "cancel", "flash", "recover_stall") if reading else ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "lost_ack"))
             for mode in modes:
                 prefix = f"nightly-local-{mode}"
                 for _ in range(3):
@@ -135,7 +159,7 @@ def inside_run():
                 )
                 subprocess.run([
                     "cargo", "test", "--offline", "--locked", "--test", "s3_architecture_contract",
-                    "namespace_read::bounded_namespace_read_with_real_requests" if reading else "source_purge::permanent_source_purge_with_real_requests", "--", "--ignored", "--exact", "--nocapture",
+                    "source_observation::bounded_source_observation_with_real_requests" if observing else ("namespace_read::bounded_namespace_read_with_real_requests" if reading else "source_purge::permanent_source_purge_with_real_requests"), "--", "--ignored", "--exact", "--nocapture",
                 ], env=environment, check=True)
                 remaining = client.list_object_versions(Bucket=bucket, Prefix=f"{prefix}/")
                 records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
@@ -143,6 +167,9 @@ def inside_run():
                 assert len(payload_records) == (0 if not reading and mode in ("normal", "flash", "lost_ack") else 3), (mode, payload_records)
                 assert any(record["Key"] == f"{prefix}/sentinel" for record in records)
                 print(f"independent S3 inspection fault={mode} source_records={len(payload_records)} sentinel=retained", flush=True)
+            if observing:
+                assert requests == {"data_get": 0, "writes": 0}, requests
+                print("source-observation data_GET=0 writes=0 missing_metadata_is_error=true shared_budget=true", flush=True)
         finally:
             control.write_text("normal")
             stopped.set()

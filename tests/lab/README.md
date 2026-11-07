@@ -67,6 +67,17 @@ Independent S3 inspection requires all three versions and the sentinel to remain
 case. It proves current-path stat semantics only, not absence of historical versions or an
 atomic absence-and-delete transaction. Local/NFS/CIFS/HDFS and task-level target mutation
 protection require their own evidence.
+`python3 tests/lab/run-source-purge-local.py --source-observation` tests the composed
+current-source observation against real S3. Nine modes cover success, denied tag
+reads, metadata NotFound while HEAD still succeeds, disconnect, silent timeout,
+cancellation, recovered disconnect/timeout, and failures alternating between stat
+and observation. One-second detection and a three-second recovery window return
+continuous loss in about three seconds, silent loss in about four seconds, and
+cancellation in about 254 ms. Proxy counters require zero data GETs/writes and
+independent inspection retains three source versions plus the sentinel per case.
+This does not establish NFS/CIFS/HDFS fault behavior, atomic source metadata
+snapshots or task-level source purge readiness.
+
 The runner must resolve the canonical Kerberos HDFS hostnames to their lab
 management/data addresses. `health-check.sh` verifies the NameNode and both
 DataNode mappings (plus the second NameNode when HA is configured) before any
