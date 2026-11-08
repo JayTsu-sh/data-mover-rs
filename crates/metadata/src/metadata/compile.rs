@@ -177,7 +177,7 @@ fn compile_copied_observations(
 
 /// Plans explicit refusal or omission outcomes without observing source data.
 /// 目标完全不能存储时传入 DestinationCannotStore；所有非 Omit 类别记为跳过，
-/// 不读取源端，也不把 RequireExact 转为严格编译失败。
+/// 不读取源端，也不把 `RequireExact` 转为严格编译失败。
 #[must_use]
 pub fn compile_unavailable_plan(policies: MetadataPolicies, reason: RefusalCause) -> MetadataPlan {
     let mut plan = MetadataPlan {

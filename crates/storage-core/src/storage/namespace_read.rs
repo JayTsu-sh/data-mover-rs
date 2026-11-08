@@ -75,7 +75,7 @@ pub enum NamespaceReadOutcome {
 /// 读取当前路径；plan=None 时只执行 stat，不借用元数据角色或读取链接。
 /// 提供计划时在同一检测／恢复窗口内捕获路径和所需属性，不读取文件数据或历史。
 /// Required 属性缺失或失败不会变成成功观察，BestEffort 保留失败事实。
-/// 只有初始 stat 的 NotFound 表示缺失，后续属性或链接读取的 NotFound 明确失败。
+/// 只有初始 stat 的 `NotFound` 表示缺失，后续属性或链接读取的 `NotFound` 明确失败。
 /// 不发出写入或后台任务；调用方自行决定是否授权清理。
 ///
 /// # Errors

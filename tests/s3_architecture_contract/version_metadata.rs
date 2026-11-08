@@ -45,6 +45,8 @@ fn captured_plan(tags: Vec<ObjectTag>) -> TestResult<MetadataPlan> {
 async fn exact_version_metadata_with_real_requests() -> TestResult {
     let storage = connected(&env::var("LAB_VERSION_METADATA_URL")?).await?;
     let version = env::var("LAB_VERSION_METADATA_ID")?;
+    let selected = SourceVersion::Id(version.clone());
+    let metadata = storage.metadata()?;
     let mode = env::var("LAB_VERSION_METADATA_MODE")?;
     let control = env::var("LAB_VERSION_METADATA_CONTROL")?;
     let path = StoragePath::new("payload")?;
@@ -62,12 +64,7 @@ async fn exact_version_metadata_with_real_requests() -> TestResult {
     let start = Instant::now();
     let result = timeout(
         Duration::from_secs(8),
-        plan.apply(
-            storage.metadata()?.as_ref(),
-            &path,
-            &SourceVersion::Id(version.clone()),
-            cancel,
-        ),
+        plan.apply(metadata.as_ref(), &path, &selected, cancel),
     )
     .await;
     let elapsed = start.elapsed();
@@ -95,45 +92,33 @@ async fn exact_version_metadata_with_real_requests() -> TestResult {
         }
         // 精确版本 tags 写入幂等；结果不明后仍只重试同一版本，不重传数据。
         plan.apply(
-            storage.metadata()?.as_ref(),
+            metadata.as_ref(),
             &path,
-            &SourceVersion::Id(version.clone()),
+            &selected,
             CancellationToken::new(),
         )
         .await?;
     }
     let verified = plan
-        .verify_published(
-            &storage,
-            &path,
-            &SourceVersion::Id(version.clone()),
-            None,
-            CancellationToken::new(),
-        )
+        .verify_published(&storage, &path, &selected, None, CancellationToken::new())
         .await?;
     assert_eq!(verified.size, Some(3));
     let empty = captured_plan(Vec::new())?;
     empty
         .apply(
-            storage.metadata()?.as_ref(),
+            metadata.as_ref(),
             &path,
-            &SourceVersion::Id(version.clone()),
+            &selected,
             CancellationToken::new(),
         )
         .await?;
     empty
-        .verify_published(
-            &storage,
-            &path,
-            &SourceVersion::Id(version.clone()),
-            None,
-            CancellationToken::new(),
-        )
+        .verify_published(&storage, &path, &selected, None, CancellationToken::new())
         .await?;
     plan.apply(
-        storage.metadata()?.as_ref(),
+        metadata.as_ref(),
         &path,
-        &SourceVersion::Id(version.clone()),
+        &selected,
         CancellationToken::new(),
     )
     .await?;

@@ -68,7 +68,7 @@ impl Error for MetadataVerificationError {
 impl MetadataPlan {
     /// 核验当前目标或指定历史版本的已捕获元数据计划，返回新描述供调用方核对类型和大小。
     /// Current 且无发布约束时保留 namespace 的目录语义；Id 精确读取历史版本。
-    /// expected_current_version 独立约束当前发布版本，不会被历史版本读取替代。
+    /// `expected_current_version` 独立约束当前发布版本，不会被历史版本读取替代。
     ///
     /// # Errors
     /// 保留不可读属性、版本变化、元数据不一致和取消的有类型错误。
