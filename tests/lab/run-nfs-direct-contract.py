@@ -16,7 +16,7 @@ import subprocess
 import threading
 import urllib.parse
 
-from nfs_fault_rpc import RpcRequests, sequence_rejection
+from nfs_fault_rpc import RpcRequests, sequence_rejection, _attribute_masks, _deny_acl_reply
 
 
 def main():
@@ -24,10 +24,13 @@ def main():
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--url', required=True)
     parser.add_argument('--functional', action='store_true')
-    parser.add_argument('--contract', choices=('direct', 'persistence', 'nonfile', 'purge'), default='direct')
+    parser.add_argument('--contract', choices=('direct', 'persistence', 'nonfile', 'purge', 'metadata-plan'), default='direct')
+    parser.add_argument('--test-name')
     parser.add_argument('--operation-tag', choices=('commit', 'lookup_path', 'remove'))
     args = parser.parse_args()
-    args.operation_tag = args.operation_tag or {'direct': 'commit', 'persistence': 'commit', 'nonfile': 'lookup_path', 'purge': 'remove'}[args.contract]
+    args.operation_tag = args.operation_tag or {'direct': 'commit', 'persistence': 'commit', 'nonfile': 'lookup_path', 'purge': 'remove', 'metadata-plan': 'lookup_path'}[args.contract]
+    if args.contract == 'metadata-plan' and not args.test_name:
+        raise ValueError('metadata-plan requires an explicit prebuilt test name')
     parsed = urllib.parse.urlsplit(args.url)
     allowed = r'/srv/nfs/v[34]:/ci/nightly-nfs-direct-[A-Za-z0-9_-]+' if args.contract == 'purge' else r'/srv/nfs/v4:/ci/nightly-nfs-direct-[A-Za-z0-9_-]+'
     if not re.fullmatch(allowed, parsed.path):
@@ -38,7 +41,7 @@ def main():
     v3 = query.get('version') == ['3']
     if v3 and not query.get('mountport'):
         raise ValueError('v3 purge relay requires the server mountport explicitly')
-    state = {'mode': 'normal', 'armed': None, 'sockets': set(), 'faults': {}, 'operation_hits': {}, 'lost_operation_replies': 0, 'seen_requests': {}, 'session_rejections': 0, 'recovery_exchanges': 0}
+    state = {'mode': 'normal', 'armed': None, 'sockets': set(), 'faults': {}, 'operation_hits': {}, 'lost_operation_replies': 0, 'seen_requests': {}, 'session_rejections': 0, 'recovery_exchanges': 0, 'attribute_requests': 0, 'common_acl_requests': 0, 'explicit_acl_requests': 0, 'acl_denials': 0, 'plan_omit_verified': False}
     triggered = threading.Event()
     guard = threading.Lock()
     stopped = threading.Event()
@@ -68,14 +71,28 @@ def main():
                     requests = RpcRequests()
                     responses = RpcRequests()
                     lost_xid = None
+                    acl_xids = set()
                     while not stopped.is_set():
                         for selected, _ in ready.select(.1):
                             data = selected.fileobj.recv(65536)
                             if not data:
                                 return
-                            records = (requests if selected.fileobj is self.request else responses).feed(data)
-                            for wire, tag, xid, message in records:
+                            records = (requests if selected.fileobj is self.request else responses).feed(data, include_payload=True)
+                            for wire, tag, xid, message, payload in records:
+                                masks = _attribute_masks(payload) if args.contract == 'metadata-plan' and selected.fileobj is self.request else None
                                 with guard:
+                                    if masks is not None:
+                                        state['attribute_requests'] += len(masks)
+                                        for request_tag, _, mask in masks:
+                                            if mask and mask[0] & (1 << 12):
+                                                key = 'explicit_acl_requests' if request_tag == 'getacl' else 'common_acl_requests'
+                                                state[key] += 1
+                                    if args.contract == 'metadata-plan' and selected.fileobj is self.request and tag == 'getacl' and state['mode'] == 'acl_denied':
+                                        acl_xids.add(xid)
+                                    deny_acl = args.contract == 'metadata-plan' and selected.fileobj is upstream and xid in acl_xids
+                                    if deny_acl:
+                                        acl_xids.remove(xid)
+                                        state['acl_denials'] += 1
                                     if selected.fileobj is self.request and tag:
                                         state['seen_requests'][tag] = state['seen_requests'].get(tag, 0) + 1
                                         if tag == 'exchange_id' and state['session_rejections']:
@@ -100,6 +117,9 @@ def main():
                                         state['faults'][mode] = state['faults'].get(mode, 0) + 1
                                     if mode == 'flash' or lose_reply:
                                         state['mode'] = 'normal'
+                                if deny_acl:
+                                    selected.data.sendall(_deny_acl_reply(payload))
+                                    continue
                                 if reject_session:
                                     self.request.sendall(sequence_rejection(xid, tag, 10052))
                                     continue
@@ -134,10 +154,15 @@ def main():
             armed = mode.removeprefix('commit-') if mode.startswith('commit-') else None
             if armed:
                 mode = armed
-            if mode not in ('normal', 'flash', 'disconnect', 'stall', 'cancel', 'lost_ack', 'bad_session'):
+            if mode not in ('normal', 'flash', 'disconnect', 'stall', 'cancel', 'lost_ack', 'bad_session', 'acl_denied'):
                 self.send_error(400)
                 return
             with guard:
+                if args.contract == 'metadata-plan' and mode == 'acl_denied':
+                    if state['common_acl_requests'] or state['explicit_acl_requests']:
+                        self.send_error(409, 'ACL requested during omitted phase')
+                        return
+                    state['plan_omit_verified'] = True
                 previous = state['mode']
                 state['mode'] = 'normal' if armed else mode
                 state['armed'] = armed
@@ -173,25 +198,31 @@ def main():
         if args.functional:
             subprocess.run([str(args.binary), '--ignored', '--exact', 'direct::real_nfs_direct_data_and_metadata_contract',
                             '--nocapture', '--test-threads=1'], check=True, env=env, timeout=100)
-        subprocess.run([str(args.binary), '--ignored', '--exact', {'direct': 'direct::fault::real_nfs_direct_fault_contract', 'persistence': 'direct::persistence::real_nfs_persistence_fault_contract', 'nonfile': 'direct::nonfile::real_nfs_nonfile_persistence_fault_contract', 'purge': 'direct::purge::real_nfs_source_purge_fault_contract'}[args.contract],
+        subprocess.run([str(args.binary), '--ignored', '--exact', args.test_name or {'direct': 'direct::fault::real_nfs_direct_fault_contract', 'persistence': 'direct::persistence::real_nfs_persistence_fault_contract', 'nonfile': 'direct::nonfile::real_nfs_nonfile_persistence_fault_contract', 'purge': 'direct::purge::real_nfs_source_purge_fault_contract'}[args.contract],
                         '--nocapture', '--test-threads=1'], check=True, env=env, timeout=180)
-        expected = [os.environ['LAB_NFS_DIRECT_ONLY']] if os.environ.get('LAB_NFS_DIRECT_ONLY') else ('flash', 'disconnect', 'stall', 'cancel', 'lost_ack')
-        if args.contract == 'purge' and urllib.parse.parse_qs(parsed.query).get('version') != ['3'] and not os.environ.get('LAB_NFS_DIRECT_ONLY'):
-            expected = (*expected, 'bad_session')
-        assert all(state['faults'].get(mode, 0) for mode in expected), state['faults']
-        if args.contract != 'direct':
-            assert all(state['operation_hits'].get(mode, 0) for mode in expected), state['operation_hits']
-            if 'lost_ack' in expected:
-                assert state['lost_operation_replies'] > 0
-            if 'bad_session' in expected:
-                assert state['session_rejections'] == 1 and state['recovery_exchanges'] == 0, state
-                print(f'independent NFS relay session_rejections={state["session_rejections"]} fresh_recovery_exchanges={state["recovery_exchanges"]}', flush=True)
-            if args.operation_tag == 'lookup_path':
-                assert state['seen_requests'].get('commit', 0) == 0, state['seen_requests']
-            print(f'independent NFS relay confirmed_tag={args.operation_tag} commit_requests={state["seen_requests"].get("commit", 0)}', flush=True)
-            print(f'independent NFS relay lost_operation_replies={state["lost_operation_replies"]}', flush=True)
-            print(f'independent NFS relay operation_hits={state["operation_hits"]}', flush=True)
-        print(f'independent NFS relay actual_fault_rpc_records={state["faults"]} scope=owned_connections_only', flush=True)
+        if args.contract == 'metadata-plan':
+            assert state['plan_omit_verified'] and state['attribute_requests'] > 0, state
+            assert state['common_acl_requests'] == 0, state
+            assert state['explicit_acl_requests'] == 3 and state['acl_denials'] == 2, state
+            print(f'independent NFS metadata audit audited_attribute_requests={state["attribute_requests"]} implicit_acl_requests={state["common_acl_requests"]} explicit_acl_requests={state["explicit_acl_requests"]} denied_acl_replies={state["acl_denials"]} omit_phase_no_acl={state["plan_omit_verified"]}', flush=True)
+        else:
+            expected = [os.environ['LAB_NFS_DIRECT_ONLY']] if os.environ.get('LAB_NFS_DIRECT_ONLY') else ('flash', 'disconnect', 'stall', 'cancel', 'lost_ack')
+            if args.contract == 'purge' and urllib.parse.parse_qs(parsed.query).get('version') != ['3'] and not os.environ.get('LAB_NFS_DIRECT_ONLY'):
+                expected = (*expected, 'bad_session')
+            assert all(state['faults'].get(mode, 0) for mode in expected), state['faults']
+            if args.contract != 'direct':
+                assert all(state['operation_hits'].get(mode, 0) for mode in expected), state['operation_hits']
+                if 'lost_ack' in expected:
+                    assert state['lost_operation_replies'] > 0
+                if 'bad_session' in expected:
+                    assert state['session_rejections'] == 1 and state['recovery_exchanges'] == 0, state
+                    print(f'independent NFS relay session_rejections={state["session_rejections"]} fresh_recovery_exchanges={state["recovery_exchanges"]}', flush=True)
+                if args.operation_tag == 'lookup_path':
+                    assert state['seen_requests'].get('commit', 0) == 0, state['seen_requests']
+                print(f'independent NFS relay confirmed_tag={args.operation_tag} commit_requests={state["seen_requests"].get("commit", 0)}', flush=True)
+                print(f'independent NFS relay lost_operation_replies={state["lost_operation_replies"]}', flush=True)
+                print(f'independent NFS relay operation_hits={state["operation_hits"]}', flush=True)
+            print(f'independent NFS relay actual_fault_rpc_records={state["faults"]} scope=owned_connections_only', flush=True)
     finally:
         stopped.set()
         disconnect()

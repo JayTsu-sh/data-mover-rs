@@ -190,6 +190,13 @@ with failed observations. Recovered failures are logged; no data read, write or
 background task is added. This is a current-path observation, not an atomic
 snapshot, historical inventory or authorization to remove a source.
 
+NFS ordinary GETATTR/LOOKUP/READDIR requests exclude ACLs. The metadata role uses
+the existing explicit ACL accessor only when the observation plan asks for ACLs;
+an omitted ACL is not fetched implicitly and is not evidence of absent support.
+This also prevents an unrelated ACL permission refusal from hiding basic file
+attributes. Explicit ACL failures remain observable while payload delivery can
+continue under the caller's existing metadata-failure policy.
+
 NFS common observations retain the SDK's returned-attribute evidence. Omitted
 mode, size or timestamps remain absent, while a present zero mode or epoch time
 remains valid. Requested missing ownership/timestamps become failed metadata

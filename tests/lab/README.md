@@ -864,3 +864,29 @@ source retention; destination readiness must precede the first delete request.
 The role's deadlines above do not establish the application's shared recovery
 budget. NFS has no atomic compare-and-unlink here; concurrent source and ancestor
 mutation must be excluded by the caller.
+
+### Metadata-plan ACL request audit
+
+`--contract metadata-plan --test-name <prebuilt-ignored-test>` reuses the same
+owned-prefix relay for an external application's source-observation contract.
+It audits the actual GETATTR/LOOKUP/READDIR attribute masks, verifies zero ACL
+queries before the `acl_denied` phase, and rewrites two real successful GETACL
+replies into ACCESS while preserving RPC identity, the real SEQUENCE response
+and PUTFH result. The bounded RPC helper's optional payload and mask/reply codecs
+have nine deterministic tests. This adds no storage role or SDK API.
+
+With SDK fdc541c, the real Linux NFSv4.1 application contract audited 118 attribute
+requests: zero implicit ACL requests, three explicit ACL requests, two denied
+replies. Its object-target plan uses S3 capability projection; the real data target
+is NFS. Source metadata failure still delivered the complete target payload and
+returned PublishedDataMetadata with the typed ACL/PermissionDenied cause, retained
+the source and refused source purge. A successful selected ACL survived snapshot
+roundtrip and copying. Independent server reads verified all three source/target
+payloads, completed permission modes and no transfer artifacts.
+
+The same SDK also passed the five v3/six v4.1 source-purge fault regressions,
+including the session-loss guard; original backups and later same-name entries
+were protected, and the metadata-plan fixtures remained intact. Silent detection
+remains about 5/15 seconds, cancellation about 252 ms. These results do not certify
+an actual S3 destination, complete CLI/ClickHouse/callback, server restart,
+v4.0/v4.2/pNFS, power-cut durability or whole-migration throughput/RSS.
