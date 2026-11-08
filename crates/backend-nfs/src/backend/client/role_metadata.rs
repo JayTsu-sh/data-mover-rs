@@ -78,12 +78,13 @@ pub(super) fn metadata_inline(
     NfsMetadataInline {
         file_handle,
         symlink: attrs.type_ == super::FType3::NF3LNK as u32,
-        uid: super::owner_id(&attrs.owner, attrs.uid, owners_are_strings),
-        gid: super::owner_id(&attrs.owner_group, attrs.gid, owners_are_strings),
-        mode: attrs.file_mode,
-        atime: super::time_to_i64(attrs.atime),
-        mtime: super::time_to_i64(attrs.mtime),
-        ctime: super::time_to_i64(attrs.ctime),
+        ownership_available: super::attributes::ownership_available(attrs),
+        uid: super::attributes::uid(attrs, owners_are_strings),
+        gid: super::attributes::gid(attrs, owners_are_strings),
+        mode: super::attributes::present(attrs, 33).then_some(attrs.file_mode),
+        atime: super::attributes::present(attrs, 47).then(|| super::time_to_i64(attrs.atime)),
+        mtime: super::attributes::present(attrs, 53).then(|| super::time_to_i64(attrs.mtime)),
+        ctime: super::attributes::present(attrs, 52).then(|| super::time_to_i64(attrs.ctime)),
     }
 }
 

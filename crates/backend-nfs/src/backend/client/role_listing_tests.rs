@@ -8,9 +8,10 @@ use std::sync::{Mutex, PoisonError};
 use futures::stream;
 use nfs_rs::{Nfs3ErrorCode as V3, Nfs4ErrorCode as V4};
 
+use super::super::nfs_timestamp;
 use super::super::{CACHE_WRITES, FType3, GLOBAL_CACHE, Time, role_metadata};
 use super::*;
-use crate::model::{FailureClass, Transience};
+use crate::model::{FailureClass, TimestampMetadata, Transience};
 
 #[path = "role_listing_completion_tests.rs"]
 mod completion;
@@ -93,15 +94,19 @@ fn a_listed_childs_ownership_and_times_are_what_a_getattr_reports() {
             let context = format!("{type_:?} {owner:?}/{group:?}");
             assert_eq!(
                 listed.ownership,
-                Some(inline_ownership(getattr.uid, getattr.gid, getattr.mode)),
+                Some(inline_ownership(
+                    getattr.uid,
+                    getattr.gid,
+                    getattr.mode.unwrap_or_else(|| panic!("fixture mode"))
+                )),
                 "{context}"
             );
             assert_eq!(
                 listed.timestamps,
                 Some(TimestampMetadata {
-                    accessed: nfs_timestamp(getattr.atime),
-                    modified: nfs_timestamp(getattr.mtime),
-                    created: nfs_timestamp(getattr.ctime),
+                    accessed: getattr.atime.and_then(nfs_timestamp),
+                    modified: getattr.mtime.and_then(nfs_timestamp),
+                    created: getattr.ctime.and_then(nfs_timestamp),
                 }),
                 "{context}"
             );
@@ -808,4 +813,40 @@ fn a_read_failure_says_what_reading_anew_could_do() {
         assert_eq!(failure.restart, restart, "{context}");
         assert_eq!(failure.failure.class, class, "{context}");
     }
+}
+
+#[test]
+fn v4_listing_omissions_do_not_create_zero_permission_or_timestamp_evidence() {
+    let mut attrs = regular();
+    attrs.nfs4_attributes = Some([(1 << 1) | (1 << 4), 0]);
+    let child = listed("x", Some(attrs.clone()), b"handle")
+        .unwrap_or_else(|_| panic!("missing optional fields must still describe data"));
+    assert_eq!(child.size, Some(attrs.filesize));
+    assert_eq!(child.mode, None);
+    assert_eq!(child.ownership, None);
+    let times = child
+        .timestamps
+        .unwrap_or_else(|| panic!("missing timestamp projection"));
+    assert_eq!(times.modified, None);
+    assert_eq!(times.created, None);
+    let metadata = role_metadata::metadata_inline(Bytes::from_static(b"handle"), &attrs, false);
+    assert_eq!(metadata.mode, None);
+    assert_eq!(metadata.mtime, None);
+    assert_eq!(metadata.ctime, None);
+    attrs.nfs4_attributes = Some([
+        (1 << 1) | (1 << 4),
+        (1 << 1) | (1 << 15) | (1 << 20) | (1 << 21),
+    ]);
+    attrs.file_mode = 0;
+    attrs.atime = Time::default();
+    attrs.mtime = Time::default();
+    attrs.ctime = Time::default();
+    let child = listed("x", Some(attrs), b"handle")
+        .unwrap_or_else(|_| panic!("zero-valued fields are valid"));
+    assert_eq!(child.mode, Some(0));
+    let times = child
+        .timestamps
+        .unwrap_or_else(|| panic!("missing timestamp projection"));
+    assert_eq!(times.modified, nfs_timestamp(0));
+    assert_eq!(times.created, nfs_timestamp(0));
 }

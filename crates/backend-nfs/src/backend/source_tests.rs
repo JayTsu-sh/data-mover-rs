@@ -8,6 +8,7 @@ struct FakeProtocol {
     payload: Bytes,
     handle: Bytes,
     maximum_read_chunk_bytes: usize,
+    content_version: Option<Bytes>,
     described: AtomicUsize,
     opened: Mutex<usize>,
     active_reads: Arc<AtomicUsize>,
@@ -60,7 +61,7 @@ impl NfsSourceProtocol for FakeProtocol {
             kind: EntryKind::File,
             size: Some(self.payload.len() as u64),
             file_handle: self.handle.clone(),
-            content_version: Bytes::from_static(b"version-1"),
+            content_version: self.content_version.clone(),
         })
     }
 
@@ -99,6 +100,7 @@ async fn one_stream_uses_one_open_cursor_and_exact_ranges() -> Result<(), Box<dy
         payload: Bytes::from(vec![7; 2 * 1024 * 1024 + 3]),
         handle: Bytes::from_static(b"stable-file-handle"),
         maximum_read_chunk_bytes: 1024 * 1024,
+        content_version: Some(Bytes::from_static(b"version-1")),
         described: AtomicUsize::new(0),
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
@@ -149,6 +151,7 @@ async fn shared_budget_bounds_nfs_prefetch_without_serializing_reads()
         payload: Bytes::from(vec![7; 4 * 1024 * 1024]),
         handle: Bytes::from_static(b"stable-file-handle"),
         maximum_read_chunk_bytes: 1024 * 1024,
+        content_version: Some(Bytes::from_static(b"version-1")),
         described: AtomicUsize::new(0),
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
@@ -204,6 +207,7 @@ async fn opened_identity_detects_change_and_precancel_avoids_another_open()
         payload: Bytes::from_static(b"payload"),
         handle: Bytes::from_static(b"current-handle"),
         maximum_read_chunk_bytes: 1024 * 1024,
+        content_version: Some(Bytes::from_static(b"version-1")),
         described: AtomicUsize::new(0),
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
@@ -269,6 +273,7 @@ async fn negotiated_protocol_limit_prevents_internal_read_resplitting()
         payload: Bytes::from_static(b"abcdefgh"),
         handle: Bytes::from_static(b"stable-file-handle"),
         maximum_read_chunk_bytes: 3,
+        content_version: Some(Bytes::from_static(b"version-1")),
         described: AtomicUsize::new(0),
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
@@ -414,6 +419,7 @@ async fn qos_paces_actual_cursor_calls_instead_of_queued_futures()
         payload: Bytes::from_static(b"abcdefghijklmnop"),
         handle: Bytes::from_static(b"handle"),
         maximum_read_chunk_bytes: 4,
+        content_version: Some(Bytes::from_static(b"version-1")),
         described: AtomicUsize::new(0),
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
@@ -451,5 +457,47 @@ async fn qos_paces_actual_cursor_calls_instead_of_queued_futures()
     }
     assert_eq!(budget.stats().source_read_operations, 4);
     assert_eq!(budget.stats().client_streamed_shaped_bytes, 16);
+    Ok(())
+}
+
+#[tokio::test]
+async fn absent_metadata_and_content_evidence_do_not_block_payload_reads()
+-> Result<(), Box<dyn std::error::Error>> {
+    let protocol = Arc::new(FakeProtocol {
+        payload: Bytes::from_static(b"payload without optional metadata"),
+        handle: Bytes::from_static(b"stable-file-handle"),
+        maximum_read_chunk_bytes: 1024,
+        content_version: None,
+        described: AtomicUsize::new(0),
+        opened: Mutex::new(0),
+        active_reads: Arc::new(AtomicUsize::new(0)),
+        maximum_active_reads: Arc::new(AtomicUsize::new(0)),
+        read_started: Arc::new(Mutex::new(Vec::new())),
+    });
+    let source = adapter(protocol.clone());
+    let path = StoragePath::new("file")?;
+    let descriptor = source.describe(&path).await?;
+    assert!(descriptor.content_version.is_none());
+    assert!(descriptor.inline_timestamps.is_none());
+    assert!(descriptor.inline_ownership.is_none());
+    let mut stream = source
+        .read(ReadRequest {
+            path,
+            range: None,
+            expected_source: Some(descriptor.source_identity),
+            maximum_chunk_bytes: 1024,
+            read_inflight: 1,
+            read_budget: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            source_qos: None,
+            version: SourceVersion::Current,
+        })
+        .await?;
+    let mut actual = Vec::new();
+    while let Some(chunk) = stream.next().await.transpose()? {
+        actual.extend_from_slice(&chunk);
+    }
+    assert_eq!(actual, protocol.payload);
+    assert_eq!(protocol.active_reads.load(Ordering::SeqCst), 0);
     Ok(())
 }

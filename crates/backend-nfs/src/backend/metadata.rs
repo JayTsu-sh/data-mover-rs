@@ -25,12 +25,13 @@ pub(crate) struct NfsMetadataAdapter {
 pub struct NfsMetadataInline {
     pub(crate) file_handle: bytes::Bytes,
     pub(crate) symlink: bool,
+    pub(crate) ownership_available: bool,
     pub(crate) uid: Option<u32>,
     pub(crate) gid: Option<u32>,
-    pub(crate) mode: u32,
-    pub(crate) atime: i64,
-    pub(crate) mtime: i64,
-    pub(crate) ctime: i64,
+    pub(crate) mode: Option<u32>,
+    pub(crate) atime: Option<i64>,
+    pub(crate) mtime: Option<i64>,
+    pub(crate) ctime: Option<i64>,
 }
 
 #[async_trait]
@@ -151,7 +152,13 @@ impl NfsMetadataAdapter {
         if !acl.access.is_empty() {
             return Ok(value.clone());
         }
-        acl.access = acl::posix_from_mode(self.protocol.stat(path).await?.mode);
+        acl.access = acl::posix_from_mode(
+            self.protocol
+                .stat(path)
+                .await?
+                .mode
+                .ok_or_else(|| missing("mode"))?,
+        );
         acl::encode_posix(&acl).map_err(|_| NfsProtocolFailure::protocol())
     }
 
@@ -161,15 +168,21 @@ impl NfsMetadataAdapter {
         plan: ObservationPlan,
         entry: NfsMetadataInline,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
-        let owner = inline_ownership(entry.uid, entry.gid, entry.mode);
-        refuse_unmapped(path, plan, owner)?;
+        let owner = entry
+            .ownership_available
+            .then_some(entry.mode)
+            .flatten()
+            .map(|mode| inline_ownership(entry.uid, entry.gid, mode));
+        if let Some(owner) = owner {
+            refuse_unmapped(path, plan, owner)?;
+        }
         let (acl, xattrs) = self
             .observe_optional_families(path, plan, entry.symlink)
             .await?;
         let timestamps = TimestampMetadata {
-            accessed: timestamp(entry.atime),
-            modified: timestamp(entry.mtime),
-            created: timestamp(entry.ctime),
+            accessed: entry.atime.and_then(timestamp),
+            modified: entry.mtime.and_then(timestamp),
+            created: entry.ctime.and_then(timestamp),
         };
         observations(path, plan, owner, timestamps, (acl, xattrs))
     }
@@ -264,22 +277,30 @@ type OptionalFamilies = (
 fn observations(
     path: &StoragePath,
     plan: ObservationPlan,
-    owner: InlineOwnership,
+    owner: Option<InlineOwnership>,
     timestamps: TimestampMetadata,
     (acl, xattrs): OptionalFamilies,
 ) -> Result<MetadataObservations, StorageRoleFailure> {
     // An owner or group the server named and nfs-rs could not map has no number to report, and
     // one made up would be written as the owner (see `nfs::owner_id`).
     let ownership = match owner {
-        InlineOwnership::Known(value) => inline(plan.ownership_mode(), value),
-        InlineOwnership::Unmapped => unmapped(plan.ownership_mode()),
+        Some(InlineOwnership::Known(value)) => inline(plan.ownership_mode(), value),
+        Some(InlineOwnership::Unmapped) => unmapped(plan.ownership_mode()),
+        None => absent(plan.ownership_mode()),
     };
     MetadataObservations::new(
         acl,
         xattrs,
         optional_not_applicable(plan.tags()),
         ownership,
-        inline(plan.timestamps(), timestamps),
+        if timestamps.accessed.is_none()
+            || timestamps.modified.is_none()
+            || timestamps.created.is_none()
+        {
+            absent(plan.timestamps())
+        } else {
+            inline(plan.timestamps(), timestamps)
+        },
     )
     .map_err(|_| {
         super::source::entry_failure(
@@ -337,7 +358,7 @@ impl Metadata for NfsMetadataAdapter {
         Ok(PermissionFacts {
             owner: entry.uid.map(PrincipalIdentity::Numeric),
             group: entry.gid.map(PrincipalIdentity::Numeric),
-            mode: Some(entry.mode & 0o7777),
+            mode: entry.mode.map(|mode| mode & 0o7777),
         })
     }
 
@@ -409,7 +430,7 @@ impl Metadata for NfsMetadataAdapter {
         let path = &descriptor.path;
         Some(
             refuse_unmapped(path, plan, owner)
-                .and_then(|()| observations(path, plan, owner, timestamps, (acl, xattrs))),
+                .and_then(|()| observations(path, plan, Some(owner), timestamps, (acl, xattrs))),
         )
     }
 
@@ -441,8 +462,11 @@ impl Metadata for NfsMetadataAdapter {
         plan: ObservationPlan,
     ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
         let entry = self.bound_entry(path, expected).await?;
-        let mode_without_ownership =
-            (entry.uid.is_none() || entry.gid.is_none()).then_some(entry.mode & 0o7777);
+        let mode_without_ownership = (entry.ownership_available
+            && (entry.uid.is_none() || entry.gid.is_none()))
+        .then_some(entry.mode)
+        .flatten()
+        .map(|mode| mode & 0o7777);
         let plan = if mode_without_ownership.is_some() {
             plan.with_ownership_mode(ObservationMode::Omit)
         } else {
@@ -529,6 +553,21 @@ fn unsupported(path: &StoragePath) -> StorageRoleFailure {
 
 pub(crate) fn timestamp(value: i64) -> Option<StorageTimestamp> {
     StorageTimestamp::new(i128::from(value), TimePrecision::Nanoseconds).ok()
+}
+
+fn absent<T>(mode: ObservationMode) -> MetadataObservation<T> {
+    if mode == ObservationMode::Omit {
+        MetadataObservation::NotRequested
+    } else {
+        MetadataObservation::Failed {
+            class: FailureClass::Protocol,
+            transience: Transience::Permanent,
+        }
+    }
+}
+
+fn missing(field: &str) -> NfsProtocolFailure {
+    NfsProtocolFailure::protocol().with_status(format!("NFS response omitted {field}"))
 }
 
 fn inline<T>(mode: ObservationMode, value: T) -> MetadataObservation<T> {

@@ -77,12 +77,13 @@ impl NfsMetadataProtocol for CancellingProtocol {
         Ok(NfsMetadataInline {
             file_handle: bytes::Bytes::from_static(b"source-handle"),
             symlink: false,
+            ownership_available: true,
             uid: (!self.owner_unmapped).then_some(12345),
             gid: (!self.owner_unmapped).then_some(12346),
-            mode: 0o640,
-            atime: 1_700_000_000_123_456_789,
-            mtime: 1_700_000_001_123_456_789,
-            ctime: 1_700_000_002_123_456_789,
+            mode: Some(0o640),
+            atime: Some(1_700_000_000_123_456_789),
+            mtime: Some(1_700_000_001_123_456_789),
+            ctime: Some(1_700_000_002_123_456_789),
         })
     }
     fn supports_acl(&self) -> bool {
@@ -551,10 +552,70 @@ async fn listed_like_stat(
         source_identity,
     )
     .with_inline_timestamps(TimestampMetadata {
-        accessed: timestamp(attrs.atime),
-        modified: timestamp(attrs.mtime),
-        created: timestamp(attrs.ctime),
+        accessed: attrs.atime.and_then(timestamp),
+        modified: attrs.mtime.and_then(timestamp),
+        created: attrs.ctime.and_then(timestamp),
     });
-    listed.inline_ownership = Some(inline_ownership(attrs.uid, attrs.gid, attrs.mode));
+    listed.inline_ownership = Some(inline_ownership(
+        attrs.uid,
+        attrs.gid,
+        attrs.mode.unwrap_or_else(|| panic!("fixture mode")),
+    ));
     listed
+}
+
+fn missing_facts(mode: ObservationMode) -> MetadataObservations {
+    observations(
+        &StoragePath::new("file").unwrap_or_else(|error| panic!("{error}")),
+        ObservationPlan::default()
+            .with_timestamps(mode)
+            .with_ownership_mode(mode),
+        None,
+        TimestampMetadata {
+            accessed: None,
+            modified: None,
+            created: None,
+        },
+        (
+            MetadataObservation::NotRequested,
+            MetadataObservation::NotRequested,
+        ),
+    )
+    .unwrap_or_else(|error| panic!("{error}"))
+}
+
+#[test]
+fn missing_metadata_is_failed_only_when_the_plan_requests_it() {
+    for mode in [
+        ObservationMode::InlineOnly,
+        ObservationMode::BestEffort,
+        ObservationMode::Required,
+    ] {
+        let facts = missing_facts(mode);
+        assert!(matches!(
+            facts.timestamps(),
+            MetadataObservation::Failed {
+                class: FailureClass::Protocol,
+                transience: Transience::Permanent
+            }
+        ));
+        assert!(matches!(
+            facts.ownership_mode(),
+            MetadataObservation::Failed {
+                class: FailureClass::Protocol,
+                transience: Transience::Permanent
+            }
+        ));
+        assert_eq!(facts.failures().count(), 2);
+    }
+    let facts = missing_facts(ObservationMode::Omit);
+    assert!(matches!(
+        facts.timestamps(),
+        MetadataObservation::NotRequested
+    ));
+    assert!(matches!(
+        facts.ownership_mode(),
+        MetadataObservation::NotRequested
+    ));
+    assert_eq!(facts.failures().count(), 0);
 }

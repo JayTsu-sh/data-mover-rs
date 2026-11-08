@@ -190,6 +190,14 @@ with failed observations. Recovered failures are logged; no data read, write or
 background task is added. This is a current-path observation, not an atomic
 snapshot, historical inventory or authorization to remove a source.
 
+NFS common observations retain the SDK's returned-attribute evidence. Omitted
+mode, size or timestamps remain absent, while a present zero mode or epoch time
+remains valid. Requested missing ownership/timestamps become failed metadata
+families; omitted families remain unrequested. Missing optional metadata does not
+prevent reading a file whose type, size and handle are available. Content-version
+hints are absent when mtime/ctime evidence is incomplete. These facts do not
+authorize source deletion; the caller still handles metadata errors and readiness.
+
 ### Publication durability
 
 `TransferRequest` and `ExpertDestinationRequest` accept

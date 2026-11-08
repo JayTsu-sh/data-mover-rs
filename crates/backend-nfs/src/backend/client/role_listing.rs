@@ -23,12 +23,10 @@ use nfs_rs::{
 use tracing::info;
 
 use super::{
-    FType3, NFSStorage, Result, invalidate_path_cache, is_nfs_noent,
-    is_retryable_with_invalidation, nfs_timestamp, owner_id, owners_are_strings, time_to_i64,
+    FType3, NFSStorage, Result, attributes, attrs_timestamps, invalidate_path_cache, is_nfs_noent,
+    is_retryable_with_invalidation, owners_are_strings,
 };
-use crate::model::{
-    EntryKind, FailureClass, StoragePath, TimestampMetadata, without_unowned_set_id,
-};
+use crate::model::{EntryKind, FailureClass, StoragePath, without_unowned_set_id};
 use crate::storage::artifacts::is_artifact_name;
 use crate::storage::backends::nfs::namespace::{
     NfsListedChild, NfsListingPages, NfsNamespaceObservation, NfsReadEnd, NfsReadFailure,
@@ -94,8 +92,8 @@ fn observation(
     } else {
         EntryKind::File
     };
-    let uid = owner_id(&attrs.owner, attrs.uid, owners_are_strings);
-    let gid = owner_id(&attrs.owner_group, attrs.gid, owners_are_strings);
+    let uid = attributes::uid(attrs, owners_are_strings);
+    let gid = attributes::gid(attrs, owners_are_strings);
     // The mode every legacy consumer applies: set-id bits of an owner that does not map stripped.
     // Then the ownership is `Unmapped` and carries no mode at all.
     let mode = without_unowned_set_id(attrs.file_mode, uid.is_some(), gid.is_some(), is_dir);
@@ -104,15 +102,11 @@ fn observation(
         gid,
         path,
         kind,
-        size: (kind == EntryKind::File).then_some(attrs.filesize),
+        size: (kind == EntryKind::File && attributes::present(attrs, 4)).then_some(attrs.filesize),
         file_handle,
-        timestamps: Some(TimestampMetadata {
-            accessed: nfs_timestamp(time_to_i64(attrs.atime)),
-            modified: nfs_timestamp(time_to_i64(attrs.mtime)),
-            created: nfs_timestamp(time_to_i64(attrs.ctime)),
-        }),
-        mode: Some(mode),
-        ownership: Some(inline_ownership(uid, gid, mode)),
+        timestamps: Some(attrs_timestamps(attrs)),
+        mode: attributes::present(attrs, 33).then_some(mode),
+        ownership: attributes::ownership_available(attrs).then(|| inline_ownership(uid, gid, mode)),
     }
 }
 

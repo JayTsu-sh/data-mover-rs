@@ -27,7 +27,6 @@ use crate::storage::backends::nfs::common::{
 };
 use crate::storage::backends::nfs::namespace::{
     NfsListingPages, NfsNamespaceObservation, NfsNamespaceProtocol, NfsReadEnd, NfsReadFailure,
-    inline_ownership,
 };
 use crate::storage::backends::nfs::protocol::classify_persistence_error;
 use crate::storage::backends::nfs::source::{
@@ -39,6 +38,7 @@ use crate::transfer_concurrency::{
 };
 use crate::{MB, Result};
 
+mod attributes;
 mod owner;
 mod role_create;
 mod role_delete;
@@ -416,27 +416,27 @@ impl NfsSourceProtocol for NFSStorage {
         let (file_handle, attrs) = self.role_lookup_with_attrs(path, false).await?;
         let kind = role_kind(&attrs);
         Ok(NfsSourceObservation {
-            uid: owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-            gid: owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
+            uid: attributes::uid(&attrs, self.owners_are_strings()),
+            gid: attributes::gid(&attrs, self.owners_are_strings()),
             kind,
             timestamps: Some(attrs_timestamps(&attrs)),
-            ownership: Some(inline_ownership(
-                owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-                owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
-                attrs.file_mode,
-            )),
-            mode: Some(attrs.file_mode),
-            size: (kind == crate::model::EntryKind::File).then_some(attrs.filesize),
-            content_version: [
-                attrs.mtime.seconds,
-                attrs.mtime.nseconds,
-                attrs.ctime.seconds,
-                attrs.ctime.nseconds,
-            ]
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect::<Vec<_>>()
-            .into(),
+            ownership: attributes::ownership(&attrs, self.owners_are_strings()),
+            mode: attributes::present(&attrs, 33).then_some(attrs.file_mode),
+            size: (kind == crate::model::EntryKind::File && attributes::present(&attrs, 4))
+                .then_some(attrs.filesize),
+            content_version: (attributes::present(&attrs, 52) && attributes::present(&attrs, 53))
+                .then(|| {
+                    [
+                        attrs.mtime.seconds,
+                        attrs.mtime.nseconds,
+                        attrs.ctime.seconds,
+                        attrs.ctime.nseconds,
+                    ]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>()
+                    .into()
+                }),
             file_handle,
         })
     }
@@ -509,9 +509,15 @@ use crate::storage::backends::nfs::metadata::timestamp as nfs_timestamp;
 /// the NFS metadata role already uses, so both roles report the same three values.
 fn attrs_timestamps(attrs: &Attr) -> crate::model::TimestampMetadata {
     crate::model::TimestampMetadata {
-        accessed: nfs_timestamp(time_to_i64(attrs.atime)),
-        modified: nfs_timestamp(time_to_i64(attrs.mtime)),
-        created: nfs_timestamp(time_to_i64(attrs.ctime)),
+        accessed: attributes::present(attrs, 47)
+            .then(|| nfs_timestamp(time_to_i64(attrs.atime)))
+            .flatten(),
+        modified: attributes::present(attrs, 53)
+            .then(|| nfs_timestamp(time_to_i64(attrs.mtime)))
+            .flatten(),
+        created: attributes::present(attrs, 52)
+            .then(|| nfs_timestamp(time_to_i64(attrs.ctime)))
+            .flatten(),
     }
 }
 
@@ -1107,19 +1113,16 @@ impl NFSStorage {
     ) -> NfsNamespaceObservation {
         let kind = role_kind(attrs);
         NfsNamespaceObservation {
-            uid: owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-            gid: owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
+            uid: attributes::uid(attrs, self.owners_are_strings()),
+            gid: attributes::gid(attrs, self.owners_are_strings()),
             path: path.clone(),
             kind,
-            size: (kind == crate::model::EntryKind::File).then_some(attrs.filesize),
+            size: (kind == crate::model::EntryKind::File && attributes::present(attrs, 4))
+                .then_some(attrs.filesize),
             file_handle,
             timestamps: Some(attrs_timestamps(attrs)),
-            mode: Some(attrs.file_mode),
-            ownership: Some(inline_ownership(
-                owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-                owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
-                attrs.file_mode,
-            )),
+            mode: attributes::present(attrs, 33).then_some(attrs.file_mode),
+            ownership: attributes::ownership(attrs, self.owners_are_strings()),
         }
     }
 

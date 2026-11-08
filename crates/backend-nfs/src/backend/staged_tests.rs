@@ -69,7 +69,7 @@ pub(super) mod tests {
             let data = files.get(path.as_str()).ok_or_else(|| NfsProtocolFailure::new(FailureClass::NotFound, Transience::Permanent))?;
             Ok(super::super::source::NfsSourceObservation {
                 kind: EntryKind::File, size: Some(data.len() as u64), file_handle: self.identity(path),
-                content_version: Bytes::copy_from_slice(blake3::hash(data).as_bytes()),
+                content_version: Some(Bytes::copy_from_slice(blake3::hash(data).as_bytes())),
                 timestamps: None, ownership: None, mode: None, uid: None, gid: None,
             })
         }

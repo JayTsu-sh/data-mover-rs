@@ -24,7 +24,7 @@ pub struct NfsSourceObservation {
     pub kind: EntryKind,
     pub size: Option<u64>,
     pub file_handle: Bytes,
-    pub content_version: Bytes,
+    pub content_version: Option<Bytes>,
     pub timestamps: Option<crate::model::TimestampMetadata>,
     pub ownership: Option<crate::storage::InlineOwnership>,
     pub mode: Option<u32>,
@@ -138,7 +138,7 @@ impl NfsReadSourceAdapter {
             size: observed.size,
             source_identity,
             backend_fact: None,
-            content_version: Some(observed.content_version),
+            content_version: observed.content_version,
             inline_timestamps: observed.timestamps,
             inline_mode: observed.mode,
             permissions: super::namespace::permission_facts(
