@@ -785,3 +785,24 @@ returned silent-loss Timeout/Unknown in about 48 s (roughly 45 s WRITE detection
 nor the deterministic close-budget regression certify a shared task recovery
 budget, source purge, post-metadata namespace persistence, ONTAP behavior or the
 whole-migration throughput/RSS target.
+
+### Published NFS file persistence
+
+The same owned-prefix runner accepts `--contract persistence`. Keep its adjacent
+`nfs_fault_rpc.py` available when deploying the runner. It assembles bounded RPC
+records, recognizes the real NFSv4 COMPOUND tag and XID, and arms failures on the
+COMMIT request. Lost responses match that COMMIT's reply XID. Independent counters
+must confirm all requested COMMIT triggers and the dropped reply; TCP segmentation
+and multi-fragment RPC parsing have standalone tests in `test_nfs_fault_rpc.py`.
+
+`direct::persistence::real_nfs_published_file_persistence_contract` checks regular
+and empty files, mode 0444, replaced files and replaced cached ancestors, with
+independent server-side payload/mode checks. Linux v3 and v4.1 passed. The v4.1
+COMMIT fault run recovered flash/lost-reply cases, returned persistent disconnect
+in about 0.63 s as Connectivity/Unknown, silent timeout in about 18 s as
+Timeout/Unknown (including a three-second CLOSE limit), and cancelled in-flight
+COMMIT about 252 ms after injection with less than 1 ms after the cancellation
+signal. Sources remained intact; explicit persistence-only retries succeeded,
+and all five destination payloads were independently checked. These role-level
+results do not certify CLI source purge, directory/symlink persistence, pNFS DS,
+shared recovery budgets, or whole-migration throughput/RSS.

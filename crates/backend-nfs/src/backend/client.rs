@@ -29,6 +29,7 @@ use crate::storage::backends::nfs::namespace::{
     NfsListingPages, NfsNamespaceObservation, NfsNamespaceProtocol, NfsReadEnd, NfsReadFailure,
     inline_ownership,
 };
+use crate::storage::backends::nfs::protocol::classify_persistence_error;
 use crate::storage::backends::nfs::source::{
     NfsProtocolFailure, NfsReadCursor, NfsSourceObservation, NfsSourceProtocol,
 };
@@ -412,7 +413,7 @@ impl NfsSourceProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<NfsSourceObservation, NfsProtocolFailure> {
-        let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
+        let (file_handle, attrs) = self.role_lookup_with_attrs(path, false).await?;
         let kind = role_kind(&attrs);
         Ok(NfsSourceObservation {
             uid: owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
@@ -525,8 +526,9 @@ impl NfsNamespaceProtocol for NFSStorage {
     async fn stat(
         &self,
         path: &crate::model::StoragePath,
+        fresh: bool,
     ) -> std::result::Result<NfsNamespaceObservation, NfsProtocolFailure> {
-        let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
+        let (file_handle, attrs) = self.role_lookup_with_attrs(path, fresh).await?;
         let kind = role_kind(&attrs);
         Ok(NfsNamespaceObservation {
             uid: owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
@@ -867,10 +869,18 @@ impl NfsStageFile for NfsRoleStageFile {
             .map(|(written, _)| written)
     }
 
-    async fn checkpoint(&self) -> std::result::Result<(), NfsProtocolFailure> {
+    async fn checkpoint(&self, whole_file: bool) -> std::result::Result<(), NfsProtocolFailure> {
         self.checkpoint_deferred_writes()
             .await
-            .map_err(crate::storage::backends::nfs::protocol::classify_error)
+            .map_err(crate::storage::backends::nfs::protocol::classify_error)?;
+        if whole_file {
+            self.storage
+                .mount
+                .commit(self.handle.inner.fh.clone(), 0, 0)
+                .await
+                .map_err(classify_persistence_error)?;
+        }
+        Ok(())
     }
 
     async fn set_len(&self, size: u64) -> std::result::Result<(), NfsProtocolFailure> {
@@ -965,12 +975,16 @@ impl NfsStagedProtocol for NFSStorage {
     async fn open_read(
         &self,
         path: &crate::model::StoragePath,
-    ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
+    ) -> std::result::Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure> {
         let handle = self
             .open(Path::new(path.as_str()), OPEN_READ)
             .await
             .map_err(classify_role_error)?;
-        Ok(Box::new(NfsRoleStageFile::new(self.clone(), handle)))
+        let identity = handle.inner.fh.clone();
+        Ok((
+            Box::new(NfsRoleStageFile::new(self.clone(), handle)),
+            identity,
+        ))
     }
 
     async fn open_write(
@@ -992,7 +1006,7 @@ impl NfsStagedProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<u64, NfsProtocolFailure> {
-        self.role_lookup_with_attrs(path)
+        self.role_lookup_with_attrs(path, false)
             .await
             .map(|(_, attrs)| attrs.filesize)
     }
@@ -1002,7 +1016,7 @@ impl NfsStagedProtocol for NFSStorage {
         path: &crate::model::StoragePath,
     ) -> std::result::Result<(bool, u64), NfsProtocolFailure> {
         // nfs-rs reports both versions' types in the v3 numbering (NF4REG is also 1).
-        self.role_lookup_with_attrs(path)
+        self.role_lookup_with_attrs(path, false)
             .await
             .map(|(_, attrs)| (attrs.type_ == FType3::NF3REG as u32, attrs.filesize))
     }
@@ -1106,8 +1120,17 @@ impl NFSStorage {
     async fn role_lookup_with_attrs(
         &self,
         path: &crate::model::StoragePath,
+        fresh: bool,
     ) -> std::result::Result<(Bytes, Attr), NfsProtocolFailure> {
-        let object = self.role_lookup_fh(Path::new(path.as_str())).await?;
+        let object = if fresh {
+            let relative = format!("{}/{}", self.root, path.as_str());
+            self.mount
+                .lookup_path(&relative)
+                .await
+                .map_err(crate::storage::backends::nfs::protocol::classify_error)?
+        } else {
+            self.role_lookup_fh(Path::new(path.as_str())).await?
+        };
         let file_handle = object.fh;
         let attrs = if let Some(attrs) = object.attr {
             attrs

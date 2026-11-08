@@ -138,7 +138,7 @@ async fn read_regular(
         Err(error) => return Err(error),
     };
     let handle = match adapter.protocol.open_read(path).await {
-        Ok(handle) => handle,
+        Ok((handle, _)) => handle,
         Err(error) if is_not_found(&error) => return Ok(None),
         Err(error) => return Err(error),
     };

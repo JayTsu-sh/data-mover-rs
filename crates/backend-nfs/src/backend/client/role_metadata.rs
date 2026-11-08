@@ -93,7 +93,7 @@ impl NfsMetadataProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> Result<NfsMetadataInline, NfsProtocolFailure> {
-        let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
+        let (file_handle, attrs) = self.role_lookup_with_attrs(path, false).await?;
         Ok(metadata_inline(
             file_handle,
             &attrs,

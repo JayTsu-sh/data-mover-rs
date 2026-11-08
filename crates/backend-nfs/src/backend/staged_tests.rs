@@ -221,7 +221,7 @@ pub(super) mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst)
                 && count.is_multiple_of(4)
             {
-                self.checkpoint().await?;
+                self.checkpoint(false).await?;
             }
             Ok(written)
         }
@@ -246,7 +246,7 @@ pub(super) mod tests {
             self.write_at(offset, data).await
         }
 
-        async fn checkpoint(&self) -> Result<(), NfsProtocolFailure> {
+        async fn checkpoint(&self, _whole_file: bool) -> Result<(), NfsProtocolFailure> {
             self.checkpoints
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -343,8 +343,8 @@ pub(super) mod tests {
         async fn open_read(
             &self,
             path: &StoragePath,
-        ) -> Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
-            self.open_write(path).await.map(|(handle, _)| handle)
+        ) -> Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure> {
+            self.open_write(path).await
         }
 
         async fn open_write(

@@ -41,6 +41,27 @@ data-mover 保留 Throttled 与原始状态，不再次启动列举退避预算�
 
 真实回归入口及严格验证范围见 [实验室说明](../../tests/lab/README.md#nfs-direct-contract)。
 
+## 已发布普通文件的持久化确认
+
+`Namespace::persist_observed` 使用已核验的目标描述符，只确认普通文件。
+身份、大小、mtime／ctime、mode 和 ownership 必须与确认前后重新解析的路径一致；
+包括端点前缀和祖先，不能把已被 rename 的缓存目录当作当前路径。
+它复用既有 `NfsNamespaceProtocol::stat` 的 fresh 参数，以及 `open_read` 返回的实际 FH；
+不创建文件，不修改权限，不读取内容，不创建传输状态。
+
+通过 `NfsStageFile::checkpoint(true)` 发出整文件 COMMIT，再确认 CLOSE 和路径观察。
+COMMIT(0,0) 的稳定存储语义见 [RFC 1813 §3.3.21](https://www.rfc-editor.org/rfc/rfc1813.html#section-3.3.21)
+及 [RFC 8881 §18.3](https://www.rfc-editor.org/rfc/rfc8881.html#section-18.3)。
+CLOSE 也是确认的一部分，nfs-rs 0.11.1 在此收束当前 mount 的 pNFS DS/LAYOUTCOMMIT；
+本次没有真实 pNFS DS 设备验收，不能把 Linux 功能用例表述为 pNFS 认证。
+原有 `checkpoint(false)` 的回执／verifier 和恢复语义不变。
+
+该操作响应在途取消，关闭最多另等 3 秒。COMMIT 与 CLOSE 均失败时同时保留两者诊断；
+确认丢失仍为 Unknown，同时准确保留 Connectivity／Timeout，不授权重放文件或删除源端。
+完整内容校验、源端新鲜性、执行身份及最终删除由原有角色与任务层继续负责。
+目录及软链接仍明确 Unsupported；OPEN／COMMIT 权限不足也必须失败并保留源端。
+该能力不解除产品当前的数据库收尾顺序，也不等于全任务共享故障预算已经接通。
+
 ## ACL 能力（2026-10-28）
 
 NFSv3 仅在实际探测到 NFSACL RPC 100227 v3 扩展时声明 `posix_acl`；后端以 typed POSIX

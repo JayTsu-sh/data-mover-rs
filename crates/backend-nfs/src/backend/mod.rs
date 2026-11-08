@@ -74,6 +74,7 @@ where
     let namespace = Arc::new(namespace::NfsNamespaceAdapter::new(
         protocol.clone(),
         identity.clone(),
+        Some(protocol.clone()),
     ));
     drop(protocol);
     Ok(Storage::connected(

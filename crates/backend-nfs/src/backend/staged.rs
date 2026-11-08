@@ -52,7 +52,15 @@ pub trait NfsStageFile: Send + Sync {
     ) -> Result<u64, NfsProtocolFailure> {
         self.write_deferred_at(offset, data).await
     }
-    async fn checkpoint(&self) -> Result<(), NfsProtocolFailure> {
+    /// false 只确认本句柄保留的 WRITE 回执；true 还执行全文件 COMMIT。
+    /// 句柄 CLOSE 与发布后路径复核由调用方继续完成，不授权跳过任一阶段。
+    async fn checkpoint(&self, whole_file: bool) -> Result<(), NfsProtocolFailure> {
+        if whole_file {
+            return Err(NfsProtocolFailure::new(
+                FailureClass::Unsupported,
+                Transience::Permanent,
+            ));
+        }
         Ok(())
     }
     async fn set_len(&self, size: u64) -> Result<(), NfsProtocolFailure>;
@@ -94,7 +102,7 @@ pub trait NfsStagedProtocol: Send + Sync {
     async fn open_read(
         &self,
         path: &StoragePath,
-    ) -> Result<Box<dyn NfsStageFile>, NfsProtocolFailure>;
+    ) -> Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure>;
     /// 返回实际写句柄的 FH，供 Direct 与打开前的观察比对；不截断现有文件。
     async fn open_write(
         &self,
@@ -311,7 +319,7 @@ impl NfsStagedDestinationAdapter {
         let checkpoint_required = stage.recovery_enabled()
             || (stage.durable_publication() && deferred_writes_used && !write_failed);
         let checkpoint_failure = if checkpoint_required {
-            handle.checkpoint().await.err()
+            handle.checkpoint(false).await.err()
         } else {
             None
         };
@@ -379,7 +387,7 @@ impl NfsStagedDestinationAdapter {
                 Transience::Unknown,
             ));
         }
-        handle.checkpoint().await.map_err(|error| {
+        handle.checkpoint(false).await.map_err(|error| {
             role_failure(stage.final_destination().path(), Operation::Write, error)
         })?;
         super::at_destination::checkpoint_barrier(stage, persisted).await
@@ -397,6 +405,7 @@ impl NfsStagedDestinationAdapter {
             .open_read(&native)
             .await
             .map_err(|error| role_failure(path, Operation::Verify, error))?
+            .0
             .into();
         let concurrency = self.protocol.read_inflight().max(1);
         let maximum_chunk_bytes = self.protocol.maximum_read_chunk_bytes().max(1);

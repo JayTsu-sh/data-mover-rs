@@ -23,6 +23,8 @@ use super::{Result, chmod, common, connect, with_identity};
 
 #[path = "direct/fault.rs"]
 mod fault;
+#[path = "direct/persistence.rs"]
+mod persistence;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires run-nfs-direct-contract.py and its owned NFS prefix"]

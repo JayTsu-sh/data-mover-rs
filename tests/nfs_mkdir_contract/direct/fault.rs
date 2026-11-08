@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Result, common, connect};
 
-async fn control(mode: &str) -> Result {
+pub(super) async fn control(mode: &str) -> Result {
     let mut socket = TcpStream::connect(env::var("LAB_NFS_DIRECT_CONTROL")?).await?;
     socket
         .write_all(format!("GET /{mode} HTTP/1.0\r\nHost: loopback\r\n\r\n").as_bytes())
