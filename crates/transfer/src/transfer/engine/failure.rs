@@ -205,8 +205,8 @@ impl TransferFailure {
     }
 
     /// 显式授权且尚未执行的 Direct 数据失败清理；不属于可恢复的 unpublished stage。
-    #[must_use]
-    pub fn has_failed_data_cleanup(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn has_failed_data_cleanup(&self) -> bool {
         self.stage_cleanup
             .as_ref()
             .is_some_and(|pending| matches!(pending.disposition, StageCleanup::FailedDirectData))

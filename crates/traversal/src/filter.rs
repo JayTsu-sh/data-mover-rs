@@ -291,14 +291,13 @@ enum Token {
     RParen,
 }
 
-pub struct Lexer<'a> {
+struct Lexer<'a> {
     input: &'a str,
     position: usize,
 }
 
 impl<'a> Lexer<'a> {
-    #[must_use]
-    pub fn new(input: &'a str) -> Self {
+    fn new(input: &'a str) -> Self {
         Lexer { input, position: 0 }
     }
 
