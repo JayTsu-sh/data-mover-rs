@@ -53,6 +53,23 @@ pub trait Namespace: Send + Sync {
         ))
     }
 
+    /// Confirms persistence of the already verified entry and its namespace binding. The
+    /// descriptor must come from this destination after its last data/metadata mutation.
+    /// Implementations recheck identity and change evidence; this is neither content validation
+    /// nor an exclusion lock. Callers must exclude concurrent writers through source removal.
+    /// Unsupported backends refuse rather than treating readable page-cache data as durable.
+    async fn persist_observed(
+        &self,
+        expected: &SourceDescriptor,
+        _cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        Err(unsupported(
+            &expected.path,
+            Operation::Publish,
+            "published entry persistence is unsupported",
+        ))
+    }
+
     /// Lists the raw direct children of one directory, page by page. See
     /// [`crate::storage::listing`] for the stream's contract.
     fn list(&self, request: ListRequest) -> ListingStream;

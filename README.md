@@ -205,6 +205,19 @@ of endpoint-root preparation or metadata the caller writes after completion:
 `CallerManaged` callers still own those steps before source cleanup. Source deletion
 is an application decision, separate from this library's successful transfer result.
 
+`Namespace::persist_observed` separately confirms an already verified destination
+entry after its last mutation, including metadata-only changes and directories.
+Unix Local synchronizes the entry and its directory chain, refuses stale identity
+or change evidence, and never reads or republishes the file body. Every barrier
+also checks and synchronizes the configured root and all its ancestors, covering a
+new endpoint root or a root moved between observations. Callers must exclude
+concurrent writers and root renames through source removal. Unanchored Local roles,
+symlinks, Windows and other backends currently return typed Unsupported. Cancellation
+is checked between blocking operations; an in-progress OS fsync cannot be preempted.
+Six real-filesystem tests cover normal files/directories, later chmod, failed file
+and directory sync, cancellation, inode/root replacement and symlink substitution.
+No power-cut, network-mount or whole-job performance result is claimed.
+
 Deterministic real-file tests check zero/default versus one/required final file
 barrier, readonly metadata, nested parent barriers, failed file/directory barriers,
 parent replacement, and explicit expert metadata durability without checkpoints.

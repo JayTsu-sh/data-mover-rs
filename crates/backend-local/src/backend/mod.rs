@@ -51,10 +51,11 @@ fn connect_roles(config: LocalBackendConfig) -> Result<Storage, Box<dyn std::err
         Arc::clone(&sandbox),
         identity.clone(),
     ));
-    let namespace = Arc::new(
-        namespace::LocalNamespace::from_root(sandbox, identity.clone())
-            .with_rename_context(config.rename_context),
-    );
+    let namespace = namespace::LocalNamespace::from_root(sandbox, identity.clone())
+        .with_rename_context(config.rename_context);
+    #[cfg(unix)]
+    let namespace = namespace.with_persistence_root(root.clone());
+    let namespace = Arc::new(namespace);
     let mut staged = staged::LocalStagedDestination::new(
         root,
         identity.clone(),

@@ -60,6 +60,8 @@ pub struct LocalNamespace {
     root_device: Option<u64>,
     rename_context: Option<RenameContext>,
     listing_resume_key: [u8; 32],
+    #[cfg(unix)]
+    persistence: Option<Arc<persistence::RootAnchor>>,
     #[cfg(any(test, feature = "test-support"))]
     probe: Arc<ListProbe>,
 }
@@ -84,9 +86,19 @@ impl LocalNamespace {
             identity,
             rename_context: None,
             listing_resume_key: listing_key(None),
+            #[cfg(unix)]
+            persistence: None,
             #[cfg(any(test, feature = "test-support"))]
             probe: Arc::new(ListProbe::default()),
         }
+    }
+
+    /// 配置根目录的持久化锚点；首次确认时也同步根目录外的新建祖先目录项。
+    #[cfg(unix)]
+    #[must_use]
+    pub fn with_persistence_root(mut self, root: PathBuf) -> Self {
+        self.persistence = Some(Arc::new(persistence::RootAnchor::new(root)));
+        self
     }
 
     #[must_use]
@@ -295,6 +307,15 @@ impl Namespace for LocalNamespace {
 
     async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         self.stat_entry(path).await
+    }
+
+    #[cfg(unix)]
+    async fn persist_observed(
+        &self,
+        expected: &SourceDescriptor,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        self.persist_entry(expected, cancel).await
     }
 
     /// Streams the directory page by page, one blocking read per page ([`listing`], P7 C5).
@@ -674,3 +695,6 @@ mod streaming_tests;
 mod symlink;
 #[cfg(test)]
 mod tests;
+
+#[cfg(unix)]
+mod persistence;

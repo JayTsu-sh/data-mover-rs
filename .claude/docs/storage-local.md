@@ -43,6 +43,19 @@ Windows 和其他非 Linux Local 的创建行为不变。
 检查点权限保持原策略：旧版 Local 指针受 umask 影响，含原始源片段的 v2 检查点从创建时即为 `0600`；
 `0644` 数据默认值不用于这些内部恢复记录。
 
+### 已发布条目的持久化确认
+
+`Namespace::persist_observed` 接受最后一次数据／元数据修改后校验所得的目标描述符。
+Unix Local 不重读文件体，按已打开的文件句柄同步数据和属性，再同步根内的父目录链；
+同步前后复核 identity、kind、size 和 content_version，路径组件及末尾均不跟随软链接。
+每次确认还按连接时 canonical 根路径核验根 inode，并从根向上同步至文件系统根，
+覆盖 app 新建 endpoint 根目录和两次观察间移走再移回同一根 inode 的情况，不缓存目录项持久性。
+调用方必须在确认至删源之间排除并发修改和根路径改名；此操作本身不提供锁。
+手工 `from_root` 的角色须配置 `with_persistence_root`，否则准确拒绝。
+软链接、Windows 和其他 backend 当前未实现该角色操作，返回 Unsupported，不伪造持久性。
+取消在阻塞操作之间检查，正在执行的系统 fsync 不能强行中断；该边界不代表整个迁移
+已经获得统一网络恢复预算。单元测试使用实际文件及受控同步失败，不宣称断电或网络挂载验收。
+
 ### 跨扫描改名证据
 
 Unix Local 为已有 metadata 中包含可表示创建时间的条目提供独立的 `RenameEvidence`：
