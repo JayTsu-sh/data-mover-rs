@@ -158,7 +158,8 @@ async fn purge_refuses_equal_length_rewrites_even_when_mtime_is_restored() -> Re
     );
     assert!(
         matches!(storage.namespace()?.purge_observed(&entry, CancellationToken::new()).await,
-        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict
+            && error.diagnostic().contains("mtime/ctime changed"))
     );
     assert_eq!(std::fs::read(file)?, b"newest");
     Ok(())
@@ -184,7 +185,8 @@ async fn purge_retains_files_without_current_change_evidence() -> Result {
         }
         assert!(
             matches!(storage.namespace()?.purge_observed(&entry, CancellationToken::new()).await,
-            Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Unsupported)
+            Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Unsupported
+                && error.diagnostic().contains("change evidence"))
         );
         assert_eq!(std::fs::read(root.path().join("file"))?, b"retained");
     }
@@ -215,7 +217,7 @@ async fn protected_directory_purge_retains_every_hidden_child_and_subtree() -> R
         .await;
     assert!(
         matches!(&result, Err(StorageRoleFailure::Entry(error))
-        if error.class() == FailureClass::Conflict),
+        if error.class() == FailureClass::Conflict && error.diagnostic().contains("not empty")),
         "{result:?}"
     );
     assert_eq!(std::fs::read(hidden)?, b"other task recovery");
