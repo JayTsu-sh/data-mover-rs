@@ -358,7 +358,7 @@ required-features = ["full"]
 [[test]]
 name = "nfs_mkdir_contract"
 path = "tests/nfs_mkdir_contract.rs"
-required-features = ["full"]
+required-features = ["backend-local", "backend-nfs"]
 
 [[test]]
 name = "observed_entry_snapshot"

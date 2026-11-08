@@ -19,3 +19,36 @@ Once a direct target has been opened, failures conservatively report `final_dest
 `EffectiveRecovery` remains an inexpensive outcome field. `Disabled` replaces its former AtomicReplace variant and is shared by AtomicReplace and Direct. Checkpointed/skipped/native outcomes retain their meaning. It does not control I/O or introduce per-chunk work.
 
 The Local comparison CLI uses `--transfer-policy checkpointed|atomic-replace|direct` and retains `--atomic-replace` as an exclusive shorthand. The NFS comparison CLI uses `--transfer-policy checkpointed|atomic-replace`. Historical benchmark snapshots keep their original APIs and labels.
+
+## NFS Direct（2026-11-08）
+
+NFS ordinary transfers now use the existing `prepare_direct`/`write`/`publish`/
+`remove_failed_direct` contract. The final regular file is visible while copying;
+there is no staging rename or checkpoint. The same-key transfer artifacts are checked
+before opening the final file. Missing artifacts require no DELETE, so an existing
+writable file in a read-only parent remains writable. Actual CREATE/OPEN returns the
+file handle with the file object; a later pathname lookup cannot claim a replacement.
+
+The opened handle is retained until writing and final close settle. Long existing
+files are truncated only after complete input; empty input truncates to zero. Final
+publication, verification, metadata application and failed-data cleanup recheck the
+opened FH. A data failure may remove only the still-owned affected output; an
+untouched existing target is retained. Issued writes with unchanged size/version are reported as uncertain instead of claiming
+cleanup success. Required durable Direct writes use existing bounded receipt batches
+rather than retaining all unstable payloads until end of file. Starting metadata work prevents data cleanup,
+and successful publication releases cleanup authority. Discard closes the handle
+and retains the final file. Generated streams still reject NFS Direct because their
+multiple-source alias protection is not implemented.
+
+After failed Direct writing or abandoned writes, CLOSE has a three-second cleanup
+budget, rather than starting a second full protocol recovery wait. Timeout is typed
+as Timeout/Unknown, keeps the preceding diagnostic, and cannot be reported as
+confirmed target cleanup. This bound is not the whole transfer's detection budget:
+real silent packet loss still takes about 45 seconds in the current SDK before
+failed-write close, about 48 seconds total. Task-wide network control remains work
+for the transfer scheduler and calling application. Normal Direct completion alone
+does not authorize application source deletion; required post-metadata persistence
+must be established separately through the namespace contract.
+
+The earlier Local-only description above records its original implementation;
+current backend capabilities and source code are authoritative for other backends.

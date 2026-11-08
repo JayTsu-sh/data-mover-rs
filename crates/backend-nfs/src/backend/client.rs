@@ -942,29 +942,11 @@ impl NfsStagedProtocol for NFSStorage {
         usize::try_from(self.config.write_chunk_bytes).unwrap_or(usize::MAX)
     }
 
-    async fn create_empty(
-        &self,
-        path: &crate::model::StoragePath,
-        mode: u32,
-    ) -> std::result::Result<(), NfsProtocolFailure> {
-        let native = Path::new(path.as_str());
-        let handle = self.create_empty_open(path, mode).await?;
-        if let Err(primary) = handle.close().await {
-            let cleanup_failure = self
-                .delete_file(native)
-                .await
-                .err()
-                .map(classify_role_error);
-            return Err(cleanup_failure.unwrap_or(primary));
-        }
-        Ok(())
-    }
-
     async fn create_empty_open(
         &self,
         path: &crate::model::StoragePath,
         mode: u32,
-    ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
+    ) -> std::result::Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure> {
         let native = Path::new(path.as_str());
         // Data and checkpoint creation select their own mode before writing any bytes.
         let Some(handle) = self.role_create_file_exclusive(native, Some(mode)).await? else {
@@ -973,7 +955,11 @@ impl NfsStagedProtocol for NFSStorage {
                 crate::model::Transience::Permanent,
             ));
         };
-        Ok(Box::new(NfsRoleStageFile::new(self.clone(), handle)))
+        let identity = handle.inner.fh.clone();
+        Ok((
+            Box::new(NfsRoleStageFile::new(self.clone(), handle)),
+            identity,
+        ))
     }
 
     async fn open_read(
@@ -990,12 +976,16 @@ impl NfsStagedProtocol for NFSStorage {
     async fn open_write(
         &self,
         path: &crate::model::StoragePath,
-    ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
+    ) -> std::result::Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure> {
         let handle = self
             .open(Path::new(path.as_str()), OPEN_WRITE)
             .await
             .map_err(classify_role_error)?;
-        Ok(Box::new(NfsRoleStageFile::new(self.clone(), handle)))
+        let identity = handle.inner.fh.clone();
+        Ok((
+            Box::new(NfsRoleStageFile::new(self.clone(), handle)),
+            identity,
+        ))
     }
 
     async fn size(

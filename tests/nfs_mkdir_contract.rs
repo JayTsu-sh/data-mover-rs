@@ -44,6 +44,9 @@
 //!     cargo test --test nfs_mkdir_contract -- --ignored --nocapture
 //! ```
 mod common;
+#[cfg(feature = "transfer")]
+#[path = "nfs_mkdir_contract/direct.rs"]
+mod direct;
 
 use std::num::NonZeroUsize;
 use std::path::Path;

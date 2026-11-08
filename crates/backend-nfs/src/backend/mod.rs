@@ -7,6 +7,8 @@ pub mod common;
 mod connectivity;
 #[cfg(test)]
 mod create_dir_tests;
+#[cfg(test)]
+mod direct_tests;
 mod listing;
 #[cfg(any(test, feature = "test-support"))]
 pub mod listing_fake;

@@ -754,3 +754,34 @@ fixtures; an empty run cannot qualify. Isolated cleanup rejects parent path
 components (including URL-encoded forms) and unsupported URL schemes. For Local,
 it resolves the actual root and refuses symlinks at or below the run directory;
 cleanup only starts after that validation succeeds.
+
+## NFS Direct contract
+
+`python3 tests/lab/run-nfs-direct-contract.py --binary <nfs_mkdir_contract> --url
+<nfs-v4.1-url>` runs an already built ignored contract against a separately prepared
+owned `nightly-nfs-direct-*` prefix. Build with `backend-local,backend-nfs,transfer,
+integrity`. Pass `--functional` to include normal Direct transfers. Preparation,
+independent server-side inspection and exact-prefix cleanup belong to the lab
+lifecycle; the runner never changes exports, firewall rules or shared services.
+`LAB_NFS_DIRECT_ONLY` selects one of `flash`, `disconnect`, `stall`, `cancel`,
+`lost_ack` for diagnosis. The functional ignored test may also run directly with
+`LAB_NFS_DIRECT_URL`, on either v3 or v4.1.
+
+The private loopback proxy injects faults only after a real confirmed WRITE. It
+checks actual fault packet counters, explicit retry and retained Local source bytes.
+Cancellation here drops the role write future after 250 ms; it does not certify
+whole-request or CLI cancellation. CLOSE uncertainty is reported and the harness
+may reset a fixture only after independently comparing its original FH. Such a reset
+is not automatic backend cleanup success. Functional coverage includes quick/full,
+long-to-short overwrite, empty files, partial data failure cleanup, replacement FH
+protection, writable files in read-only parents and real owner-setting refusal with
+published data retained. Independent server-side reads must check payloads, owners,
+permissions and absence of stage/pointer artifacts.
+
+On Linux NFSv3/v4.1, the functional paths passed. The real v4.1 proxy run recovered
+flash/lost-response cases, returned persistent disconnect in about 0.96 s, and
+returned silent-loss Timeout/Unknown in about 48 s (roughly 45 s WRITE detection plus
+3 s failed CLOSE). Role cancellation returned in about 252 ms. Neither these results
+nor the deterministic close-budget regression certify a shared task recovery
+budget, source purge, post-metadata namespace persistence, ONTAP behavior or the
+whole-migration throughput/RSS target.

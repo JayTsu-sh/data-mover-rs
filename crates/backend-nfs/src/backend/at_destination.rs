@@ -29,7 +29,10 @@ use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::artifacts::{ArtifactKind, artifact_name, artifact_temporary_name};
 use crate::storage::discovery::{DestinationArtifacts, discover};
 use crate::storage::pointer::{DestinationPointer, MAX_POINTER_BYTES};
-use crate::storage::{DestinationPrepareRequest, PreparedStage, StorageRoleFailure};
+use crate::storage::{
+    DestinationPrepareRequest, PrepareFact, PrepareRequest, PreparedStage, ResumeMode,
+    StorageRoleFailure,
+};
 
 #[path = "hash_checkpoint.rs"]
 mod hash_checkpoint;
@@ -110,7 +113,10 @@ fn fence(stage: &PreparedStage) -> Result<&Fence, StorageRoleFailure> {
         .backend_state()
         .as_ref()
         .and_then(|state| state.downcast_ref::<NfsStageState>())
-        .map(|state| &state.fence)
+        .and_then(|state| match state {
+            NfsStageState::Staged { fence } => Some(fence),
+            NfsStageState::Direct(_) => None,
+        })
         .ok_or_else(|| invalid(stage.final_destination().path(), FailureClass::Corruption))
 }
 
@@ -243,6 +249,51 @@ impl DestinationArtifacts for NfsArtifacts<'_> {
     }
 }
 
+/// Direct 只清理同一最终名称的传输产物，不为不存在的产物发出 DELETE。
+pub(super) async fn clear_before_direct(
+    adapter: &NfsStagedDestinationAdapter,
+    request: &PrepareRequest,
+) -> Result<PrepareFact, StorageRoleFailure> {
+    let final_path = request.final_destination.path();
+    let artifacts = NfsArtifacts {
+        adapter,
+        stage: artifact_path(final_path, ArtifactKind::Stage, false)?,
+        pointer: artifact_path(final_path, ArtifactKind::Pointer, false)?,
+        pointer_temporary: artifact_path(final_path, ArtifactKind::Pointer, true)?,
+    };
+    let observations = tokio::join!(
+        adapter.protocol.stat(&artifacts.stage),
+        adapter.protocol.stat(&artifacts.pointer),
+        adapter.protocol.stat(&artifacts.pointer_temporary)
+    );
+    let temporary_exists = observations.2.is_ok();
+    let mut found_any = false;
+    for observed in [observations.0, observations.1, observations.2] {
+        match observed {
+            Ok((true, _)) => found_any = true,
+            Ok((false, _)) => {
+                return Err(role_failure(final_path, Operation::Prepare, not_regular()));
+            }
+            Err(error) if is_not_found(&error) => {}
+            Err(error) => return Err(role_failure(final_path, Operation::Prepare, error)),
+        }
+    }
+    if !found_any {
+        return Ok(PrepareFact::Fresh);
+    }
+    let request = DestinationPrepareRequest::new(request.clone(), [0; 32])
+        .with_resume(ResumeMode::Restart)
+        .with_recoverable(false);
+    let found = discover(&artifacts, &request).await?;
+    // 没有主 pointer 时也可能留下失败的临时写入；只删除本最终名称的保留产物。
+    if temporary_exists {
+        delete_if_present(adapter, &artifacts.pointer_temporary)
+            .await
+            .map_err(|error| role_failure(final_path, Operation::Prepare, error))?;
+    }
+    Ok(found.fact)
+}
+
 /// Prepares a stage at the destination: looks at what is there and resumes or starts over as the
 /// decision table says. A resume takes the stage over — rewrites its pointer with a new nonce —
 /// before it truncates the stage to the durable prefix.
@@ -268,7 +319,7 @@ pub(super) async fn prepare(
         0,
         None,
     );
-    stage.set_backend_state(Some(Arc::new(NfsStageState {
+    stage.set_backend_state(Some(Arc::new(NfsStageState::Staged {
         fence: Fence::new(request.transfer_identity),
     })));
     stage.mark_at_destination(found.fact);
@@ -343,7 +394,7 @@ async fn create(
         .protocol
         .create_empty_open(path, mode)
         .await
-        .map(Arc::from)
+        .map(|(handle, _)| Arc::from(handle))
         .map_err(|error| role_failure(final_path, Operation::Prepare, transient_collision(error)))
 }
 
@@ -377,7 +428,7 @@ async fn reopen(
         other => other,
     };
     opened
-        .map(Arc::from)
+        .map(|(handle, _)| Arc::from(handle))
         .map_err(|error| role_failure(final_path, Operation::Prepare, transient_collision(error)))
 }
 
@@ -467,7 +518,7 @@ async fn write_temporary(
     bytes: &[u8],
 ) -> Result<(), NfsProtocolFailure> {
     delete_if_present(adapter, temporary).await?;
-    let handle = adapter
+    let (handle, _) = adapter
         .protocol
         // Checkpoint temporaries may carry raw source fragments; keep them private from CREATE.
         .create_empty_open(temporary, 0o600)

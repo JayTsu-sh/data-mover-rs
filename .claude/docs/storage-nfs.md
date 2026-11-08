@@ -26,6 +26,21 @@ VerifyThenResume 的修改操作仍是 Protocol / Unknown，重放前需核验�
 data-mover 保留 Throttled 与原始状态，不再次启动列举退避预算。
 原生库增加 v4.2 不表示 data-mover 自动声明该版本；当前 dialect 仍明确映射 v3 / v4.0 / v4.1。
 
+## 普通文件 Direct
+
+普通传输支持既有 `TransferPolicy::Direct`：直接写最终文件，不创建 stage／pointer，
+不进行发布 rename。已有文件无截断打开，源数据完整结束后才调整最终长度；空文件同样处理。
+源／目标 FH 相同则在写入前拒绝。元数据仍独立复制及校验，失败保留数据。
+
+既有 `NfsStagedProtocol::create_empty_open`／`open_write` 扩展为返回实际句柄与 FH，
+适配器复用同一连接的 `NfsSourceProtocol::describe` 核验归属，不增加另一套观察接口。
+失败清理只针对本次拥有且受影响的最终文件，路径已替换、已进入元数据阶段或已发布均拒绝删除。
+失败／放弃写入后的 CLOSE 最多等待 3 秒；结果未知必须报告，不能宣称目标已清理。
+该期限不包括底层 WRITE 的故障检测；目前真实 v4.1 静默丢包检测约 45 秒、连同关闭约 48 秒，
+不能据此声称产品已经满足尽早退出目标。普通 Direct 成功也不替代删源前的独立持久化门槛。
+
+真实回归入口及严格验证范围见 [实验室说明](../../tests/lab/README.md#nfs-direct-contract)。
+
 ## ACL 能力（2026-10-28）
 
 NFSv3 仅在实际探测到 NFSACL RPC 100227 v3 扩展时声明 `posix_acl`；后端以 typed POSIX

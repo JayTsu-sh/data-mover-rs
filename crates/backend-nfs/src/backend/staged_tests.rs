@@ -28,7 +28,10 @@ pub(super) mod tests {
         pub(in crate::storage::backends::nfs) files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         pub(in crate::storage::backends::nfs) creations: Mutex<Vec<(String, u32)>>,
         opens: std::sync::atomic::AtomicU64,
+        pub(in crate::backend) identities: Mutex<HashMap<String, u64>>,
+        next_identity: std::sync::atomic::AtomicU64,
         closes: Arc<std::sync::atomic::AtomicU64>,
+        pub(in crate::backend) close_stalls: Arc<std::sync::atomic::AtomicBool>,
         pub(in crate::backend) rename_mode: std::sync::atomic::AtomicU8,
         active_writes: Arc<std::sync::atomic::AtomicUsize>,
         maximum_active_writes: Arc<std::sync::atomic::AtomicUsize>,
@@ -37,23 +40,49 @@ pub(super) mod tests {
         maximum_read_chunk: std::sync::atomic::AtomicUsize,
         maximum_write_chunk: std::sync::atomic::AtomicUsize,
         write_sizes: Arc<Mutex<Vec<usize>>>,
-        deferred_writes: Arc<std::sync::atomic::AtomicU64>,
+        pub(in crate::backend) deferred_writes: Arc<std::sync::atomic::AtomicU64>,
         checkpoint_pending_writes: Arc<std::sync::atomic::AtomicU64>,
         uncommitted_writes: Arc<std::sync::atomic::AtomicU64>,
-        checkpoints: Arc<std::sync::atomic::AtomicU64>,
+        pub(in crate::backend) checkpoints: Arc<std::sync::atomic::AtomicU64>,
         uncommitted_closes: Arc<std::sync::atomic::AtomicU64>,
         failed_write_offset: Arc<Mutex<Option<u64>>>,
         checkpoint_gate: Arc<Mutex<Option<Arc<CheckpointGate>>>>,
-        unstable_pressure: Arc<std::sync::atomic::AtomicBool>,
+        pub(in crate::backend) unstable_pressure: Arc<std::sync::atomic::AtomicBool>,
         size_calls: std::sync::atomic::AtomicU64,
         /// Writes of a pointer (through its temporary): one per recorded checkpoint.
         pointer_writes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+
+    impl FakeProtocol {
+        fn identity(&self, path: &StoragePath) -> Bytes {
+            let generation = self.identities.lock().unwrap_or_else(PoisonError::into_inner)
+                .get(path.as_str()).copied().unwrap_or(0);
+            Bytes::from(format!("fh:{}:{generation}", path.as_str()))
+        }
+    }
+
+    #[async_trait]
+    impl super::super::source::NfsSourceProtocol for FakeProtocol {
+        async fn describe(&self, path: &StoragePath) -> Result<super::super::source::NfsSourceObservation, NfsProtocolFailure> {
+            let files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+            let data = files.get(path.as_str()).ok_or_else(|| NfsProtocolFailure::new(FailureClass::NotFound, Transience::Permanent))?;
+            Ok(super::super::source::NfsSourceObservation {
+                kind: EntryKind::File, size: Some(data.len() as u64), file_handle: self.identity(path),
+                content_version: Bytes::copy_from_slice(blake3::hash(data).as_bytes()),
+                timestamps: None, ownership: None, mode: None, uid: None, gid: None,
+            })
+        }
+        async fn open(&self, _: &StoragePath) -> Result<(Box<dyn super::super::source::NfsReadCursor>, Bytes), NfsProtocolFailure> {
+            Err(NfsProtocolFailure::new(FailureClass::Unsupported, Transience::Permanent))
+        }
     }
 
     struct FakeFile {
         path: String,
         files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         closes: Arc<std::sync::atomic::AtomicU64>,
+        close_stalls: Arc<std::sync::atomic::AtomicBool>,
         active_writes: Arc<std::sync::atomic::AtomicUsize>,
         maximum_active_writes: Arc<std::sync::atomic::AtomicUsize>,
         active_reads: Arc<std::sync::atomic::AtomicUsize>,
@@ -237,6 +266,9 @@ pub(super) mod tests {
         }
 
         async fn close(&self) -> Result<(), NfsProtocolFailure> {
+            if self.close_stalls.load(std::sync::atomic::Ordering::Acquire) {
+                futures::future::pending::<()>().await;
+            }
             if !self.path.contains(".pointer") {
                 self.closes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -281,39 +313,44 @@ pub(super) mod tests {
                 .max(1)
         }
 
-        async fn create_empty(
+        async fn create_empty_open(
             &self,
             path: &StoragePath,
             mode: u32,
-        ) -> Result<(), NfsProtocolFailure> {
+        ) -> Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure> {
+            {
             let mut files = self
                 .files
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if files.insert(path.as_str().to_owned(), Vec::new()).is_some() {
+            if files.contains_key(path.as_str()) {
                 return Err(NfsProtocolFailure::new(
                     FailureClass::Conflict,
                     Transience::Permanent,
                 ));
             }
+            files.insert(path.as_str().to_owned(), Vec::new());
+            self.identities.lock().unwrap_or_else(PoisonError::into_inner).insert(
+                path.as_str().to_owned(), self.next_identity.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
             self.creations
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((path.as_str().to_owned(), mode));
-            Ok(())
+            }
+            self.open_write(path).await
         }
 
         async fn open_read(
             &self,
             path: &StoragePath,
         ) -> Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
-            self.open_write(path).await
+            self.open_write(path).await.map(|(handle, _)| handle)
         }
 
         async fn open_write(
             &self,
             path: &StoragePath,
-        ) -> Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
+        ) -> Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure> {
             if !self
                 .files
                 .lock()
@@ -328,10 +365,12 @@ pub(super) mod tests {
             if !path.as_str().contains(".pointer") {
                 self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            Ok(Box::new(FakeFile {
+            let identity = self.identity(path);
+            Ok((Box::new(FakeFile {
                 path: path.as_str().to_owned(),
                 files: Arc::clone(&self.files),
                 closes: Arc::clone(&self.closes),
+                close_stalls: Arc::clone(&self.close_stalls),
                 active_writes: Arc::clone(&self.active_writes),
                 maximum_active_writes: Arc::clone(&self.maximum_active_writes),
                 active_reads: Arc::clone(&self.active_reads),
@@ -346,7 +385,7 @@ pub(super) mod tests {
                 checkpoint_gate: Arc::clone(&self.checkpoint_gate),
                 unstable_pressure: Arc::clone(&self.unstable_pressure),
                 pointer_writes: Arc::clone(&self.pointer_writes),
-            }))
+            }), identity))
         }
 
         async fn size(&self, path: &StoragePath) -> Result<u64, NfsProtocolFailure> {

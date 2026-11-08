@@ -9,7 +9,9 @@ use futures::stream::FuturesOrdered;
 use tokio_util::sync::CancellationToken;
 
 use super::at_destination::write_pointer;
-use super::source::{NfsProtocolFailure, entry_failure, role_failure};
+use super::source::{
+    NfsProtocolFailure, NfsReadSourceAdapter, NfsSourceProtocol, entry_failure, role_failure,
+};
 use crate::model::{
     AclEncoding, BackendIdentity, FailureClass, Operation, StoragePath, Transience,
 };
@@ -20,10 +22,14 @@ use crate::storage::{
     StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
+#[path = "direct.rs"]
+mod direct;
 #[path = "positioned_writer.rs"]
 mod positioned_writer;
 #[path = "staged_acl.rs"]
 mod staged_acl;
+#[path = "staged_metadata.rs"]
+mod staged_metadata;
 
 #[async_trait]
 pub trait NfsStageFile: Send + Sync {
@@ -79,29 +85,21 @@ pub trait NfsStagedProtocol: Send + Sync {
     fn maximum_write_chunk_bytes(&self) -> usize {
         1024 * 1024
     }
-    async fn create_empty(&self, path: &StoragePath, mode: u32) -> Result<(), NfsProtocolFailure>;
+    /// 返回同一次独占 CREATE 实际打开的文件及 FH，禁止创建后重新按名称认领。
     async fn create_empty_open(
         &self,
         path: &StoragePath,
         mode: u32,
-    ) -> Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
-        self.create_empty(path, mode).await?;
-        match self.open_write(path).await {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                let _ = self.delete(path).await;
-                Err(error)
-            }
-        }
-    }
+    ) -> Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure>;
     async fn open_read(
         &self,
         path: &StoragePath,
     ) -> Result<Box<dyn NfsStageFile>, NfsProtocolFailure>;
+    /// 返回实际写句柄的 FH，供 Direct 与打开前的观察比对；不截断现有文件。
     async fn open_write(
         &self,
         path: &StoragePath,
-    ) -> Result<Box<dyn NfsStageFile>, NfsProtocolFailure>;
+    ) -> Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure>;
     async fn size(&self, path: &StoragePath) -> Result<u64, NfsProtocolFailure>;
     /// Whether `path` is a regular file, and its size. The default treats whatever `size`
     /// answers for as a file; a protocol that sees file types says otherwise.
@@ -118,11 +116,12 @@ pub struct NfsStagedDestinationAdapter {
     owned_stages: Mutex<HashSet<Bytes>>,
     prepared_handles: Mutex<HashMap<Bytes, Arc<dyn NfsStageFile>>>,
     metadata: Option<Arc<dyn Metadata>>,
+    source: NfsReadSourceAdapter,
 }
 
-pub(super) struct NfsStageState {
-    /// The stage's pointer's nonce and transfer identity (ADR-0006).
-    pub(super) fence: super::at_destination::Fence,
+pub(super) enum NfsStageState {
+    Staged { fence: super::at_destination::Fence },
+    Direct(direct::DirectState),
 }
 
 struct NfsWriteProgress {
@@ -149,8 +148,12 @@ impl NfsWriteProgress {
 }
 
 impl NfsStagedDestinationAdapter {
-    pub fn new(protocol: Arc<dyn NfsStagedProtocol>, identity: BackendIdentity) -> Self {
+    pub fn new<P>(protocol: Arc<P>, identity: BackendIdentity) -> Self
+    where
+        P: NfsStagedProtocol + NfsSourceProtocol + 'static,
+    {
         Self {
+            source: NfsReadSourceAdapter::new(protocol.clone(), identity.clone()),
             protocol,
             identity,
             owned_stages: Mutex::new(HashSet::new()),
@@ -176,7 +179,12 @@ impl NfsStagedDestinationAdapter {
                 Transience::Permanent,
             )
         })?;
-        let path = super::at_destination::stage_path(stage)?;
+        let path = if stage.direct() {
+            direct::state(stage)?;
+            stage.final_destination().path().clone()
+        } else {
+            super::at_destination::stage_path(stage)?
+        };
         if !self
             .owned_stages
             .lock()
@@ -236,10 +244,17 @@ impl NfsStagedDestinationAdapter {
         if let Some(handle) = self.take_prepared_handle(stage.token()) {
             return Ok(handle);
         }
+        if stage.direct() {
+            return Err(failure(
+                native,
+                FailureClass::Conflict,
+                Transience::Permanent,
+            ));
+        }
         self.protocol
             .open_write(native)
             .await
-            .map(Arc::from)
+            .map(|(handle, _)| Arc::from(handle))
             .map_err(|error| {
                 role_failure(stage.final_destination().path(), Operation::Write, error)
             })
@@ -282,10 +297,17 @@ impl NfsStagedDestinationAdapter {
         stage: &PreparedStage,
         handle: &Arc<dyn NfsStageFile>,
         deferred_writes_used: bool,
-        write_failed: bool,
+        write_failure: Option<&StorageRoleFailure>,
         persisted: u64,
         issued: u64,
     ) -> Result<(), StorageRoleFailure> {
+        direct::mark_finalizing(stage);
+        let write_failed = write_failure.is_some();
+        if stage.direct() && write_failed {
+            direct::close_failed(stage, handle, write_failure).await?;
+            direct::release_file(stage);
+            return Ok(());
+        }
         let checkpoint_required = stage.recovery_enabled()
             || (stage.durable_publication() && deferred_writes_used && !write_failed);
         let checkpoint_failure = if checkpoint_required {
@@ -298,7 +320,11 @@ impl NfsStagedDestinationAdapter {
         } else {
             persisted
         };
-        let truncate_failure = if write_failed
+        let truncate_failure = if stage.direct() && !write_failed {
+            direct::mark_mutation(stage);
+            handle.set_len(issued).await.err()
+        } else if write_failed
+            && !stage.direct()
             && retained_prefix < issued
             && !stage.checkpoint_enabled()
             && stage.restored_checkpoint().is_none()
@@ -307,11 +333,14 @@ impl NfsStagedDestinationAdapter {
         } else {
             None
         };
-        let close_failure = if stage.recovery_enabled() || stage.durable_publication() {
+        let close_failure = if stage.direct() && write_failed {
+            handle.close_uncommitted().await.err()
+        } else if stage.recovery_enabled() || stage.durable_publication() {
             handle.close().await.err()
         } else {
             handle.close_uncommitted().await.err()
         };
+        direct::release_file(stage);
         if let Some(error) = truncate_failure.or(checkpoint_failure).or(close_failure) {
             return Err(role_failure(
                 stage.final_destination().path(),
@@ -540,6 +569,18 @@ impl NfsStagedDestinationAdapter {
 
 #[async_trait]
 impl StagedDestination for NfsStagedDestinationAdapter {
+    fn supports_direct(&self) -> bool {
+        true
+    }
+
+    async fn prepare_direct(
+        &self,
+        request: crate::storage::PrepareRequest,
+        cancel: CancellationToken,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        self.open_direct(request, cancel).await
+    }
+
     fn supports_hash_checkpoint(&self) -> bool {
         true
     }
@@ -610,7 +651,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             stage,
             &handle,
             progress.deferred_writes_used,
-            progress.failure.is_some(),
+            progress.failure.as_ref(),
             progress.persisted,
             progress.issued,
         )
@@ -653,7 +694,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             stage,
             &handle,
             progress.deferred_writes_used,
-            progress.failure.is_some(),
+            progress.failure.as_ref(),
             progress.persisted,
             progress.issued,
         )
@@ -723,6 +764,9 @@ impl StagedDestination for NfsStagedDestinationAdapter {
                 Transience::Permanent,
             ));
         }
+        if stage.direct() {
+            self.confirm_direct(stage).await?;
+        }
         Ok(VerificationEvidence {
             verified_bytes: request.expected_size,
             blake3: hash,
@@ -749,6 +793,10 @@ impl StagedDestination for NfsStagedDestinationAdapter {
         if stage.recovered_publication().is_some() {
             return Ok(());
         }
+        if stage.direct() {
+            direct::mark_metadata(stage);
+            self.confirm_direct(stage).await?;
+        }
         let metadata = self.metadata.as_ref().ok_or_else(|| {
             failure(
                 stage.final_destination().path(),
@@ -757,6 +805,15 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             )
         })?;
         metadata.apply(&path, mutation, cancel).await
+    }
+
+    async fn apply_metadata_batch(
+        &self,
+        stage: &PreparedStage,
+        mutations: Vec<MetadataMutation>,
+        cancel: CancellationToken,
+    ) -> Result<(), crate::storage::StagedMetadataApplicationFailure> {
+        self.apply_batch(stage, mutations, cancel).await
     }
 
     async fn publish(
@@ -771,6 +828,15 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             error,
             final_destination_changed: false,
         })?;
+        if stage.direct() {
+            return self
+                .finish_direct(stage)
+                .await
+                .map_err(|error| PublicationFailure {
+                    error,
+                    final_destination_changed: true,
+                });
+        }
         let final_path = stage.final_destination().path().clone();
         super::at_destination::before_publication(self, stage)
             .await
@@ -801,7 +867,16 @@ impl StagedDestination for NfsStagedDestinationAdapter {
 
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
         self.validate(&stage)?;
+        if stage.direct() {
+            let result = self.close_direct(&stage).await;
+            self.release_authority(&stage);
+            return result;
+        }
         super::at_destination::discard(self, &stage).await
+    }
+
+    async fn remove_failed_direct(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
+        self.cleanup_direct(stage).await
     }
 }
 

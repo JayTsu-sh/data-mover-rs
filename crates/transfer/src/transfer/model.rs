@@ -41,7 +41,7 @@ pub enum TransferPolicy {
     /// Other destinations may retain persistence required by their protocol.
     AtomicReplace,
     /// Write the final path directly, without staging, rename, or checkpoints.
-    /// Failure may leave partial content. Supported by Unix Local and HDFS destinations.
+    /// Failure may leave partial content. Requires destination `supports_direct()` capability.
     /// HDFS recreates the target and completes its writer; Local writes the existing inode.
     Direct,
 }
