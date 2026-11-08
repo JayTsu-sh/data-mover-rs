@@ -9,6 +9,11 @@ pub const MAX_SINGLE_REQUEST_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct S3BucketCapabilities {
+    /// A completed object publication is persistent by the store's contract. A fresh HEAD can
+    /// confirm that the verified object still has its namespace binding; it is not a data or
+    /// metadata verification, and must never be inferred merely from GET/HEAD readability.
+    /// NAS buckets remain uncertified for this contract.
+    pub durable_object_publication: bool,
     /// A read can be pinned by the store to what was described: `If-Match` on the `ETag`, or
     /// `?versionId=`. Without it every ranged read is checked after the fact instead: the
     /// response's `ETag`, `Content-Range` total and `Last-Modified` must be the described ones, a
@@ -45,6 +50,7 @@ pub struct S3BucketCapabilities {
 impl S3BucketCapabilities {
     /// An object bucket of any S3 profile.
     pub const OBJECT: Self = Self {
+        durable_object_publication: true,
         conditional_reads: true,
         multipart: true,
         resumable: true,
@@ -63,6 +69,7 @@ impl S3BucketCapabilities {
     /// `/` holding content is stored as a file; `CopyObject` between a NAS and another bucket
     /// answers 501.
     pub const NAS: Self = Self {
+        durable_object_publication: false,
         conditional_reads: false,
         multipart: false,
         resumable: false,

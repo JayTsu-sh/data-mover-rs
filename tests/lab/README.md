@@ -76,6 +76,19 @@ Independent S3 inspection requires all three versions and the sentinel to remain
 case. It proves current-path stat semantics only, not absence of historical versions or an
 atomic absence-and-delete transaction. Local/NFS/CIFS/HDFS and task-level target mutation
 protection require their own evidence.
+
+`python3 tests/lab/run-source-purge-local.py --namespace-persistence` reuses that fixture for
+the S3 target's existing `Namespace::persist_observed`. It captures a current descriptor and
+an exact-version descriptor, then exercises normal HEAD, permission refusal, persistent loss,
+silent timeout, cancellation, recovered disconnect and recovered timeout. Independent reads
+require all three original versions and the sentinel in every case; proxy counters require
+zero payload GETs and mutations. This is a read-only storage-role contract. It does not prove
+whole-job source-removal sequencing, ClickHouse/callback behavior, other S3 vendors, NAS bucket
+durability, power-cut recovery or migration throughput/RSS targets.
+The fixture can run an already built external integration test with
+`LAB_S3_PURGE_TEST_BINARY` and its exact `LAB_S3_PURGE_TEST_NAME`, without changing the fixture's
+independent version/mutation checks. The test binary uses the existing `LAB_S3_PURGE_*`
+environment to address the owned prefix and arm faults.
 `python3 tests/lab/run-source-purge-local.py --source-observation` tests the composed
 current-source observation against real S3. Nine modes cover success, denied tag
 reads, metadata NotFound while HEAD still succeeds, disconnect, silent timeout,

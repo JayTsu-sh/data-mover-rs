@@ -539,6 +539,25 @@ mapping. `smb2_only` and the legacy `CifsStorage` path remain removed (#150).
 `CIFS_REAL_SERVER`, `CIFS_REAL_SECOND_SERVER`, `CIFS_REAL_SHARE`, `CIFS_REAL_USER`,
 and `CIFS_REAL_PASS`.
 
+### Published-object persistence
+
+`Namespace::persist_observed` supports already verified S3 data objects on object buckets.
+It sends one fresh HEAD, selecting the exact version when the descriptor pins one, and checks
+the endpoint binding, identity, size, ETag and any captured Last-Modified. Empty objects and
+nonempty keys ending in `/` use the same contract. Publication durability comes from the
+object store's completed-write contract, not from HEAD readability or an ETag being an MD5.
+The call does no payload GET, PUT, COPY, tag read or mutation. It does not validate content or
+metadata, and callers must exclude concurrent writers until source removal.
+
+The existing `S3BucketCapabilities` distinguishes this contract with
+`durable_object_publication`; object buckets enable it and uncertified NAS buckets refuse it.
+Virtual prefixes, root descriptors, delete markers, incomplete/foreign evidence, an ignored
+version selection, failed HEAD or cancellation cannot confirm persistence. Read retries and
+the overall deadline belong to the caller; protocol errors keep their typed cause. This is
+not a guarantee about a store's cross-region replicas, power-loss behavior or every S3 vendor.
+See the [S3 consistency contract](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)
+and [HEAD semantics](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html).
+
 ### Scan network failures
 
 Protocol clients report definite connection loss and typed deadlines. The CIFS

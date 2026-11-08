@@ -38,7 +38,7 @@ def isolated_run():
     try:
         print(f"isolated source-purge image={docker('inspect', container, '--format', '{{.Image}}')}", flush=True)
         pid = docker("inspect", container, "--format", "{{.State.Pid}}")
-        arguments = [flag for flag in ("--namespace-read", "--source-observation") if flag in sys.argv]
+        arguments = [flag for flag in ("--namespace-read", "--source-observation", "--namespace-persistence") if flag in sys.argv]
         subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *arguments], check=True)
     finally:
         docker("rm", "-f", "-v", container)
@@ -66,7 +66,8 @@ def inside_run():
     client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     stopped = threading.Event()
     observing = "--source-observation" in sys.argv
-    reading = "--namespace-read" in sys.argv or observing
+    persisting = "--namespace-persistence" in sys.argv
+    reading = "--namespace-read" in sys.argv or observing or persisting
     alternating = [0]
     requests = {"data_get": 0, "writes": 0}
     with tempfile.TemporaryDirectory(prefix="source-purge-") as directory:
@@ -84,7 +85,7 @@ def inside_run():
                 tagging = self.command == "GET" and "tagging" in self.path
                 probing = reading and payload and (tagging if observing else self.command == "HEAD")
                 affected = deleting or probing
-                if observing:
+                if observing or persisting:
                     if self.command == "GET" and payload and not tagging:
                         requests["data_get"] += 1
                     if self.command in ("PUT", "POST", "DELETE"):
@@ -157,19 +158,30 @@ def inside_run():
                     LAB_S3_PURGE_URL=f"s3://purge-test:purge-test-isolated-only@{bucket}.127.0.0.1:{server.server_port}/{prefix}",
                     LAB_S3_PURGE_KEY="payload", LAB_S3_PURGE_FAULT=mode, LAB_S3_PURGE_CONTROL=str(control),
                 )
-                subprocess.run([
+                if persisting:
+                    test_name = "namespace_persistence::published_object_persistence_with_real_requests"
+                elif observing:
+                    test_name = "source_observation::bounded_source_observation_with_real_requests"
+                elif reading:
+                    test_name = "namespace_read::bounded_namespace_read_with_real_requests"
+                else:
+                    test_name = "source_purge::permanent_source_purge_with_real_requests"
+                command = [
                     "cargo", "test", "--offline", "--locked", "--test", "s3_architecture_contract",
-                    "source_observation::bounded_source_observation_with_real_requests" if observing else ("namespace_read::bounded_namespace_read_with_real_requests" if reading else "source_purge::permanent_source_purge_with_real_requests"), "--", "--ignored", "--exact", "--nocapture",
-                ], env=environment, check=True)
+                    test_name, "--", "--ignored", "--exact", "--nocapture",
+                ]
+                if binary := os.environ.get("LAB_S3_PURGE_TEST_BINARY"):
+                    command = [binary, os.environ["LAB_S3_PURGE_TEST_NAME"], "--ignored", "--exact", "--nocapture"]
+                subprocess.run(command, env=environment, check=True)
                 remaining = client.list_object_versions(Bucket=bucket, Prefix=f"{prefix}/")
                 records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
                 payload_records = [record for record in records if record["Key"] == f"{prefix}/payload"]
                 assert len(payload_records) == (0 if not reading and mode in ("normal", "flash", "lost_ack") else 3), (mode, payload_records)
                 assert any(record["Key"] == f"{prefix}/sentinel" for record in records)
                 print(f"independent S3 inspection fault={mode} source_records={len(payload_records)} sentinel=retained", flush=True)
-            if observing:
+            if observing or persisting:
                 assert requests == {"data_get": 0, "writes": 0}, requests
-                print("source-observation data_GET=0 writes=0 missing_metadata_is_error=true shared_budget=true", flush=True)
+                print("target-persistence data_GET=0 writes=0" if persisting else "source-observation data_GET=0 writes=0 missing_metadata_is_error=true shared_budget=true", flush=True)
         finally:
             control.write_text("normal")
             stopped.set()

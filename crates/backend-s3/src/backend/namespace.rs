@@ -26,6 +26,7 @@ use crate::storage::{
     SourceDescriptor, StorageRoleFailure,
 };
 
+mod persistence;
 mod purge;
 
 const NO_DIRECTORIES: &str = "S3 prefixes are virtual; creating a directory is unsupported";
@@ -128,6 +129,14 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
     async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         refuse_artifact(path)?;
         self.stat_entry(path).await
+    }
+
+    async fn persist_observed(
+        &self,
+        expected: &SourceDescriptor,
+        cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        self.persist_entry(expected, &cancel).await
     }
 
     /// The subdirectories of the prefix, and its objects: on a bucket that keeps histories

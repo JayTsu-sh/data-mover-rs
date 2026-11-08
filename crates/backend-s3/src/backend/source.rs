@@ -56,7 +56,7 @@ fn pinned_version(facts: &S3ObjectFacts, requested: &SourceVersion) -> SourceVer
 
 /// Whether a HEAD for `requested` answered with that version. The `"null"` version is reported as
 /// `"null"` or not at all.
-fn answers_version(facts: &S3ObjectFacts, requested: &str) -> bool {
+pub(super) fn answers_version(facts: &S3ObjectFacts, requested: &str) -> bool {
     match facts.version_id.as_deref() {
         Some(reported) => reported == requested,
         None => requested == "null",

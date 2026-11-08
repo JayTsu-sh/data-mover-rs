@@ -2,6 +2,8 @@
 //! that keeps histories, of one child per key with its history (P7 §10), `stat`, and the verbs S3
 //! cannot serve.
 
+#[path = "namespace_persistence_tests.rs"]
+mod persistence_tests;
 #[path = "namespace_purge_tests.rs"]
 mod purge_tests;
 
