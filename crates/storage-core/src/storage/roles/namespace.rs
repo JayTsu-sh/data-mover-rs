@@ -153,10 +153,12 @@ pub trait Namespace: Send + Sync {
     /// directories must be empty; object stores override this to remove all versions and markers
     /// of the exact key, retaining the latest record until the other records have been removed.
     ///
-    /// The caller authorizes deletion only after its own publication, verification and external
-    /// commits succeed. It must exclude concurrent writers: protocols do not universally offer
-    /// atomic compare-and-unlink. A failure may follow partial historical cleanup; re-observe
-    /// before retrying. Missing entries are idempotent. This never recursively deletes children.
+    /// The caller authorizes deletion only after publication, required metadata, selected
+    /// verification and required persistence succeed. External bookkeeping is caller policy,
+    /// not enforced by this role. It must exclude concurrent writers: protocols do not
+    /// universally offer atomic compare-and-unlink. A failure may follow partial historical
+    /// cleanup; re-observe before retrying. Missing entries are idempotent. This never recursively
+    /// deletes children.
     async fn purge_observed(
         &self,
         entry: &ObservedEntry,

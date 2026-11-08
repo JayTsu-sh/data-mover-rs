@@ -1,7 +1,7 @@
 //! 永久清理跨多页、多批版本，保持当前锚点，并保留同前缀子项。
 
 use super::*;
-use crate::model::ObservedEntry;
+use crate::model::{ObservedEntry, StorageTimestamp, TimePrecision};
 use crate::storage::PurgeOutcome;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
@@ -141,6 +141,47 @@ async fn suspended_and_never_versioned_buckets_delete_exact_null_record() -> Tes
         );
         assert_eq!(protocol.version_deletes(), [("key".into(), "null".into())]);
         assert!(protocol.plain_deletes_of_final_keys().is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_purge_compares_list_and_head_times_at_observed_precision() -> TestResult {
+    let listed = StorageTimestamp::new(1_700_000_000_123_000_000, TimePrecision::Milliseconds)?;
+    let coarse = StorageTimestamp::new(1_700_000_000_000_000_000, TimePrecision::Seconds)?;
+    let changed_second = StorageTimestamp::new(1_700_000_001_000_000_000, TimePrecision::Seconds)?;
+    let changed_millis =
+        StorageTimestamp::new(1_700_000_000_124_000_000, TimePrecision::Milliseconds)?;
+    for (head, changed_body, allowed) in [
+        (Some(coarse), false, true),
+        (Some(listed), false, true),
+        (Some(changed_second), false, false),
+        (Some(changed_millis), false, false),
+        (None, false, false),
+        (Some(coarse), true, false),
+    ] {
+        let protocol = Arc::new(MemoryS3::default());
+        put(&protocol, "key", b"payload").await?;
+        *protocol.last_modified.lock().await = Some(listed);
+        let namespace = namespace(&protocol)?;
+        let entry = observed(namespace.as_ref(), "key").await?;
+        *protocol.last_modified.lock().await = head;
+        if changed_body {
+            put(&protocol, "key", b"changed").await?;
+        }
+        let result = namespace
+            .purge_observed(&entry, CancellationToken::new())
+            .await;
+        if allowed {
+            assert_eq!(result?, PurgeOutcome::Deleted { records: 1 });
+            assert_eq!(protocol.version_deletes(), [("key".into(), "null".into())]);
+        } else {
+            assert!(
+                matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
+            );
+            assert!(protocol.version_deletes().is_empty());
+            assert!(protocol.objects.lock().await.contains_key("key"));
+        }
     }
     Ok(())
 }

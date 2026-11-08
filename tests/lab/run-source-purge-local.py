@@ -38,7 +38,7 @@ def isolated_run():
     try:
         print(f"isolated source-purge image={docker('inspect', container, '--format', '{{.Image}}')}", flush=True)
         pid = docker("inspect", container, "--format", "{{.State.Pid}}")
-        arguments = [flag for flag in ("--namespace-read", "--source-observation", "--namespace-persistence") if flag in sys.argv]
+        arguments = [flag for flag in ("--namespace-read", "--source-observation", "--namespace-persistence", "--current-source") if flag in sys.argv]
         subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *arguments], check=True)
     finally:
         docker("rm", "-f", "-v", container)
@@ -63,13 +63,19 @@ def inside_run():
     )
     bucket = f"source-purge-{uuid.uuid4().hex[:12]}"
     client.create_bucket(Bucket=bucket)
-    client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+    current_source = "--current-source" in sys.argv
+    if not current_source:
+        client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     stopped = threading.Event()
     observing = "--source-observation" in sys.argv
     persisting = "--namespace-persistence" in sys.argv
     reading = "--namespace-read" in sys.argv or observing or persisting
+    if current_source and reading:
+        raise ValueError("--current-source is only for source purge")
     alternating = [0]
     requests = {"data_get": 0, "writes": 0}
+    if current_source:
+        requests["payload_heads"] = 0
     with tempfile.TemporaryDirectory(prefix="source-purge-") as directory:
         control = Path(directory) / "fault"
         control.write_text("normal")
@@ -85,11 +91,13 @@ def inside_run():
                 tagging = self.command == "GET" and "tagging" in self.path
                 probing = reading and payload and (tagging if observing else self.command == "HEAD")
                 affected = deleting or probing
-                if observing or persisting:
+                if observing or persisting or current_source:
                     if self.command == "GET" and payload and not tagging:
                         requests["data_get"] += 1
                     if self.command in ("PUT", "POST", "DELETE"):
                         requests["writes"] += 1
+                    if current_source and self.command == "HEAD" and payload:
+                        requests["payload_heads"] += 1
                 if observing and payload and mode == "alternate":
                     if self.command == "HEAD":
                         alternating[0] += 1
@@ -150,7 +158,7 @@ def inside_run():
             modes = ("normal", "readonly", "missing_metadata", "disconnect", "stall", "cancel", "flash", "recover_stall", "alternate") if observing else (("normal", "readonly", "disconnect", "stall", "cancel", "flash", "recover_stall") if reading else ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "lost_ack"))
             for mode in modes:
                 prefix = f"nightly-local-{mode}"
-                for _ in range(3):
+                for _ in range(1 if current_source else 3):
                     client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
                 client.put_object(Bucket=bucket, Key=f"{prefix}/sentinel", Body=b"retain")
                 environment = dict(os.environ, S3_CONNECT_TIMEOUT="1", S3_OPERATION_TIMEOUT="2", S3_READ_TIMEOUT="1")
@@ -172,16 +180,22 @@ def inside_run():
                 ]
                 if binary := os.environ.get("LAB_S3_PURGE_TEST_BINARY"):
                     command = [binary, os.environ["LAB_S3_PURGE_TEST_NAME"], "--ignored", "--exact", "--nocapture"]
+                before_heads = requests.get("payload_heads", 0)
                 subprocess.run(command, env=environment, check=True)
+                if current_source and mode == "normal":
+                    assert requests["payload_heads"] - before_heads == 1, requests
                 remaining = client.list_object_versions(Bucket=bucket, Prefix=f"{prefix}/")
                 records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
                 payload_records = [record for record in records if record["Key"] == f"{prefix}/payload"]
-                assert len(payload_records) == (0 if not reading and mode in ("normal", "flash", "lost_ack") else 3), (mode, payload_records)
+                assert len(payload_records) == (0 if not reading and mode in ("normal", "flash", "lost_ack") else (1 if current_source else 3)), (mode, payload_records)
                 assert any(record["Key"] == f"{prefix}/sentinel" for record in records)
                 print(f"independent S3 inspection fault={mode} source_records={len(payload_records)} sentinel=retained", flush=True)
             if observing or persisting:
                 assert requests == {"data_get": 0, "writes": 0}, requests
                 print("target-persistence data_GET=0 writes=0" if persisting else "source-observation data_GET=0 writes=0 missing_metadata_is_error=true shared_budget=true", flush=True)
+            if current_source:
+                assert requests["data_get"] == 0, requests
+                print(f"current-source purge data_GET=0 normal_payload_HEAD=1 requests={requests}", flush=True)
         finally:
             control.write_text("normal")
             stopped.set()

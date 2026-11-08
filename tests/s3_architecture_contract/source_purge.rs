@@ -1,4 +1,4 @@
-//! 真实 S3 链路的永久清理与故障验证。外部 runner 创建独立、已开版本的测试前缀。
+//! 真实 S3 链路的永久清理与故障验证；runner 创建独立的普通桶或版本化桶。
 
 use std::{env, fs, time::Duration};
 
@@ -42,6 +42,9 @@ async fn permanent_source_purge_with_real_requests() -> TestResult {
     let source = observed(&storage, &key)
         .await?
         .ok_or("seeded source missing")?;
+    let expected_records = source
+        .history()
+        .map_or(1, |history| history.records().len() as u64);
     let fault = env::var("LAB_S3_PURGE_FAULT").unwrap_or_else(|_| "normal".into());
     let control = env::var("LAB_S3_PURGE_CONTROL").ok();
     if let Some(control) = &control {
@@ -93,7 +96,12 @@ async fn permanent_source_purge_with_real_requests() -> TestResult {
             assert!(observed(&storage, &key).await?.is_none());
         }
         "normal" => {
-            assert!(matches!(result?, PurgeOutcome::Deleted { records } if records >= 3));
+            assert_eq!(
+                result?,
+                PurgeOutcome::Deleted {
+                    records: expected_records
+                }
+            );
             assert!(observed(&storage, &key).await?.is_none());
         }
         "disconnect" | "stall" | "cancel" | "readonly" => {
@@ -116,22 +124,32 @@ async fn permanent_source_purge_with_real_requests() -> TestResult {
                     FailureClass::Connectivity | FailureClass::Timeout
                 )),
             }
-            let retained = observed(&storage, &key)
-                .await?
-                .ok_or("current source record was deleted after fault")?;
-            assert_eq!(
-                retained
-                    .history()
-                    .and_then(ObjectHistory::latest)
-                    .map(VersionRecord::identity),
-                source
-                    .history()
-                    .and_then(ObjectHistory::latest)
-                    .map(VersionRecord::identity)
-            );
+            assert_source_retained(&storage, &key, &source).await?;
         }
         _ => return Err("unknown source purge fault mode".into()),
     }
     assert!(observed(&storage, "sentinel").await?.is_some());
+    Ok(())
+}
+
+async fn assert_source_retained(
+    storage: &Storage,
+    key: &str,
+    source: &ObservedEntry,
+) -> TestResult {
+    let retained = observed(storage, key)
+        .await?
+        .ok_or("current source record was deleted after fault")?;
+    assert_eq!(retained.source_identity(), source.source_identity());
+    assert_eq!(
+        retained
+            .history()
+            .and_then(ObjectHistory::latest)
+            .map(VersionRecord::identity),
+        source
+            .history()
+            .and_then(ObjectHistory::latest)
+            .map(VersionRecord::identity)
+    );
     Ok(())
 }

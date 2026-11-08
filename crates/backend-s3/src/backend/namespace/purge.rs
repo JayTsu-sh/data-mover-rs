@@ -117,8 +117,7 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
             .map_err(StorageRoleFailure::Entry)?;
         if current.source_identity != *entry.source_identity()
             || current.size != entry.size()
-            || facts.last_modified.map(StorageTimestamp::unix_nanos)
-                != entry.modified().map(StorageTimestamp::unix_nanos)
+            || !same_modified(facts.last_modified, entry.modified())
         {
             return Err(failure(
                 key,
@@ -264,6 +263,21 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
                 return Ok(batch);
             }
         }
+    }
+}
+
+/// LIST 的毫秒和 HEAD 的 HTTP 秒按实际较粗精度比较；缺失证据不能与已有时间相等。
+fn same_modified(actual: Option<StorageTimestamp>, expected: Option<StorageTimestamp>) -> bool {
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => {
+            let quantum = actual
+                .precision()
+                .quantum_nanos()
+                .max(expected.precision().quantum_nanos());
+            actual.unix_nanos().div_euclid(quantum) == expected.unix_nanos().div_euclid(quantum)
+        }
+        (None, None) => true,
+        _ => false,
     }
 }
 

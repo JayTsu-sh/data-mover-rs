@@ -68,6 +68,22 @@ cancellation, a recovered disconnect and a lost deletion response followed by an
 This is a storage-role contract; task-level ClickHouse/callback and other backends use their
 separate integration gates.
 
+`--current-source` uses the same contract against a bucket that was never versioned.
+Its observation comes from LIST (milliseconds), whereas the purge guard reads HEAD
+(whole HTTP seconds). The guard compares at the coarser observed precision while
+retaining identity, ETag, size and missing-time checks. Six deterministic combinations
+cover matching precisions, changed seconds/milliseconds, missing time and changed
+equal-size content. The original implementation fails the matching LIST/HEAD case.
+All seven real fault cases passed for both current-only and versioned fixtures;
+the current-only normal path issues exactly one payload HEAD and no data GET.
+Recovery in this fixture is an explicit test retry, not an application retry claim.
+Concurrency exclusion is still required; same-ETag changes inside a HEAD time tick
+cannot be detected from that header. No new public functions or SDK changes are needed.
+The final full `make ci` passed on Rust 1.98.1, including strict Clippy, architecture
+and minimal-feature checks, workspace tests, examples and Local E2E. These results
+are limited to the tested RustFS protocol path; they do not certify NAS buckets,
+other vendors, application-level retry budgets or whole-migration throughput/RSS.
+
 `python3 tests/lab/run-source-purge-local.py --namespace-read` reuses the isolated fixture for
 `read_namespace_entry`, a bounded read-only stat with caller-selected detection/recovery
 deadlines and cancellation. It covers a present path, typed absence, permission refusal,
