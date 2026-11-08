@@ -4,12 +4,10 @@ import struct
 MAX_RECORD = 8 * 1024 * 1024
 
 
-def compound_tag(payload):
+def _compound_header(payload):
     if len(payload) < 24:
         return None
     _, message, rpc_version, program, version, procedure = struct.unpack_from('>6I', payload)
-    if (message, rpc_version, program, version) == (0, 2, 100003, 3):
-        return 'remove' if procedure in (12, 13) else None
     if (message, rpc_version, program, version, procedure) != (0, 2, 100003, 4, 1):
         return None
     offset = 24
@@ -24,7 +22,18 @@ def compound_tag(payload):
     offset += 4
     if size > 1024 or offset + size > len(payload):
         return None
-    return bytes(payload[offset:offset + size]).decode('ascii', errors='replace')
+    tag = bytes(payload[offset:offset + size]).decode('ascii', errors='replace')
+    return tag, offset + (size + 3) // 4 * 4
+
+
+def compound_tag(payload):
+    if len(payload) < 24:
+        return None
+    _, message, rpc_version, program, version, procedure = struct.unpack_from('>6I', payload)
+    if (message, rpc_version, program, version) == (0, 2, 100003, 3):
+        return 'remove' if procedure in (12, 13) else None
+    header = _compound_header(payload)
+    return header[0] if header is not None else None
 
 
 class RpcRequests:
