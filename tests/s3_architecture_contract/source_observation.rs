@@ -7,18 +7,23 @@ use tokio_util::sync::CancellationToken;
 use super::{TestResult, connected};
 use data_mover::model::{FailureClass, ObservationMode, ObservationPlan, StoragePath};
 use data_mover::storage::{
-    EntryObservationFailure, NamespaceReadCause, NamespaceReadFailure, NamespaceReadPolicy,
-    SourceObservationReadOutcome, StorageRoleFailure, read_source_observation,
+    EntryObservationFailure, NamespaceReadCause, NamespaceReadFailure, NamespaceReadOutcome,
+    NamespaceReadPolicy, StorageRoleFailure, read_namespace_entry,
 };
 
 fn check_result(
     fault: &str,
     elapsed: Duration,
-    result: Result<SourceObservationReadOutcome, NamespaceReadFailure>,
+    result: Result<NamespaceReadOutcome, NamespaceReadFailure>,
 ) -> TestResult {
     match fault {
         "normal" | "flash" | "recover_stall" => {
-            let entry = result?.entry.ok_or("source must remain present")?;
+            let NamespaceReadOutcome::Observation {
+                entry: Some(entry), ..
+            } = result?
+            else {
+                return Err("source observation must remain present".into());
+            };
             assert_eq!(entry.metadata().tags().value().map(Vec::len), Some(0));
         }
         "cancel" => {
@@ -75,10 +80,10 @@ async fn bounded_source_observation_with_real_requests() -> TestResult {
     };
     let plan = ObservationPlan::default().with_tags(ObservationMode::Required);
     let start = Instant::now();
-    let result = read_source_observation(
+    let result = read_namespace_entry(
         &storage,
         &StoragePath::new("payload")?,
-        plan,
+        Some(plan),
         policy,
         &cancel,
     )
@@ -91,17 +96,16 @@ async fn bounded_source_observation_with_real_requests() -> TestResult {
         elapsed.as_millis()
     );
     check_result(&fault, elapsed, result)?;
-    assert!(
-        read_source_observation(
+    assert!(matches!(
+        read_namespace_entry(
             &storage,
             &StoragePath::new("missing")?,
-            plan,
+            Some(plan),
             policy,
             &CancellationToken::new()
         )
-        .await?
-        .entry
-        .is_none()
-    );
+        .await?,
+        NamespaceReadOutcome::Observation { entry: None, .. }
+    ));
     Ok(())
 }

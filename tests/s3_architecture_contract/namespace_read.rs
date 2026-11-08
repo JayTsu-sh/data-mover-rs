@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 use super::{TestResult, connected};
 use data_mover::model::{FailureClass, StoragePath};
 use data_mover::storage::{
-    NamespaceReadCause, NamespaceReadFailure, NamespaceReadPolicy, StorageRoleFailure,
-    read_namespace_entry,
+    NamespaceReadCause, NamespaceReadFailure, NamespaceReadOutcome, NamespaceReadPolicy,
+    StorageRoleFailure, read_namespace_entry,
 };
 
 #[tokio::test]
@@ -33,8 +33,14 @@ async fn bounded_namespace_read_with_real_requests() -> TestResult {
         retry_interval: Duration::from_millis(100),
     };
     let start = Instant::now();
-    let result =
-        read_namespace_entry(&storage, &StoragePath::new("payload")?, policy, &cancel).await;
+    let result = read_namespace_entry(
+        &storage,
+        &StoragePath::new("payload")?,
+        None,
+        policy,
+        &cancel,
+    )
+    .await;
     let elapsed = start.elapsed();
     fs::write(&control, "normal")?;
     watcher.await?;
@@ -43,7 +49,13 @@ async fn bounded_namespace_read_with_real_requests() -> TestResult {
         elapsed.as_millis()
     );
     match fault.as_str() {
-        "normal" | "flash" | "recover_stall" => assert!(result?.descriptor.is_some()),
+        "normal" | "flash" | "recover_stall" => assert!(matches!(
+            result?,
+            NamespaceReadOutcome::Descriptor {
+                descriptor: Some(_),
+                ..
+            }
+        )),
         "cancel" => {
             assert!(matches!(
                 result,
@@ -66,16 +78,19 @@ async fn bounded_namespace_read_with_real_requests() -> TestResult {
         }
         _ => return Err("unknown namespace-read fault".into()),
     }
-    assert!(
+    assert!(matches!(
         read_namespace_entry(
             &storage,
             &StoragePath::new("missing")?,
+            None,
             policy,
             &CancellationToken::new()
         )
-        .await?
-        .descriptor
-        .is_none()
-    );
+        .await?,
+        NamespaceReadOutcome::Descriptor {
+            descriptor: None,
+            ..
+        }
+    ));
     Ok(())
 }

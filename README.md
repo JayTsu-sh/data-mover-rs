@@ -176,8 +176,10 @@ result after timeout/cancellation; retry only the same explicit version and muta
 
 ### Bounded current-source observations
 
-`storage::read_source_observation` captures the current namespace descriptor and an
-explicit `ObservationPlan` under one caller-selected `NamespaceReadPolicy` and
+`storage::read_namespace_entry` accepts an optional `ObservationPlan`. With `None`,
+it only performs stat and returns `NamespaceReadOutcome::Descriptor`, without metadata
+or link calls. With `Some(plan)`, it captures the current descriptor and requested
+attributes as `NamespaceReadOutcome::Observation` under one `NamespaceReadPolicy` and
 cancellation token. Detection deadlines and the first-failure recovery window
 cover stat, required attributes and link observation together; each retry observes
 the current path again. Only the initial stat's typed NotFound returns `entry=None`.

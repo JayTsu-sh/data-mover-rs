@@ -10,7 +10,8 @@ use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    NamespaceReadCause, NamespaceReadFailure, NamespaceReadPolicy, read_source_observation,
+    NamespaceReadCause, NamespaceReadFailure, NamespaceReadOutcome, NamespaceReadPolicy,
+    read_namespace_entry,
 };
 use crate::model::{
     BackendIdentity, BackendKind, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
@@ -157,10 +158,10 @@ async fn metadata_not_found_permission_and_authentication_are_failures_without_r
         FailureClass::Authentication,
     ] {
         let (storage, source) = fixture(false, Reply::Error(class))?;
-        let result = read_source_observation(
+        let result = read_namespace_entry(
             &storage,
             &StoragePath::new("file")?,
-            plan(ObservationMode::Required),
+            Some(plan(ObservationMode::Required)),
             policy(),
             &CancellationToken::new(),
         )
@@ -181,10 +182,10 @@ async fn source_stat_and_metadata_share_one_window_and_cancel_stops_inflight_obs
 -> TestResult {
     let (storage, source) = fixture(true, Reply::Stall)?;
     let start = Instant::now();
-    let result = read_source_observation(
+    let result = read_namespace_entry(
         &storage,
         &StoragePath::new("file")?,
-        plan(ObservationMode::Required),
+        Some(plan(ObservationMode::Required)),
         policy(),
         &CancellationToken::new(),
     )
@@ -204,10 +205,10 @@ async fn source_stat_and_metadata_share_one_window_and_cancel_stops_inflight_obs
     });
     let start = Instant::now();
     assert!(matches!(
-        read_source_observation(
+        read_namespace_entry(
             &storage,
             &StoragePath::new("file")?,
-            plan(ObservationMode::Required),
+            Some(plan(ObservationMode::Required)),
             policy(),
             &cancel
         )
@@ -236,7 +237,7 @@ async fn required_missing_or_failed_facts_are_never_successful_observations() ->
     ] {
         let (storage, source) = fixture(false, Reply::Facts(facts(observation)?))?;
         assert!(
-            matches!(read_source_observation(&storage, &StoragePath::new("file")?, plan(ObservationMode::Required), policy(), &CancellationToken::new()).await,
+            matches!(read_namespace_entry(&storage, &StoragePath::new("file")?, Some(plan(ObservationMode::Required)), policy(), &CancellationToken::new()).await,
             Err(NamespaceReadFailure::Operation { attempts: 1, last, .. })
                 if matches!(*last, NamespaceReadCause::MissingMetadata(ref failures) if failures.len() == 1 && failures[0].family == MetadataFamily::Tags && failures[0].class == class))
         );
@@ -249,16 +250,19 @@ async fn required_missing_or_failed_facts_are_never_successful_observations() ->
 async fn recovered_read_returns_the_actual_facts_and_best_effort_keeps_data_readable() -> TestResult
 {
     let (storage, source) = fixture(false, Reply::Recover)?;
-    let result = read_source_observation(
+    let result = read_namespace_entry(
         &storage,
         &StoragePath::new("file")?,
-        plan(ObservationMode::Omit),
+        Some(plan(ObservationMode::Omit)),
         policy(),
         &CancellationToken::new(),
     )
     .await?;
-    assert_eq!(result.attempts, 2);
-    assert_eq!(result.entry.ok_or("missing source")?.size(), Some(7));
+    let NamespaceReadOutcome::Observation { entry, attempts } = result else {
+        return Err("expected observation".into());
+    };
+    assert_eq!(attempts, 2);
+    assert_eq!(entry.ok_or("missing source")?.size(), Some(7));
     assert_eq!(source.metadata_calls.load(Ordering::SeqCst), 2);
     let tags = vec![ObjectTag::new("raw", "value")?];
     let (storage, _) = fixture(
@@ -268,34 +272,35 @@ async fn recovered_read_returns_the_actual_facts_and_best_effort_keeps_data_read
             provenance: MetadataProvenance::AdditionalCall,
         })?),
     )?;
-    let result = read_source_observation(
+    let result = read_namespace_entry(
         &storage,
         &StoragePath::new("file")?,
-        plan(ObservationMode::Required),
+        Some(plan(ObservationMode::Required)),
         policy(),
         &CancellationToken::new(),
     )
     .await?;
+    let NamespaceReadOutcome::Observation { entry, .. } = result else {
+        return Err("expected observation".into());
+    };
     assert_eq!(
-        result
-            .entry
-            .ok_or("missing source")?
-            .metadata()
-            .tags()
-            .value(),
+        entry.ok_or("missing source")?.metadata().tags().value(),
         Some(&tags)
     );
     let (storage, source) = fixture(false, Reply::Error(FailureClass::Connectivity))?;
-    let result = read_source_observation(
+    let result = read_namespace_entry(
         &storage,
         &StoragePath::new("file")?,
-        plan(ObservationMode::BestEffort),
+        Some(plan(ObservationMode::BestEffort)),
         policy(),
         &CancellationToken::new(),
     )
     .await?;
-    assert_eq!(result.attempts, 1);
-    let entry = result.entry.ok_or("missing readable source")?;
+    let NamespaceReadOutcome::Observation { entry, attempts } = result else {
+        return Err("expected observation".into());
+    };
+    assert_eq!(attempts, 1);
+    let entry = entry.ok_or("missing readable source")?;
     assert_eq!(entry.size(), Some(7));
     assert!(matches!(
         entry.metadata().tags(),
@@ -305,5 +310,26 @@ async fn recovered_read_returns_the_actual_facts_and_best_effort_keeps_data_read
         }
     ));
     assert_eq!(source.stat_calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn descriptor_only_read_does_not_acquire_or_request_metadata() -> TestResult {
+    let (storage, source) = fixture(false, Reply::Stall)?;
+    let start = Instant::now();
+    let result = read_namespace_entry(
+        &storage,
+        &StoragePath::new("file")?,
+        None,
+        policy(),
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert!(
+        matches!(result, NamespaceReadOutcome::Descriptor { descriptor: Some(ref descriptor), attempts: 1 } if descriptor.size == Some(7))
+    );
+    assert_eq!(source.stat_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(source.metadata_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(start.elapsed(), Duration::ZERO);
     Ok(())
 }

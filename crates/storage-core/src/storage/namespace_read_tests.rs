@@ -9,7 +9,10 @@ use async_trait::async_trait;
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
-use super::{NamespaceReadCause, NamespaceReadFailure, NamespaceReadPolicy, read_namespace_entry};
+use super::{
+    NamespaceReadCause, NamespaceReadFailure, NamespaceReadOutcome, NamespaceReadPolicy,
+    read_namespace_entry,
+};
 use crate::model::{
     BackendIdentity, BackendKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
     Transience,
@@ -92,9 +95,14 @@ async fn only_typed_not_found_proves_path_absence_and_a_recovered_fault_is_not_a
     let path = StoragePath::new("file")?;
     let (storage, fault) = fixture(FailureClass::Connectivity, true, false)?;
     let outcome =
-        read_namespace_entry(&storage, &path, policy(), &CancellationToken::new()).await?;
-    assert!(outcome.descriptor.is_none());
-    assert_eq!(outcome.attempts, 2);
+        read_namespace_entry(&storage, &path, None, policy(), &CancellationToken::new()).await?;
+    assert!(matches!(
+        outcome,
+        NamespaceReadOutcome::Descriptor {
+            descriptor: None,
+            attempts: 2
+        }
+    ));
     assert_eq!(fault.calls.load(Ordering::SeqCst), 2);
     Ok(())
 }
@@ -111,6 +119,7 @@ async fn permission_and_authentication_are_final_even_when_adapter_marks_them_tr
         let error = read_namespace_entry(
             &storage,
             &StoragePath::new("file")?,
+            None,
             policy(),
             &CancellationToken::new(),
         )
@@ -134,6 +143,7 @@ async fn stalled_requests_cannot_reset_the_window_and_cancel_interrupts_inflight
         read_namespace_entry(
             &storage,
             &StoragePath::new("file")?,
+            None,
             policy(),
             &CancellationToken::new()
         )
@@ -149,7 +159,14 @@ async fn stalled_requests_cannot_reset_the_window_and_cancel_interrupts_inflight
     });
     let start = Instant::now();
     assert!(matches!(
-        read_namespace_entry(&storage, &StoragePath::new("file")?, policy(), &cancel).await,
+        read_namespace_entry(
+            &storage,
+            &StoragePath::new("file")?,
+            None,
+            policy(),
+            &cancel
+        )
+        .await,
         Err(NamespaceReadFailure::Cancelled { .. })
     ));
     assert_eq!(start.elapsed(), Duration::from_millis(250));

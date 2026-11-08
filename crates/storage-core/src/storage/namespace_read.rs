@@ -58,29 +58,33 @@ pub enum NamespaceReadFailure {
     },
 }
 
-/// `descriptor=None` 只表示本次路径 stat 的准确 NotFound，不证明历史、父目录或整棵树缺失。
+/// None 只表示初始 stat 的准确 NotFound，不证明历史、父目录或整棵树缺失。
+/// 返回分支由调用方是否提供观察计划决定。
 #[derive(Debug)]
-pub struct NamespaceReadOutcome {
-    pub descriptor: Option<SourceDescriptor>,
-    pub attempts: u32,
+pub enum NamespaceReadOutcome {
+    Descriptor {
+        descriptor: Option<SourceDescriptor>,
+        attempts: u32,
+    },
+    Observation {
+        entry: Option<ObservedEntry>,
+        attempts: u32,
+    },
 }
 
-/// 当前路径与显式请求属性的一次只读观察；None 仅来自初始 stat 的准确 `NotFound`。
-#[derive(Debug)]
-pub struct SourceObservationReadOutcome {
-    pub entry: Option<ObservedEntry>,
-    pub attempts: u32,
-}
-
-/// 只重试可安全重发的 stat；没有写入、后台任务、游标或 checkpoint。
-/// 连接由已有 role/client 维护，本函数不把失效的 session 伪装为恢复成功。
+/// 读取当前路径；plan=None 时只执行 stat，不借用元数据角色或读取链接。
+/// 提供计划时在同一检测／恢复窗口内捕获路径和所需属性，不读取文件数据或历史。
+/// Required 属性缺失或失败不会变成成功观察，BestEffort 保留失败事实。
+/// 只有初始 stat 的 NotFound 表示缺失，后续属性或链接读取的 NotFound 明确失败。
+/// 不发出写入或后台任务；调用方自行决定是否授权清理。
 ///
 /// # Errors
-/// 保留首末有类型原因。权限／认证等明确错误不重试；首次故障后的单一截止时间
-/// 约束全部退避与在途请求，取消可打断任意等待。
+/// 保留首末有类型原因；权限／认证等明确错误不重试，恢复不重置整个窗口。
+/// 取消可打断在途请求和退避；无效策略或缺少 namespace 角色在 IO 前拒绝。
 pub async fn read_namespace_entry(
     storage: &Storage,
     path: &StoragePath,
+    plan: Option<ObservationPlan>,
     policy: NamespaceReadPolicy,
     cancel: &CancellationToken,
 ) -> Result<NamespaceReadOutcome, NamespaceReadFailure> {
@@ -88,57 +92,40 @@ pub async fn read_namespace_entry(
         return Err(NamespaceReadFailure::InvalidPolicy);
     }
     let namespace = storage.namespace()?;
-    let (descriptor, attempts) = read_recovered(
-        path,
-        policy,
-        cancel,
-        || async {
-            match namespace.stat(path).await {
-                Ok(descriptor) => Ok(Some(descriptor)),
-                Err(StorageRoleFailure::Entry(error))
-                    if error.class() == FailureClass::NotFound =>
-                {
-                    Ok(None)
+    if let Some(plan) = plan {
+        let (entry, attempts) = read_recovered(
+            path,
+            policy,
+            cancel,
+            || observe_current(storage, path, plan),
+            NamespaceReadCause::ObservationTimeout,
+        )
+        .await?;
+        Ok(NamespaceReadOutcome::Observation { entry, attempts })
+    } else {
+        let (descriptor, attempts) = read_recovered(
+            path,
+            policy,
+            cancel,
+            || async {
+                match namespace.stat(path).await {
+                    Ok(descriptor) => Ok(Some(descriptor)),
+                    Err(StorageRoleFailure::Entry(error))
+                        if error.class() == FailureClass::NotFound =>
+                    {
+                        Ok(None)
+                    }
+                    Err(error) => Err(NamespaceReadCause::Role(error)),
                 }
-                Err(error) => Err(NamespaceReadCause::Role(error)),
-            }
-        },
-        NamespaceReadCause::Timeout,
-    )
-    .await?;
-    Ok(NamespaceReadOutcome {
-        descriptor,
-        attempts,
-    })
-}
-
-/// 在同一检测／恢复窗口内捕获当前路径及所需属性；不读文件数据，不枚举历史。
-/// Required 属性缺失或失败不会变成成功观察，BestEffort 仍保留失败事实。
-/// 只有 stat 的 `NotFound` 返回 None；后续属性或链接读取的 `NotFound` 明确失败。
-/// 不发出写入或后台任务；调用方自行决定是否以及如何授权源清理。
-///
-/// # Errors
-/// 首末原因、超时及取消保持有类型，权限／认证等明确错误不重试；恢复不重置整个窗口。
-pub async fn read_source_observation(
-    storage: &Storage,
-    path: &StoragePath,
-    plan: ObservationPlan,
-    policy: NamespaceReadPolicy,
-    cancel: &CancellationToken,
-) -> Result<SourceObservationReadOutcome, NamespaceReadFailure> {
-    if policy.operation_timeout.is_zero() || policy.retry_interval.is_zero() {
-        return Err(NamespaceReadFailure::InvalidPolicy);
+            },
+            NamespaceReadCause::Timeout,
+        )
+        .await?;
+        Ok(NamespaceReadOutcome::Descriptor {
+            descriptor,
+            attempts,
+        })
     }
-    storage.namespace()?;
-    let (entry, attempts) = read_recovered(
-        path,
-        policy,
-        cancel,
-        || observe_current(storage, path, plan),
-        NamespaceReadCause::ObservationTimeout,
-    )
-    .await?;
-    Ok(SourceObservationReadOutcome { entry, attempts })
 }
 
 async fn observe_current(
