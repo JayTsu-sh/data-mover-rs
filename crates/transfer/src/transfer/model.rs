@@ -363,35 +363,22 @@ impl TransferRequest {
     /// A real unversioned directory marker is unwrapped to its original File observation when
     /// the destination holds directory objects. Virtual directories are never synthesized into
     /// objects; versioned marker directories use history replay at `history_source_path()`.
+    /// 观察值可以按值传入或通过 Arc 共享；历史记录索引为 None 时选择观察到的当前对象。
+    /// 克隆请求只共享观察数据，不复制整份版本历史。
     ///
     /// # Errors
     /// Rejects an observation from another storage, a non-file entry, a deleted key, or a
     /// history segment that does not identify the current object.
     pub fn from_observation(
         source: Storage,
-        observation: ObservedEntry,
-        destination: Storage,
-        cancel: CancellationToken,
-    ) -> Result<Self, TransferValueError> {
-        Self::from_shared_observation(source, Arc::new(observation), None, destination, cancel)
-    }
-
-    /// Borrows one immutable observation through an Arc, optionally selecting one history record.
-    /// Request cloning shares the original observation, including large histories. A directory's
-    /// real current marker is selected without cloning it when the destination holds objects.
-    ///
-    /// # Errors
-    /// Rejects a foreign backend, invalid index, delete marker or non-readable entry before I/O.
-    pub fn from_shared_observation(
-        source: Storage,
-        observation: Arc<ObservedEntry>,
+        observation: impl Into<Arc<ObservedEntry>>,
         version_index: Option<usize>,
         destination: Storage,
         cancel: CancellationToken,
     ) -> Result<Self, TransferValueError> {
         let observed = ObservedSource::new(
             &source,
-            observation,
+            observation.into(),
             version_index,
             destination.holds_directory_objects(),
         )?;

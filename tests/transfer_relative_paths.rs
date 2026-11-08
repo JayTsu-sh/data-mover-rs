@@ -53,6 +53,7 @@ async fn scanned_files_keep_their_relative_paths_between_different_roots() -> Te
                     TransferRequest::from_observation(
                         source.clone(),
                         *entry,
+                        None,
                         destination.clone(),
                         CancellationToken::new(),
                     )?

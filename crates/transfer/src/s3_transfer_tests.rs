@@ -160,6 +160,7 @@ async fn mixed_history_copies_its_empty_current_object_to_unversioned_s3() -> Te
         transfer(TransferRequest::from_observation(
             source.clone(),
             entry,
+            None,
             destination.clone(),
             CancellationToken::new(),
         )?)
@@ -213,6 +214,7 @@ async fn a_child_copy_creates_its_parent_after_the_content_object_is_skipped() -
         transfer(TransferRequest::from_observation(
             source.clone(),
             child,
+            None,
             destination,
             CancellationToken::new(),
         )?)
@@ -262,6 +264,7 @@ async fn unversioned_marker_survives_snapshot_and_copies_its_exact_s3_key() -> T
         let copy = TransferRequest::from_observation(
             source.clone(),
             restored,
+            None,
             destination,
             CancellationToken::new(),
         )?;
@@ -297,8 +300,9 @@ async fn virtual_directory_is_not_synthesized_into_an_s3_marker() -> TestResult 
             TransferRequest::from_observation(
                 source.clone(),
                 restored,
+                None,
                 destination.clone(),
-                CancellationToken::new(),
+                CancellationToken::new()
             )
             .is_err()
         );
@@ -310,6 +314,7 @@ async fn virtual_directory_is_not_synthesized_into_an_s3_marker() -> TestResult 
         transfer(TransferRequest::from_observation(
             source.clone(),
             child,
+            None,
             destination,
             CancellationToken::new(),
         )?)

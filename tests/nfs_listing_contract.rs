@@ -42,6 +42,7 @@ async fn listed_nfs_file_can_be_copied_to_local() -> Result<(), Box<dyn Error>> 
     let request = TransferRequest::from_observation(
         source.clone(),
         observed,
+        None,
         destination.clone(),
         CancellationToken::new(),
     )?;

@@ -48,6 +48,7 @@ fn request(
     Ok(TransferRequest::from_observation(
         source.clone(),
         observed,
+        None,
         destination.clone(),
         CancellationToken::new(),
     )?)
@@ -249,7 +250,7 @@ async fn shared_observation_pins_one_historical_record_without_cloning_history()
     for native in [false, true] {
         let (protocol, storage, observed) = bucket(true).await?;
         let observed = Arc::new(observed);
-        let request = TransferRequest::from_shared_observation(
+        let request = TransferRequest::from_observation(
             storage,
             Arc::clone(&observed),
             Some(0),
@@ -287,7 +288,7 @@ async fn shared_current_observation_rejects_replacement_before_destination_write
     let observed = Arc::new(observed);
     let destination = s3::connect(protocol.clone(), endpoint_of(&protocol), None)?;
     assert!(
-        TransferRequest::from_shared_observation(
+        TransferRequest::from_observation(
             storage.clone(),
             Arc::clone(&observed),
             Some(7),
@@ -296,7 +297,7 @@ async fn shared_current_observation_rejects_replacement_before_destination_write
         )
         .is_err()
     );
-    let request = TransferRequest::from_shared_observation(
+    let request = TransferRequest::from_observation(
         storage,
         observed,
         None,
@@ -342,7 +343,7 @@ async fn shared_history_directory_selects_its_real_object_path() -> TestResult {
     let observed = Arc::new(observation(descriptor)?);
     assert_eq!(observed.kind(), EntryKind::Directory);
     let destination = s3::connect(protocol.clone(), endpoint_of(&protocol), None)?;
-    let request = TransferRequest::from_shared_observation(
+    let request = TransferRequest::from_observation(
         storage,
         observed,
         Some(0),
@@ -385,7 +386,7 @@ async fn shared_selected_null_rejects_overwrite_and_rejects_marker_indices() -> 
     let destination = s3::connect(protocol.clone(), endpoint_of(&protocol), None)?;
     for invalid in [marker, history.records().len()] {
         assert!(
-            TransferRequest::from_shared_observation(
+            TransferRequest::from_observation(
                 storage.clone(),
                 Arc::clone(&observed),
                 Some(invalid),
@@ -395,7 +396,7 @@ async fn shared_selected_null_rejects_overwrite_and_rejects_marker_indices() -> 
             .is_err()
         );
     }
-    let request = TransferRequest::from_shared_observation(
+    let request = TransferRequest::from_observation(
         storage,
         observed,
         Some(null),

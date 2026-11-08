@@ -157,12 +157,7 @@ async fn mixed_history_copies_its_empty_current_object_to_unversioned_s3() -> Te
             directory_object_action(&entry, &destination),
             DirectoryObjectAction::Copy
         );
-        transfer(TransferRequest::from_observation(
-            source.clone(),
-            entry,
-            destination.clone(),
-            CancellationToken::new(),
-        )?)
+        transfer(TransferRequest::from_observation(source.clone(), entry, None, destination.clone(), CancellationToken::new())?)
         .await?;
         {
             let objects = target.objects.lock().await;
@@ -210,12 +205,7 @@ async fn a_child_copy_creates_its_parent_after_the_content_object_is_skipped() -
         );
         // Deliberately leave the scanned parent Directory uncreated: normal file transfer
         // must create its own missing parents, independently of the skipped content object.
-        transfer(TransferRequest::from_observation(
-            source.clone(),
-            child,
-            destination,
-            CancellationToken::new(),
-        )?)
+        transfer(TransferRequest::from_observation(source.clone(), child, None, destination, CancellationToken::new())?)
         .await?;
         assert!(root.path().join("parent").is_dir());
         assert_eq!(fs::read(root.path().join("parent/child"))?, b"child bytes");
@@ -259,12 +249,7 @@ async fn unversioned_marker_survives_snapshot_and_copies_its_exact_s3_key() -> T
             directory_object_action(&restored, &destination),
             DirectoryObjectAction::Copy
         );
-        let copy = TransferRequest::from_observation(
-            source.clone(),
-            restored,
-            destination,
-            CancellationToken::new(),
-        )?;
+        let copy = TransferRequest::from_observation(source.clone(), restored, None, destination, CancellationToken::new())?;
         assert_eq!(copy.source_path().as_str(), "empty/");
         transfer(copy).await?;
         let objects = target.objects.lock().await;
@@ -294,12 +279,7 @@ async fn virtual_directory_is_not_synthesized_into_an_s3_marker() -> TestResult 
         let target = Arc::new(MemoryS3::default());
         let destination = connect(target.clone(), endpoint_of(&target), None)?;
         assert!(
-            TransferRequest::from_observation(
-                source.clone(),
-                restored,
-                destination.clone(),
-                CancellationToken::new(),
-            )
+            TransferRequest::from_observation(source.clone(), restored, None, destination.clone(), CancellationToken::new())
             .is_err()
         );
         assert!(target.objects.lock().await.is_empty());
@@ -307,12 +287,7 @@ async fn virtual_directory_is_not_synthesized_into_an_s3_marker() -> TestResult 
             .into_iter()
             .find(|entry| entry.path().as_str() == "virtual/child")
             .ok_or("virtual directory child missing from scan")?;
-        transfer(TransferRequest::from_observation(
-            source.clone(),
-            child,
-            destination,
-            CancellationToken::new(),
-        )?)
+        transfer(TransferRequest::from_observation(source.clone(), child, None, destination, CancellationToken::new())?)
         .await?;
         let objects = target.objects.lock().await;
         assert_eq!(objects.len(), 1);
