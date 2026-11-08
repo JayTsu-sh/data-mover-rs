@@ -529,22 +529,7 @@ impl NfsNamespaceProtocol for NFSStorage {
         fresh: bool,
     ) -> std::result::Result<NfsNamespaceObservation, NfsProtocolFailure> {
         let (file_handle, attrs) = self.role_lookup_with_attrs(path, fresh).await?;
-        let kind = role_kind(&attrs);
-        Ok(NfsNamespaceObservation {
-            uid: owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-            gid: owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
-            path: path.clone(),
-            kind,
-            size: (kind == crate::model::EntryKind::File).then_some(attrs.filesize),
-            file_handle,
-            timestamps: Some(attrs_timestamps(&attrs)),
-            mode: Some(attrs.file_mode),
-            ownership: Some(inline_ownership(
-                owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-                owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
-                attrs.file_mode,
-            )),
-        })
+        Ok(self.role_namespace_observation(path, file_handle, &attrs))
     }
 
     async fn directory_handle(
@@ -1114,6 +1099,30 @@ fn build_cache_root_fh(server_id: u64, raw_fh: &Bytes) -> Bytes {
 }
 
 impl NFSStorage {
+    fn role_namespace_observation(
+        &self,
+        path: &crate::model::StoragePath,
+        file_handle: Bytes,
+        attrs: &Attr,
+    ) -> NfsNamespaceObservation {
+        let kind = role_kind(attrs);
+        NfsNamespaceObservation {
+            uid: owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
+            gid: owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
+            path: path.clone(),
+            kind,
+            size: (kind == crate::model::EntryKind::File).then_some(attrs.filesize),
+            file_handle,
+            timestamps: Some(attrs_timestamps(attrs)),
+            mode: Some(attrs.file_mode),
+            ownership: Some(inline_ownership(
+                owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
+                owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
+                attrs.file_mode,
+            )),
+        }
+    }
+
     /// Optimized role-only lookup. nfs-rs already folds GETATTR into LOOKUP on every supported
     /// dialect, so reuse those attributes instead of paying a second metadata RPC. Directory-cache
     /// hits can lack attributes and deliberately fall back to one GETATTR.
