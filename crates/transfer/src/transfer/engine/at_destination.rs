@@ -94,7 +94,9 @@ pub(super) async fn prepare(
         source: descriptor.clone(),
         recovery_binding,
     };
-    prepare_with(destination, prepare, &spec, lease).await
+    let mut stage = prepare_with(destination, prepare, &spec, lease).await?;
+    stage.set_failed_data_cleanup(request.failed_data_cleanup);
+    Ok(stage)
 }
 
 /// [`prepare`] from plain inputs, shared with the expert destination half.

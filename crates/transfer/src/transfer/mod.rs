@@ -8,8 +8,8 @@ mod model;
 
 pub use crate::model::SourceVersion;
 pub use crate::storage::{
-    DeleteMarkerOutcome, PrepareFact, ReadBackMethod, RestartReason, UnpinnedReadReason,
-    UploadDigest, UploadDigestGap,
+    DeleteMarkerOutcome, FailedDataCleanup, PrepareFact, ReadBackMethod, RestartReason,
+    UnpinnedReadReason, UploadDigest, UploadDigestGap,
 };
 pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
 pub use engine::{
@@ -77,3 +77,6 @@ mod caller_metadata_tests;
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used)]
 mod metadata_failure_tests;
+
+#[cfg(all(test, unix))]
+mod direct_failure_cleanup_tests;

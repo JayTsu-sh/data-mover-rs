@@ -1,3 +1,4 @@
+use super::{FailedCleanup, StageCleanup};
 use std::error::Error;
 use std::path::Path;
 
@@ -144,7 +145,10 @@ fn transfer_display_keeps_session_and_cleanup_diagnostics_with_typed_causes() ->
         TransferSide::Source,
         source.clone(),
     );
-    failure.cleanup_failure = Some(Box::new(cleanup.clone()));
+    failure.cleanup_failure = Some(Box::new(FailedCleanup {
+        error: cleanup.clone(),
+        disposition: StageCleanup::Unpublished,
+    }));
     let message = failure.to_string();
     for detail in [
         "Connectivity",

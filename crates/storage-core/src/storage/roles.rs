@@ -22,7 +22,7 @@ pub use namespace::{
     NamespaceCapabilities, PurgeOutcome,
 };
 pub use stage::DeferredCheckpoint;
-pub use stage::PreparedStage;
+pub use stage::{FailedDataCleanup, PreparedStage};
 pub use verification::{ReadBackMethod, UnpinnedReadReason, UploadDigest, UploadDigestGap};
 use version::version_unsupported;
 
@@ -653,6 +653,18 @@ pub trait StagedDestination: Send + Sync {
         stage: &PreparedStage,
         request: PublishRequest,
     ) -> Result<PublicationEvidence, PublicationFailure>;
+    /// 显式授权后的 Direct 数据失败清理。只删除本次拥有的坏输出；不得删除未修改的
+    /// 已有目标、源别名或被替换的无关条目。调用方必须先收束本次写任务，
+    /// 并在准备到清理完成之间排除并发写入；此操作不提供跨协议原子 compare-and-unlink。
+    /// 元数据错误与未知发布结果不调用此接口；普通 discard 不授予这种权限。
+    async fn remove_failed_direct(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
+        Err(super::checkpoint_stream::failure(
+            stage.final_destination.path(),
+            FailureClass::Unsupported,
+            "owned Direct data failure cleanup is unsupported",
+        ))
+    }
+
     /// Removes an unpublished stage. A stage kept at the destination removes its pointer
     /// before the staged content, so a clean-up that fails halfway never leaves a pointer that
     /// would resume the stage (ADR-0006).

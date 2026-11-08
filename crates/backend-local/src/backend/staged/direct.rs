@@ -110,7 +110,7 @@ impl LocalStagedDestination {
         let private_creation = request.final_destination.private_creation();
         let source = request.source.source_identity;
         let open_path = path.clone();
-        let (directory, file) = tokio::task::spawn_blocking(move || {
+        let (directory, file, cleanup) = tokio::task::spawn_blocking(move || {
             let fail = |class| failure(&open_path, Operation::Prepare, class);
             if cancel.is_cancelled() {
                 return Err(fail(FailureClass::Cancelled));
@@ -124,13 +124,14 @@ impl LocalStagedDestination {
                 .read(true)
                 .write(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            let file = match create_file(&directory, &name, &options, private_creation) {
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    directory.open_with(&name, &options)
+            let (file, created) =
+                match create_file(&directory, &name, &options, private_creation) {
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => directory
+                        .open_with(&name, &options)
+                        .map(|file| (file, false)),
+                    other => other.map(|file| (file, true)),
                 }
-                other => other,
-            }
-            .map_err(|e| io_failure(&open_path, Operation::Prepare, &e))?;
+                .map_err(|e| io_failure(&open_path, Operation::Prepare, &e))?;
             let metadata = file
                 .metadata()
                 .map_err(|e| io_failure(&open_path, Operation::Prepare, &e))?;
@@ -147,7 +148,9 @@ impl LocalStagedDestination {
                 return Err(fail(FailureClass::Conflict));
             }
             // Truncation is deferred to the writer so subsequent errors carry the direct handle.
-            Ok((Arc::new(directory), Arc::new(file.into_std())))
+            let file = Arc::new(file.into_std());
+            let cleanup = super::direct_cleanup::MutationEvidence::new(created, &metadata);
+            Ok((Arc::new(directory), file, Arc::new(cleanup)))
         })
         .await
         .map_err(|_| failure(&path, Operation::Prepare, FailureClass::Internal))??;
@@ -175,6 +178,7 @@ impl LocalStagedDestination {
             relative,
             name,
             first_write: AtomicBool::new(true),
+            direct_cleanup: Some(cleanup),
             transfer_identity: None,
         })));
         Ok(target)

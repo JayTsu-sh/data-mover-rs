@@ -9,6 +9,16 @@ use crate::storage::PrepareFact;
 
 mod checkpoint;
 
+/// 数据失败后的清理权限；不能授权删除元数据失败或发布状态未知的目标。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FailedDataCleanup {
+    /// 默认不授予 Direct 失败目标的删除权限。
+    #[default]
+    Keep,
+    /// Direct 失败时保留专用清理句柄，由 backend 核验本次输出的所有权。
+    RemoveOwned,
+}
+
 /// Opaque linear prepared destination state bound to one backend and final destination.
 pub struct PreparedStage {
     pub(crate) owner: crate::model::BackendIdentity,
@@ -20,8 +30,9 @@ pub struct PreparedStage {
     pub(crate) deferred_checkpoint: Option<DeferredCheckpoint>,
     /// Whether the caller requires final publication persistence barriers.
     pub(crate) durable_publication: bool,
-    /// Direct targets are already visible and must never enter stage cleanup or recovery.
+    /// Direct targets are already visible and never enter unpublished-stage recovery.
     pub(crate) direct: bool,
+    pub(crate) failed_data_cleanup: FailedDataCleanup,
     pub(crate) backend_state: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     pub(crate) claim: std::sync::Mutex<Option<std::fs::File>>,
 
@@ -65,6 +76,7 @@ impl PreparedStage {
             deferred_checkpoint: None,
             durable_publication: true,
             direct: false,
+            failed_data_cleanup: FailedDataCleanup::Keep,
             backend_state: None,
             claim: std::sync::Mutex::new(claim),
             prepare_fact: PrepareFact::Fresh,
@@ -145,6 +157,17 @@ impl PreparedStage {
     pub fn set_direct(&mut self, value: bool) {
         self.direct = value;
     }
+
+    /// 是否显式保留 Direct 数据失败清理权限；不代表目标已有删除证据。
+    #[must_use]
+    pub const fn failed_data_cleanup(&self) -> FailedDataCleanup {
+        self.failed_data_cleanup
+    }
+
+    pub fn set_failed_data_cleanup(&mut self, policy: FailedDataCleanup) {
+        self.failed_data_cleanup = policy;
+    }
+
     /// Record backend state while preparing the destination stage.
     pub fn set_backend_state(
         &mut self,

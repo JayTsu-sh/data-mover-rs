@@ -37,6 +37,8 @@ mod at_destination;
 mod checkpoint;
 mod direct;
 #[cfg(unix)]
+mod direct_cleanup;
+#[cfg(unix)]
 mod direct_durability;
 #[cfg(unix)]
 mod direct_patch;
@@ -110,12 +112,14 @@ struct LocalStageState {
     relative: PathBuf,
     name: std::ffi::OsString,
     first_write: AtomicBool,
+    #[cfg(unix)]
+    direct_cleanup: Option<Arc<direct_cleanup::MutationEvidence>>,
     /// The transfer identity a destination-kept stage's pointer records.
     transfer_identity: Option<[u8; 32]>,
 }
 
 pub struct LocalStagedDestination {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(unix, test, feature = "test-support"))]
     root: Arc<PathBuf>,
     root_dir: Arc<Dir>,
     identity: BackendIdentity,
@@ -161,10 +165,13 @@ impl LocalStagedDestination {
             ));
         }
         let root = root.into();
+        #[cfg(unix)]
+        let root = std::fs::canonicalize(root)
+            .map_err(|error| io_failure(&StoragePath::root(), Operation::Prepare, &error))?;
         let root_dir = Dir::open_ambient_dir(&root, ambient_authority())
             .map_err(|error| io_failure(&StoragePath::root(), Operation::Prepare, &error))?;
         Ok(Self {
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(any(unix, test, feature = "test-support"))]
             root: Arc::new(root),
             root_dir: Arc::new(root_dir),
             identity,
@@ -267,6 +274,8 @@ impl LocalStagedDestination {
             relative,
             name,
             first_write: AtomicBool::new(fresh),
+            #[cfg(unix)]
+            direct_cleanup: None,
             transfer_identity,
         })));
         Ok(())
@@ -969,6 +978,8 @@ impl StagedDestination for LocalStagedDestination {
         let probe = Arc::clone(&self.write_probe);
         let durable = Self::needs_stage_barrier(stage);
         let direct = stage.direct();
+        #[cfg(unix)]
+        direct_cleanup::mark_mutation(stage);
         let written = tokio::task::spawn_blocking(move || {
             if direct {
                 file.set_len(0)?;
@@ -1027,6 +1038,8 @@ impl StagedDestination for LocalStagedDestination {
             .await?;
         let fresh = Self::take_fresh_write(stage);
         if stage.direct() {
+            #[cfg(unix)]
+            direct_cleanup::mark_mutation(stage);
             let target = Arc::clone(&file);
             tokio::task::spawn_blocking(move || target.set_len(0))
                 .await
@@ -1386,6 +1399,11 @@ impl StagedDestination for LocalStagedDestination {
         }
         self.cleanup_stage_artifacts(&stage, Operation::Namespace)
             .await
+    }
+
+    #[cfg(unix)]
+    async fn remove_failed_direct(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
+        direct_cleanup::remove(self, stage).await
     }
 }
 

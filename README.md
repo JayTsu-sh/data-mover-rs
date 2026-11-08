@@ -225,6 +225,29 @@ These verify the executed barriers and failure propagation, not device power-cut
 behavior or whole-job throughput/RSS. NFS/CIFS Direct and application integration
 remain separate work.
 
+### Failed Direct data cleanup
+
+Ordinary `TransferRequest::with_failed_data_cleanup(FailedDataCleanup::RemoveOwned)`
+opts in to retaining a dedicated cleanup handle for Direct Transfer/Verify failures.
+The caller executes `failure.cleanup_for_policy(TransferPolicy::Direct)` after the
+attempt has returned; writer tasks have settled before that return. This is separate
+from unpublished staging/recovery. The default keeps existing Direct behavior.
+Metadata failures, including explicitly published data with failed metadata, and
+unknown publication/persistence failures retain the destination.
+
+Unix Local records create-new versus existing, initial inode/change evidence and
+an independent mutation intent. Cleanup checks the configured canonical root, held
+parent and leaf inode without following symlinks. It removes only a newly created
+or attributable changed output; unchanged/unattributed existing targets remain.
+Missing output is idempotent, with parent synchronization still required. Replacement
+or sync failures retain typed cleanup evidence alongside the original transfer error.
+Callers must exclude concurrent writers from prepare through cleanup; this is not
+an atomic compare-and-unlink primitive. Other adapters currently refuse the new role.
+Eight real-file backend tests and five ordinary engine tests cover ownership, all
+Local writers, replacement/root changes, source aliases, cancellation, metadata
+retention and publication uncertainty. No network-mount or throughput/RSS acceptance
+is claimed. Expert/generated streams do not yet expose this ordinary request option.
+
 ### Direct native S3 copy
 
 Direct S3-to-S3 transfers use one server-side `CopyObject` when both endpoints have

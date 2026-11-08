@@ -126,6 +126,8 @@ pub(super) async fn write(
         .await?;
     let fresh = LocalStagedDestination::take_fresh_write(stage);
     if stage.direct() {
+        #[cfg(unix)]
+        super::direct_cleanup::mark_mutation(stage);
         LocalStagedDestination::sync_written_file(
             Arc::clone(&file),
             0,

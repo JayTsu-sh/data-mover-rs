@@ -21,7 +21,7 @@ use crate::storage::backends::local::{test_destination_storage_with_role, test_s
 type Result = std::result::Result<(), Box<dyn std::error::Error>>;
 
 // 模拟计划与实际能力不符；真实 Local 对 tags 的写入会返回有类型 Unsupported。
-fn refused_plan() -> std::result::Result<Arc<MetadataPlan>, Box<dyn std::error::Error>> {
+pub(super) fn refused_plan() -> std::result::Result<Arc<MetadataPlan>, Box<dyn std::error::Error>> {
     let observations = MetadataObservations::new(
         MetadataObservation::NotRequested,
         MetadataObservation::NotRequested,

@@ -55,6 +55,7 @@ async fn prepare_native_stage(
         stage.mark_at_destination(fact);
     }
     stage.set_exclusive(Some(Box::new(lease)));
+    stage.set_failed_data_cleanup(request.failed_data_cleanup);
     if request
         .publication_durability
         .required(request.transfer_policy)

@@ -6,7 +6,7 @@ use crate::metadata::MetadataPlan;
 use crate::model::{
     EntryKind, ObservedEntry, SourceIdentity, SourceVersion, StoragePath, StorageTimestamp,
 };
-use crate::storage::{SourceQosGroup, Storage};
+use crate::storage::{FailedDataCleanup, SourceQosGroup, Storage};
 
 use super::TransferIdentity;
 
@@ -113,6 +113,7 @@ pub struct TransferRequest {
     pub(crate) metadata_mode: MetadataTransferMode,
     pub(crate) metadata_plan: Option<Arc<MetadataPlan>>,
     pub(crate) metadata_failure_policy: MetadataFailurePolicy,
+    pub(crate) failed_data_cleanup: FailedDataCleanup,
 }
 
 /// One source selection, optionally constrained by an observation. An observed selection
@@ -348,6 +349,7 @@ impl TransferRequest {
             metadata_mode: MetadataTransferMode::Automatic,
             metadata_plan: None,
             metadata_failure_policy: MetadataFailurePolicy::default(),
+            failed_data_cleanup: FailedDataCleanup::default(),
         }
     }
 
@@ -533,6 +535,14 @@ impl TransferRequest {
     #[must_use]
     pub const fn with_metadata_failure_policy(mut self, policy: MetadataFailurePolicy) -> Self {
         self.metadata_failure_policy = policy;
+        self
+    }
+
+    /// 选择 Direct 数据失败时的显式清理权限；清理由 `failure.cleanup_for_policy` 执行。
+    /// 元数据错误与未知发布失败保留目标，不受此选项影响。
+    #[must_use]
+    pub const fn with_failed_data_cleanup(mut self, cleanup: FailedDataCleanup) -> Self {
+        self.failed_data_cleanup = cleanup;
         self
     }
 

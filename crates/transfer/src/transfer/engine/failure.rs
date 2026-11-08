@@ -9,7 +9,7 @@ use crate::metadata::role_failure_text;
 use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::checkpoint::CheckpointPhase;
 use crate::storage::{PreparedStage, SourceQosStats, StagedDestination, StorageRoleFailure};
-use crate::transfer::TransferPolicy;
+use crate::transfer::{FailedDataCleanup, TransferPolicy};
 
 /// Structured failure from the unified transfer lifecycle.
 #[derive(Debug)]
@@ -22,7 +22,7 @@ pub struct TransferFailure {
     /// Why copied metadata was refused while planning, before anything was written.
     pub(super) refusal: Option<Box<crate::metadata::MetadataPlanError>>,
     stage_cleanup: Option<Box<FailedStage>>,
-    cleanup_failure: Option<Box<StorageRoleFailure>>,
+    cleanup_failure: Option<Box<FailedCleanup>>,
     pub(super) final_destination_changed: bool,
     source_qos: SourceQosStats,
 }
@@ -34,16 +34,23 @@ struct FailedMetadata {
     published_data: Option<Box<TransferOutcome>>,
 }
 
+#[derive(Debug)]
+struct FailedCleanup {
+    error: StorageRoleFailure,
+    disposition: StageCleanup,
+}
+
 struct FailedStage {
     destination: Arc<dyn StagedDestination>,
     stage: PreparedStage,
     disposition: StageCleanup,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum StageCleanup {
     Unpublished,
     AfterPublication,
+    FailedDirectData,
 }
 
 impl fmt::Debug for FailedStage {
@@ -121,14 +128,21 @@ impl TransferFailure {
         destination: Arc<dyn StagedDestination>,
         stage: PreparedStage,
     ) -> Self {
-        if stage.direct() {
+        let disposition = if stage.direct() {
             self.final_destination_changed = true;
-            return self;
-        }
+            if stage.failed_data_cleanup() != FailedDataCleanup::RemoveOwned
+                || !matches!(self.phase, TransferPhase::Transfer | TransferPhase::Verify)
+            {
+                return self;
+            }
+            StageCleanup::FailedDirectData
+        } else {
+            StageCleanup::Unpublished
+        };
         self.stage_cleanup = Some(Box::new(FailedStage {
             destination,
             stage,
-            disposition: StageCleanup::Unpublished,
+            disposition,
         }));
         self
     }
@@ -188,6 +202,14 @@ impl TransferFailure {
         self.stage_cleanup
             .as_ref()
             .is_some_and(|pending| matches!(pending.disposition, StageCleanup::Unpublished))
+    }
+
+    /// 显式授权且尚未执行的 Direct 数据失败清理；不属于可恢复的 unpublished stage。
+    #[must_use]
+    pub fn has_failed_data_cleanup(&self) -> bool {
+        self.stage_cleanup
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.disposition, StageCleanup::FailedDirectData))
     }
 
     /// Whether publication committed — or may have: an S3 completion that failed without a
@@ -281,7 +303,9 @@ impl TransferFailure {
     ///
     /// Checkpointed attempts retain unpublished recovery state. Other policies discard it;
     /// after possible publication only transient artifacts are removed. Cleanup never rolls
-    /// back the final path. A cleanup error is retained alongside the original failure.
+    /// back the final path, except explicitly opted-in Direct data failures: their backend
+    /// verifies and removes only this attempt's owned bad output. Metadata and unknown
+    /// publication failures retain the destination. Cleanup errors keep the original cause.
     #[must_use]
     pub async fn cleanup_for_policy(mut self, policy: TransferPolicy) -> Self {
         if policy == TransferPolicy::Checkpointed && self.has_unpublished_stage() {
@@ -290,18 +314,27 @@ impl TransferFailure {
         let Some(pending) = self.stage_cleanup.take() else {
             return self;
         };
+        let disposition = pending.disposition;
         let result = match pending.disposition {
             StageCleanup::AfterPublication => cleanup_published(pending).await,
             StageCleanup::Unpublished => pending.destination.discard(pending.stage).await,
+            StageCleanup::FailedDirectData => {
+                pending
+                    .destination
+                    .remove_failed_direct(pending.stage)
+                    .await
+            }
         };
-        self.cleanup_failure = result.err().map(Box::new);
+        self.cleanup_failure = result
+            .err()
+            .map(|error| Box::new(FailedCleanup { error, disposition }));
         self
     }
 
     /// Failure to release owned artifacts, separate from the transfer's original cause.
     #[must_use]
     pub fn cleanup_failure(&self) -> Option<&StorageRoleFailure> {
-        self.cleanup_failure.as_deref()
+        self.cleanup_failure.as_ref().map(|failed| &failed.error)
     }
 
     /// Consumes this failure and discards its unpublished stage, whether recoverable or ephemeral.
@@ -374,10 +407,15 @@ impl fmt::Display for TransferFailure {
             negotiation::write_metadata_detail(formatter, None, self.metadata_failure(), None)?;
         }
         if let Some(cleanup) = &self.cleanup_failure {
+            let operation = if matches!(cleanup.disposition, StageCleanup::FailedDirectData) {
+                "direct data cleanup"
+            } else {
+                "artifact cleanup"
+            };
             write!(
                 formatter,
-                "; artifact cleanup failed: {}",
-                role_failure_text(cleanup)
+                "; {operation} failed: {}",
+                role_failure_text(&cleanup.error)
             )?;
         }
         Ok(())

@@ -56,6 +56,20 @@ Unix Local 不重读文件体，按已打开的文件句柄同步数据和属性
 取消在阻塞操作之间检查，正在执行的系统 fsync 不能强行中断；该边界不代表整个迁移
 已经获得统一网络恢复预算。单元测试使用实际文件及受控同步失败，不宣称断电或网络挂载验收。
 
+### Direct 数据失败清理
+
+普通传输显式选择 `FailedDataCleanup::RemoveOwned` 时，Transfer／Verify 错误保留独立
+清理句柄，调用方执行 `cleanup_for_policy`；它不是可恢复的 unpublished stage。
+默认 Direct 仍保留可见目标，普通 `discard` 不新增删除权限。元数据错误和未知发布／
+持久化错误均不进入此删除路径。该选项目前不覆盖 expert／生成流。
+
+Unix Local 在已有 prepare 属性上记录新建／已有、初始 dev／ino／size／mtime／ctime，
+各 writer 在 truncate 前记录独立修改意图；不为默认 Direct 增加逐文件 stat。
+清理前重验 canonical 根、根内父目录、末尾 inode；只移除本次新建或能归因于本次写入
+的坏结果。已有未修改或证据不足的目标保留，路径替换拒绝。缺失幂等仍同步父目录，
+同步失败保留原始传输错误和独立清理错误。调用方须排除 prepare 至清理期间的并发写，
+不能把这个机制解释为原子 compare-and-unlink。实际文件测试不替代网络挂载或性能验收。
+
 ### 跨扫描改名证据
 
 Unix Local 为已有 metadata 中包含可表示创建时间的条目提供独立的 `RenameEvidence`：
