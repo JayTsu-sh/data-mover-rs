@@ -16,8 +16,9 @@ use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    AclEncoding, EntryKind, FailureClass, MetadataObservation, ObservationMode, ObservationPlan,
-    ObservedEntry, SourceVersion, StoragePath, StorageTimestamp,
+    AclEncoding, EntryKind, EntryOperationFailure, FailureClass, MetadataObservation,
+    ObservationMode, ObservationPlan, ObservedEntry, Operation, SourceVersion, StoragePath,
+    StorageTimestamp, Transience,
 };
 
 use crate::storage::{
@@ -478,7 +479,33 @@ impl Endpoint {
             bytes = bytes.saturating_add(chunk.len() as u64);
             hasher.update(&chunk);
         }
+        self.validate_read_length(descriptor, bytes)?;
         Ok((*hasher.finalize().as_bytes(), bytes))
+    }
+
+    fn validate_read_length(
+        &self,
+        descriptor: &SourceDescriptor,
+        bytes: u64,
+    ) -> Result<(), IntegrityFailure> {
+        let Some(expected) = descriptor.size else {
+            return Ok(());
+        };
+        if expected == bytes {
+            return Ok(());
+        }
+        // 同时短读仍可能得到相同摘要；两端都必须满足自己描述中的已知长度。
+        let failure = EntryOperationFailure::new(
+            self.path.clone(),
+            Operation::Read,
+            FailureClass::Protocol,
+            Transience::Permanent,
+            format!(
+                "content read length differs from description: expected={expected}, actual={bytes}"
+            ),
+        )
+        .unwrap_or_else(|_| unreachable!("bounded length diagnostics are valid"));
+        Err(self.attribute(StorageRoleFailure::Entry(failure)))
     }
 }
 

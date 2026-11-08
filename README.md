@@ -475,6 +475,12 @@ report them adds an `IntegrityIgnored` fact. A DXN NFSv4 endpoint can use
 `IntegrityPlan::default()` to avoid requesting its unsupported ACL and xattr
 families.
 
+Content comparison also checks each stream against its descriptor's known size.
+Premature EOF or excess bytes fail with a side-attributed `Protocol` / `Read`
+failure, even when both streams produce the same incomplete digest. A descriptor
+without a size continues to compare the bytes through EOF. Metadata-only checks
+do not read data or infer stream completeness.
+
 ### Integrity-check timestamp options
 
 `IntegrityOptions` controls modification-time comparison.
