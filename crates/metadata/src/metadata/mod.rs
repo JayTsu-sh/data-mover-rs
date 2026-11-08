@@ -28,9 +28,7 @@ mod version_tests;
 pub use verify::MetadataVerificationError;
 
 pub use compile::compile_metadata_plan;
-pub use compile::{
-    compile_copied_metadata_plan, compile_nothing_stored_plan, compile_unavailable_plan,
-};
+pub use compile::{compile_copied_metadata_plan, compile_unavailable_plan};
 use errors::family_name;
 pub use errors::role_failure_text;
 pub use errors::{

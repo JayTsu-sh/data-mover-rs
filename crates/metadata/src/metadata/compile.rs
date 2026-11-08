@@ -175,17 +175,9 @@ fn compile_copied_observations(
     Ok(plan)
 }
 
-/// The plan for a destination that stores nothing a copy carries: every family the policies ask
-/// for is skipped because of the destination, the rest omitted — decided without reading the
-/// source, since no value there could change it. Any policy but `Omit` counts as asked, whatever
-/// its strength: what a destination cannot store at all is not the copy's to refuse. The reason
-/// is always the destination's, even where the source could not have read the family either.
-#[must_use]
-pub fn compile_nothing_stored_plan(policies: MetadataPolicies) -> MetadataPlan {
-    compile_unavailable_plan(policies, RefusalCause::DestinationCannotStore)
-}
-
 /// Plans explicit refusal or omission outcomes without observing source data.
+/// 目标完全不能存储时传入 DestinationCannotStore；所有非 Omit 类别记为跳过，
+/// 不读取源端，也不把 RequireExact 转为严格编译失败。
 #[must_use]
 pub fn compile_unavailable_plan(policies: MetadataPolicies, reason: RefusalCause) -> MetadataPlan {
     let mut plan = MetadataPlan {

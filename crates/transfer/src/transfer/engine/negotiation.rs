@@ -10,7 +10,7 @@ use crate::metadata::{
     AclTarget, MetadataApplicationFailure, MetadataPlan, MetadataPlanError, MetadataPlanRequest,
     MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget, RefusalCause, RefusalSide,
     TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
-    compile_nothing_stored_plan, compile_unavailable_plan, role_failure_text,
+    compile_unavailable_plan, role_failure_text,
 };
 use crate::model::{
     EntryKind, MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan,
@@ -235,7 +235,10 @@ fn nothing_stored(requested: CopiedMetadataRequest, copy_tags: bool) -> CopiedMe
         .with_acl(optional_policy(requested.acl()))
         .with_xattrs(optional_policy(requested.xattrs()))
         .with_tags(optional_policy(copy_tags));
-    CopiedMetadataPlan::Automatic(compile_nothing_stored_plan(policies))
+    CopiedMetadataPlan::Automatic(compile_unavailable_plan(
+        policies,
+        RefusalCause::DestinationCannotStore,
+    ))
 }
 
 /// The source's metadata role with the baseline it observes for a copy, and what the destination
