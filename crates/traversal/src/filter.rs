@@ -79,12 +79,7 @@ fn included_entry_decision(result: &MatchResult, is_dir: bool) -> Option<(bool, 
 /// # 参数说明
 /// - `match_expressions`: 匹配表达式，用于白名单过滤
 /// - `exclude_expressions`: 排除表达式，用于黑名单过滤
-/// - `file_name`: 文件名（可选）
-/// - `file_path`: 文件路径（可选）
-/// - `file_type`: 文件类型（"file"或"dir"，可选）
-/// - `modified_epoch`: 文件修改时间的 epoch seconds（可选）
-/// - `size`: 文件大小（可选）
-/// - `extension`: 文件扩展名（可选）
+/// - `input`: 当前条目的名称、路径、类型、修改时间、大小和扩展名等过滤事实
 /// - `now_epoch`: 固定的 Unix 秒时间；None 时读取一次当前时间，所有过滤共用该基准
 ///
 /// # 返回值

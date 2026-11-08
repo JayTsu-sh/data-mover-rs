@@ -367,8 +367,8 @@ impl TransferRequest {
     /// 克隆请求只共享观察数据，不复制整份版本历史。
     ///
     /// # Errors
-    /// Rejects an observation from another storage, a non-file entry, a deleted key, or a
-    /// history segment that does not identify the current object.
+    /// 拒绝其他 backend 的观察、不合法索引、所选删除标记和不可读条目。
+    /// 未指定记录索引时，历史必须标识观察到的当前对象；显式索引可以选择历史对象。
     pub fn from_observation(
         source: Storage,
         observation: impl Into<Arc<ObservedEntry>>,

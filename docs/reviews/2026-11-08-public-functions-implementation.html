@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>公开接口收敛实施记录 · 2026-11-08</title>
+<style>body{font:16px/1.7 system-ui,sans-serif;background:#f4f6f8;color:#203040;margin:0}main{max-width:1120px;margin:auto;padding:32px 24px 64px}h1,h2{line-height:1.3}h2{margin-top:32px}a{color:#175c96}code{background:#e7edf3;padding:2px 4px;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse;background:white}td,th{border:1px solid #ccd6e0;padding:14px;text-align:left;vertical-align:top}th{min-width:145px;background:#eaf0f5}p{margin:10px 0}.note{border-left:5px solid #247b78;background:white;padding:14px 20px}.pending{border-color:#b67c26}.small{font-size:14px;color:#526577}@media print{body{background:white}main{max-width:none;padding:0}tr{break-inside:avoid}a{color:inherit}}</style></head><body><main>
+<h1>公开接口收敛实施记录</h1>
+<p>2026-11-08 · 基于原接口扩展、迁移调用方并移除重复入口。</p>
+<p class="note">本记录只说明已落地的第一批接口收敛，不代表完整迁移优化或全部审查建议已完成。审查冻结时的源码和候选方案保留在 <a href="2026-11-08-public-functions-review.html">原审查文档</a>。</p>
+<h2>代码范围</h2>
+<p>data-mover 源码提交：<code>3b34f324697cdbdeec7e1adc54928f7227143d50</code>。terrasync 提交 <code>55c32db</code> 的 Cargo.toml 和 Cargo.lock 中 13 个 data-mover 包固定到同一提交，调用方同时迁移；没有添加兼容转发入口。</p>
+<h2>已经实施</h2><table><thead><tr><th>职责</th><th>统一入口及保留的合同</th></tr></thead><tbody><tr><th>普通观察传输构造</th><td><code>TransferRequest::from_observation(source, observation, version_index, destination, cancel)</code><p>接收按值或 Arc 观察；删除 from_shared_observation。保持历史索引、marker、身份和写前检查，克隆请求仍共享历史。</p><a href="../../crates/transfer/src/transfer/model.rs">实现</a></td></tr>
+<tr><th>实时／固定时间过滤</th><td><code>should_skip(..., now_epoch: Option&lt;i64&gt;)</code><p>删除 should_skip_at。固定时间不读系统时钟，实时路径取一次时间；包含、排除、下钻三分量不变。</p><a href="../../crates/traversal/src/filter.rs">实现</a></td></tr>
+<tr><th>不可存储计划</th><td><code>compile_unavailable_plan(policies, reason)</code><p>删除 compile_nothing_stored_plan 的固定参数转发；DestinationCannotStore 仍将请求类别记为 skipped，不改为严格编译失败。</p><a href="../../crates/metadata/src/metadata/compile.rs">实现</a></td></tr>
+<tr><th>HDFS 解析</th><td><code>HdfsLocation::parse(location, &amp;HdfsConfig)</code><p>删除 parse_configured。显式传入默认、HA 或认证配置，不依赖环境配置；URL 校验、拒绝和脱敏规则不变。</p><a href="../../crates/storage-core/src/storage/config/hdfs.rs">实现</a></td></tr>
+<tr><th>有界路径读取</th><td><code>read_namespace_entry(storage, path, Option&lt;ObservationPlan&gt;, policy, cancel)</code><p>删除 read_source_observation 和 SourceObservationReadOutcome；扩展既有 NamespaceReadOutcome 区分 Descriptor 与 Observation。无计划只 stat；属性与 stat 共用原恢复窗口，属性 NotFound 仍是失败。</p><a href="../../crates/storage-core/src/storage/namespace_read.rs">实现</a></td></tr>
+<tr><th>计划应用</th><td><code>MetadataPlan::apply(target, path, &amp;SourceVersion, cancel)</code><p>删除计划层 apply_to_version；当前／历史目标显式选择，历史版本不回退当前对象。family 顺序、取消和部分应用报告保持不变。角色层的 apply/apply_to_version 尚待后续收敛。</p><a href="../../crates/metadata/src/metadata/mod.rs">实现</a></td></tr>
+<tr><th>发布／历史校验</th><td><code>MetadataPlan::verify_published(target, path, &amp;SourceVersion, expected_current_version, cancel)</code><p>删除 verify_version。历史读取与当前发布约束独立；Current 无约束仍用 namespace stat，旧路径没有增加读取。新增组合同时检查当前 HEAD 与精确历史版本。</p><a href="../../crates/metadata/src/metadata/verify.rs">实现</a></td></tr></tbody></table>
+<p>另将 <code>Lexer</code> 和构造方法限制在解析实现内部，将仅四个单元测试使用的 <code>has_failed_data_cleanup</code> 限制为 <code>cfg(test) + pub(crate)</code>。总计删除七个重复公开函数入口，另收窄两个公开函数的可见性；没有改变 Direct／Checkpoint 或删源授权。</p>
+<h2>验证</h2>
+<p class="note">本地 CI 各阶段通过：data-mover 的架构守卫、harness、独立 feature 矩阵、严格 all-targets Clippy（零警告）、workspace／文档测试（2,428 passed、53 ignored）、examples 和 e2e-local；terrasync 的 fmt、workspace all-targets check／Clippy、workspace（633 passed、121 ignored）和串行远端进程 E2E（16 passed）。terrasync Clippy 仍有既有告警；ignored 为默认套件未运行项，不能视为相应实机验收通过。</p>
+<ul><li>现有普通／历史观察测试 18 项，过滤相关测试 280 项，HDFS crate 测试 105 项通过。</li><li>路径读取确定性测试 8 项通过，包括仅 stat 不访问 metadata，以及 stat／属性共享恢复窗口、取消和准确 NotFound。</li><li>元数据引擎测试 64 项通过，新增组合验证证明“历史版本存在”不能替代“当前发布版本未变化”的约束。</li><li>隔离 RustFS：属性观察 9 种、stat 7 种、历史元数据应用 7 种场景通过，覆盖权限拒绝、断连、静默超时、取消、闪断恢复和适用的提交响应丢失。</li><li>独立 S3 检查确认观察无数据 GET／写入、全部源版本与哨兵保留；历史 tags 写入不创建数据版本，当前版本和内容不变，不发出数据 GET／PUT。测试容器已清理。</li></ul>
+<h2>架构审查结论</h2>
+<p>路径观察与恢复机制仍集中在 storage-core，版本选择和元数据计划执行仍由原引擎负责。terrasync 只传计划与选择并消费有类型的结果，不增加 backend 分支、协议重试或新的恢复循环。观察继续使用 Arc 共享历史；无计划的路径读取不新增属性接口调用，旧发布校验路径不新增 HEAD。检查覆盖职责归属、重复入口删除和调用方迁移。</p>
+<h2>后续事项与人工确认</h2>
+<p class="note pending">Expert 构造合并尚未实施：拟在原 <code>new</code> 上接收选择枚举 <code>Current</code>／<code>Observed { version_index }</code>，保留“当前对象变化检查”和“固定扫描捕获版本”的不同语义。现有 SourceVersion 无法表达观察索引；新增公开选择类型正在等待人工明确确认，依据 <a href="../../AGENTS.md">AGENTS.md</a>。</p>
+<ul><li>ReadSource 的 describe／describe_version，以及 Metadata 角色层的 apply／apply_to_version 仍待收敛，需同步所有 adapter、wrapper 与测试，并保证不支持历史版本时先拒绝、无当前对象副作用。</li><li>QoS 构造统一与两套准入账本合并尚未实施；后者须作为独立行为修复验证，不能只修改名称。</li><li>校验期间在途 IO 的取消缺口仍待独立修复；本批没有宣称已完成统一网络故障控制。</li><li>其余条件性合并及可见性建议仍以原审查文档为准。确需新公开请求／模式／入口时先人工确认。</li></ul>
+<h2>性能与未测范围</h2>
+<p>本批通过结构和请求计数确认旧路径未增加数据读取、属性读取或历史克隆，没有执行迁移吞吐／峰值 RSS 的正式同环境 A/B，因此不能据此声称已达到全量 5% 损失目标。本地工具链为 rustc 1.98.1；没有另行复跑 CI 固定的 Rust 1.95。真实故障只复测了上述隔离 S3 链路；Windows 和本批 NFS／CIFS／HDFS 真实服务未测。HDFS 的 105 项为自动测试，不是实机 HA 验收。</p>
+<p class="small">原始测试日志与隔离配置保留仓库外。完整迁移需求仍以 <a href="../../../terrasync-rs/docs/specs/2026-11-06-full-migration-optimization.html">迁移设计文档</a> 和两个仓库的开发／故障约束为准。</p>
+</main></body></html>
