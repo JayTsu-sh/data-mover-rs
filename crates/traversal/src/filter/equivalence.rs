@@ -466,11 +466,11 @@ mod tests {
                 .assert_value("compare")
         );
         assert_eq!(
-            should_skip(Some(&path_first), None, input),
+            should_skip(Some(&path_first), None, input, None),
             (true, false, false)
         );
         assert_eq!(
-            should_skip(Some(&name_first), None, input),
+            should_skip(Some(&name_first), None, input, None),
             (true, true, true)
         );
     }

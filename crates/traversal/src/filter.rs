@@ -85,6 +85,7 @@ fn included_entry_decision(result: &MatchResult, is_dir: bool) -> Option<(bool, 
 /// - `modified_epoch`: 文件修改时间的 epoch seconds（可选）
 /// - `size`: 文件大小（可选）
 /// - `extension`: 文件扩展名（可选）
+/// - `now_epoch`: 固定的 Unix 秒时间；None 时读取一次当前时间，所有过滤共用该基准
 ///
 /// # 返回值
 /// 返回一个三元组 (`should_skip`, `continue_scan`, `check_children`)，其中：
@@ -101,22 +102,15 @@ pub fn should_skip(
     match_expressions: Option<&FilterExpression>,
     exclude_expressions: Option<&FilterExpression>,
     input: FilterInput<'_>,
+    now_epoch: Option<i64>,
 ) -> (bool, bool, bool) {
     selection::trace_input(match_expressions, exclude_expressions, input);
-    selection::decide(match_expressions, exclude_expressions, input, now_secs())
-}
-
-/// 按调用方固定的 Unix 秒时间评估；包含、排除和目录剪枝使用同一时间基准。
-/// 不读取系统时钟，也不重写相对时间表达式。
-#[must_use]
-pub fn should_skip_at(
-    match_expressions: Option<&FilterExpression>,
-    exclude_expressions: Option<&FilterExpression>,
-    input: FilterInput<'_>,
-    now_epoch: i64,
-) -> (bool, bool, bool) {
-    selection::trace_input(match_expressions, exclude_expressions, input);
-    selection::decide(match_expressions, exclude_expressions, input, now_epoch)
+    selection::decide(
+        match_expressions,
+        exclude_expressions,
+        input,
+        now_epoch.unwrap_or_else(now_secs),
+    )
 }
 
 /// 解析过滤表达式的辅助函数
@@ -1708,6 +1702,7 @@ mod tests {
                     size: $size,
                     extension: $extension,
                 },
+                None,
             )
         }};
     }

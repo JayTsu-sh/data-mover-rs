@@ -19,9 +19,7 @@
 //! settle, not for a timestamp to exist. A final missing time retains the DSL's `LazyMatch`
 //! semantics; an observation still pending must never be mistaken for a final missing value.
 
-use crate::filter::{
-    FilterExpression, FilterInput, parse_filter_expression, should_skip, should_skip_at,
-};
+use crate::filter::{FilterExpression, FilterInput, parse_filter_expression, should_skip};
 use crate::model::{EntryKind, MetadataFamily, MetadataRequirements};
 use crate::time_util::unix_nanos_to_secs;
 use crate::traversal::{TraversalCandidate, TraversalDecision, TraversalFilter};
@@ -191,19 +189,12 @@ impl TraversalFilter for DslTraversalFilter {
             return TraversalDecision::unfiltered(candidate.kind);
         }
         let input = filter_input(candidate);
-        let (skip, continue_scan, check_children) = match self.time_anchor {
-            Some(epoch) => should_skip_at(
-                self.match_expressions.as_ref(),
-                self.exclude_expressions.as_ref(),
-                input,
-                epoch,
-            ),
-            None => should_skip(
-                self.match_expressions.as_ref(),
-                self.exclude_expressions.as_ref(),
-                input,
-            ),
-        };
+        let (skip, continue_scan, check_children) = should_skip(
+            self.match_expressions.as_ref(),
+            self.exclude_expressions.as_ref(),
+            input,
+            self.time_anchor,
+        );
         TraversalDecision {
             emit: !skip,
             descend: continue_scan,

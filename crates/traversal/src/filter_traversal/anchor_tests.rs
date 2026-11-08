@@ -1,7 +1,7 @@
 //! 固定时钟与有序策略指纹分别用于本轮评估和跨轮选择比较。
 use super::DslTraversalFilter;
 use crate::AssertTestValue;
-use crate::filter::{FilterInput, parse_filter_expression, should_skip_at};
+use crate::filter::{FilterInput, parse_filter_expression, should_skip};
 use crate::model::{EntryKind, MetadataObservations, StorageTimestamp, TimePrecision};
 use crate::traversal::{TraversalCandidate, TraversalFilter};
 
@@ -59,6 +59,6 @@ fn extreme_explicit_clocks_do_not_overflow_relative_time_comparison() {
         file_type: Some("file"),
         ..FilterInput::default()
     };
-    assert!(!should_skip_at(Some(&expression), None, input(i64::MIN), i64::MAX).0);
-    assert!(should_skip_at(Some(&expression), None, input(i64::MAX), i64::MIN).0);
+    assert!(!should_skip(Some(&expression), None, input(i64::MIN), Some(i64::MAX)).0);
+    assert!(should_skip(Some(&expression), None, input(i64::MAX), Some(i64::MIN)).0);
 }
