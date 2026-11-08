@@ -18,7 +18,8 @@ import boto3
 from botocore.config import Config
 
 ROOT = Path(__file__).resolve().parents[2]
-MODES = ("normal", "deny", "disconnect", "stall", "cancel", "flash", "lost_ack")
+MODES = ("normal", "deny", "disconnect", "stall", "cancel", "flash", "lost_ack",
+         "verify_head", "verify_current", "verify_tags", "verify_empty")
 
 
 def docker(*args):
@@ -83,6 +84,17 @@ def inside():
                 tagging = self.command == "PUT" and "tagging" in arguments
                 requests.append((self.command, self.path, arguments))
                 payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                read_stall = (
+                    urllib.parse.urlsplit(self.path).path.endswith("/payload")
+                    and ((mode in ("verify_head", "verify_current", "verify_empty") and self.command == "HEAD")
+                         or (mode == "verify_tags" and self.command == "GET" and "tagging" in arguments))
+                )
+                if read_stall:
+                    faults[mode] = faults.get(mode, 0) + 1
+                    stopped.wait(10)
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    return
                 if tagging and mode in ("deny", "disconnect", "stall", "cancel", "flash"):
                     faults[mode] = faults.get(mode, 0) + 1
                     if mode == "deny":
@@ -136,22 +148,27 @@ def inside():
                 })
                 subprocess.run([
                     "cargo", "test", "--offline", "--locked", "--test", "s3_architecture_contract",
-                    "version_metadata::exact_version_metadata_with_real_requests", "--", "--ignored", "--exact", "--nocapture",
+                    ("version_metadata::cancel_read_only_verification" if mode.startswith("verify_")
+                     else "version_metadata::exact_version_metadata_with_real_requests"),
+                    "--", "--ignored", "--exact", "--nocapture",
                 ], cwd=ROOT, env=environment, check=True)
                 key = f"{mode}/payload"
                 versions = client.list_object_versions(Bucket=bucket, Prefix=key)
                 assert len(versions.get("Versions", [])) == 2 and not versions.get("DeleteMarkers"), versions
-                for version, data, raw in ((old, b"old", "updated"), (current, b"current", "current")):
+                old_tags = "old" if mode.startswith("verify_") else "updated"
+                for version, data, raw in ((old, b"old", old_tags), (current, b"current", "current")):
                     assert client.get_object(Bucket=bucket, Key=key, VersionId=version)["Body"].read() == data
                     assert client.get_object_tagging(Bucket=bucket, Key=key, VersionId=version)["TagSet"] == [{"Key": "raw", "Value": raw}]
                 assert client.get_object(Bucket=bucket, Key=key)["Body"].read() == b"current"
                 selected = [item for item in requests if f"/{mode}/" in item[1]]
                 for method, path, arguments in selected:
+                    if mode.startswith("verify_"):
+                        assert method in ("HEAD", "GET"), (method, path)
                     if method == "PUT":
                         assert "tagging" in arguments and arguments.get("versionId") == [old], (method, path)
                     assert method not in ("POST", "DELETE")
                     assert not (method == "GET" and "payload" in path and "tagging" not in arguments), (method, path)
-                print(f"independent version metadata fault={mode} versions=2 old_tags=updated current=unchanged data_GET=0 data_PUT=0", flush=True)
+                print(f"independent version metadata fault={mode} versions=2 old_tags={old_tags} current=unchanged data_GET=0 data_PUT=0", flush=True)
             assert all(faults.get(mode, 0) >= 1 for mode in MODES if mode != "normal"), faults
             assert not client.list_multipart_uploads(Bucket=bucket).get("Uploads")
         finally:

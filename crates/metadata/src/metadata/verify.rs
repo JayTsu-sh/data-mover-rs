@@ -69,6 +69,7 @@ impl MetadataPlan {
     /// 核验当前目标或指定历史版本的已捕获元数据计划，返回新描述供调用方核对类型和大小。
     /// Current 且无发布约束时保留 namespace 的目录语义；Id 精确读取历史版本。
     /// `expected_current_version` 独立约束当前发布版本，不会被历史版本读取替代。
+    /// 取消会丢弃在途只读请求，不再等待其返回或启动后续读取。
     ///
     /// # Errors
     /// 保留不可读属性、版本变化、元数据不一致和取消的有类型错误。
@@ -80,9 +81,26 @@ impl MetadataPlan {
         expected_current_version: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<SourceDescriptor, MetadataVerificationError> {
-        if cancel.is_cancelled() {
-            return Err(MetadataVerificationError::Cancelled);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(MetadataVerificationError::Cancelled),
+            result = self.verify_selected(target, path, version, expected_current_version, cancel.clone()) => {
+                match result {
+                    Ok(_) if cancel.is_cancelled() => Err(MetadataVerificationError::Cancelled),
+                    result => result,
+                }
+            }
         }
+    }
+
+    async fn verify_selected(
+        &self,
+        target: &Storage,
+        path: &StoragePath,
+        version: &SourceVersion,
+        expected_current_version: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<SourceDescriptor, MetadataVerificationError> {
         let current = if let Some(expected) = expected_current_version {
             let descriptor = target
                 .read_source()

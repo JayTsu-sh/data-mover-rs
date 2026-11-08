@@ -22,6 +22,8 @@ mod compile;
 mod errors;
 mod verify;
 #[cfg(test)]
+mod verify_cancel_tests;
+#[cfg(test)]
 mod verify_tests;
 #[cfg(test)]
 mod version_tests;

@@ -49,6 +49,15 @@ the same version selection. The runner independently reads both versions and tag
 It verifies the metadata API; task-level catalogue mapping and aggregate callback
 semantics require separate terrasync tests. The owned container is removed on exit.
 
+The same runner also stalls read-only verification at historical HEAD, current-version
+HEAD, tags GET and the stat used by an empty metadata plan. Cancellation after 250 ms
+returned typed `MetadataVerificationError::Cancelled` in 252–254 ms in the 2026-11-08
+run. Independent inspection found both original bodies/tags and their two versions
+unchanged; proxy records contained no payload GET or mutation. Deterministic tests
+also cover an independent permission read and confirm the pending futures are dropped.
+These checks establish cancellation of verification, not network detection/recovery
+budgets, other protocols' handle cleanup, or whole-migration throughput/RSS targets.
+
 `python3 tests/lab/run-source-purge-local.py` runs the exact-version source-purge contract in
 an isolated local RustFS container, using a cached image (override `SOURCE_PURGE_S3_IMAGE`),
 `docker`, `nsenter`, `boto3`, and cached Rust dependencies. It creates only its own bucket and

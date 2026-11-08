@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 use super::{TestResult, connected};
 use data_mover::metadata::{
     AclTarget, MetadataPlan, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget,
-    MetadataVerificationError, OwnershipTarget, TimestampTargetCapability, ValueTarget,
-    compile_metadata_plan,
+    MetadataVerificationError, OwnershipTarget, RefusalCause, TimestampTargetCapability,
+    ValueTarget, compile_metadata_plan, compile_unavailable_plan,
 };
 use data_mover::model::{
     MetadataObservation, MetadataObservations, MetadataProvenance, ObjectTag, SourceVersion,
@@ -38,6 +38,53 @@ fn captured_plan(tags: Vec<ObjectTag>) -> TestResult<MetadataPlan> {
         policies: MetadataPolicies::default().with_tags(MetadataPolicy::RequireExact),
         principal_mapper: None,
     })?)
+}
+
+#[tokio::test]
+#[ignore = "requires run-version-metadata-local.py owned real versioned S3 and controlled proxy"]
+async fn cancel_read_only_verification() -> TestResult {
+    let storage = connected(&env::var("LAB_VERSION_METADATA_URL")?).await?;
+    let mode = env::var("LAB_VERSION_METADATA_MODE")?;
+    let control = env::var("LAB_VERSION_METADATA_CONTROL")?;
+    let version = env::var("LAB_VERSION_METADATA_ID")?;
+    let path = StoragePath::new("payload")?;
+    let plan = if mode == "verify_empty" {
+        compile_unavailable_plan(
+            MetadataPolicies::default(),
+            RefusalCause::DestinationCannotStore,
+        )
+    } else {
+        captured_plan(vec![ObjectTag::new("raw", "old")?])?
+    };
+    let selected = if matches!(mode.as_str(), "verify_empty" | "verify_current") {
+        SourceVersion::Current
+    } else {
+        SourceVersion::Id(version.clone())
+    };
+    let expected = (mode == "verify_current").then_some(version.as_str());
+    let cancel = CancellationToken::new();
+    let cancelling = cancel.clone();
+    fs::write(&control, &mode)?;
+    let watcher = tokio::spawn(async move {
+        sleep(Duration::from_millis(250)).await;
+        cancelling.cancel();
+    });
+    let start = Instant::now();
+    let result = timeout(
+        Duration::from_secs(2),
+        plan.verify_published(&storage, &path, &selected, expected, cancel),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    fs::write(&control, "normal")?;
+    watcher.await?;
+    assert!(matches!(result?, Err(MetadataVerificationError::Cancelled)));
+    assert!(elapsed < Duration::from_millis(750));
+    println!(
+        "read-only verification fault={mode} elapsed_ms={} typed=Cancelled",
+        elapsed.as_millis()
+    );
+    Ok(())
 }
 
 #[tokio::test]
