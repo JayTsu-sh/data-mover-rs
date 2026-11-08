@@ -827,3 +827,40 @@ silent loss returned Timeout in about 15 s and cancellation returned in about
 sequence under the same operation deadline, with no backend requery loop.
 These results do not certify whole-task source purge, physical pNFS DS, NFSv4.2,
 shared task recovery budgets or whole-migration performance/RSS.
+
+### Protected NFS source removal
+
+`--contract purge` selects `direct::purge::real_nfs_source_purge_fault_contract`
+and arms the actual REMOVE. The adjacent RPC helper also recognizes NFSv3
+REMOVE/RMDIR procedures. For v3, provide the server's `mountport` in the URL;
+the runner creates a second private relay for that service without changing
+rpcbind, exports or firewall rules. `LAB_NFS_PURGE_BACKUP_DIR` must name the
+owned persistent Local backup directory. Prepare and independently inspect the
+source and backup before exact-prefix cleanup.
+
+`direct::purge::real_nfs_protected_source_purge_contract` passed Linux v3/v4.1:
+ordinary files and repeated absence, equal-length rewrite with restored mtime,
+leaf and cached-parent replacement (using a separate UID cache namespace),
+child-then-empty-directory removal, hidden nonempty children, broken symlinks,
+readonly-parent refusal and endpoint-root refusal. Independent reads verified
+six backup payloads and the literal link target, confirmed deletions, and every
+refused source/replacement.
+
+Both dialects passed flash, disconnect, silent loss, cancellation and a dropped
+successful REMOVE reply. V4.1 flash/lost-reply replay completed; disconnect
+returned Connectivity/Unknown in 322 ms, silent loss Timeout/Unknown in 15.0 s,
+and cancellation Cancelled/Unknown in 252 ms. A sixth v4.1-only synthetic
+BADSESSION reply returned uncertainty with zero new EXCHANGE_ID requests.
+V3 conservatively returned Connectivity/Unknown for flash/disconnect (about
+1 ms) and lost reply (142 ms), Timeout/Unknown in 5.0 s and cancellation in
+253 ms. In the v3 lost-reply case the source was independently confirmed absent;
+the original backup remained intact. In every uncertain case a later same-name
+replacement was retained when purging the old observation. The relay confirms
+actual operation triggers and matches the lost reply's XID.
+
+These are storage-role checks, not whole-CLI/database/callback, server restart,
+power-cut, v4.0/v4.2/pNFS or throughput/RSS acceptance. Unknown is not proof of
+source retention; destination readiness must precede the first delete request.
+The role's deadlines above do not establish the application's shared recovery
+budget. NFS has no atomic compare-and-unlink here; concurrent source and ancestor
+mutation must be excluded by the caller.

@@ -236,6 +236,26 @@ These verify the executed barriers and failure propagation, not device power-cut
 behavior or whole-job throughput/RSS. NFS/CIFS Direct and application integration
 remain separate work.
 
+### Protected NFS source removal
+
+`Namespace::purge_observed` supports Linux-validated NFSv3/v4.1 files, symlinks
+and empty directories. It extends the existing NFS deletion interface with the
+original observation. The adapter freshly resolves the parent from the endpoint
+prefix, looks up the leaf through that parent and checks handle, kind, file size,
+mtime/ctime and captured permissions before one REMOVE/RMDIR. It never recursively
+removes children, cleans hidden transfer artifacts or reissues an uncertain delete
+under a new name/session identity. Directory timestamps may change through the
+caller's own child cleanup; identity, permissions and emptiness still apply.
+
+Missing original change evidence, failed metadata observations, foreign bindings,
+history, markers and named-only permissions are refused. NFSv4.0 and other
+unvalidated dialects remain Unsupported. In-flight cancellation and unconfirmed
+mutations retain Unknown; only authoritative name absence is AlreadyAbsent.
+The caller must confirm destination data, required metadata, verification and
+durability first and exclude concurrent source/ancestor mutation. This is no
+atomic compare-and-unlink, content checksum, ClickHouse acknowledgement or
+application scheduling policy. Timestamp precision remains server-dependent.
+
 ### Failed Direct data cleanup
 
 Ordinary `TransferRequest::with_failed_data_cleanup(FailedDataCleanup::RemoveOwned)`

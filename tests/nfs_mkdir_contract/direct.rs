@@ -27,6 +27,8 @@ mod fault;
 mod nonfile;
 #[path = "direct/persistence.rs"]
 mod persistence;
+#[path = "direct/purge.rs"]
+mod purge;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires run-nfs-direct-contract.py and its owned NFS prefix"]

@@ -8,6 +8,8 @@ def compound_tag(payload):
     if len(payload) < 24:
         return None
     _, message, rpc_version, program, version, procedure = struct.unpack_from('>6I', payload)
+    if (message, rpc_version, program, version) == (0, 2, 100003, 3):
+        return 'remove' if procedure in (12, 13) else None
     if (message, rpc_version, program, version, procedure) != (0, 2, 100003, 4, 1):
         return None
     offset = 24
@@ -50,3 +52,14 @@ class RpcRequests:
                 self.wire.clear()
                 self.payload.clear()
         return records
+
+
+def sequence_rejection(xid, tag, status):
+    """One accepted RPC reply with a failed SEQUENCE, without forwarding a mutation."""
+    encoded = tag.encode('ascii')
+    if len(encoded) > 1024 or not 0 <= xid <= 0xffffffff:
+        raise ValueError('invalid lab reply identity')
+    payload = struct.pack('>6I', xid, 1, 0, 0, 0, 0)
+    payload += struct.pack('>2I', status, len(encoded)) + encoded + b'\0' * (-len(encoded) % 4)
+    payload += struct.pack('>3I', 1, 53, status)
+    return struct.pack('>I', 0x80000000 | len(payload)) + payload

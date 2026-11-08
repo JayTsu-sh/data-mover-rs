@@ -10,14 +10,14 @@ use super::staged::NfsStagedProtocol;
 
 use super::source::{NfsProtocolFailure, role_failure};
 use crate::model::{
-    BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength, Operation,
-    OwnershipMode, SourceIdentity, SourceVersion, StoragePath, SymlinkTarget,
-    SymlinkTargetEncoding, Transience,
+    BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
+    ObservedEntry, Operation, OwnershipMode, SourceIdentity, SourceVersion, StoragePath,
+    SymlinkTarget, SymlinkTargetEncoding, Transience,
 };
 use crate::storage::artifacts::{is_artifact_native, is_artifact_path};
 use crate::storage::{InlineOwnership, ListingFacts};
 use crate::storage::{
-    ListRequest, ListingStream, Namespace, NamespaceCapabilities, SourceDescriptor,
+    ListRequest, ListingStream, Namespace, NamespaceCapabilities, PurgeOutcome, SourceDescriptor,
     StorageRoleFailure,
 };
 
@@ -247,7 +247,13 @@ pub trait NfsNamespaceProtocol: Send + Sync {
     ) -> Result<(), NfsProtocolFailure> {
         Ok(())
     }
-    async fn delete(&self, path: &StoragePath, kind: EntryKind) -> Result<(), NfsProtocolFailure>;
+    /// expected 非空时仅删除重新核验的原源项；不得清理目录内的任何产物。
+    async fn delete(
+        &self,
+        path: &StoragePath,
+        kind: EntryKind,
+        expected: Option<&ObservedEntry>,
+    ) -> Result<(), NfsProtocolFailure>;
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), NfsProtocolFailure>;
 }
 
@@ -378,9 +384,17 @@ impl Namespace for NfsNamespaceAdapter {
         checked(path)?;
         let observed = self.describe(path, false).await?;
         self.protocol
-            .delete(path, observed.kind)
+            .delete(path, observed.kind, None)
             .await
             .map_err(|error| role_failure(path, Operation::Namespace, error))
+    }
+
+    async fn purge_observed(
+        &self,
+        entry: &ObservedEntry,
+        cancel: CancellationToken,
+    ) -> Result<PurgeOutcome, StorageRoleFailure> {
+        self.purge_entry(entry, cancel).await
     }
 
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {
@@ -606,7 +620,15 @@ mod tests {
             &self,
             _path: &StoragePath,
             _kind: EntryKind,
+            expected: Option<&crate::model::ObservedEntry>,
         ) -> Result<(), NfsProtocolFailure> {
+            if expected.is_some() {
+                return Err(NfsProtocolFailure::new(
+                    crate::model::FailureClass::Unsupported,
+                    crate::model::Transience::Permanent,
+                ));
+            }
+
             Err(NfsProtocolFailure::protocol())
         }
         /// A destination whose missing parent `d/missing` is refused.
@@ -674,7 +696,15 @@ mod tests {
             &self,
             _path: &StoragePath,
             _kind: EntryKind,
+            expected: Option<&crate::model::ObservedEntry>,
         ) -> Result<(), NfsProtocolFailure> {
+            if expected.is_some() {
+                return Err(NfsProtocolFailure::new(
+                    crate::model::FailureClass::Unsupported,
+                    crate::model::Transience::Permanent,
+                ));
+            }
+
             Err(NfsProtocolFailure::protocol())
         }
         async fn rename(
@@ -922,3 +952,10 @@ mod persistence;
 #[cfg(test)]
 #[path = "namespace_persistence_tests.rs"]
 mod persistence_tests;
+
+#[path = "namespace_purge.rs"]
+pub(in crate::backend) mod purge;
+
+#[cfg(test)]
+#[path = "namespace_purge_tests.rs"]
+mod purge_tests;

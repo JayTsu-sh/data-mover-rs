@@ -130,7 +130,15 @@ impl NfsNamespaceProtocol for AccessFirst {
         &self,
         _path: &StoragePath,
         _kind: EntryKind,
+        expected: Option<&crate::model::ObservedEntry>,
     ) -> Result<(), NfsProtocolFailure> {
+        if expected.is_some() {
+            return Err(NfsProtocolFailure::new(
+                crate::model::FailureClass::Unsupported,
+                crate::model::Transience::Permanent,
+            ));
+        }
+
         Err(unused())
     }
 

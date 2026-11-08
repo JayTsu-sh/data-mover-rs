@@ -200,7 +200,19 @@ impl NfsNamespaceProtocol for Protocol {
     async fn create_directory(&self, _: &StoragePath) -> ProtocolResult<()> {
         Err(unavailable())
     }
-    async fn delete(&self, _: &StoragePath, _: EntryKind) -> ProtocolResult<()> {
+    async fn delete(
+        &self,
+        _: &StoragePath,
+        _: EntryKind,
+        expected: Option<&crate::model::ObservedEntry>,
+    ) -> ProtocolResult<()> {
+        if expected.is_some() {
+            return Err(NfsProtocolFailure::new(
+                crate::model::FailureClass::Unsupported,
+                crate::model::Transience::Permanent,
+            ));
+        }
+
         Err(unavailable())
     }
     async fn rename(&self, _: &StoragePath, _: &StoragePath) -> ProtocolResult<()> {

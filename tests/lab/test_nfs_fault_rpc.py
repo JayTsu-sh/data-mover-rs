@@ -2,7 +2,7 @@
 import struct
 import unittest
 
-from nfs_fault_rpc import MAX_RECORD, RpcRequests
+from nfs_fault_rpc import MAX_RECORD, RpcRequests, sequence_rejection
 
 
 def request(tag=b'commit', program=100003):
@@ -32,6 +32,21 @@ class RpcFaultTagTests(unittest.TestCase):
     def test_other_rpc_program_is_never_a_commit_trigger(self):
         wire = frame(request(program=100005))
         self.assertEqual(RpcRequests().feed(wire), [(wire, None, 1, 0)])
+
+    def test_v3_only_remove_and_rmdir_are_purge_triggers(self):
+        for procedure in (3, 12, 13, 21):
+            payload = struct.pack('>10I', 7, 0, 2, 100003, 3, procedure, 0, 0, 0, 0)
+            wire = frame(payload)
+            tag = 'remove' if procedure in (12, 13) else None
+            self.assertEqual(RpcRequests().feed(wire), [(wire, tag, 7, 0)])
+
+    def test_session_rejection_preserves_rpc_and_compound_identity(self):
+        wire = sequence_rejection(7, 'remove', 10052)
+        self.assertEqual(RpcRequests().feed(wire), [(wire, None, 7, 1)])
+        self.assertEqual(struct.unpack_from('>6I', wire, 4), (7, 1, 0, 0, 0, 0))
+        self.assertEqual(struct.unpack_from('>2I', wire, 28), (10052, 6))
+        self.assertEqual(wire[36:42], b'remove')
+        self.assertEqual(struct.unpack_from('>3I', wire, 44), (1, 53, 10052))
 
     def test_oversized_request_is_rejected_before_buffering(self):
         with self.assertRaises(ValueError):

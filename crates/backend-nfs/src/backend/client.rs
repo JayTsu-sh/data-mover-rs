@@ -597,7 +597,19 @@ impl NfsNamespaceProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
         kind: crate::model::EntryKind,
+        expected: Option<&crate::model::ObservedEntry>,
     ) -> std::result::Result<(), NfsProtocolFailure> {
+        if let Some(expected) = expected {
+            if !matches!(self.version(), NFSVersion::NFSv3 | NFSVersion::NFSv4p1) {
+                return Err(NfsProtocolFailure::new(
+                    crate::model::FailureClass::Unsupported,
+                    crate::model::Transience::Permanent,
+                )
+                .with_status("protected NFS source purge is validated only for v3 and v4.1"));
+            }
+            return self.role_purge_observed(path, kind, expected).await;
+        }
+
         let native = PathBuf::from(path.as_str());
         if kind == crate::model::EntryKind::Directory {
             self.role_cleanup_artifacts(&native, true).await?;
