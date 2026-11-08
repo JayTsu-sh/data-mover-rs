@@ -150,7 +150,7 @@ pub fn build_hdfs_client(
     location: &str,
     config: &HdfsConfig,
 ) -> Result<(Client, HdfsLocation), StorageError> {
-    let parsed = HdfsLocation::parse_configured(location, config)?;
+    let parsed = HdfsLocation::parse(location, config)?;
     let config_dir = match &config.config_dir {
         Some(directory) => directory.clone(),
         None => std::env::current_exe().unwrap_or_else(|_| {

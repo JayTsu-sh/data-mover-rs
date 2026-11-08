@@ -51,7 +51,7 @@ fn validated_hdfs_lab_root_with_config(
     if location[authority_end..].contains("//") {
         return Err("HDFS lab root must not contain empty path components".to_string());
     }
-    let parsed = data_mover::storage::HdfsLocation::parse_configured(location, config)
+    let parsed = data_mover::storage::HdfsLocation::parse(location, config)
         .map_err(|error| error.to_string())?;
     let components = parsed
         .root()
@@ -303,6 +303,7 @@ async fn client_can_be_built_from_explicit_inputs_only() -> Result<(), Box<dyn s
 fn simple_location_contract_is_platform_independent() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = data_mover::storage::HdfsLocation::parse(
         "hdfs://migration%20user@127.0.0.1:9000/warehouse/%E7%9B%AE%E5%BD%95/",
+        &HdfsConfig::default(),
     )?;
     assert_eq!(parsed.user(), "migration user");
     assert_eq!(parsed.endpoint(), "hdfs://127.0.0.1:9000");
@@ -317,7 +318,7 @@ fn simple_location_contract_is_platform_independent() -> Result<(), Box<dyn std:
         ..Default::default()
     };
     assert!(
-        data_mover::storage::HdfsLocation::parse_configured(
+        data_mover::storage::HdfsLocation::parse(
             "hdfs://migration@127.0.0.1:9000/warehouse",
             &kerberos,
         )

@@ -77,29 +77,14 @@ impl fmt::Debug for HdfsConfig {
 }
 
 impl HdfsLocation {
-    /// Parse `hdfs://user@host:port/root` without consulting ambient Hadoop
-    /// configuration or authentication state.
-    ///
-    /// # Errors
-    ///
-    /// Returns a configuration error when the URL is not an explicit,
-    /// password-free Simple-auth direct `NameNode` location.
-    pub fn parse(location: &str) -> Result<Self, StorageError> {
-        let parsed = Self::parse_configured(location, &HdfsConfig::default())?;
-        if parsed.kind != HdfsEndpointKind::Direct {
-            return Err(config_error("direct HDFS location requires an RPC port"));
-        }
-        Ok(parsed)
-    }
-
     /// Parse either a direct `NameNode` or explicitly configured logical
     /// `NameService` location.
     ///
     /// # Errors
     ///
-    /// Returns a configuration error for incomplete topology, non-Simple
+    /// Returns a configuration error for incomplete topology, unsupported
     /// authentication, or an invalid location.
-    pub fn parse_configured(location: &str, config: &HdfsConfig) -> Result<Self, StorageError> {
+    pub fn parse(location: &str, config: &HdfsConfig) -> Result<Self, StorageError> {
         validate_percent_encoding(location)?;
         reject_raw_traversal(location)?;
         let url =
@@ -183,7 +168,7 @@ pub fn endpoint_identity(
     location: &str,
     config: &HdfsConfig,
 ) -> Result<crate::model::BackendIdentity, StorageError> {
-    HdfsLocation::parse_configured(location, config)?.endpoint_identity()
+    HdfsLocation::parse(location, config)?.endpoint_identity()
 }
 
 impl HdfsConfig {
