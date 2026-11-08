@@ -43,6 +43,16 @@ Windows 和其他非 Linux Local 的创建行为不变。
 检查点权限保持原策略：旧版 Local 指针受 umask 影响，含原始源片段的 v2 检查点从创建时即为 `0600`；
 `0644` 数据默认值不用于这些内部恢复记录。
 
+### 受保护的源条目清理
+
+Unix Local 的 `Namespace::purge_observed` 在持有的父目录内复核 kind、dev／ino、文件大小，
+并比较捕获时的 mtime／ctime 变化证据；同 inode 等长改写后恢复 mtime 仍须保留源并报 Conflict。
+变化证据统一附在 v2 Local 私有事实中，列举、Stat 和直接观察复用已有 metadata，不增加逐文件 stat；
+观察及快照原样保留这些字节，调用方不解释协议字段。缺失、损坏或非当前格式的文件证据返回
+Unsupported，保留源并要求重新观察，不回退为只比较大小和 mtime。目录仅比较 kind 与身份，
+允许已授权子项删除引起的目录时间变化。非 Unix Local 缺少可靠身份和变化证据，受保护清理返回
+Unsupported；取消仍独立返回 Cancelled。此操作不提供原子 compare-and-unlink，调用方须排除并发写入。
+
 ### 已发布条目的持久化确认
 
 `Namespace::persist_observed` 接受最后一次数据／元数据修改后校验所得的目标描述符。

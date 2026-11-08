@@ -529,11 +529,22 @@ async fn snapshot_rebuild_preserves_private_local_facts_without_requery() -> io:
     let PrivateBackendEntryFacts::Local(facts) = rebuilt.backend_facts() else {
         panic!("expected local backend facts");
     };
-    assert_eq!(facts.first(), Some(&1));
-    let (encoded, _) = facts[1..].as_chunks::<8>();
+    assert_eq!(facts.first(), Some(&2));
+    assert_eq!(facts.len(), 89);
+    let (encoded, _) = facts[1..57].as_chunks::<8>();
     for (encoded, expected) in encoded.iter().zip(expected) {
         assert_eq!(*encoded, expected.to_le_bytes());
     }
+    let mut version = Vec::new();
+    for value in [
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ] {
+        version.extend_from_slice(&value.to_le_bytes());
+    }
+    assert_eq!(purge_content_version(facts), Some(version.as_slice()));
     Ok(())
 }
 

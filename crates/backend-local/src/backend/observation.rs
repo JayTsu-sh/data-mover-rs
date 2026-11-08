@@ -29,6 +29,11 @@ mod capabilities;
 #[path = "observation_listed.rs"]
 mod listed;
 
+mod facts;
+pub(super) use facts::backend_facts;
+#[cfg(unix)]
+pub(super) use facts::purge_content_version;
+
 pub struct LocalObservationAdapter {
     root: Arc<Dir>,
     root_device: Option<u64>,
@@ -764,34 +769,6 @@ pub fn source_identity(
         path.as_str().as_bytes(),
     )
     .map_err(|_| failure(path, FailureClass::Internal))
-}
-
-#[cfg(unix)]
-pub(super) fn backend_facts(metadata: &Metadata) -> Vec<u8> {
-    use cap_std::fs::MetadataExt as _;
-    let mut facts = Vec::with_capacity(57);
-    facts.push(1);
-    for value in [
-        metadata.dev(),
-        metadata.ino(),
-        metadata.mode().into(),
-        metadata.uid().into(),
-        metadata.gid().into(),
-        metadata.nlink(),
-        metadata.rdev(),
-    ] {
-        facts.extend_from_slice(&value.to_le_bytes());
-    }
-    facts
-}
-
-#[cfg(not(unix))]
-pub(super) fn backend_facts(metadata: &Metadata) -> Vec<u8> {
-    let mut facts = Vec::with_capacity(17);
-    facts.push(1);
-    facts.extend_from_slice(&metadata.len().to_le_bytes());
-    facts.extend_from_slice(&u64::from(metadata.permissions().readonly()).to_le_bytes());
-    facts
 }
 
 fn failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {

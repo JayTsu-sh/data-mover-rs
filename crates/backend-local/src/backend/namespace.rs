@@ -38,7 +38,7 @@ use super::rename;
 use crate::model::OwnershipMode;
 use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
-    Operation, RenameContext, StoragePath, SymlinkTarget, Transience,
+    ObservedEntry, Operation, RenameContext, StoragePath, SymlinkTarget, Transience,
 };
 #[cfg(unix)]
 use crate::storage::InlineOwnership;
@@ -46,7 +46,7 @@ use crate::storage::artifacts::is_artifact_name;
 use crate::storage::durability::sync_directory;
 use crate::storage::{
     CaseSensitivity, ListRequest, ListingStream, NameNormalization, NameSemantics, Namespace,
-    NamespaceCapabilities, SourceDescriptor, StorageRoleFailure,
+    NamespaceCapabilities, PurgeOutcome, SourceDescriptor, StorageRoleFailure,
 };
 use hooks::Hooks;
 #[cfg(any(test, feature = "test-support"))]
@@ -385,6 +385,32 @@ impl Namespace for LocalNamespace {
         self.delete_one(path).await
     }
 
+    async fn purge_observed(
+        &self,
+        entry: &ObservedEntry,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<PurgeOutcome, StorageRoleFailure> {
+        if cancel.is_cancelled() {
+            return Err(entry_failure(
+                entry.path(),
+                Operation::Namespace,
+                FailureClass::Cancelled,
+            ));
+        }
+        #[cfg(unix)]
+        {
+            self.purge_entry(entry, cancel).await
+        }
+        #[cfg(not(unix))]
+        {
+            Err(entry_failure(
+                entry.path(),
+                Operation::Namespace,
+                FailureClass::Unsupported,
+            ))
+        }
+    }
+
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {
         self.rename_one(from, to).await
     }
@@ -698,3 +724,6 @@ mod tests;
 
 #[cfg(unix)]
 mod persistence;
+
+#[cfg(unix)]
+mod purge;
