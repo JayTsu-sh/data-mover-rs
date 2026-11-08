@@ -7,7 +7,7 @@ use crate::model::{EntryKind, FailureClass, ObservedEntry, StoragePath, Transien
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::backends::nfs::namespace::NfsNamespaceObservation;
 use crate::storage::backends::nfs::namespace::purge::{refused, verify_current};
-use crate::storage::backends::nfs::protocol::{classify_error, classify_persistence_error};
+use crate::storage::backends::nfs::protocol::{classify_error, classify_mutation_error};
 use crate::storage::backends::nfs::source::NfsProtocolFailure;
 use bytes::Bytes;
 use nfs_rs::{DirectoryCookie, NfsError, ReaddirplusPage};
@@ -50,7 +50,7 @@ impl NFSStorage {
                 self.forget_subtree(native);
                 Ok(())
             }
-            Err(error) => Err(classify_persistence_error(error)),
+            Err(error) => Err(classify_mutation_error(error)),
         }
     }
 

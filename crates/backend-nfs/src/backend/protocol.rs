@@ -90,8 +90,8 @@ pub fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
     with_server_status(NfsProtocolFailure::new(class, transience), &error)
 }
 
-/// 持久化确认不重放数据；保留网络原因，同时仍以 Unknown 拒绝授权删源。
-pub(super) fn classify_persistence_error(error: NfsError) -> NfsProtocolFailure {
+/// 修改或持久化结果未知时保留网络原因，不能将 Unknown 升级为成功。
+pub(super) fn classify_mutation_error(error: NfsError) -> NfsProtocolFailure {
     let cause = recovery_failure_class(&error);
     let mut failure = classify_error(error);
     if failure.transience == Transience::Unknown
@@ -518,14 +518,14 @@ mod tests {
 
     #[test]
     fn persistence_keeps_network_causes_without_granting_retry_safety() {
-        let failure = classify_persistence_error(outcome_error(
+        let failure = classify_mutation_error(outcome_error(
             nfs_rs::OperationOutcome::Uncertain,
             nfs_rs::OperationClass::ReplaySensitive,
             nfs_rs::RecoveryAction::VerifyThenResume,
         ));
         assert_eq!(failure.class, FailureClass::Timeout);
         assert_eq!(failure.transience, Transience::Unknown);
-        let failure = classify_persistence_error(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_ACCESS));
+        let failure = classify_mutation_error(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_ACCESS));
         assert_eq!(failure.class, FailureClass::PermissionDenied);
         assert_eq!(failure.transience, Transience::Permanent);
     }

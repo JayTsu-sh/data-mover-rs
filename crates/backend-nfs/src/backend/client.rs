@@ -28,7 +28,7 @@ use crate::storage::backends::nfs::common::{
 use crate::storage::backends::nfs::namespace::{
     NfsListingPages, NfsNamespaceObservation, NfsNamespaceProtocol, NfsReadEnd, NfsReadFailure,
 };
-use crate::storage::backends::nfs::protocol::classify_persistence_error;
+use crate::storage::backends::nfs::protocol::classify_mutation_error;
 use crate::storage::backends::nfs::source::{
     NfsProtocolFailure, NfsReadCursor, NfsSourceObservation, NfsSourceProtocol,
 };
@@ -881,7 +881,7 @@ impl NfsStageFile for NfsRoleStageFile {
                 .mount
                 .commit(self.handle.inner.fh.clone(), 0, 0)
                 .await
-                .map_err(classify_persistence_error)?;
+                .map_err(classify_mutation_error)?;
         }
         Ok(())
     }
