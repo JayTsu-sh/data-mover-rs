@@ -95,10 +95,10 @@ fn plan() -> Result<MetadataPlan> {
 async fn captured_plan_mutates_only_the_explicit_target_version() -> Result {
     let target = VersionTarget::default();
     let report = plan()?
-        .apply_to_version(
+        .apply(
             &target,
             &StoragePath::new("key")?,
-            "target-v1",
+            &SourceVersion::Id("target-v1".to_owned()),
             CancellationToken::new(),
         )
         .await?;
@@ -124,10 +124,10 @@ async fn captured_plan_mutates_only_the_explicit_target_version() -> Result {
 #[tokio::test]
 async fn unsupported_version_mutation_is_reported_without_current_writes() -> Result {
     let failure = plan()?
-        .apply_to_version(
+        .apply(
             &CurrentOnly,
             &StoragePath::new("key")?,
-            "target-v1",
+            &SourceVersion::Id("target-v1".to_owned()),
             CancellationToken::new(),
         )
         .await
@@ -145,7 +145,12 @@ async fn cancelled_version_plan_does_not_mutate_any_version() -> Result {
     cancel.cancel();
     assert!(
         plan()?
-            .apply_to_version(&target, &StoragePath::new("key")?, "target-v1", cancel)
+            .apply(
+                &target,
+                &StoragePath::new("key")?,
+                &SourceVersion::Id("target-v1".to_owned()),
+                cancel
+            )
             .await
             .is_err()
     );

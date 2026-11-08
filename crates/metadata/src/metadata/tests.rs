@@ -298,6 +298,7 @@ async fn a_refused_family_leaves_the_rest_applied_and_then_fails_the_item() {
         .apply(
             &target,
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -340,6 +341,7 @@ async fn a_required_family_that_fails_to_apply_still_fails_the_copy() {
         .apply(
             &target,
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -424,6 +426,7 @@ async fn exact_plan_applies_every_family_without_loss() {
         .apply(
             &target,
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -504,6 +507,7 @@ async fn unsupported_and_not_applicable_have_distinct_results() {
                 cancel_after: None,
             },
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -589,6 +593,7 @@ async fn cancellation_and_storage_failure_are_distinct_and_stop_application() {
         .apply(
             &cancelled_target,
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             cancel,
         )
         .await
@@ -605,6 +610,7 @@ async fn cancellation_and_storage_failure_are_distinct_and_stop_application() {
         .apply(
             &failing_target,
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -624,6 +630,7 @@ async fn cancellation_and_storage_failure_are_distinct_and_stop_application() {
         .apply(
             &mid_cancel_target,
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -644,6 +651,7 @@ async fn cancellation_and_storage_failure_are_distinct_and_stop_application() {
         .apply(
             &mid_failure_target,
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await

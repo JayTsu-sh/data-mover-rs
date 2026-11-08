@@ -66,69 +66,60 @@ impl Error for MetadataVerificationError {
 }
 
 impl MetadataPlan {
-    /// Checks the final target against this mapped plan, returning its fresh description so the
-    /// caller can also verify type and size. ACLs compare native semantics; tags/xattrs compare
-    /// complete sets. `expected_version` pins the publication of a versioned destination.
+    /// 核验当前目标或指定历史版本的已捕获元数据计划，返回新描述供调用方核对类型和大小。
+    /// Current 且无发布约束时保留 namespace 的目录语义；Id 精确读取历史版本。
+    /// expected_current_version 独立约束当前发布版本，不会被历史版本读取替代。
     ///
     /// # Errors
-    /// Reports unreadable/mismatched families and retains typed target read failures.
+    /// 保留不可读属性、版本变化、元数据不一致和取消的有类型错误。
     pub async fn verify_published(
         &self,
         target: &Storage,
         path: &StoragePath,
-        expected_version: Option<&str>,
+        version: &SourceVersion,
+        expected_current_version: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<SourceDescriptor, MetadataVerificationError> {
         if cancel.is_cancelled() {
             return Err(MetadataVerificationError::Cancelled);
         }
-        // namespace 的目录投影不承诺绑定对象版本；版本化发布使用读取角色的 HEAD 描述。
-        let descriptor = if expected_version.is_some() {
-            target
+        let current = if let Some(expected) = expected_current_version {
+            let descriptor = target
                 .read_source()
                 .map_err(MetadataVerificationError::Capability)?
                 .describe(path)
                 .await
+                .map_err(MetadataVerificationError::Read)?;
+            if descriptor.version != SourceVersion::Id(expected.to_owned()) {
+                return Err(MetadataVerificationError::VersionChanged { path: path.clone() });
+            }
+            Some(descriptor)
         } else {
-            target
-                .namespace()
-                .map_err(MetadataVerificationError::Capability)?
-                .stat(path)
-                .await
-        }
-        .map_err(MetadataVerificationError::Read)?;
-        if expected_version
-            .is_some_and(|expected| descriptor.version != SourceVersion::Id(expected.to_owned()))
-        {
-            return Err(MetadataVerificationError::VersionChanged { path: path.clone() });
-        }
-        self.verify_descriptor(target, descriptor, cancel).await
-    }
-
-    /// 核验指定的既有历史版本；与发布校验不同，不要求它仍是当前版本。
-    ///
-    /// # Errors
-    /// 保留精确版本读取、身份不匹配及元数据不一致的有类型错误。
-    pub async fn verify_version(
-        &self,
-        target: &Storage,
-        path: &StoragePath,
-        version_id: &str,
-        cancel: CancellationToken,
-    ) -> Result<SourceDescriptor, MetadataVerificationError> {
-        if cancel.is_cancelled() {
-            return Err(MetadataVerificationError::Cancelled);
-        }
-        let version = SourceVersion::Id(version_id.to_owned());
-        let descriptor = target
-            .read_source()
-            .map_err(MetadataVerificationError::Capability)?
-            .describe_version(path, &version)
-            .await
-            .map_err(MetadataVerificationError::Read)?;
-        if descriptor.version != version {
-            return Err(MetadataVerificationError::VersionChanged { path: path.clone() });
-        }
+            None
+        };
+        let descriptor = match version {
+            SourceVersion::Current => match current {
+                Some(descriptor) => descriptor,
+                None => target
+                    .namespace()
+                    .map_err(MetadataVerificationError::Capability)?
+                    .stat(path)
+                    .await
+                    .map_err(MetadataVerificationError::Read)?,
+            },
+            SourceVersion::Id(_) => {
+                let descriptor = target
+                    .read_source()
+                    .map_err(MetadataVerificationError::Capability)?
+                    .describe_version(path, version)
+                    .await
+                    .map_err(MetadataVerificationError::Read)?;
+                if &descriptor.version != version {
+                    return Err(MetadataVerificationError::VersionChanged { path: path.clone() });
+                }
+                descriptor
+            }
+        };
         self.verify_descriptor(target, descriptor, cancel).await
     }
 

@@ -11,7 +11,8 @@ use data_mover::metadata::{
     compile_metadata_plan,
 };
 use data_mover::model::{
-    MetadataObservation, MetadataObservations, MetadataProvenance, ObjectTag, StoragePath,
+    MetadataObservation, MetadataObservations, MetadataProvenance, ObjectTag, SourceVersion,
+    StoragePath,
 };
 
 fn captured_plan(tags: Vec<ObjectTag>) -> TestResult<MetadataPlan> {
@@ -61,7 +62,12 @@ async fn exact_version_metadata_with_real_requests() -> TestResult {
     let start = Instant::now();
     let result = timeout(
         Duration::from_secs(8),
-        plan.apply_to_version(storage.metadata()?.as_ref(), &path, &version, cancel),
+        plan.apply(
+            storage.metadata()?.as_ref(),
+            &path,
+            &SourceVersion::Id(version.clone()),
+            cancel,
+        ),
     )
     .await;
     let elapsed = start.elapsed();
@@ -88,40 +94,58 @@ async fn exact_version_metadata_with_real_requests() -> TestResult {
             _ => assert!(detail.contains("Connectivity") || detail.contains("Timeout")),
         }
         // 精确版本 tags 写入幂等；结果不明后仍只重试同一版本，不重传数据。
-        plan.apply_to_version(
+        plan.apply(
             storage.metadata()?.as_ref(),
             &path,
-            &version,
+            &SourceVersion::Id(version.clone()),
             CancellationToken::new(),
         )
         .await?;
     }
     let verified = plan
-        .verify_version(&storage, &path, &version, CancellationToken::new())
+        .verify_published(
+            &storage,
+            &path,
+            &SourceVersion::Id(version.clone()),
+            None,
+            CancellationToken::new(),
+        )
         .await?;
     assert_eq!(verified.size, Some(3));
     let empty = captured_plan(Vec::new())?;
     empty
-        .apply_to_version(
+        .apply(
             storage.metadata()?.as_ref(),
             &path,
-            &version,
+            &SourceVersion::Id(version.clone()),
             CancellationToken::new(),
         )
         .await?;
     empty
-        .verify_version(&storage, &path, &version, CancellationToken::new())
+        .verify_published(
+            &storage,
+            &path,
+            &SourceVersion::Id(version.clone()),
+            None,
+            CancellationToken::new(),
+        )
         .await?;
-    plan.apply_to_version(
+    plan.apply(
         storage.metadata()?.as_ref(),
         &path,
-        &version,
+        &SourceVersion::Id(version.clone()),
         CancellationToken::new(),
     )
     .await?;
     assert!(matches!(
-        plan.verify_published(&storage, &path, Some(&version), CancellationToken::new())
-            .await,
+        plan.verify_published(
+            &storage,
+            &path,
+            &SourceVersion::Current,
+            Some(&version),
+            CancellationToken::new()
+        )
+        .await,
         Err(MetadataVerificationError::VersionChanged { .. })
     ));
     Ok(())

@@ -63,6 +63,7 @@ async fn every_skipped_family_is_reported_with_its_reason() {
         .apply(
             &recording(),
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -102,6 +103,7 @@ async fn a_failed_item_still_reports_what_was_skipped() {
                 applied: Mutex::new(Vec::new()),
             },
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -246,6 +248,7 @@ async fn the_copied_plan_keeps_the_reasons() {
         .apply(
             &recording(),
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -279,6 +282,7 @@ async fn a_destination_that_stores_nothing_skips_everything_asked_for() {
         .apply(
             &recording(),
             &StoragePath::new("object").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await

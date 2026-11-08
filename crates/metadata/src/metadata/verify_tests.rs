@@ -16,7 +16,7 @@ use super::{
 };
 use crate::model::{
     MetadataFamily, MetadataObservation, MetadataObservationParts, MetadataProvenance, ObjectTag,
-    StoragePath,
+    SourceVersion, StoragePath,
 };
 use crate::storage::MetadataMutation;
 
@@ -57,12 +57,19 @@ async fn target_tags_are_read_back_as_a_complete_set() -> TestResult {
     plan.apply(
         storage.metadata()?.as_ref(),
         &path,
+        &SourceVersion::Current,
         CancellationToken::new(),
     )
     .await?;
     let initial_reads = *protocol.tag_reads.lock().await;
     let actual = plan
-        .verify_published(&storage, &path, Some("v1"), CancellationToken::new())
+        .verify_published(
+            &storage,
+            &path,
+            &SourceVersion::Current,
+            Some("v1"),
+            CancellationToken::new(),
+        )
         .await?;
     assert_eq!(actual.size, Some(7));
     assert!(*protocol.tag_reads.lock().await > initial_reads);
@@ -74,8 +81,14 @@ async fn target_tags_are_read_back_as_a_complete_set() -> TestResult {
             CancellationToken::new(),
         )
         .await?;
-    plan.verify_published(&storage, &path, Some("v1"), CancellationToken::new())
-        .await?;
+    plan.verify_published(
+        &storage,
+        &path,
+        &SourceVersion::Current,
+        Some("v1"),
+        CancellationToken::new(),
+    )
+    .await?;
     storage
         .metadata()?
         .apply(
@@ -89,7 +102,7 @@ async fn target_tags_are_read_back_as_a_complete_set() -> TestResult {
         )
         .await?;
     assert!(matches!(
-        plan.verify_published(&storage, &path, Some("v1"), CancellationToken::new()).await,
+        plan.verify_published(&storage, &path, &SourceVersion::Current, Some("v1"), CancellationToken::new()).await,
         Err(MetadataVerificationError::Mismatch { families, .. }) if families == [MetadataFamily::Tags]
     ));
     Ok(())
@@ -109,16 +122,70 @@ async fn publication_version_and_cancellation_are_checked_before_accepting_metad
         .put_version("file", "v2", Bytes::from_static(b"replacement"))
         .await;
     assert!(matches!(
-        plan.verify_published(&storage, &path, Some("v1"), CancellationToken::new())
-            .await,
+        plan.verify_published(
+            &storage,
+            &path,
+            &SourceVersion::Current,
+            Some("v1"),
+            CancellationToken::new()
+        )
+        .await,
         Err(MetadataVerificationError::VersionChanged { .. })
     ));
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert!(matches!(
-        plan.verify_published(&storage, &path, Some("v2"), cancel)
+        plan.verify_published(&storage, &path, &SourceVersion::Current, Some("v2"), cancel)
             .await,
         Err(MetadataVerificationError::Cancelled)
+    ));
+    Ok(())
+}
+
+/// 历史读取选择和当前发布约束必须独立生效，不能拿旧版本的存在冒充当前发布。
+#[tokio::test]
+async fn historical_verification_preserves_an_independent_current_publication_guard() -> TestResult
+{
+    let protocol = Arc::new(MemoryS3::default());
+    protocol
+        .put_version("file", "v1", Bytes::from_static(b"old"))
+        .await;
+    let storage = connect(Arc::clone(&protocol), identity(), None)?;
+    let path = StoragePath::new("file")?;
+    let version = SourceVersion::Id("v1".to_owned());
+    let plan = tags_plan(vec![ObjectTag::new("a", "1")?])?;
+    plan.apply(
+        storage.metadata()?.as_ref(),
+        &path,
+        &version,
+        CancellationToken::new(),
+    )
+    .await?;
+    protocol
+        .put_version("file", "v2", Bytes::from_static(b"new"))
+        .await;
+    for expected_current in [None, Some("v2")] {
+        let actual = plan
+            .verify_published(
+                &storage,
+                &path,
+                &version,
+                expected_current,
+                CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(actual.version, version);
+    }
+    assert!(matches!(
+        plan.verify_published(
+            &storage,
+            &path,
+            &version,
+            Some("v1"),
+            CancellationToken::new()
+        )
+        .await,
+        Err(MetadataVerificationError::VersionChanged { .. })
     ));
     Ok(())
 }

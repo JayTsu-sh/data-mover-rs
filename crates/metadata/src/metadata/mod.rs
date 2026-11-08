@@ -5,8 +5,8 @@ use std::fmt;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    AclEncoding, FailureClass, MappedOwnership, MetadataObservations, OwnershipMode, StoragePath,
-    TimePrecision,
+    AclEncoding, FailureClass, MappedOwnership, MetadataObservations, OwnershipMode, SourceVersion,
+    StoragePath, TimePrecision,
 };
 use crate::storage::{
     Metadata, MetadataMutation, PreparedStage, StagedDestination, StagedMetadataApplicationFailure,
@@ -318,6 +318,8 @@ impl MetadataPlan {
     /// Applies the immutable plan in family order. A family the target refuses does not stop the
     /// others; the item fails afterwards with every refusal listed.
     ///
+    /// version 指定既有目标版本，Id 不会创建新版本或回退修改当前对象。
+    ///
     /// # Errors
     /// Returns every failed family and the partial application report on cancellation or target
     /// storage failure.
@@ -325,32 +327,18 @@ impl MetadataPlan {
         &self,
         target: &dyn Metadata,
         path: &StoragePath,
+        version: &SourceVersion,
         cancel: CancellationToken,
     ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
-        self.apply_to(ApplicationTarget::Published { target, path }, cancel)
-            .await
-    }
-
-    /// 将计划应用到精确的既有目标版本；不会创建版本或回退修改当前对象。
-    ///
-    /// # Errors
-    /// 返回所有失败类别及部分应用报告；不支持版本写入时明确失败。
-    pub async fn apply_to_version(
-        &self,
-        target: &dyn Metadata,
-        path: &StoragePath,
-        version_id: &str,
-        cancel: CancellationToken,
-    ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
-        self.apply_to(
-            ApplicationTarget::Version {
+        let destination = match version {
+            SourceVersion::Current => ApplicationTarget::Published { target, path },
+            SourceVersion::Id(version_id) => ApplicationTarget::Version {
                 target,
                 path,
                 version_id,
             },
-            cancel,
-        )
-        .await
+        };
+        self.apply_to(destination, cancel).await
     }
 
     /// Checks that recovered staged metadata still satisfies this plan.

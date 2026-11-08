@@ -471,6 +471,7 @@ async fn cancellation_stops_published_application_at_once() {
             .apply(
                 &target,
                 &StoragePath::new("file").unwrap(),
+                &SourceVersion::Current,
                 CancellationToken::new(),
             )
             .await
@@ -565,6 +566,7 @@ async fn a_lost_session_stops_application() {
         .apply(
             &target,
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await

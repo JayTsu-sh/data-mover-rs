@@ -110,6 +110,7 @@ async fn partial_acl_report_survives_application_and_checkpoint_binds_omissions(
         .apply(
             &target,
             &StoragePath::new("file")?,
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await?;
@@ -169,6 +170,7 @@ async fn partial_without_preserved_ownership_applies_explicit_deny_all()
         .apply(
             &AcceptMetadata,
             &StoragePath::new("file")?,
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await?;
@@ -391,6 +393,7 @@ async fn failed_acl_application_preserves_omissions() -> Result<(), Box<dyn std:
         .apply(
             &RejectAcl,
             &StoragePath::new("file")?,
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
