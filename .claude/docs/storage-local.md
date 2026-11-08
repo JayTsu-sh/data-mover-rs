@@ -50,7 +50,10 @@ Unix Local 的 `Namespace::purge_observed` 在持有的父目录内复核 kind�
 变化证据统一附在 v2 Local 私有事实中，列举、Stat 和直接观察复用已有 metadata，不增加逐文件 stat；
 观察及快照原样保留这些字节，调用方不解释协议字段。缺失、损坏或非当前格式的文件证据返回
 Unsupported，保留源并要求重新观察，不回退为只比较大小和 mtime。目录仅比较 kind 与身份，
-允许已授权子项删除引起的目录时间变化。非 Unix Local 缺少可靠身份和变化证据，受保护清理返回
+允许已授权子项删除引起的目录时间变化。受保护目录清理只使用严格 `remove_dir`；任何隐藏条目，
+包括 `.data-mover-*` 文件、链接或子树，都会保留并报 Conflict，不推导其任务所有权，不递归扫除。
+普通 `delete`／`delete_tree` 仍保留下文约定的显式 artifact 清理语义。
+非 Unix Local 缺少可靠身份和变化证据，受保护清理返回
 Unsupported；取消仍独立返回 Cancelled。此操作不提供原子 compare-and-unlink，调用方须排除并发写入。
 
 ### 已发布条目的持久化确认

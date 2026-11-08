@@ -67,6 +67,7 @@ async fn purge_does_not_recurse_and_accepts_directory_mtime_changes_after_child_
     std::fs::write(root.path().join("tree/file"), b"copied")?;
     let storage = connect(root.path()).await?;
     let entry = observed(&storage, "tree").await?;
+    let before = std::fs::metadata(root.path().join("tree"))?;
     assert!(
         storage
             .namespace()?
@@ -76,10 +77,16 @@ async fn purge_does_not_recurse_and_accepts_directory_mtime_changes_after_child_
     );
     assert_eq!(std::fs::read(root.path().join("tree/file"))?, b"copied");
     let file = observed(&storage, "tree/file").await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
     storage
         .namespace()?
         .purge_observed(&file, CancellationToken::new())
         .await?;
+    let after = std::fs::metadata(root.path().join("tree"))?;
+    assert_ne!(
+        (before.ctime(), before.ctime_nsec()),
+        (after.ctime(), after.ctime_nsec())
+    );
     storage
         .namespace()?
         .purge_observed(&entry, CancellationToken::new())
@@ -181,5 +188,65 @@ async fn purge_retains_files_without_current_change_evidence() -> Result {
         );
         assert_eq!(std::fs::read(root.path().join("file"))?, b"retained");
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_directory_purge_retains_every_hidden_child_and_subtree() -> Result {
+    let root = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    std::fs::create_dir(root.path().join("tree"))?;
+    let storage = connect(root.path()).await?;
+    let entry = observed(&storage, "tree").await?;
+    let hidden = root.path().join("tree/.data-mover-other-task.stage");
+    let nested = root
+        .path()
+        .join("tree/.data-mover-unrelated/nested/private");
+    let linked = root.path().join("tree/.data-mover-link");
+    std::fs::write(&hidden, b"other task recovery")?;
+    std::fs::create_dir_all(nested.parent().ok_or("nested parent")?)?;
+    std::fs::write(&nested, b"unrelated subtree")?;
+    std::fs::write(outside.path().join("private"), b"outside")?;
+    std::os::unix::fs::symlink(outside.path(), &linked)?;
+    let result = storage
+        .namespace()?
+        .purge_observed(&entry, CancellationToken::new())
+        .await;
+    assert!(
+        matches!(&result, Err(StorageRoleFailure::Entry(error))
+        if error.class() == FailureClass::Conflict),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read(hidden)?, b"other task recovery");
+    assert_eq!(std::fs::read(nested)?, b"unrelated subtree");
+    assert!(std::fs::symlink_metadata(linked)?.is_symlink());
+    assert_eq!(std::fs::read(outside.path().join("private"))?, b"outside");
+    assert!(root.path().join("tree").is_dir());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_empty_directory_purge_is_successful_and_idempotent() -> Result {
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir(root.path().join("tree"))?;
+    let storage = connect(root.path()).await?;
+    let entry = observed(&storage, "tree").await?;
+    assert_eq!(
+        storage
+            .namespace()?
+            .purge_observed(&entry, CancellationToken::new())
+            .await?,
+        PurgeOutcome::Deleted { records: 1 }
+    );
+    assert_eq!(
+        storage
+            .namespace()?
+            .purge_observed(&entry, CancellationToken::new())
+            .await?,
+        PurgeOutcome::AlreadyAbsent
+    );
+    assert!(!root.path().join("tree").exists());
     Ok(())
 }

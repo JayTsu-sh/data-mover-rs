@@ -4,7 +4,7 @@ use std::io;
 use cap_std::fs::Metadata;
 use tokio_util::sync::CancellationToken;
 
-use super::{LocalNamespace, checked, delete_entry, entry_failure, in_parent, io_failure};
+use super::{LocalNamespace, checked, entry_failure, in_parent, io_failure, remove_link_or_file};
 use crate::model::observation::PrivateBackendEntryFacts;
 use crate::model::{BackendIdentity, EntryKind, FailureClass, ObservedEntry, Operation};
 use crate::storage::backends::local::observation::{
@@ -34,7 +34,12 @@ impl LocalNamespace {
                     let metadata = parent.symlink_metadata(name)?;
                     verify(&expected, identity, &metadata)?;
                     check_cancel(&cancel)?;
-                    delete_entry(parent, name)
+                    // 受保护 purge 只获准删除这一条目，隐藏项也必须视为非空。
+                    if expected.kind() == EntryKind::Directory {
+                        parent.remove_dir(name)
+                    } else {
+                        remove_link_or_file(parent, name)
+                    }
                 })
             });
             match result {
