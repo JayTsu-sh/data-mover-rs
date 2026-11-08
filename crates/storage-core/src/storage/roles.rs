@@ -646,8 +646,8 @@ pub trait StagedDestination: Send + Sync {
         Ok(())
     }
     /// Makes the stage the final object. On success nothing of the stage is left at the
-    /// destination — no stage, no pointer — so a verification that fails after publication can
-    /// drop the stage without cleaning anything up.
+    /// destination — no stage, no pointer. Ordinary discard never removes this final object;
+    /// explicitly authorized Direct data failure cleanup may remove only its owned output.
     async fn publish(
         &self,
         stage: &PreparedStage,
@@ -656,7 +656,8 @@ pub trait StagedDestination: Send + Sync {
     /// 显式授权后的 Direct 数据失败清理。只删除本次拥有的坏输出；不得删除未修改的
     /// 已有目标、源别名或被替换的无关条目。调用方必须先收束本次写任务，
     /// 并在准备到清理完成之间排除并发写入；此操作不提供跨协议原子 compare-and-unlink。
-    /// 元数据错误与未知发布结果不调用此接口；普通 discard 不授予这种权限。
+    /// 元数据错误不授予删除权限；未知写入／发布结果必须保留输出并明确返回未确认原因。
+    /// 普通 discard 不授予这种权限。
     async fn remove_failed_direct(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
         Err(super::checkpoint_stream::failure(
             stage.final_destination.path(),

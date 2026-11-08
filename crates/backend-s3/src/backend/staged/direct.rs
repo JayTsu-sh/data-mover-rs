@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::source::{cancelled, classified_entry, entry, role_failure};
 use super::super::{S3Protocol, S3ProtocolFailure, S3WriteFacts, composite_etag};
 use super::completion::completed_object;
+use super::direct_cleanup::DirectCleanup;
 use super::parts::{PartTarget, UploadedParts};
 use super::{S3StagedDestination, cleanup_result, limits, planned_part_size, single, streaming};
 use crate::model::{BackendKind, FailureClass, Operation, StoragePath, Transience};
@@ -37,6 +38,7 @@ pub(super) struct DirectUpload {
     /// `Direct` completion replaces the final object irreversibly.
     expected_size: Option<u64>,
     state: Mutex<DirectState>,
+    cleanup: DirectCleanup,
 }
 
 #[derive(Default)]
@@ -58,6 +60,16 @@ fn upload_of(stage: &PreparedStage) -> Option<&DirectUpload> {
         .backend_state()
         .as_deref()?
         .downcast_ref::<DirectUpload>()
+}
+
+pub(super) fn cleanup_authority(stage: &PreparedStage) -> Option<&DirectCleanup> {
+    if let Some(single) = single::of(stage) {
+        return Some(&single.cleanup);
+    }
+    if let Some(streamed) = streaming::of(stage) {
+        return Some(&streamed.cleanup);
+    }
+    upload_of(stage).map(|upload| &upload.cleanup)
 }
 
 /// What the write that made the object reported, once it is written.
@@ -168,6 +180,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             part_size,
             expected_size,
             state: Mutex::new(DirectState::default()),
+            cleanup: DirectCleanup::default(),
         })));
         Ok(stage)
     }
@@ -269,7 +282,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 "the S3 Direct input differs from the source's size",
             ));
         }
-        let facts = self.complete_direct(path, upload_id, &sent, size).await?;
+        let facts = self
+            .complete_direct(path, upload, upload_id, &sent, size)
+            .await?;
         let mut state = upload.lock();
         state.open = None;
         state.written = Some((size, facts));
@@ -287,19 +302,29 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     async fn complete_direct(
         &self,
         path: &StoragePath,
+        upload: &DirectUpload,
         upload_id: &str,
         sent: &UploadedParts,
         size: u64,
     ) -> Result<S3WriteFacts, StorageRoleFailure> {
         let etags: Vec<String> = sent.parts.iter().map(|part| part.1.clone()).collect();
         let expected = composite_etag(&etags);
+        upload.cleanup.attempted();
         let facts = match self
             .protocol
             .complete_multipart(path.as_str(), upload_id, &sent.parts)
             .await
         {
-            Ok(facts) => facts,
+            Ok(facts) => {
+                upload
+                    .cleanup
+                    .confirmed(size, &facts, self.protocol.versioning_enabled());
+                facts
+            }
             Err(failure) => {
+                if single::definite_refusal(&failure) {
+                    upload.cleanup.refused();
+                }
                 self.settle_direct_completion(path, upload_id, size, expected.as_deref(), failure)
                     .await?
             }

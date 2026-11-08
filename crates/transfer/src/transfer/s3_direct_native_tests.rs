@@ -8,8 +8,8 @@ use crate::model::{FailureClass, ObjectTag, StoragePath, Transience};
 use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context, source_storage};
 use crate::storage::backends::s3::{S3NativeContext, S3Protocol as _, S3ProtocolFailure, connect};
 use crate::transfer::{
-    EffectiveRecovery, MetadataFailurePolicy, ReadBackVerification, TransferPhase, TransferPolicy,
-    TransferRequest, TransferRoute, transfer,
+    EffectiveRecovery, FailedDataCleanup, MetadataFailurePolicy, MetadataTransferMode,
+    ReadBackVerification, TransferPhase, TransferPolicy, TransferRequest, TransferRoute, transfer,
 };
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -95,6 +95,7 @@ async fn direct_native_tag_failure_keeps_completed_verified_data_and_source() ->
         ));
         let failure = transfer(
             request(&protocol, verify)?
+                .with_failed_data_cleanup(FailedDataCleanup::RemoveOwned)
                 .with_metadata_failure_policy(MetadataFailurePolicy::PublishData),
         )
         .await
@@ -112,9 +113,64 @@ async fn direct_native_tag_failure_keeps_completed_verified_data_and_source() ->
             Some(&payload)
         );
         assert_eq!(*protocol.native_copies.lock().await, 1);
+        let failure = failure.cleanup_for_policy(TransferPolicy::Direct).await;
+        assert!(failure.cleanup_failure().is_none());
+        assert!(!failure.has_failed_data_cleanup());
+        assert_eq!(protocol.objects.lock().await.get("file"), Some(&payload));
         if verify == ReadBackVerification::Enabled {
             assert!(protocol.range_dispatches.lock().await.len() >= 2);
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_refusal_and_unknown_copy_keep_existing_target_with_precise_cleanup_result() -> Result
+{
+    for denied in [false, true] {
+        let protocol = Arc::new(MemoryS3::default());
+        let source = Bytes::from_static(b"source data");
+        let prior = Bytes::from_static(b"unrelated existing data");
+        protocol
+            .objects
+            .lock()
+            .await
+            .insert("src/file".into(), source.clone());
+        protocol
+            .objects
+            .lock()
+            .await
+            .insert("file".into(), prior.clone());
+        *protocol.native_failure.lock().await = Some(S3ProtocolFailure::entry(
+            if denied {
+                FailureClass::PermissionDenied
+            } else {
+                FailureClass::Connectivity
+            },
+            if denied {
+                Transience::Permanent
+            } else {
+                Transience::Unknown
+            },
+            "native copy refused or unconfirmed",
+        ));
+        let failure = transfer(
+            request(&protocol, ReadBackVerification::Disabled)?
+                .with_metadata_mode(MetadataTransferMode::CallerManaged)
+                .with_failed_data_cleanup(FailedDataCleanup::RemoveOwned),
+        )
+        .await
+        .err()
+        .ok_or("injected failure must stop native copy")?;
+        assert_eq!(failure.phase(), TransferPhase::Transfer);
+        let failure = failure.cleanup_for_policy(TransferPolicy::Direct).await;
+        assert_eq!(failure.cleanup_failure().is_none(), denied, "{failure}");
+        if !denied {
+            assert!(failure.to_string().contains("write outcome is unconfirmed"));
+        }
+        assert_eq!(protocol.objects.lock().await.get("src/file"), Some(&source));
+        assert_eq!(protocol.objects.lock().await.get("file"), Some(&prior));
+        assert!(protocol.version_deletes().is_empty());
     }
     Ok(())
 }

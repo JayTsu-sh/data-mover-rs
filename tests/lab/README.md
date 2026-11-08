@@ -919,3 +919,44 @@ were protected, and the metadata-plan fixtures remained intact. Silent detection
 remains about 5/15 seconds, cancellation about 252 ms. These results do not certify
 an actual S3 destination, complete CLI/ClickHouse/callback, server restart,
 v4.0/v4.2/pNFS, power-cut durability or whole-migration throughput/RSS.
+
+## S3 Direct failed-data cleanup
+
+`python3 tests/lab/run-direct-data-cleanup-local.py` verifies the existing
+`FailedDataCleanup::RemoveOwned` policy against isolated RustFS. Sixty cases cover
+never-versioned and versioned destinations, small native copies, 12 MiB multipart
+writes, and nonempty slash-ended keys using streamed PUT. The parent independently
+reads source bodies/versions, old destination versions and a sentinel. RustFS uses
+one mutable null version for slash-ended keys even in the version-enabled fixture;
+this is checked as observed, not reported as immutable version coverage.
+
+Confirmed write receipts authorize cleanup after data verification fails. Immutable
+versions are deleted by their exact reported ID; mutable slots require fresh size
+and ETag checks. No-write refusals leave preexisting output intact. Lost write
+responses and inferred matching content do not grant deletion authority. Default
+Keep and metadata failures retain data. Uncertified NAS output remains unsupported.
+The caller still excludes concurrent writers; mutable HEAD plus DELETE is not an
+atomic conditional mutation.
+
+Permission refusal, corrupt readback, persistent disconnect, silent timeout, lost
+DELETE acknowledgment and cancellation preserve typed original/cleanup causes.
+Unknown DELETE outcomes remain Unknown even when independent inspection proves the
+object was removed. Cancellation waits for an actual target GET before signalling
+and returns Cancelled while cleanup removes only confirmed owned output. No blind
+retry is added. Request timeouts are explicitly 1/2 seconds; these tests do not
+establish production-wide budgets, other vendors, power-loss guarantees, application
+ClickHouse/callback behavior, or whole-migration performance. All six owned containers
+and namespaces are removed on exit.
+
+Architecture review: policy and failure cleanup authorization remain in the generic
+transfer engine, while receipt ownership, version checks and protocol deletion live
+in the S3 staged destination. Existing role methods and VerifyRequest cancellation
+are extended; no public function/type or SDK dependency is added.
+
+On Rust 1.98.1 the full CI scope passed. The initial `make ci` passed guards,
+feature isolation and strict Clippy, then exhausted local disk during batched test
+linking. The remaining workspace libraries, all 46 integration targets, test-enabled
+example, doctests, examples, Local E2E and final fmt were rerun as 52 sequential
+steps and passed. This is completed equivalent CI scope, not an uninterrupted
+`make ci` run; ignored external fixtures remain ignored except the sixty cases
+explicitly executed above.

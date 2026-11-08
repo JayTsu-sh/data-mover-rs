@@ -385,9 +385,16 @@ pub(super) async fn send_copy<P: S3Protocol>(
             "S3 object content differs from the published size",
         )));
     }
+    single.cleanup.attempted();
     let facts = match adapter.protocol.copy_from(source, path.as_str()).await {
-        Ok(facts) => settle_copy_version(&*adapter.protocol, path, source.size, facts).await,
+        Ok(facts) => {
+            single
+                .cleanup
+                .confirmed(expected_size, &facts, adapter.protocol.versioning_enabled());
+            settle_copy_version(&*adapter.protocol, path, source.size, facts).await
+        }
         Err(failure) if single::definite_refusal(&failure) => {
+            single.cleanup.refused();
             return Err(unchanged(role_failure(path, Operation::Publish, failure)));
         }
         Err(failure) if !adapter.protocol.bucket_capabilities().md5_etags => {

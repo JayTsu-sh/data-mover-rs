@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::source::{cancelled, classified_entry, entry, role_failure};
 use super::super::{S3Protocol, S3ProtocolFailure, S3StreamedPut, S3WriteFacts};
+use super::direct_cleanup::DirectCleanup;
 use super::settle::{Previous, Settling, settle_unknown_write};
 use super::single::{changed, definite_refusal, same_etag, unchanged};
 use super::{S3StagedDestination, single};
@@ -67,6 +68,7 @@ pub(super) struct StreamingStage {
     hold_limit: Duration,
     settle_grace: Duration,
     state: Mutex<StreamingState>,
+    pub(super) cleanup: DirectCleanup,
 }
 
 #[derive(Default)]
@@ -264,6 +266,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             hold_limit: self.hold_limit,
             settle_grace: self.settle_grace,
             state: Mutex::new(StreamingState::default()),
+            cleanup: DirectCleanup::default(),
         })));
         Ok(stage.disable_recovery())
     }
@@ -293,6 +296,7 @@ pub(super) async fn write<P: S3Protocol + 'static>(
     let mut inflight = InFlight::start(adapter, path, size, chunks);
     let (last, md5) = send_all_but_last(input, &sender, streaming, &mut inflight, path).await?;
     if streaming.commit_in_write {
+        streaming.cleanup.attempted();
         forward(&sender, last, streaming.stall, &mut inflight, path).await?;
         drop(sender);
         let facts = finish(adapter, path, streaming, inflight, &md5)
@@ -428,6 +432,7 @@ async fn finish<P: S3Protocol>(
     let put = match reply {
         Ok(put) => put,
         Err(failure) if definite_refusal(&failure) => {
+            streaming.cleanup.refused();
             return Err(unchanged(role_failure(path, Operation::Publish, failure)));
         }
         Err(failure) => {
@@ -445,6 +450,11 @@ async fn finish<P: S3Protocol>(
             return Ok(settled);
         }
     };
+    streaming.cleanup.confirmed(
+        streaming.expected_size,
+        &put.facts,
+        adapter.protocol.versioning_enabled(),
+    );
     if put.etag_is_md5 && is_md5_etag(&put.facts.etag) && !same_etag(&put.facts.etag, md5) {
         return Err(changed(classified_entry(
             path,

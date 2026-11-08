@@ -52,3 +52,23 @@ must be established separately through the namespace contract.
 
 The earlier Local-only description above records its original implementation;
 current backend capabilities and source code are authoritative for other backends.
+
+## S3 Direct failed-data cleanup（2026-11-09）
+
+Explicit `FailedDataCleanup::RemoveOwned` now applies to data verification failures
+following Direct publication. Ordinary discard, the default Keep policy, and metadata
+failures retain final output. The existing S3 staged role records the original write
+receipt privately; a matching object inferred after an unacknowledged write is not
+ownership proof. No-write refusals require no final-object cleanup.
+
+Certified object buckets remove only a confirmed immutable version by its reported
+ID, or a mutable/null slot after fresh size/ETag checks. Replaced output, missing
+version echoes and uncertain write outcomes are retained with explicit typed errors.
+NAS output is not certified for this cleanup. Concurrent writers remain excluded;
+HEAD followed by mutable DELETE is not atomic. Failed deletion preserves the original
+data failure and its cleanup cause; an unacknowledged DELETE remains Unknown.
+
+The existing VerifyRequest cancellation token now covers in-flight read-only HEAD
+and GET, avoiding a wait for SDK read timeout. Cleanup still has the protocol's
+operation timeout and does not add retries. The isolated real sixty-case matrix is
+documented in [the lab guide](../../tests/lab/README.md#s3-direct-failed-data-cleanup).

@@ -23,7 +23,7 @@ use crate::storage::{
     VerifyRequest, WriteEvidence,
 };
 
-use super::source::{classified_entry, entry, role_failure};
+use super::source::{cancelled, classified_entry, entry, role_failure};
 
 mod at_destination;
 mod checkpoint_cleanup;
@@ -32,6 +32,7 @@ mod checkpointed_parts;
 mod completion;
 mod delete_marker;
 mod direct;
+mod direct_cleanup;
 mod directory_object;
 #[cfg(test)]
 mod directory_object_tests;
@@ -420,17 +421,27 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         stage: &PreparedStage,
         request: VerifyRequest,
     ) -> Result<VerificationEvidence, StorageRoleFailure> {
-        if stage.direct() {
-            return self.verify_direct(stage, &request).await;
+        let cancel = request.cancel.clone();
+        let verification = async {
+            if stage.direct() {
+                return self.verify_direct(stage, &request).await;
+            }
+            if let Some(single) = single::of(stage) {
+                return single::verify(self, stage, single, &request).await;
+            }
+            if let Some(streamed) = streaming::of(stage) {
+                return streaming::verify(self, stage, streamed, &request).await;
+            }
+            let upload =
+                at_destination::of(stage).ok_or_else(|| foreign(stage, Operation::Verify))?;
+            self.verify_final_upload(stage, upload, &request).await
+        };
+        // HEAD／GET 均为只读 HTTP；取消可以释放整条核验 future，不等下层请求超时。
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(cancelled(stage.final_destination().path(), Operation::Verify)),
+            result = verification => result,
         }
-        if let Some(single) = single::of(stage) {
-            return single::verify(self, stage, single, &request).await;
-        }
-        if let Some(streamed) = streaming::of(stage) {
-            return streaming::verify(self, stage, streamed, &request).await;
-        }
-        let upload = at_destination::of(stage).ok_or_else(|| foreign(stage, Operation::Verify))?;
-        self.verify_final_upload(stage, upload, &request).await
     }
 
     async fn apply_metadata(
@@ -510,6 +521,10 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             final_destination_changed: false,
         })?;
         self.publish_final_upload(stage, upload, &request).await
+    }
+
+    async fn remove_failed_direct(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
+        self.remove_direct_data(stage).await
     }
 
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {

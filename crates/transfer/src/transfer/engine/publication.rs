@@ -245,7 +245,11 @@ fn retain_published_failure(
     source_qos: SourceQosStats,
 ) -> TransferFailure {
     failure.final_destination_changed = true;
-    if transferred.stage.checkpoint_enabled() || transferred.stage.recovered_publication().is_some()
+    if transferred.stage.direct() && failure.phase() == TransferPhase::Verify {
+        // 已确认发布后的数据校验失败仍保留显式坏输出清理授权；元数据和未知发布结果不走此路。
+        failure = failure.with_stage(transferred.destination, transferred.stage);
+    } else if transferred.stage.checkpoint_enabled()
+        || transferred.stage.recovered_publication().is_some()
     {
         failure = failure.with_committed_cleanup(transferred.destination, transferred.stage);
     }

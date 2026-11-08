@@ -19,6 +19,7 @@ use super::super::{
     S3NativeCopySource, S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3WriteFacts,
     is_real_version_id,
 };
+use super::direct_cleanup::DirectCleanup;
 use super::settle::{Previous, Settling, settle_unknown_write};
 use super::{PART_SIZE, S3StagedDestination, directory_object, native_final};
 use crate::model::{FailureClass, ObjectTag, Operation, StoragePath, Transience};
@@ -76,6 +77,7 @@ pub(super) struct SingleStage {
     /// ours ([`settle`](super::settle)).
     previous: Option<Previous>,
     state: Mutex<SingleState>,
+    pub(super) cleanup: DirectCleanup,
 }
 
 #[derive(Default)]
@@ -249,6 +251,7 @@ impl<P: S3Protocol> S3StagedDestination<P> {
             expected_size: size,
             previous,
             state: Mutex::new(SingleState::default()),
+            cleanup: DirectCleanup::default(),
         })));
         stage.disable_recovery()
     }
@@ -422,13 +425,20 @@ async fn put<P: S3Protocol>(
 ) -> Result<S3WriteFacts, PublicationFailure> {
     let digest = body.md5();
     let quoted_md5 = format!("\"{digest:x}\"");
+    single.cleanup.attempted();
     let failure = match adapter
         .protocol
         .put_object(path.as_str(), body, &BASE64_STANDARD.encode(digest))
         .await
     {
-        Ok(facts) => return Ok(facts),
+        Ok(facts) => {
+            single
+                .cleanup
+                .confirmed(expected_size, &facts, adapter.protocol.versioning_enabled());
+            return Ok(facts);
+        }
         Err(failure) if definite_refusal(&failure) => {
+            single.cleanup.refused();
             return Err(unchanged(role_failure(path, Operation::Publish, failure)));
         }
         Err(failure) => failure,
