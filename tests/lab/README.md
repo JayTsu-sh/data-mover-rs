@@ -960,3 +960,29 @@ example, doctests, examples, Local E2E and final fmt were rerun as 52 sequential
 steps and passed. This is completed equivalent CI scope, not an uninterrupted
 `make ci` run; ignored external fixtures remain ignored except the sixty cases
 explicitly executed above.
+
+## Direct publication version receipts
+
+The existing `run-direct-native-local.py` matrix now runs thirteen real scenarios.
+A version-enabled target preseeded with an identical old body is tested with a copy
+request disconnected before forwarding, a committed copy with a lost reply, and a
+successful copy whose version header the private proxy removes. Independent version
+and body reads require the original target version and source to remain, exactly one
+target version for the uncommitted request, and two for the committed cases. Direct
+returns no created-version ID in all three cases. The original ten success/metadata/
+network/cancellation/recovery cases remain; a lost acknowledged response also returns
+no created-version ID even when independent inspection proves the new version exists.
+Normal acknowledged writes still report their version, and no client payload GET is
+introduced on quick paths. The explicit recovery attempts remain test retries.
+
+A deterministic preexisting-body regression first returned preexisting-target as this
+attempt's new version and failed; the corrected Direct contract passes all thirteen
+Direct unit tests. The existing ambiguous multipart test now separately checks that
+Direct keeps the completed body without inventing a receipt, while retaining the
+unchanged Checkpointed expectation until that separate path is addressed. Complete
+CI scope passes via guards, feature matrix, strict Clippy and 52 sequential workspace/
+example/Local steps; final transfer-target strict Clippy checks the revised assertion.
+These results certify the tested Direct RustFS path, not AtomicReplace/Checkpointed
+publication identity, application history purge or other vendors. No SDK or public API
+is added, and all owned containers are removed. Application ClickHouse/callback and
+normal-path resource measurements are separate acceptance gates.

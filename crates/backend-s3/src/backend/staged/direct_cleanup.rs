@@ -19,12 +19,26 @@ enum WriteClaim {
     },
 }
 
+/// 本次写入回执同时决定坏输出清理权限与可公开的已创建版本；不复制第二份归属状态。
 #[derive(Default)]
 pub(super) struct DirectCleanup {
     claim: Mutex<WriteClaim>,
 }
 
 impl DirectCleanup {
+    /// 发布版本必须来自本次写入回执；用于内容核验的推断版本不是新建版本证明。
+    pub(super) fn publication_version(&self) -> Option<String> {
+        let claim = self.claim.lock().unwrap_or_else(PoisonError::into_inner);
+        match &*claim {
+            WriteClaim::Confirmed { facts, .. } => facts
+                .reported_version
+                .as_ref()
+                .filter(|id| is_real_version_id(id))
+                .cloned(),
+            WriteClaim::Untouched | WriteClaim::Uncertain => None,
+        }
+    }
+
     pub(super) fn attempted(&self) {
         *self.claim.lock().unwrap_or_else(PoisonError::into_inner) = WriteClaim::Uncertain;
     }

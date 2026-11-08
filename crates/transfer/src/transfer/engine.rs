@@ -167,6 +167,8 @@ pub struct TransferOutcome {
     pub route: TransferRoute,
     pub recovery: EffectiveRecovery,
     /// The version the publication created, for a destination that versions its objects.
+    /// S3 Direct reports one only from this attempt's acknowledged write receipt; a matching
+    /// current object's inferred version is not evidence that this publication created it.
     pub destination_version: Option<String>,
     /// How the copy was checked (P7 §14.2 N4): the read-back method used (`NotPerformed` when
     /// read-back is disabled; `EtagBracketed` with its reason where reads cannot be pinned) and

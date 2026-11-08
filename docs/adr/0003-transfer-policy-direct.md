@@ -72,3 +72,19 @@ The existing VerifyRequest cancellation token now covers in-flight read-only HEA
 and GET, avoiding a wait for SDK read timeout. Cleanup still has the protocol's
 operation timeout and does not add retries. The isolated real sixty-case matrix is
 documented in [the lab guide](../../tests/lab/README.md#s3-direct-failed-data-cleanup).
+
+## S3 Direct created-version evidence
+
+Direct publication now exports a destination version only from this attempt's original
+successful write receipt. It reuses the existing private write claim introduced for
+owned failed-data cleanup and the existing PublicationEvidence/TransferOutcome fields;
+no public function or type is added. A failed CopyObject can find preexisting identical
+data, and an acknowledged copy with no version header can infer a stale version from
+LIST. Those content checks do not prove that the inferred version was newly created.
+The data may be usable while destination_version remains None. Historical callers must
+require a confirmed mapping and block later versions when publication is unconfirmed.
+
+This change applies to Direct single/native, multipart and streamed paths. Existing
+AtomicReplace/Checkpointed inference and checkpoint recovery are a separate remaining
+step before enabling application-wide historical source purge. It adds no normal
+storage request or retained per-entry state; publication reads the existing bounded claim.

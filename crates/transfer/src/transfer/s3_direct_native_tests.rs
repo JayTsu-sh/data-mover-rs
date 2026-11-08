@@ -5,7 +5,9 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, ObjectTag, StoragePath, Transience};
-use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context, source_storage};
+use crate::storage::backends::s3::tests::{
+    MemoryS3, Versioning, endpoint_of, native_context, source_storage,
+};
 use crate::storage::backends::s3::{S3NativeContext, S3Protocol as _, S3ProtocolFailure, connect};
 use crate::transfer::{
     EffectiveRecovery, FailedDataCleanup, MetadataFailurePolicy, MetadataTransferMode,
@@ -270,5 +272,37 @@ async fn direct_native_refuses_the_same_actual_key_under_different_roots() -> Re
         protocol.objects.lock().await.get("src/file"),
         Some(&payload)
     );
+    Ok(())
+}
+
+/// 内容相同只能证明当前数据满足要求，不能证明已有版本由本次发布创建。
+#[tokio::test]
+async fn matching_old_version_is_not_a_confirmed_new_publication() -> Result {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    let payload = Bytes::from_static(b"identical historical payload");
+    protocol
+        .put_version("src/file", "source-version", payload.clone())
+        .await;
+    protocol
+        .put_version("file", "preexisting-target", payload.clone())
+        .await;
+    *protocol.native_failure.lock().await = Some(S3ProtocolFailure::session(
+        FailureClass::Connectivity,
+        Transience::Unknown,
+        "copy response unavailable without a write receipt",
+    ));
+    let outcome = transfer(
+        request(&protocol, ReadBackVerification::Disabled)?
+            .with_metadata_mode(MetadataTransferMode::CallerManaged),
+    )
+    .await?;
+    assert!(
+        outcome.destination_version.is_none(),
+        "preexisting target version must not be claimed as newly published: {:?}",
+        outcome.destination_version
+    );
+    assert_eq!(protocol.objects.lock().await.get("file"), Some(&payload));
+    assert!(protocol.version_deletes().is_empty());
     Ok(())
 }

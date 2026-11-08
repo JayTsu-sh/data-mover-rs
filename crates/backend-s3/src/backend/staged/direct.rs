@@ -455,12 +455,12 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             final_destination_changed: false,
         };
         self.validate(stage).map_err(unchanged)?;
-        let facts =
-            written_facts(stage).ok_or_else(|| unchanged(not_written(path, Operation::Publish)))?;
+        written_facts(stage).ok_or_else(|| unchanged(not_written(path, Operation::Publish)))?;
+        let version = cleanup_authority(stage).and_then(DirectCleanup::publication_version);
         Ok(PublicationEvidence::new(
             path.clone(),
             PublicationDisposition::Published,
-            facts.version_id,
+            version,
         ))
     }
 

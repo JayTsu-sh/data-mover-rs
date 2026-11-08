@@ -17,7 +17,7 @@ import boto3
 from botocore.config import Config
 
 ROOT = Path(__file__).resolve().parents[2]
-MODES = ("quick", "full", "tags_quick", "tags_full", "deny", "disconnect", "stall", "cancel", "flash", "lost_ack")
+MODES = ("quick", "full", "tags_quick", "tags_full", "deny", "disconnect", "stall", "cancel", "flash", "lost_ack", "same_disconnect", "same_lost_ack", "same_omitted")
 
 
 def docker(*args):
@@ -61,7 +61,10 @@ def inside():
     client.create_bucket(Bucket=bucket)
     client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     body = b"Z" * 1024
+    original_targets = {}
     for mode in MODES:
+        if mode.startswith("same_"):
+            original_targets[mode] = client.put_object(Bucket=bucket, Key=f"{mode}/target/payload", Body=body, Tagging="generation=source")["VersionId"]
         client.put_object(Bucket=bucket, Key=f"{mode}/src/payload", Body=body, Tagging="generation=source")
     stopped = threading.Event()
     requests, faults = [], {}
@@ -78,7 +81,7 @@ def inside():
                 copying = self.command == "PUT" and self.headers.get("x-amz-copy-source") is not None
                 tagging = self.command == "PUT" and "tagging" in self.path
                 requests.append((self.command, self.path, copying, tagging))
-                affected = copying and mode in ("deny", "disconnect", "stall", "cancel", "flash") or tagging and mode.startswith("tags_")
+                affected = copying and mode in ("deny", "disconnect", "stall", "cancel", "flash", "same_disconnect") or tagging and mode.startswith("tags_")
                 if affected:
                     faults[mode] = faults.get(mode, 0) + 1
                     if mode == "deny" or tagging:
@@ -102,15 +105,17 @@ def inside():
                     upstream.request(self.command, self.path, payload, dict(self.headers))
                     response = upstream.getresponse()
                     payload = response.read()
-                    if copying and mode == "lost_ack":
+                    if copying and mode in ("lost_ack", "same_lost_ack"):
                         faults[mode] = faults.get(mode, 0) + 1
                         control.write_text("normal")
                         self.close_connection = True
                         self.connection.shutdown(socket.SHUT_RDWR)
                         return
+                    if copying and mode == "same_omitted":
+                        faults[mode] = faults.get(mode, 0) + 1
                     self.send_response(response.status)
                     for key, value in response.getheaders():
-                        if key.lower() not in ("connection", "content-length", "transfer-encoding"):
+                        if key.lower() not in ("connection", "content-length", "transfer-encoding") and not (copying and mode == "same_omitted" and key.lower() == "x-amz-version-id"):
                             self.send_header(key, value)
                     self.send_header("Content-Length", response.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(payload)))
                     self.end_headers()
@@ -139,7 +144,10 @@ def inside():
                 assert not records.get("DeleteMarkers"), records
                 versions = records.get("Versions", [])
                 targets = [item for item in versions if item["Key"] == f"{mode}/target/payload"]
-                assert len(targets) == (0 if mode == "cancel" else 1), (mode, targets)
+                expected_targets = 0 if mode == "cancel" else (2 if mode in ("same_lost_ack", "same_omitted") else 1)
+                assert len(targets) == expected_targets, (mode, targets)
+                if mode in original_targets:
+                    assert any(item["VersionId"] == original_targets[mode] for item in targets), (mode, targets)
                 assert len(versions) == 1 + len(targets), (mode, versions)
                 for item in versions:
                     assert client.get_object(Bucket=bucket, Key=item["Key"], VersionId=item["VersionId"])["Body"].read() == body

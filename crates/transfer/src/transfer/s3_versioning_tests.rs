@@ -608,11 +608,11 @@ async fn a_copy_reply_without_a_version_claims_the_latest_version() -> TestResul
     Ok(())
 }
 
-/// A completion whose reply is lost — on the checkpointed upload and on a `Direct` one — is
-/// settled through the key's versions: the latest has our size and composite `ETag`, so its
-/// version is claimed.
+/// Direct 缺少本次完成回执时只确认数据存在，不把推断版本公开为本次创建的版本。
+/// Checkpointed 的既有推断契约在后续独立处理；两种路径均核验实际版本、内容和产物。
 #[tokio::test]
-async fn an_ambiguous_completion_claims_the_version_it_made() -> TestResult {
+async fn ambiguous_completion_keeps_data_without_inventing_a_direct_version_receipt() -> TestResult
+{
     for (final_key, policy) in [
         ("ambiguous", TransferPolicy::Checkpointed),
         ("ambiguous-direct", TransferPolicy::Direct),
@@ -622,7 +622,18 @@ async fn an_ambiguous_completion_claims_the_version_it_made() -> TestResult {
         *protocol.complete_commits_then_fails.lock().await = true;
         let outcome = transfer(request(&protocol, final_key, policy)?).await?;
         assert_eq!(*protocol.completes.lock().await, 1, "{final_key}");
-        clean_versions(&protocol, final_key, 1, Some(version(&outcome)?)).await?;
+        let reported = if policy == TransferPolicy::Direct {
+            assert!(outcome.destination_version.is_none());
+            None
+        } else {
+            Some(version(&outcome)?)
+        };
+        clean_versions(&protocol, final_key, 1, reported).await?;
+        let actual = entries(&protocol, final_key).await?;
+        assert_eq!(
+            stored(&protocol, final_key, &actual[0].version_id).await,
+            Some(data)
+        );
     }
     Ok(())
 }

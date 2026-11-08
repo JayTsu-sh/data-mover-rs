@@ -23,12 +23,12 @@ fn class(error: &TransferFailure) -> TestResult<FailureClass> {
     }
 }
 
-fn check_success(outcome: &TransferOutcome) {
+fn check_success(outcome: &TransferOutcome, version_confirmed: bool) {
     assert_eq!(outcome.route, TransferRoute::Native);
     assert_eq!(outcome.recovery, EffectiveRecovery::Disabled);
     assert_eq!(outcome.transferred_bytes, 1024);
     assert_eq!(outcome.source_qos.native_requests, 1);
-    assert!(outcome.destination_version.is_some());
+    assert_eq!(outcome.destination_version.is_some(), version_confirmed);
 }
 
 #[tokio::test]
@@ -72,7 +72,10 @@ async fn direct_native_with_real_requests() -> TestResult {
     );
     let result = result?;
     match mode.as_str() {
-        "quick" | "full" | "lost_ack" => check_success(&result?),
+        "quick" | "full" => check_success(&result?, true),
+        "lost_ack" | "same_disconnect" | "same_lost_ack" | "same_omitted" => {
+            check_success(&result?, false);
+        }
         "tags_quick" | "tags_full" => {
             let failure = result.err().ok_or("metadata refusal succeeded")?;
             assert_eq!(failure.phase(), TransferPhase::Metadata);
@@ -80,6 +83,7 @@ async fn direct_native_with_real_requests() -> TestResult {
                 failure
                     .published_data()
                     .ok_or("published data evidence missing")?,
+                true,
             );
             assert!(failure.to_string().contains("PermissionDenied"));
         }
@@ -102,7 +106,7 @@ async fn direct_native_with_real_requests() -> TestResult {
             }
             // 故障恢复后显式重试；取消不重用已取消请求。
             if mode != "cancel" {
-                check_success(&transfer(request).await?);
+                check_success(&transfer(request).await?, true);
             }
         }
         _ => return Err("unknown Direct native test mode".into()),
