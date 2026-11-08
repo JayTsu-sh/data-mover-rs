@@ -806,3 +806,24 @@ signal. Sources remained intact; explicit persistence-only retries succeeded,
 and all five destination payloads were independently checked. These role-level
 results do not certify CLI source purge, directory/symlink persistence, pNFS DS,
 shared recovery budgets, or whole-migration throughput/RSS.
+
+### Published NFS directories and symlinks
+
+`--contract nonfile` selects
+`direct::nonfile::real_nfs_nonfile_persistence_fault_contract` and arms actual
+`lookup_path` requests. The runner asserts zero file COMMITs and matches the lost
+reply by XID. The functional
+`direct::nonfile::real_nfs_directory_and_symlink_persistence_contract` checks
+empty/readonly directories, exact restored nanosecond mtime after child creation,
+broken symlinks and replacement protection on Linux v3/v4.1. Independent server
+inspection checks mode, mtime, child bytes and literal link targets.
+
+Directory/link mutations rely on NFS's synchronous namespace/SETATTR completion
+contract; persistence confirmation freshly resolves and checks the full path twice.
+No regular-file OPEN or COMMIT is issued for these entries. Linux v4.1 flash and
+lost-reply cases recovered; disconnect returned Connectivity in about 0.32 s,
+silent loss returned Timeout in about 15 s and cancellation returned in about
+252 ms. A lost uncached read reply is recovered inside nfs-rs using one fresh
+sequence under the same operation deadline, with no backend requery loop.
+These results do not certify whole-task source purge, physical pNFS DS, NFSv4.2,
+shared task recovery budgets or whole-migration performance/RSS.

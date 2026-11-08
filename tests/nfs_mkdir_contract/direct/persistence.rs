@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Result, common, connect};
 
-async fn copy(source: &Storage, target: &Storage, path: &StoragePath) -> Result {
+pub(super) async fn copy(source: &Storage, target: &Storage, path: &StoragePath) -> Result {
     transfer(
         TransferRequest::new(
             source.clone(),

@@ -29,6 +29,8 @@ type ProtocolResult<T> = std::result::Result<T, NfsProtocolFailure>;
 #[derive(Default)]
 struct State {
     generation: AtomicU64,
+    kind: AtomicU64,
+    replace_on_second_fresh: AtomicBool,
     fresh_stats: AtomicU64,
     opened: AtomicU64,
     committed: AtomicU64,
@@ -143,16 +145,24 @@ impl NfsNamespaceProtocol for Protocol {
         path: &StoragePath,
         fresh: bool,
     ) -> ProtocolResult<NfsNamespaceObservation> {
-        if fresh {
-            self.0.fresh_stats.fetch_add(1, Ordering::AcqRel);
+        if fresh
+            && self.0.fresh_stats.fetch_add(1, Ordering::AcqRel) == 1
+            && self.0.replace_on_second_fresh.load(Ordering::Acquire)
+        {
+            self.0.generation.fetch_add(1, Ordering::AcqRel);
         }
+        let kind = match self.0.kind.load(Ordering::Acquire) {
+            1 => EntryKind::Directory,
+            2 => EntryKind::Symlink,
+            _ => EntryKind::File,
+        };
         let time = Some(
             StorageTimestamp::new(123, TimePrecision::Nanoseconds).map_err(|_| unavailable())?,
         );
         Ok(NfsNamespaceObservation {
             path: path.clone(),
-            kind: EntryKind::File,
-            size: Some(3),
+            kind,
+            size: (kind == EntryKind::File).then_some(3),
             file_handle: handle(&self.0),
             timestamps: Some(TimestampMetadata {
                 accessed: time,
@@ -343,5 +353,43 @@ async fn cancellation_interrupts_inflight_commit_and_pre_cancel_opens_nothing() 
         matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled)
     );
     assert_eq!(state.committed.load(Ordering::Acquire), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn directory_and_symlink_confirmation_never_open_or_commit_a_file() -> Result {
+    for kind in [1, 2] {
+        let (mut namespace, state, path) = fixture()?;
+        namespace.persistence = None;
+        state.kind.store(kind, Ordering::Release);
+        let expected = namespace.stat(&path).await?;
+        namespace
+            .persist_observed(&expected, CancellationToken::new())
+            .await?;
+        assert_eq!(state.fresh_stats.load(Ordering::Acquire), 2);
+        assert_eq!(state.opened.load(Ordering::Acquire), 0);
+        assert_eq!(state.committed.load(Ordering::Acquire), 0);
+        assert_eq!(state.closed.load(Ordering::Acquire), 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_file_replacement_during_confirmation_is_refused() -> Result {
+    for kind in [1, 2] {
+        let (namespace, state, path) = fixture()?;
+        state.kind.store(kind, Ordering::Release);
+        let expected = namespace.stat(&path).await?;
+        state.replace_on_second_fresh.store(true, Ordering::Release);
+        let error = namespace
+            .persist_observed(&expected, CancellationToken::new())
+            .await
+            .err()
+            .ok_or("replacement accepted")?;
+        assert!(
+            matches!(error, StorageRoleFailure::Entry(error) if error.class() == FailureClass::Conflict)
+        );
+        assert_eq!(state.opened.load(Ordering::Acquire), 0);
+    }
     Ok(())
 }

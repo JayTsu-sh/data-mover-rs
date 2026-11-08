@@ -196,6 +196,7 @@ pub trait NfsListingPages: Send {
     fn reached(&mut self, next: DirectoryCookie) -> bool;
 }
 
+/// namespace 修改必须按 NFS 协议在稳定存储完成后才返回成功；目录／链接确认依赖此契约。
 #[async_trait]
 pub trait NfsNamespaceProtocol: Send + Sync {
     async fn create_symlink(

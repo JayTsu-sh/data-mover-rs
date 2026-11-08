@@ -2989,9 +2989,8 @@ dependencies = [
 
 [[package]]
 name = "nfs-rs"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39deafafcd18d68d46634ab3760dc536473b8f830fbb6ffc758af03b53693128"
+version = "0.11.3"
+source = "git+https://github.com/JayTsu-sh/nfs-rs?rev=7d984b41c0d6364bb0161e8080465bd680d16db2#7d984b41c0d6364bb0161e8080465bd680d16db2"
 dependencies = [
  "async-trait",
  "byteorder",

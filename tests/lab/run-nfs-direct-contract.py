@@ -24,14 +24,16 @@ def main():
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--url', required=True)
     parser.add_argument('--functional', action='store_true')
-    parser.add_argument('--contract', choices=('direct', 'persistence'), default='direct')
+    parser.add_argument('--contract', choices=('direct', 'persistence', 'nonfile'), default='direct')
+    parser.add_argument('--operation-tag', choices=('commit', 'lookup_path'))
     args = parser.parse_args()
+    args.operation_tag = args.operation_tag or ('lookup_path' if args.contract == 'nonfile' else 'commit')
     parsed = urllib.parse.urlsplit(args.url)
     if not re.fullmatch(r'/srv/nfs/v4:/ci/nightly-nfs-direct-[A-Za-z0-9_-]+', parsed.path):
         raise ValueError('owned prepared v4 NFS prefix required')
     if not args.binary.is_file():
         raise ValueError('prebuilt contract binary required')
-    state = {'mode': 'normal', 'armed': None, 'sockets': set(), 'faults': {}, 'commit_hits': {}, 'lost_commit_replies': 0}
+    state = {'mode': 'normal', 'armed': None, 'sockets': set(), 'faults': {}, 'operation_hits': {}, 'lost_operation_replies': 0, 'seen_requests': {}}
     triggered = threading.Event()
     guard = threading.Lock()
     stopped = threading.Event()
@@ -67,17 +69,19 @@ def main():
                             records = (requests if selected.fileobj is self.request else responses).feed(data)
                             for wire, tag, xid, message in records:
                                 with guard:
-                                    if tag == 'commit' and state['armed']:
+                                    if selected.fileobj is self.request and tag:
+                                        state['seen_requests'][tag] = state['seen_requests'].get(tag, 0) + 1
+                                    if tag == args.operation_tag and state['armed']:
                                         if state['armed'] == 'lost_ack':
                                             lost_xid = xid
                                         state['mode'] = state['armed']
-                                        state['commit_hits'][state['armed']] = state['commit_hits'].get(state['armed'], 0) + 1
+                                        state['operation_hits'][state['armed']] = state['operation_hits'].get(state['armed'], 0) + 1
                                         state['armed'] = None
                                         triggered.set()
                                     mode = state['mode']
                                     lose_reply = mode == 'lost_ack' and selected.fileobj is upstream and message == 1 and (lost_xid is None or xid == lost_xid)
                                     if lose_reply and lost_xid is not None:
-                                        state['lost_commit_replies'] += 1
+                                        state['lost_operation_replies'] += 1
                                     if mode in ('flash', 'disconnect', 'stall', 'cancel') or lose_reply:
                                         state['faults'][mode] = state['faults'].get(mode, 0) + 1
                                     if mode == 'flash' or lose_reply:
@@ -143,16 +147,19 @@ def main():
         if args.functional:
             subprocess.run([str(args.binary), '--ignored', '--exact', 'direct::real_nfs_direct_data_and_metadata_contract',
                             '--nocapture', '--test-threads=1'], check=True, env=env, timeout=100)
-        subprocess.run([str(args.binary), '--ignored', '--exact', ('direct::fault::real_nfs_direct_fault_contract' if args.contract == 'direct' else 'direct::persistence::real_nfs_persistence_fault_contract'),
+        subprocess.run([str(args.binary), '--ignored', '--exact', {'direct': 'direct::fault::real_nfs_direct_fault_contract', 'persistence': 'direct::persistence::real_nfs_persistence_fault_contract', 'nonfile': 'direct::nonfile::real_nfs_nonfile_persistence_fault_contract'}[args.contract],
                         '--nocapture', '--test-threads=1'], check=True, env=env, timeout=180)
         expected = [os.environ['LAB_NFS_DIRECT_ONLY']] if os.environ.get('LAB_NFS_DIRECT_ONLY') else ('flash', 'disconnect', 'stall', 'cancel', 'lost_ack')
         assert all(state['faults'].get(mode, 0) for mode in expected), state['faults']
-        if args.contract == 'persistence':
-            assert all(state['commit_hits'].get(mode, 0) for mode in expected), state['commit_hits']
+        if args.contract != 'direct':
+            assert all(state['operation_hits'].get(mode, 0) for mode in expected), state['operation_hits']
             if 'lost_ack' in expected:
-                assert state['lost_commit_replies'] > 0
-            print(f'independent NFS relay lost_commit_replies={state["lost_commit_replies"]}', flush=True)
-            print(f'independent NFS relay commit_operation_hits={state["commit_hits"]}', flush=True)
+                assert state['lost_operation_replies'] > 0
+            if args.operation_tag == 'lookup_path':
+                assert state['seen_requests'].get('commit', 0) == 0, state['seen_requests']
+            print(f'independent NFS relay confirmed_tag={args.operation_tag} commit_requests={state["seen_requests"].get("commit", 0)}', flush=True)
+            print(f'independent NFS relay lost_operation_replies={state["lost_operation_replies"]}', flush=True)
+            print(f'independent NFS relay operation_hits={state["operation_hits"]}', flush=True)
         print(f'independent NFS relay actual_fault_rpc_records={state["faults"]} scope=owned_connections_only', flush=True)
     finally:
         stopped.set()
