@@ -72,6 +72,16 @@ URL 协议版本本身不构成 ACL 能力证明。当前 ACL 自动复制、损
 [元数据协商](metadata-negotiation.md#acl-自动复制与错误报告)。四组合的历史实机结果见
 [验收报告](../../docs/reports/2026-10-28-nfs-acl-four-way-validation.md)，其旧复制开关不属于当前接口。
 
+## 元数据应用取消
+
+既有 `Metadata::apply` 的令牌覆盖 NFS 元数据写入及 ACL 读回等待，而不只检查调用前状态。
+预先取消返回 Metadata / Cancelled / Transient，不发送修改请求；在途取消返回
+Metadata / Cancelled / Unknown，并明确元数据写入未确认。批量 xattr 取消后停止后续修改。
+已发送请求可能仍在服务端完成，不能以取消证明属性未变，也不能授权删源。
+协议原有安全重放、会话 slot fencing 和正常拒绝分类保持由 backend／nfs-rs 负责。
+Linux v3/v4.1 的真实故障范围、取消耗时和未覆盖项见
+[实验室说明](../../tests/lab/README.md#nfs-metadata-cancellation-2026-11-09)。
+
 ## 读写块大小
 
 挂载后分别计算读写上限：读侧取客户端/默认上限与 rsize 的最小值，写侧取客户端/默认上限与 wsize 的最小值，两者不相互限制。客户端/默认上限继续保持现有 1 MiB 封顶规则，零值视为未指定。

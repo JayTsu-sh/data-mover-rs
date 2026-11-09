@@ -23,6 +23,8 @@ use super::{Result, chmod, common, connect, with_identity};
 
 #[path = "direct/fault.rs"]
 mod fault;
+#[path = "direct/metadata_cancel.rs"]
+mod metadata_cancel;
 #[path = "direct/nonfile.rs"]
 mod nonfile;
 #[path = "direct/persistence.rs"]

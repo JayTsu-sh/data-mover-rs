@@ -31,7 +31,7 @@ def compound_tag(payload):
         return None
     _, message, rpc_version, program, version, procedure = struct.unpack_from('>6I', payload)
     if (message, rpc_version, program, version) == (0, 2, 100003, 3):
-        return 'remove' if procedure in (12, 13) else None
+        return {2: 'setattr', 12: 'remove', 13: 'remove'}.get(procedure)
     header = _compound_header(payload)
     return header[0] if header is not None else None
 

@@ -1239,3 +1239,55 @@ The existing sixty Direct failed-data cleanup cases were rerun and passed after
 this change. Architecture review confirms that read pins, raw write receipts and
 checkpoint serialization stay in the S3 backend; application readiness and callback
 policy remain outside it. No public functions/types or SDK revisions were added.
+
+### NFS metadata cancellation (2026-11-09)
+
+The existing `run-nfs-direct-contract.py` relay accepts `--contract metadata-cancel`.
+Use a prebuilt `nfs_mkdir_contract` test binary and an exclusively prepared
+`/srv/nfs/v3:/ci/nightly-nfs-direct-*` or `/srv/nfs/v4:/ci/nightly-nfs-direct-*`
+URL; v3 also needs its actual `mountport`. Preparation, independent inspection
+and cleanup must remain inside that exact owned prefix. No export, server or
+firewall changes are required. The contract uses `Metadata::apply`'s existing
+cancellation token; it adds no public library function or type.
+
+The default family is mode and the default operation tag is `setattr`. It runs
+flash disconnect, persistent disconnect, silent loss, caller cancellation after
+an observed real request, and lost-response recovery. Set
+`LAB_NFS_DIRECT_ONLY=cancel` for a single cancellation case and
+`LAB_NFS_METADATA_FAMILY=owner|time|acl` to select another family. NFSv4.1 ACL
+uses `--operation-tag setacl` or `getacl` to interrupt its write or readback.
+Each case copies a real nested payload first, keeps its Local source, and retries
+only the requested metadata explicitly through a fresh direct connection.
+
+The Linux VM 104 v3/v4.1 exports passed 16 cases: five mode faults per dialect,
+one owner and one timestamp cancellation per dialect, plus v4.1 ACL SET and
+readback cancellation. Every cancellation returned in less than one second
+(0 ms at the fixture's timer resolution). Independent guest reads confirmed
+all 16 nested payloads survived and mode/owner/nanosecond mtime matched after
+explicit recovery. The interrupted ACL payload was the server's existing ACL;
+this does not prove a changed ACL or arbitrary xattr survived a lost response.
+Deterministic tests cover cancellation during all five writable mutation
+families, no follow-up xattr, correct Metadata operation, and Unknown in-flight
+outcome; the pre-cancel case performs no protocol operation.
+
+These cases exercise the backend token, not a whole product job, callback,
+ClickHouse cancellation, or cross-generation execution fencing. Cancellation
+cannot retract a request already accepted by a server. The v4.1 session slot
+uses the pinned SDK's existing fence-on-drop behavior; no SDK change is made.
+Uncancelled silent loss still took about 15 seconds on v4.1 and about 5 seconds
+on v3; it is not evidence of a universal three-second network-detection bound.
+Raw logs and independent checks for this run are in
+`/tmp/native-nfs-metadata-cancel-real/` on the development host.
+
+Validation for this change covered the complete `make ci` scope in sequential
+steps: architecture and harness guards, minimal-feature matrix, strict all-target
+Clippy, workspace library/integration/example/doc tests, compilation of every
+example, and the two Local E2E test targets. The first all-example link and the
+Local runner's duplicate all-example build hit the shared cache disk limit.
+Compilation then passed while releasing only each completed compile-only example
+executable; the unchanged Local E2E tests passed separately. This is not a claim
+that one unmodified `make ci` invocation completed. Existing `binrw` future
+compatibility notes remain. The final architecture review kept cancellation and
+NFS outcome classification together in the metadata adapter, reused its existing
+token and failure mapping, and added neither product policy nor public API.
+Normal whole-migration throughput/RSS is not certified by these backend tests.

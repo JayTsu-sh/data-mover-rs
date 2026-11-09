@@ -33,11 +33,11 @@ class RpcFaultTagTests(unittest.TestCase):
         wire = frame(request(program=100005))
         self.assertEqual(RpcRequests().feed(wire), [(wire, None, 1, 0)])
 
-    def test_v3_only_remove_and_rmdir_are_purge_triggers(self):
-        for procedure in (3, 12, 13, 21):
+    def test_v3_mutation_tags_distinguish_setattr_from_purge(self):
+        for procedure in (2, 3, 12, 13, 21):
             payload = struct.pack('>10I', 7, 0, 2, 100003, 3, procedure, 0, 0, 0, 0)
             wire = frame(payload)
-            tag = 'remove' if procedure in (12, 13) else None
+            tag = {2: 'setattr', 12: 'remove', 13: 'remove'}.get(procedure)
             self.assertEqual(RpcRequests().feed(wire), [(wire, tag, 7, 0)])
 
     def test_session_rejection_preserves_rpc_and_compound_identity(self):

@@ -9,8 +9,8 @@ use crate::model::acl::equivalent_native;
 use crate::model::{
     AclEncoding, AclMetadata, EntryKind, ExtendedAttribute, FailureClass, MetadataCapabilities,
     MetadataFamily as F, MetadataObservation, MetadataObservations, MetadataProvenance,
-    ObservationMode, ObservationPlan, ObservationSupport as S, OwnershipMode, SourceVersion,
-    StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata, Transience,
+    ObservationMode, ObservationPlan, ObservationSupport as S, Operation, OwnershipMode,
+    SourceVersion, StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata, Transience,
 };
 use crate::storage::{
     CopiedMetadataObservation, InlineOwnership, Metadata, MetadataMutation, PermissionFacts,
@@ -496,49 +496,53 @@ impl Metadata for NfsMetadataAdapter {
         mutation: MetadataMutation,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
-        if cancel.is_cancelled() {
-            return Err(super::source::cancelled(path));
-        }
-        let result = match mutation {
-            MetadataMutation::Acl(value) => self.apply_acl(path, &value).await,
-            MetadataMutation::Xattrs(values) => {
-                if !self.protocol.supports_xattrs() {
-                    return Err(unsupported(path));
-                }
-                for value in values {
-                    if cancel.is_cancelled() {
-                        return Err(super::source::cancelled(path));
-                    }
-                    self.protocol
-                        .set_xattr(path, &value)
-                        .await
-                        .map_err(|error| {
-                            super::source::role_failure(
-                                path,
-                                crate::model::Operation::Metadata,
-                                error,
-                            )
-                        })?;
-                }
-                return Ok(());
-            }
-            MetadataMutation::NumericOwnership(value) => {
-                self.protocol.set_numeric_ownership(path, value).await
-            }
-            MetadataMutation::Mode(mode) => self.protocol.set_mode(path, mode).await,
-            MetadataMutation::Timestamps(value) => self.protocol.set_timestamps(path, value).await,
-            MetadataMutation::Tags(_) | MetadataMutation::MappedOwnership(_) => {
-                return Err(super::source::entry_failure(
-                    path,
-                    crate::model::Operation::Metadata,
-                    crate::model::FailureClass::Unsupported,
-                    crate::model::Transience::Permanent,
-                ));
-            }
+        let cancelled = |transience, status| {
+            super::source::role_failure(
+                path,
+                Operation::Metadata,
+                NfsProtocolFailure::new(FailureClass::Cancelled, transience).with_status(status),
+            )
         };
-        result.map_err(|error| {
-            super::source::role_failure(path, crate::model::Operation::Metadata, error)
-        })
+        if cancel.is_cancelled() {
+            return Err(cancelled(
+                Transience::Transient,
+                "NFS metadata cancelled before starting",
+            ));
+        }
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(cancelled(Transience::Unknown,
+                "NFS metadata cancelled in flight; metadata write is unconfirmed")),
+            result = async {
+                let result = match mutation {
+                    MetadataMutation::Acl(value) => self.apply_acl(path, &value).await,
+                    MetadataMutation::Xattrs(values) => {
+                        if !self.protocol.supports_xattrs() {
+                            return Err(unsupported(path));
+                        }
+                        for value in values {
+                            if cancel.is_cancelled() {
+                                return Err(cancelled(Transience::Unknown,
+                                    "NFS metadata cancelled before next xattr; metadata update is incomplete"));
+                            }
+                            self.protocol.set_xattr(path, &value).await.map_err(|error| {
+                                super::source::role_failure(path, Operation::Metadata, error)
+                            })?;
+                        }
+                        return Ok(());
+                    }
+                    MetadataMutation::NumericOwnership(value) => {
+                        self.protocol.set_numeric_ownership(path, value).await
+                    }
+                    MetadataMutation::Mode(mode) => self.protocol.set_mode(path, mode).await,
+                    MetadataMutation::Timestamps(value) => self.protocol.set_timestamps(path, value).await,
+                    MetadataMutation::Tags(_) | MetadataMutation::MappedOwnership(_) => {
+                        return Err(unsupported(path));
+                    }
+                };
+                result.map_err(|error| super::source::role_failure(path, Operation::Metadata, error))
+            } => result,
+        }
     }
 }
 

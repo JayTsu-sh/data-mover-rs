@@ -24,15 +24,15 @@ def main():
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--url', required=True)
     parser.add_argument('--functional', action='store_true')
-    parser.add_argument('--contract', choices=('direct', 'persistence', 'nonfile', 'purge', 'metadata-plan'), default='direct')
+    parser.add_argument('--contract', choices=('direct', 'persistence', 'nonfile', 'purge', 'metadata-plan', 'metadata-cancel'), default='direct')
     parser.add_argument('--test-name')
-    parser.add_argument('--operation-tag', choices=('commit', 'lookup_path', 'remove'))
+    parser.add_argument('--operation-tag', choices=('commit', 'lookup_path', 'remove', 'setattr', 'setacl', 'getacl'))
     args = parser.parse_args()
-    args.operation_tag = args.operation_tag or {'direct': 'commit', 'persistence': 'commit', 'nonfile': 'lookup_path', 'purge': 'remove', 'metadata-plan': 'lookup_path'}[args.contract]
+    args.operation_tag = args.operation_tag or {'direct': 'commit', 'persistence': 'commit', 'nonfile': 'lookup_path', 'purge': 'remove', 'metadata-plan': 'lookup_path', 'metadata-cancel': 'setattr'}[args.contract]
     if args.contract == 'metadata-plan' and not args.test_name:
         raise ValueError('metadata-plan requires an explicit prebuilt test name')
     parsed = urllib.parse.urlsplit(args.url)
-    allowed = r'/srv/nfs/v[34]:/ci/nightly-nfs-direct-[A-Za-z0-9_-]+' if args.contract == 'purge' else r'/srv/nfs/v4:/ci/nightly-nfs-direct-[A-Za-z0-9_-]+'
+    allowed = r'/srv/nfs/v[34]:/ci/nightly-nfs-direct-[A-Za-z0-9_-]+' if args.contract in ('purge', 'metadata-cancel') else r'/srv/nfs/v4:/ci/nightly-nfs-direct-[A-Za-z0-9_-]+'
     if not re.fullmatch(allowed, parsed.path):
         raise ValueError('owned prepared NFS prefix required')
     if not args.binary.is_file():
@@ -40,7 +40,7 @@ def main():
     query = urllib.parse.parse_qs(parsed.query)
     v3 = query.get('version') == ['3']
     if v3 and not query.get('mountport'):
-        raise ValueError('v3 purge relay requires the server mountport explicitly')
+        raise ValueError('v3 relay requires the server mountport explicitly')
     state = {'mode': 'normal', 'armed': None, 'sockets': set(), 'faults': {}, 'operation_hits': {}, 'lost_operation_replies': 0, 'seen_requests': {}, 'session_rejections': 0, 'recovery_exchanges': 0, 'attribute_requests': 0, 'common_acl_requests': 0, 'explicit_acl_requests': 0, 'acl_denials': 0, 'plan_omit_verified': False}
     triggered = threading.Event()
     guard = threading.Lock()
@@ -198,7 +198,7 @@ def main():
         if args.functional:
             subprocess.run([str(args.binary), '--ignored', '--exact', 'direct::real_nfs_direct_data_and_metadata_contract',
                             '--nocapture', '--test-threads=1'], check=True, env=env, timeout=100)
-        subprocess.run([str(args.binary), '--ignored', '--exact', args.test_name or {'direct': 'direct::fault::real_nfs_direct_fault_contract', 'persistence': 'direct::persistence::real_nfs_persistence_fault_contract', 'nonfile': 'direct::nonfile::real_nfs_nonfile_persistence_fault_contract', 'purge': 'direct::purge::real_nfs_source_purge_fault_contract'}[args.contract],
+        subprocess.run([str(args.binary), '--ignored', '--exact', args.test_name or {'direct': 'direct::fault::real_nfs_direct_fault_contract', 'persistence': 'direct::persistence::real_nfs_persistence_fault_contract', 'nonfile': 'direct::nonfile::real_nfs_nonfile_persistence_fault_contract', 'purge': 'direct::purge::real_nfs_source_purge_fault_contract', 'metadata-cancel': 'direct::metadata_cancel::real_nfs_metadata_fault_contract'}[args.contract],
                         '--nocapture', '--test-threads=1'], check=True, env=env, timeout=180)
         if args.contract == 'metadata-plan':
             assert state['plan_omit_verified'] and state['attribute_requests'] > 0, state

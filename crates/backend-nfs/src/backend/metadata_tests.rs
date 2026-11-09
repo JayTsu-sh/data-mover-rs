@@ -6,6 +6,9 @@ use super::super::source::role_failure;
 use super::*;
 use crate::model::{FailureClass, Transience};
 
+#[path = "metadata_cancel_tests.rs"]
+mod metadata_cancel_tests;
+
 #[path = "native_acl_tests.rs"]
 mod native_acl_tests;
 
