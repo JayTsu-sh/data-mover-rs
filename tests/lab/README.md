@@ -68,6 +68,31 @@ cancellation, a recovered disconnect and a lost deletion response followed by an
 This is a storage-role contract; task-level ClickHouse/callback and other backends use their
 separate integration gates.
 
+The versioned purge route now also rejects contradictory `IsLatest` evidence: the same
+version ID cannot occur as both current and historical. Both encounter orders are checked,
+for data versions and delete markers; deterministic checks also cover the mutable null ID.
+The private batch accumulator rejects the listing before returning any deletion candidates.
+It adds no public interface, SDK change, storage request, or collection tied to total history.
+
+The two new deterministic tests first failed because the contradictory flags were accepted.
+After the fix, the S3 backend suite passed 416 tests (two ignored). The isolated versioned
+runner adds four real response-rewrite cases: data/marker, current-first/history-first.
+The original seven fault cases and all four new cases passed; the proxy observed zero DELETE
+requests in the contradictory cases, and independent reads retained all three data versions
+or all four records including the current marker, plus the unrelated sentinel. The response
+rewrite preserves the real version ID and fields, changing only a duplicate record's
+`IsLatest`; it is a controlled malformed-response test, not evidence of a real server defect.
+
+The complete CI scope was run in parts: architecture/harness/minimal-feature gates passed;
+strict all-target Clippy passed after extracting the new fixture assertion from a function
+that exceeded its line limit. All workspace library, integration, example-test and doc-test
+steps passed. Building all example binaries initially exhausted the shared task cache disk;
+only completed Main-project cache libraries/tests were released, then the full example
+build passed. This cache cleanup kept source, SDK libraries, fixed benchmark binaries and
+unrelated work. Local E2E and the seven current-only fault cases passed, completing the same validation
+scope. No application-level callback, source-key fencing, other vendor, or full-migration
+performance certification is implied by these malformed-listing checks.
+
 `--current-source` uses the same contract against a bucket that was never versioned.
 Its observation comes from LIST (milliseconds), whereas the purge guard reads HEAD
 (whole HTTP seconds). The guard compares at the coarser observed precision while

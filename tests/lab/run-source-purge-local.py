@@ -7,6 +7,7 @@ Uses the container network namespace so host firewall/NAT rules need no changes.
 
 import http.client
 import http.server
+import copy
 import os
 from pathlib import Path
 import socket
@@ -17,6 +18,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 
 import boto3
 from botocore.config import Config
@@ -74,6 +76,8 @@ def inside_run():
         raise ValueError("--current-source is only for source purge")
     alternating = [0]
     requests = {"data_get": 0, "writes": 0}
+    if not reading and not current_source:
+        requests["version_deletes"] = 0
     if current_source:
         requests["payload_heads"] = 0
     with tempfile.TemporaryDirectory(prefix="source-purge-") as directory:
@@ -87,6 +91,8 @@ def inside_run():
             def handle_request(self):
                 mode = control.read_text().strip()
                 deleting = self.command == "DELETE" and "versionId=" in self.path
+                if deleting and "version_deletes" in requests:
+                    requests["version_deletes"] += 1
                 payload = self.path.partition("?")[0].endswith("/payload")
                 tagging = self.command == "GET" and "tagging" in self.path
                 probing = reading and payload and (tagging if observing else self.command == "HEAD")
@@ -134,6 +140,19 @@ def inside_run():
                     upstream.request(self.command, self.path, body=body, headers=dict(self.headers))
                     response = upstream.getresponse()
                     payload = response.read()
+                    rewritten = mode.startswith("contradictory_") and self.command == "GET" and "versions" in self.path and response.status == 200
+                    if rewritten:
+                        document = ET.fromstring(payload)
+                        if document.tag.startswith("{"):
+                            ET.register_namespace("", document.tag[1:].partition("}")[0])
+                        kind = "DeleteMarker" if mode.startswith("contradictory_marker_") else "Version"
+                        latest = next(node for node in document if node.tag.rsplit("}", 1)[-1] == kind and
+                                      node.find("{*}IsLatest").text == "true")
+                        duplicate = copy.deepcopy(latest)
+                        duplicate.find("{*}IsLatest").text = "false"
+                        position = list(document).index(latest) + int(mode.endswith("_current_first"))
+                        document.insert(position, duplicate)
+                        payload = ET.tostring(document, encoding="utf-8")
                     if deleting and mode == "lost_ack":
                         control.write_text("normal")
                         self.close_connection = True
@@ -141,7 +160,7 @@ def inside_run():
                         return
                     self.send_response(response.status)
                     for key, value in response.getheaders():
-                        if key.lower() not in ("connection", "transfer-encoding", "content-length"):
+                        if key.lower() not in ("connection", "transfer-encoding", "content-length") and not (rewritten and key.lower().startswith("x-amz-checksum")):
                             self.send_header(key, value)
                     self.send_header("Content-Length", response.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(payload)))
                     self.end_headers()
@@ -156,10 +175,15 @@ def inside_run():
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             modes = ("normal", "readonly", "missing_metadata", "disconnect", "stall", "cancel", "flash", "recover_stall", "alternate") if observing else (("normal", "readonly", "disconnect", "stall", "cancel", "flash", "recover_stall") if reading else ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "lost_ack"))
+            if not reading and not current_source:
+                modes += ("contradictory_data_current_first", "contradictory_data_history_first",
+                          "contradictory_marker_current_first", "contradictory_marker_history_first")
             for mode in modes:
                 prefix = f"nightly-local-{mode}"
                 for _ in range(1 if current_source else 3):
                     client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
+                if mode.startswith("contradictory_marker_"):
+                    client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
                 client.put_object(Bucket=bucket, Key=f"{prefix}/sentinel", Body=b"retain")
                 environment = dict(os.environ, S3_CONNECT_TIMEOUT="1", S3_OPERATION_TIMEOUT="2", S3_READ_TIMEOUT="1")
                 environment.update(
@@ -181,13 +205,17 @@ def inside_run():
                 if binary := os.environ.get("LAB_S3_PURGE_TEST_BINARY"):
                     command = [binary, os.environ["LAB_S3_PURGE_TEST_NAME"], "--ignored", "--exact", "--nocapture"]
                 before_heads = requests.get("payload_heads", 0)
+                before_deletes = requests.get("version_deletes", 0)
                 subprocess.run(command, env=environment, check=True)
+                if mode.startswith("contradictory_"):
+                    assert requests["version_deletes"] == before_deletes, (mode, requests)
                 if current_source and mode == "normal":
                     assert requests["payload_heads"] - before_heads == 1, requests
                 remaining = client.list_object_versions(Bucket=bucket, Prefix=f"{prefix}/")
                 records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
                 payload_records = [record for record in records if record["Key"] == f"{prefix}/payload"]
-                assert len(payload_records) == (0 if not reading and mode in ("normal", "flash", "lost_ack") else (1 if current_source else 3)), (mode, payload_records)
+                expected = 0 if not reading and mode in ("normal", "flash", "lost_ack") else 1 if current_source else 4 if mode.startswith("contradictory_marker_") else 3
+                assert len(payload_records) == expected, (mode, payload_records)
                 assert any(record["Key"] == f"{prefix}/sentinel" for record in records)
                 print(f"independent S3 inspection fault={mode} source_records={len(payload_records)} sentinel=retained", flush=True)
             if observing or persisting:

@@ -32,6 +32,13 @@ impl Batch {
         version: VersionRecord,
     ) -> Result<(), StorageRoleFailure> {
         self.found = true;
+        if self.current_and_history_conflict(&version) {
+            return Err(failure(
+                key,
+                FailureClass::Protocol,
+                "the same version is listed as current and historical; current record retained",
+            ));
+        }
         if version.is_latest() {
             if self
                 .latest
@@ -52,6 +59,17 @@ impl Batch {
             }
         }
         Ok(())
+    }
+
+    fn current_and_history_conflict(&self, version: &VersionRecord) -> bool {
+        let id = version.version_id().unwrap_or("null");
+        if version.is_latest() {
+            self.older.iter().any(|older| older == id)
+        } else {
+            self.latest
+                .as_ref()
+                .is_some_and(|latest| latest.version_id().unwrap_or("null") == id)
+        }
     }
 }
 
@@ -323,5 +341,78 @@ async fn request<T>(
         biased;
         () = cancel.cancelled() => Err(failure(key, FailureClass::Cancelled, "purge request cancelled; sent mutation outcome may be unknown")),
         result = operation => result.map_err(|error| role_failure(key, Operation::Namespace, error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{BackendIdentity, BackendKind, IdentityStrength, SourceIdentity};
+
+    type Result = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    fn record(
+        latest: bool,
+        marker: bool,
+        version: Option<&str>,
+    ) -> std::result::Result<VersionRecord, Box<dyn std::error::Error + Send + Sync>> {
+        let identity = BackendIdentity::new(BackendKind::S3, "purge-contradiction")?;
+        let kind = if marker {
+            RecordKind::DeleteMarker { modified: None }
+        } else {
+            RecordKind::Object {
+                size: 7,
+                etag: "etag".into(),
+                modified: None,
+            }
+        };
+        let strength = if version.is_some() {
+            IdentityStrength::VersionScoped
+        } else {
+            IdentityStrength::PathScoped
+        };
+        Ok(VersionRecord::new(
+            version.map(str::to_owned),
+            latest,
+            kind,
+            SourceIdentity::new(identity, strength, b"same-version")?,
+            None,
+        )?)
+    }
+
+    fn reject_conflicting_current_flag(marker: bool) -> Result {
+        let key = StoragePath::new("payload")?;
+        for (version, current_first) in [Some("same-version"), None]
+            .into_iter()
+            .flat_map(|version| [false, true].map(|first| (version, first)))
+        {
+            let mut batch = Batch {
+                latest: None,
+                older: Vec::new(),
+                found: false,
+            };
+            batch.remember(&key, record(current_first, marker, version)?)?;
+            let error = batch
+                .remember(&key, record(!current_first, marker, version)?)
+                .err()
+                .ok_or("contradictory current/historical version was accepted")?;
+            assert!(
+                matches!(error, StorageRoleFailure::Entry(ref cause)
+                if cause.class() == FailureClass::Protocol
+                    && cause.diagnostic().contains("current and historical")),
+                "{error:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn data_version_cannot_be_both_current_and_historical() -> Result {
+        reject_conflicting_current_flag(false)
+    }
+
+    #[test]
+    fn delete_marker_cannot_be_both_current_and_historical() -> Result {
+        reject_conflicting_current_flag(true)
     }
 }

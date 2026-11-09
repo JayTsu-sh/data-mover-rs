@@ -34,6 +34,23 @@ async fn observed(storage: &Storage, key: &str) -> TestResult<Option<ObservedEnt
         .transpose()
 }
 
+fn reject_contradictory_listing(
+    fault: &str,
+    result: Result<PurgeOutcome, StorageRoleFailure>,
+) -> TestResult {
+    let error = result
+        .err()
+        .ok_or("contradictory listing authorized purge")?;
+    assert!(
+        matches!(error, StorageRoleFailure::Entry(ref cause)
+        if cause.class() == FailureClass::Protocol
+            && cause.diagnostic().contains("current and historical")),
+        "{error:?}"
+    );
+    println!("contradictory listing refused fault={fault} cause={error:?}");
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated real S3 fixture and optional controlled fault proxy"]
 async fn permanent_source_purge_with_real_requests() -> TestResult {
@@ -75,6 +92,7 @@ async fn permanent_source_purge_with_real_requests() -> TestResult {
     );
     let result = result?;
     match fault.as_str() {
+        mode if mode.starts_with("contradictory_") => reject_contradictory_listing(mode, result)?,
         "flash" | "lost_ack" => {
             if let Err(error) = result {
                 let class = match error {
