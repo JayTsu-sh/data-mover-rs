@@ -40,7 +40,7 @@ def isolated_run():
     try:
         print(f"isolated source-purge image={docker('inspect', container, '--format', '{{.Image}}')}", flush=True)
         pid = docker("inspect", container, "--format", "{{.State.Pid}}")
-        arguments = [flag for flag in ("--namespace-read", "--source-observation", "--namespace-persistence", "--current-source", "--version-batch", "--version-batch-perf") if flag in sys.argv]
+        arguments = [flag for flag in ("--namespace-read", "--source-observation", "--namespace-persistence", "--marker-persistence", "--current-source", "--version-batch", "--version-batch-perf") if flag in sys.argv]
         subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *arguments], check=True)
     finally:
         docker("rm", "-f", "-v", container)
@@ -73,7 +73,8 @@ def inside_run():
         client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     stopped = threading.Event()
     observing = "--source-observation" in sys.argv
-    persisting = "--namespace-persistence" in sys.argv
+    marker_persist = "--marker-persistence" in sys.argv
+    persisting = "--namespace-persistence" in sys.argv or marker_persist
     reading = "--namespace-read" in sys.argv or observing or persisting
     if current_source and reading:
         raise ValueError("--current-source is only for source purge")
@@ -100,7 +101,17 @@ def inside_run():
                 payload = self.path.partition("?")[0].endswith("/payload")
                 tagging = self.command == "GET" and "tagging" in self.path
                 probing = reading and payload and (tagging if observing else self.command == "HEAD")
+                listing_marker = marker_persist and self.command == "GET" and "versions" in self.path.partition("?")[2]
+                if mode.startswith("list_"):
+                    probing = listing_marker
+                    mode = mode.removeprefix("list_")
                 affected = deleting or probing
+                if marker_persist and probing and mode in ("replaced", "missing"):
+                    if mode == "replaced":
+                        client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"replacement")
+                    else:
+                        client.delete_object(Bucket=bucket, Key=f"{prefix}/payload", VersionId=current_marker)
+                    control.write_text("normal")
                 if observing or persisting or current_source:
                     if self.command == "GET" and payload and not tagging:
                         requests["data_get"] += 1
@@ -191,6 +202,13 @@ def inside_run():
                         return
                     self.send_response(response.status)
                     for key, value in response.getheaders():
+                        if marker_persist and probing:
+                            if key.lower() == "x-amz-version-id" and mode == "missing_id":
+                                continue
+                            if key.lower() == "x-amz-version-id" and mode == "wrong_id":
+                                value = "wrong-marker-version"
+                            if key.lower() == "x-amz-delete-marker" and mode == "invalid_type":
+                                value = "unknown"
                         if key.lower() not in ("connection", "transfer-encoding", "content-length") and not (rewritten and key.lower().startswith("x-amz-checksum")):
                             self.send_header(key, value)
                     self.send_header("Content-Length", response.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(payload)))
@@ -209,6 +227,8 @@ def inside_run():
             if not reading and not current_source:
                 modes += ("partial_denial", "malformed_batch", "contradictory_data_current_first", "contradictory_data_history_first",
                           "contradictory_marker_current_first", "contradictory_marker_history_first")
+            if marker_persist:
+                modes += ("list_disconnect", "list_stall", "list_cancel", "missing_id", "wrong_id", "invalid_type", "replaced", "missing")
             for mode in modes:
                 prefix = f"nightly-local-{mode}"
                 for index in range(1 if current_source else 5 if mode == "partial_denial" else 3):
@@ -217,6 +237,10 @@ def inside_run():
                     # bulk marker deletes; a single marker does not reproduce the failure.
                     if not reading and not current_source and mode == "normal" and index < 2:
                         client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
+                if marker_persist:
+                    historical_marker = client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")["VersionId"]
+                    client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"before current marker")
+                    current_marker = client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")["VersionId"]
                 if mode.startswith("contradictory_marker_"):
                     client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
                 client.put_object(Bucket=bucket, Key=f"{prefix}/sentinel", Body=b"retain")
@@ -225,7 +249,10 @@ def inside_run():
                     LAB_S3_PURGE_URL=f"s3://purge-test:purge-test-isolated-only@{bucket}.127.0.0.1:{server.server_port}/{prefix}",
                     LAB_S3_PURGE_KEY="payload", LAB_S3_PURGE_FAULT=mode, LAB_S3_PURGE_CONTROL=str(control),
                 )
-                if persisting:
+                if marker_persist:
+                    environment.update(LAB_S3_HISTORICAL_MARKER=historical_marker, LAB_S3_CURRENT_MARKER=current_marker)
+                    test_name = "marker_persistence::published_marker_persistence_with_real_requests"
+                elif persisting:
                     test_name = "namespace_persistence::published_object_persistence_with_real_requests"
                 elif observing:
                     test_name = "source_observation::bounded_source_observation_with_real_requests"
@@ -252,6 +279,8 @@ def inside_run():
                 records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
                 payload_records = [record for record in records if record["Key"] == f"{prefix}/payload"]
                 expected = 0 if not reading and mode in ("normal", "flash", "lost_ack") else 3 if mode == "partial_denial" else 1 if mode == "malformed_batch" or current_source else 4 if mode.startswith("contradictory_marker_") else 3
+                if marker_persist:
+                    expected = 7 if mode == "replaced" else 5 if mode == "missing" else 6
                 assert len(payload_records) == expected, (mode, payload_records)
                 assert any(record["Key"] == f"{prefix}/sentinel" for record in records)
                 print(f"independent S3 inspection fault={mode} source_records={len(payload_records)} sentinel=retained", flush=True)

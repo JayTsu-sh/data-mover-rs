@@ -430,6 +430,7 @@ impl S3Protocol for MemoryS3 {
             )
         })?;
         Ok(S3ObjectFacts {
+            delete_marker: false,
             size: self
                 .declared_size
                 .lock()
@@ -458,13 +459,23 @@ impl S3Protocol for MemoryS3 {
             .get(&(key.to_string(), version_id.to_string()))
             .cloned();
         let bytes = match stored {
-            Some(stored) => stored.ok_or_else(not_found)?,
+            Some(Some(bytes)) => bytes,
+            Some(None) => {
+                return Ok(S3ObjectFacts {
+                    delete_marker: true,
+                    size: 0,
+                    etag: String::new(),
+                    version_id: Some(version_id.to_owned()),
+                    last_modified: *self.last_modified.lock().await,
+                });
+            }
             None if self.version.lock().await.as_deref() == Some(version_id) => {
                 return self.head(relative_key).await;
             }
             None => return Err(not_found()),
         };
         Ok(S3ObjectFacts {
+            delete_marker: false,
             size: bytes.len() as u64,
             etag: self.etag_for(&bytes),
             version_id: Some(version_id.to_string()),

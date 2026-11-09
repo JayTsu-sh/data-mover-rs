@@ -73,6 +73,7 @@ mod tests {
 
     fn described() -> S3ObjectFacts {
         S3ObjectFacts {
+            delete_marker: false,
             size: 10,
             etag: "\"nas-1\"".into(),
             version_id: None,
@@ -113,6 +114,7 @@ mod tests {
             Some(S3ObjectChange::LastModified)
         );
         let undated = S3ObjectFacts {
+            delete_marker: false,
             last_modified: None,
             ..described()
         };

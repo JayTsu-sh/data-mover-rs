@@ -9,6 +9,8 @@ use super::{S3Namespace, S3Protocol, S3ProtocolFailure, refuse_artifact};
 use crate::model::{EntryKind, FailureClass, IdentityStrength, Operation, StoragePath, Transience};
 use crate::storage::{SourceDescriptor, StorageRoleFailure};
 
+mod markers;
+
 impl<P: S3Protocol + 'static> S3Namespace<P> {
     pub(super) async fn persist_entry(
         &self,
@@ -51,7 +53,7 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
             return Err(rejected(
                 &expected.path,
                 FailureClass::Unsupported,
-                "S3 persistence requires a certified object bucket and a bound data object with size and ETag; virtual prefixes, delete markers and NAS buckets are unsupported",
+                "S3 persistence requires a certified object bucket and a bound data object with size and ETag or selected marker evidence; virtual prefixes and NAS buckets are unsupported",
             ));
         }
         Ok(())
@@ -61,6 +63,9 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
         &self,
         expected: &SourceDescriptor,
     ) -> Result<(), StorageRoleFailure> {
+        if markers::selected(expected).is_some() {
+            return self.confirm_marker(expected).await;
+        }
         self.validate_persistence(expected)?;
         let facts = match expected.version.version_id() {
             Some(id) => self.protocol.head_version(expected.path.as_str(), id).await,

@@ -115,6 +115,8 @@ pub(super) fn unsubmitted_delete(cause: &S3ProtocolFailure) -> S3ProtocolFailure
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct S3ObjectFacts {
+    /// 指定版本 HEAD 确认的是删除标记；此时 size／etag 不表示可读数据。
+    pub delete_marker: bool,
     pub size: u64,
     pub etag: String,
     pub version_id: Option<String>,

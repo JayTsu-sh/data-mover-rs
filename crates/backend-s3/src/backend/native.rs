@@ -273,6 +273,7 @@ mod tests {
 
     fn facts(etag: &str) -> S3ObjectFacts {
         S3ObjectFacts {
+            delete_marker: false,
             size: 5,
             etag: etag.to_string(),
             version_id: None,

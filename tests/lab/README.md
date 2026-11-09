@@ -260,6 +260,19 @@ The fixture can run an already built external integration test with
 `LAB_S3_PURGE_TEST_BINARY` and its exact `LAB_S3_PURGE_TEST_NAME`, without changing the fixture's
 independent version/mutation checks. The test binary uses the existing `LAB_S3_PURGE_*`
 environment to address the owned prefix and arm faults.
+`python3 tests/lab/run-source-purge-local.py --marker-persistence` covers selected deletion
+markers through the same public `describe_version` and `persist_observed` operations. The owned
+fixture has four data versions, two markers and an unrelated sentinel per case. Fifteen modes
+cover normal exact-marker HEAD and current-binding LIST, denied reads, disconnect/stall/cancel
+at both HEAD and LIST, explicit recovery after flash/stall, missing/wrong version headers,
+invalid marker type, actual current replacement and actual permanent marker removal. The
+2026-11-09 run passed all fifteen; observed disconnects returned in 2–5 ms, stalls in 1003–1006 ms
+and cancellation in 253 ms under the 1-second read / 2-second operation test profile. Independent
+version inspection and proxy counters confirmed no payload GET or mutation by the Rust
+operations; only the named replacement/removal was performed by fixture control. The plain
+marker descriptor cannot be read as empty data. This verifies the storage contract on RustFS,
+not task source purge, other vendors or a unified network-jitter recovery budget.
+
 `python3 tests/lab/run-source-purge-local.py --source-observation` tests the composed
 current-source observation against real S3. Nine modes cover success, denied tag
 reads, metadata NotFound while HEAD still succeeds, disconnect, silent timeout,

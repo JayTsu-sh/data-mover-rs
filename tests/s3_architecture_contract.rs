@@ -19,6 +19,8 @@ mod checkpoint_version;
 mod direct_cleanup;
 #[path = "s3_architecture_contract/direct_native.rs"]
 mod direct_native;
+#[path = "s3_architecture_contract/marker_persistence.rs"]
+mod marker_persistence;
 #[path = "s3_architecture_contract/namespace_persistence.rs"]
 mod namespace_persistence;
 #[path = "s3_architecture_contract/namespace_read.rs"]

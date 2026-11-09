@@ -517,6 +517,7 @@ pub(super) async fn verify_written<P: S3Protocol>(
         .and_then(|evidence| evidence.version.clone())
         .or(written.version_id);
     let pinned = S3ObjectFacts {
+        delete_marker: false,
         size: request.expected_size,
         etag: written.etag,
         version_id: version,
@@ -578,6 +579,7 @@ async fn verify_bracketed<P: S3Protocol>(
         return Err(differs());
     }
     let anchor = S3ObjectFacts {
+        delete_marker: false,
         version_id: None,
         ..anchor
     };

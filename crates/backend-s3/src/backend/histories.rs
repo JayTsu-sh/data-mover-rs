@@ -298,6 +298,7 @@ fn object_record(
     last_modified: Option<StorageTimestamp>,
 ) -> Result<(RecordKind, SourceIdentity, String), EntryOperationFailure> {
     let facts = S3ObjectFacts {
+        delete_marker: false,
         size: listed.size,
         etag: listed.etag,
         version_id: Some(listed.version_id),

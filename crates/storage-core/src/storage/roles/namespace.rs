@@ -57,6 +57,9 @@ pub trait Namespace: Send + Sync {
     /// descriptor must come from this destination after its last data/metadata mutation.
     /// Implementations recheck identity and change evidence; this is neither content validation
     /// nor an exclusion lock. Callers must exclude concurrent writers through source removal.
+    /// S3 对象桶也可确认 `describe_version` 返回的选中删除标记。Id 复核精确历史版本；
+    /// 将该描述的 version 设为 Current 会额外要求此标记仍为当前唯一记录，其原有身份
+    /// 和 history 事实必须保留。null 标记还要求可比较的修改时间证据。不读取内容或改写。
     /// Unsupported backends refuse rather than treating readable page-cache data as durable.
     async fn persist_observed(
         &self,

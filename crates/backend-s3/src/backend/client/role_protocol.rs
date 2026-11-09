@@ -36,6 +36,7 @@ mod network_tests;
 
 mod delete_batch;
 mod delete_marker;
+mod head;
 mod hints;
 mod listing;
 mod multipart;
@@ -195,10 +196,15 @@ impl S3Storage {
             .key(&full_key)
             .set_version_id(version_id.map(str::to_string))
             .send()
-            .await
-            .map_err(|error| {
+            .await;
+        match response {
+            Ok(response) => head::facts(&response, version_id),
+            Err(error) => {
+                if let Some(marker) = head::marker_error(error.raw_response(), version_id) {
+                    return marker;
+                }
                 let failure = classify_sdk!(error, "S3 HeadObject request failed");
-                if version_id.is_some() {
+                Err(if version_id.is_some() {
                     versioned_failure(
                         error.raw_response().map(|r| r.status().as_u16()),
                         error
@@ -208,25 +214,9 @@ impl S3Storage {
                     )
                 } else {
                     failure
-                }
-            })?;
-        let size = response
-            .content_length()
-            .and_then(|n| u64::try_from(n).ok())
-            .ok_or_else(|| {
-                s3_role_entry(
-                    crate::model::FailureClass::Corruption,
-                    "S3 HeadObject returned invalid content length",
-                )
-            })?;
-        Ok(crate::storage::backends::s3::S3ObjectFacts {
-            size,
-            etag: response.e_tag().unwrap_or_default().to_string(),
-            version_id: response.version_id().map(str::to_string),
-            last_modified: response
-                .last_modified()
-                .and_then(|time| http_last_modified(time.secs())),
-        })
+                })
+            }
+        }
     }
 }
 

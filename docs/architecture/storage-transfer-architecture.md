@@ -1013,10 +1013,23 @@ Semantics the procedure relies on:
 - **Duplicates.** Nothing is skipped as already copied: running a finished version again adds
   another destination version. A failure with `final_destination_changed` may already have created
   one.
-- **Delete markers.** A marker has no content: `Id(marker)` answers the versioned `HEAD` with 405
-  and fails that entry as `NotFound`. data-mover never writes a delete marker to a final key;
-  replaying one (a plain `DeleteObject` on the destination key between the versions around it) is
-  the caller's decision.
+- **Delete markers.** A marker has no content. `ReadSource::describe_version(Id(marker))`
+  accepts an exact marker HEAD (including the standard 405 response only when its marker and
+  version headers confirm the requested identity). The descriptor has `size=None`, no content
+  version and `listing_only=true`; its one-record history is partial. `read` refuses it, even for
+  an empty range. `describe(Current)` still reports absence when a marker hides the current key.
+  Marker replay uses the existing namespace deletion semantics between data versions; the caller
+  owns sequencing and the actual published version mapping.
+- **Marker persistence.** A certified object bucket's `Namespace::persist_observed` confirms a
+  selected marker with one exact-version HEAD. It preserves both historical and current records.
+  For a marker descriptor whose selector is changed to `Current`, it additionally lists the exact
+  key and requires the same marker to be its unique latest record. Pagination retains at most
+  one current record and conflict flags, and stops once the ordered key cursor has passed the key.
+  The outer cancellation token cancels HEAD and LIST. A null marker requires modification-time
+  evidence; NAS, foreign/incomplete evidence, contradictory latest records, missing identity or
+  changed current bindings fail closed. These are read-only checks, not writer exclusion locks;
+  the caller must exclude concurrent writers through source deletion. SDK request timeouts and
+  caller budgets still apply; this operation adds no implicit product retry window.
 - **Destinations without versioning.** In a suspended or unversioned bucket every copy replaces the
   single `"null"` version, so only the last copied version remains and `destination_version` is
   `None`.

@@ -5,8 +5,9 @@ use bytes::Bytes;
 use futures::{StreamExt as _, future::BoxFuture, stream::FuturesOrdered};
 
 use crate::model::{
-    BackendIdentity, EntryKind, FailureClass, IdentityStrength, ModelValueError, Operation,
-    SourceIdentity, SourceVersion, StoragePath, TimestampMetadata, Transience,
+    BackendIdentity, EntryKind, FailureClass, HistoryOrder, IdentityStrength, ModelValueError,
+    ObjectHistory, Operation, SourceIdentity, SourceVersion, StoragePath, TimestampMetadata,
+    Transience,
 };
 use crate::storage::ListingFacts;
 use crate::storage::{
@@ -14,8 +15,11 @@ use crate::storage::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::histories::record;
+
 use super::{
-    S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3SeenObject, is_real_version_id, object_change,
+    S3ListedVersion, S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3SeenObject, S3VersionFacts,
+    is_real_version_id, object_change,
 };
 
 pub struct S3ReadSource<P> {
@@ -90,8 +94,70 @@ impl<P: S3Protocol + 'static> S3ReadSource<P> {
             // versioned object bucket marked `bucket_type=nas`): the `ETag` identifies the object.
             facts.version_id = None;
         }
+        if facts.delete_marker
+            && (operation != Operation::Observe || matches!(version, SourceVersion::Current))
+        {
+            return Err(classified_entry(
+                path,
+                operation,
+                FailureClass::NotFound,
+                Transience::Permanent,
+                "delete marker has no readable object data",
+            ));
+        }
         Ok(facts)
     }
+}
+
+/// 单个选中标记只提供该版本的事实，partial history 不声称整个 key 已列举完整。
+pub(super) fn marker_descriptor(
+    identity: &BackendIdentity,
+    path: &StoragePath,
+    facts: &S3ObjectFacts,
+) -> Result<SourceDescriptor, StorageRoleFailure> {
+    let id = facts
+        .version_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            classified_entry(
+                path,
+                Operation::Observe,
+                FailureClass::Protocol,
+                Transience::Unknown,
+                "marker has no confirmed version id",
+            )
+        })?;
+    let marker = record(
+        identity,
+        path,
+        S3ListedVersion {
+            key: path.as_str().into(),
+            facts: S3VersionFacts {
+                version_id: id.into(),
+                is_latest: false,
+                delete_marker: true,
+                size: 0,
+                etag: String::new(),
+            },
+            last_modified: facts.last_modified,
+            position: None,
+        },
+    )
+    .map_err(StorageRoleFailure::Entry)?;
+    let mut descriptor = SourceDescriptor::new(
+        path.clone(),
+        EntryKind::File,
+        None,
+        marker.identity().clone(),
+    );
+    descriptor.version = SourceVersion::Id(id.into());
+    descriptor.listing.listing_only = true;
+    descriptor.listing.history = Some(Box::new(
+        ObjectHistory::segment_of(vec![marker], HistoryOrder::Server, 0, false, None)
+            .map_err(|error| entry(path, Operation::Observe, error.to_string()))?,
+    ));
+    Ok(descriptor)
 }
 
 /// The identity of the object at `path` as `facts` describe it: `VersionScoped(version id)` for a
@@ -104,6 +170,12 @@ pub(super) fn object_identity(
     path: &StoragePath,
     facts: &super::S3ObjectFacts,
 ) -> Result<SourceIdentity, ModelValueError> {
+    if facts.delete_marker {
+        return Err(ModelValueError::new(
+            "source_identity",
+            "a delete marker has no data-object identity",
+        ));
+    }
     match real_version(facts) {
         Some(version) => {
             SourceIdentity::new(backend.clone(), IdentityStrength::VersionScoped, version)
@@ -188,6 +260,9 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
                 Transience::Permanent,
                 "the S3 store did not answer with the requested version",
             ));
+        }
+        if facts.delete_marker {
+            return marker_descriptor(&self.identity, path, &facts);
         }
         let source_identity = object_identity(&self.identity, path, &facts)
             .map_err(|e| entry(path, Operation::Observe, e.to_string()))?;

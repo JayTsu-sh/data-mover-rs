@@ -423,6 +423,7 @@ pub(super) fn object_facts(
     last_modified: Option<StorageTimestamp>,
 ) -> S3ObjectFacts {
     S3ObjectFacts {
+        delete_marker: false,
         size,
         etag: etag.to_string(),
         version_id: version_id.map(str::to_string),
@@ -459,6 +460,13 @@ pub(super) fn file_descriptor(
     path: StoragePath,
     facts: &S3ObjectFacts,
 ) -> Result<SourceDescriptor, EntryOperationFailure> {
+    if facts.delete_marker {
+        return Err(child_failure(
+            &path,
+            FailureClass::NotFound,
+            "selected version is a delete marker, not a data object",
+        ));
+    }
     let source_identity = object_identity(identity, &path, facts)
         .map_err(|_| child_failure(&path, FailureClass::Protocol, "invalid S3 object identity"))?;
     let mut descriptor =

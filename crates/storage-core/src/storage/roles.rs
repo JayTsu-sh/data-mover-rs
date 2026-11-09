@@ -174,6 +174,10 @@ pub trait ReadSource: Send + Sync {
     /// Describes one version of `path`. The descriptor pins the version it describes, which a
     /// versioned source resolves from `Current` to the version it found.
     ///
+    /// 对象存储可描述明确选中的删除标记：`listing_only=true`、`size=None`，history
+    /// 仅携带一个已选记录，且不声称整个 key 历史完整。它不是可读数据，`read` 必须拒绝；
+    /// `Current` 隐藏的删除标记仍按当前对象缺失处理。
+    ///
     /// The default serves sources without versions: `Current` is [`ReadSource::describe`], and
     /// `Id` is `Unsupported`.
     async fn describe_version(

@@ -56,6 +56,7 @@ pub(super) async fn describe_source(
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
         })?;
+    super::observation::refuse_unreadable(&descriptor)?;
     if let Some(observed) = request.source_observation() {
         super::observation::validate_constraint(source, observed, &descriptor)?;
     }

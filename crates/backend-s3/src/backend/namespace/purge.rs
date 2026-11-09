@@ -395,7 +395,10 @@ fn batch_result(
 }
 
 /// LIST 的毫秒和 HEAD 的 HTTP 秒按实际较粗精度比较；缺失证据不能与已有时间相等。
-fn same_modified(actual: Option<StorageTimestamp>, expected: Option<StorageTimestamp>) -> bool {
+pub(super) fn same_modified(
+    actual: Option<StorageTimestamp>,
+    expected: Option<StorageTimestamp>,
+) -> bool {
     match (actual, expected) {
         (Some(actual), Some(expected)) => {
             let quantum = actual

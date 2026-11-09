@@ -75,6 +75,7 @@ mod tests {
 
     fn described() -> S3ObjectFacts {
         S3ObjectFacts {
+            delete_marker: false,
             size: 10,
             etag: "\"nas-1\"".into(),
             version_id: None,
@@ -101,6 +102,7 @@ mod tests {
         let replaced = (true, FailureClass::Conflict, Transience::Permanent);
         let same = described();
         let unquoted = S3ObjectFacts {
+            delete_marker: false,
             etag: "nas-1".into(),
             last_modified: None,
             ..described()
@@ -111,14 +113,17 @@ mod tests {
         }
         for current in [
             S3ObjectFacts {
+                delete_marker: false,
                 etag: "\"nas-2\"".into(),
                 ..described()
             },
             S3ObjectFacts {
+                delete_marker: false,
                 size: 11,
                 ..described()
             },
             S3ObjectFacts {
+                delete_marker: false,
                 last_modified: http_last_modified(1_790_000_001),
                 ..described()
             },

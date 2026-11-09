@@ -26,8 +26,9 @@ pub enum InlineOwnership {
 /// most listings.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ListingFacts {
-    /// The key's whole history, from the listing of a versioned bucket; carried onto the observed
-    /// entry, each record observed on its own when the plan asks for more than the listing gave.
+    /// 版本桶列举携带的历史段，完整性由 `ObjectHistory::is_complete` 标明。
+    /// 指定删除标记的 `describe_version` 可只携带一个选中记录的非完整历史；不能据此
+    /// 推断整个 key 已列举完毕。计划需要额外事实时按记录观察。
     pub history: Option<Box<ObjectHistory>>,
     /// A real unversioned zero-byte object represented by this logical directory. Absent on
     /// virtual directories; retained separately so object-store copies do not invent or lose keys.
