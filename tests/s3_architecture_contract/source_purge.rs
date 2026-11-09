@@ -204,3 +204,60 @@ async fn assert_source_retained(
     );
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires run-source-purge-local.py --null-source or --null-marker owned RustFS"]
+async fn mutable_null_source_purge_with_real_requests() -> TestResult {
+    let storage = connected(&env::var("LAB_S3_PURGE_URL")?).await?;
+    let key = env::var("LAB_S3_PURGE_KEY")?;
+    let source = observed(&storage, &key)
+        .await?
+        .ok_or("seeded null source missing")?;
+    let fault = env::var("LAB_S3_PURGE_FAULT")?;
+    let control = env::var("LAB_S3_PURGE_CONTROL")?;
+    assert!(
+        source
+            .history()
+            .and_then(ObjectHistory::latest)
+            .is_some_and(|record| record.version_id().is_none())
+    );
+    if fault == "nullchanged" {
+        // 在发请求前推进服务端时钟，避免把实际替换误测成 SDK 超时。
+        sleep(Duration::from_millis(1100)).await;
+    }
+    fs::write(&control, &fault)?;
+    let started = Instant::now();
+    let result = timeout(
+        Duration::from_secs(10),
+        storage
+            .namespace()?
+            .purge_observed(&source, CancellationToken::new()),
+    )
+    .await;
+    fs::write(&control, "normal")?;
+    let result = result?;
+    println!(
+        "null-source fault={fault} elapsed_ms={} result={result:?}",
+        started.elapsed().as_millis()
+    );
+    match fault.as_str() {
+        "normal" => {
+            assert_eq!(result?, PurgeOutcome::Deleted { records: 1 });
+            assert!(observed(&storage, &key).await?.is_none());
+        }
+        "nullchanged" => {
+            let error = result
+                .err()
+                .ok_or("changed null source was permanently deleted")?;
+            assert!(
+                matches!(error.source.as_ref(), StorageRoleFailure::Entry(cause)
+                if cause.class() == FailureClass::Conflict),
+                "{error:?}"
+            );
+            assert_source_retained(&storage, &key, &source).await?;
+        }
+        _ => return Err("unknown null-source fault".into()),
+    }
+    assert!(observed(&storage, "sentinel").await?.is_some());
+    Ok(())
+}

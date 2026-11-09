@@ -40,7 +40,7 @@ def isolated_run():
     try:
         print(f"isolated source-purge image={docker('inspect', container, '--format', '{{.Image}}')}", flush=True)
         pid = docker("inspect", container, "--format", "{{.State.Pid}}")
-        arguments = [flag for flag in ("--namespace-read", "--source-observation", "--namespace-persistence", "--marker-persistence", "--current-source", "--version-batch", "--version-batch-perf") if flag in sys.argv]
+        arguments = [flag for flag in ("--namespace-read", "--source-observation", "--namespace-persistence", "--marker-persistence", "--current-source", "--null-source", "--null-marker", "--version-batch", "--version-batch-perf") if flag in sys.argv]
         subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *arguments], check=True)
     finally:
         docker("rm", "-f", "-v", container)
@@ -69,8 +69,10 @@ def inside_run():
         from source_version_batch import run
         return run(client, bucket, performance="--version-batch-perf" in sys.argv)
     current_source = "--current-source" in sys.argv
+    null_marker = "--null-marker" in sys.argv
+    null_source = "--null-source" in sys.argv or null_marker
     if not current_source:
-        client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+        client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Suspended" if null_source else "Enabled"})
     stopped = threading.Event()
     observing = "--source-observation" in sys.argv
     marker_persist = "--marker-persistence" in sys.argv
@@ -112,13 +114,22 @@ def inside_run():
                     else:
                         client.delete_object(Bucket=bucket, Key=f"{prefix}/payload", VersionId=current_marker)
                     control.write_text("normal")
-                if observing or persisting or current_source:
+                if observing or persisting or current_source or null_source:
                     if self.command == "GET" and payload and not tagging:
                         requests["data_get"] += 1
                     if self.command in ("PUT", "POST", "DELETE"):
                         requests["writes"] += 1
                     if current_source and self.command == "HEAD" and payload:
                         requests["payload_heads"] += 1
+                if null_source and mode == "nullchanged" and self.command == "GET" and "versions" in self.path.partition("?")[2]:
+                    # 同一个可变 null 槽，内容／opaque identity 不变，但修改事实必须改变。
+                    if null_marker:
+                        # 重复 Delete 可由服务幂等合并；先写数据，再重建同一个 null 标记槽。
+                        client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
+                        client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
+                    else:
+                        client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
+                    control.write_text("normal")
                 if observing and payload and mode == "alternate":
                     if self.command == "HEAD":
                         alternating[0] += 1
@@ -229,14 +240,18 @@ def inside_run():
                           "contradictory_marker_current_first", "contradictory_marker_history_first")
             if marker_persist:
                 modes += ("list_disconnect", "list_stall", "list_cancel", "missing_id", "wrong_id", "invalid_type", "replaced", "missing")
+            if null_source:
+                modes = ("normal", "nullchanged")
             for mode in modes:
                 prefix = f"nightly-local-{mode}"
-                for index in range(1 if current_source else 5 if mode == "partial_denial" else 3):
+                for index in range(1 if current_source or null_source else 5 if mode == "partial_denial" else 3):
                     client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
                     # Two historical markers of the same key catch acknowledged-but-retained
                     # bulk marker deletes; a single marker does not reproduce the failure.
                     if not reading and not current_source and mode == "normal" and index < 2:
                         client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
+                if null_marker:
+                    client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
                 if marker_persist:
                     historical_marker = client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")["VersionId"]
                     client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"before current marker")
@@ -249,7 +264,9 @@ def inside_run():
                     LAB_S3_PURGE_URL=f"s3://purge-test:purge-test-isolated-only@{bucket}.127.0.0.1:{server.server_port}/{prefix}",
                     LAB_S3_PURGE_KEY="payload", LAB_S3_PURGE_FAULT=mode, LAB_S3_PURGE_CONTROL=str(control),
                 )
-                if marker_persist:
+                if null_source:
+                    test_name = "source_purge::mutable_null_source_purge_with_real_requests"
+                elif marker_persist:
                     environment.update(LAB_S3_HISTORICAL_MARKER=historical_marker, LAB_S3_CURRENT_MARKER=current_marker)
                     test_name = "marker_persistence::published_marker_persistence_with_real_requests"
                 elif persisting:
@@ -274,11 +291,15 @@ def inside_run():
                 if current_source and mode == "normal":
                     assert requests["payload_heads"] - before_heads == 1, requests
                 if not reading and not current_source and mode == "normal":
-                    assert requests["version_deletes"] - before_deletes == 4, requests
+                    assert requests["version_deletes"] - before_deletes == (1 if null_source else 4), requests
+                if mode == "nullchanged":
+                    assert requests["version_deletes"] == before_deletes, requests
                 remaining = client.list_object_versions(Bucket=bucket, Prefix=f"{prefix}/")
                 records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
                 payload_records = [record for record in records if record["Key"] == f"{prefix}/payload"]
                 expected = 0 if not reading and mode in ("normal", "flash", "lost_ack") else 3 if mode == "partial_denial" else 1 if mode == "malformed_batch" or current_source else 4 if mode.startswith("contradictory_marker_") else 3
+                if null_source:
+                    expected = 0 if mode == "normal" else 1
                 if marker_persist:
                     expected = 7 if mode == "replaced" else 5 if mode == "missing" else 6
                 assert len(payload_records) == expected, (mode, payload_records)
@@ -287,6 +308,9 @@ def inside_run():
             if observing or persisting:
                 assert requests == {"data_get": 0, "writes": 0}, requests
                 print("target-persistence data_GET=0 writes=0" if persisting else "source-observation data_GET=0 writes=0 missing_metadata_is_error=true shared_budget=true", flush=True)
+            if null_source:
+                assert requests["data_get"] == 0, requests
+                print(f"null-source marker={null_marker} normal_deleted=true changed_retained=true data_GET=0", flush=True)
             if current_source:
                 assert requests["data_get"] == 0, requests
                 print(f"current-source purge data_GET=0 normal_payload_HEAD=1 requests={requests}", flush=True)

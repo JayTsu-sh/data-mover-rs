@@ -6,7 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{TestResult, connected};
 use data_mover::model::{FailureClass, SourceVersion, StoragePath};
+use data_mover::storage::Storage;
 use data_mover::storage::{Namespace, SourceDescriptor, StorageRoleFailure};
+use data_mover::transfer::{TransferPhase, TransferRequest, transfer};
 
 #[tokio::test]
 #[ignore = "requires run-source-purge-local.py --marker-persistence owned RustFS and proxy"]
@@ -46,6 +48,7 @@ async fn published_marker_persistence_with_real_requests() -> TestResult {
             .persist_observed(marker, CancellationToken::new())
             .await?;
     }
+    refuse_marker_transfer(&storage, &historical).await?;
     current.version = SourceVersion::Current;
     faulted_confirmation(namespace.as_ref(), &current).await?;
     // 旧标记不会因当前绑定变化而不可描述，整个验证不读取数据、不改写对象。
@@ -137,4 +140,21 @@ fn failure_class(result: Result<(), StorageRoleFailure>) -> FailureClass {
         Err(error) => class(&error),
         Ok(()) => panic!("injected failure must not confirm marker persistence"),
     }
+}
+
+async fn refuse_marker_transfer(storage: &Storage, marker: &SourceDescriptor) -> TestResult {
+    let result = transfer(
+        TransferRequest::new(
+            storage.clone(),
+            marker.path.clone(),
+            storage.clone(),
+            CancellationToken::new(),
+        )
+        .with_source_version(marker.version.clone()),
+    )
+    .await;
+    let error = result.err().ok_or("marker was transferred as empty data")?;
+    assert_eq!(error.phase(), TransferPhase::Describe);
+    println!("marker ordinary-transfer refused_at=Describe before_destination_mutation=true");
+    Ok(())
 }

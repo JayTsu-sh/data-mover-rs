@@ -273,6 +273,20 @@ operations; only the named replacement/removal was performed by fixture control.
 marker descriptor cannot be read as empty data. This verifies the storage contract on RustFS,
 not task source purge, other vendors or a unified network-jitter recovery budget.
 
+`python3 tests/lab/run-source-purge-local.py --null-source` and `--null-marker`
+check the mutable null slot on a real suspended RustFS bucket. Each runs an unchanged
+record and a replacement after its original observation. The data replacement keeps
+its bytes/ETag; the marker replacement writes data and recreates the null marker
+(repeated Delete alone may be idempotently merged). The 2026-11-09 run deleted the
+unchanged slots and refused both replacements before any source DELETE, with one
+record and the sentinel retained and no payload GET. Comparison uses the model's
+normalized absent version ID, not the literal string `"null"`. A deterministic
+regression first failed with the old condition and passes for data and markers,
+while immutable IDs retain their prior behavior. The fixture waits for modification
+time to advance before issuing the tested request; this is no product retry/delay.
+The marker-persistence suite also verifies actual ordinary transfer refusal at
+Describe before destination mutation in all fifteen modes.
+
 `python3 tests/lab/run-source-purge-local.py --source-observation` tests the composed
 current-source observation against real S3. Nine modes cover success, denied tag
 reads, metadata NotFound while HEAD still succeeds, disconnect, silent timeout,

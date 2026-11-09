@@ -429,7 +429,7 @@ fn same_anchor(actual: &VersionRecord, expected: &VersionRecord) -> bool {
         && actual.identity() == expected.identity()
         && same_payload
         // null 记录可以原地替换，不能只靠版本号或 marker 的路径身份保护。
-        && (actual.version_id() != Some("null") || actual.modified() == expected.modified())
+        && (actual.version_id().is_some() || actual.modified() == expected.modified())
 }
 
 fn cancelled(key: &StoragePath, submitted: bool) -> StorageRoleFailure {
@@ -655,3 +655,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "purge/null_anchor_tests.rs"]
+mod null_anchor_tests;
