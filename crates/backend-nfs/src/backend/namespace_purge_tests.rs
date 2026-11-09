@@ -232,10 +232,10 @@ async fn confirmed_absent_and_unknown_outcomes_remain_distinct_without_reissue()
             0 => assert!(matches!(result, Ok(PurgeOutcome::Deleted { records: 1 }))),
             1 => assert!(matches!(result, Ok(PurgeOutcome::AlreadyAbsent))),
             2 => assert!(
-                matches!(result, Err(StorageRoleFailure::Session(error)) if error.class() == FailureClass::Connectivity && error.transience() == Transience::Unknown)
+                matches!(result, Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Session(error) if error.class() == FailureClass::Connectivity && error.transience() == Transience::Unknown))
             ),
             _ => assert!(
-                matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
+                matches!(result, Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::Conflict))
             ),
         }
         assert_eq!(protocol.calls.load(Ordering::Acquire), 1);
@@ -258,7 +258,7 @@ async fn cancellation_before_start_has_no_io_and_inflight_cancellation_remains_u
     };
     let (result, ()) = tokio::join!(namespace.purge_observed(&entry, cancel.clone()), trigger);
     assert!(
-        matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled && error.transience() == Transience::Unknown)
+        matches!(result, Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::Cancelled && error.transience() == Transience::Unknown))
     );
     assert_eq!(protocol.calls.load(Ordering::Acquire), 1);
     Ok(())

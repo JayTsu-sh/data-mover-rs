@@ -17,8 +17,8 @@ use crate::model::{
 use crate::storage::artifacts::{is_artifact_native, is_artifact_path};
 use crate::storage::{InlineOwnership, ListingFacts};
 use crate::storage::{
-    ListRequest, ListingStream, Namespace, NamespaceCapabilities, PurgeOutcome, SourceDescriptor,
-    StorageRoleFailure,
+    ListRequest, ListingStream, Namespace, NamespaceCapabilities, PurgeFailure, PurgeOutcome,
+    SourceDescriptor, StorageRoleFailure,
 };
 
 #[derive(Clone)]
@@ -393,8 +393,10 @@ impl Namespace for NfsNamespaceAdapter {
         &self,
         entry: &ObservedEntry,
         cancel: CancellationToken,
-    ) -> Result<PurgeOutcome, StorageRoleFailure> {
-        self.purge_entry(entry, cancel).await
+    ) -> Result<PurgeOutcome, PurgeFailure> {
+        self.purge_entry(entry, cancel)
+            .await
+            .map_err(PurgeFailure::from)
     }
 
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {

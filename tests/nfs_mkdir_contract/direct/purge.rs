@@ -10,8 +10,8 @@ use data_mover::model::{
     SymlinkTarget, SymlinkTargetEncoding, Transience,
 };
 use data_mover::storage::{
-    CreateSymlinkRequest, MetadataMutation, PurgeOutcome, Storage, StorageRoleFailure,
-    create_directory_all, observe_descriptor,
+    CreateSymlinkRequest, MetadataMutation, PurgeFailure, PurgeOutcome, Storage,
+    StorageRoleFailure, create_directory_all, observe_descriptor,
 };
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
@@ -64,7 +64,7 @@ async fn conflict(source: &Storage, entry: &ObservedEntry) -> Result {
         .err()
         .ok_or("changed source was purged")?;
     assert!(
-        matches!(error, StorageRoleFailure::Entry(error) if error.class() == FailureClass::Conflict)
+        matches!(error.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::Conflict)
     );
     Ok(())
 }
@@ -288,7 +288,7 @@ async fn permission_refusal(
         .err()
         .ok_or("readonly parent allowed deletion")?;
     assert!(
-        matches!(error, StorageRoleFailure::Entry(error) if error.class() == FailureClass::PermissionDenied)
+        matches!(error.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::PermissionDenied)
     );
     Ok(())
 }
@@ -318,7 +318,7 @@ async fn real_nfs_source_purge_fault_contract() -> Result {
     Ok(())
 }
 
-type PurgeResult = std::result::Result<PurgeOutcome, StorageRoleFailure>;
+type PurgeResult = std::result::Result<PurgeOutcome, PurgeFailure>;
 
 async fn purge_fault(mode: &str) -> Result {
     control("normal").await?;
@@ -397,7 +397,7 @@ fn check_fault_result(result: PurgeResult, mode: &str, v3: bool) -> Result<bool>
         let error = result
             .err()
             .ok_or("unconfirmed source purge became success")?;
-        let (class, transience, diagnostic) = match &error {
+        let (class, transience, diagnostic) = match error.source.as_ref() {
             StorageRoleFailure::Entry(error) => {
                 (error.class(), error.transience(), error.diagnostic())
             }

@@ -14,7 +14,7 @@ use crate::storage::SourceDescriptor;
 use crate::storage::listing::{ListRequest, ListingStream};
 
 mod purge;
-pub use purge::PurgeOutcome;
+pub use purge::{PurgeFailure, PurgeOutcome};
 
 /// Creates a link itself; the target is stored verbatim, never traversed during creation.
 /// Parents must exist. Ownership and times may be sent with creation in one protocol operation.
@@ -158,13 +158,17 @@ pub trait Namespace: Send + Sync {
     /// not enforced by this role. It must exclude concurrent writers: protocols do not
     /// universally offer atomic compare-and-unlink. A failure may follow partial historical
     /// cleanup; re-observe before retrying. Missing entries are idempotent. This never recursively
-    /// deletes children.
+    /// deletes children. `PurgeFailure` preserves the first typed cause and each additional
+    /// failed version in the bounded batch. An error does not mean no historical record was
+    /// deleted, and cancellation after submission may leave unknown outcomes.
     async fn purge_observed(
         &self,
         entry: &ObservedEntry,
         cancel: CancellationToken,
-    ) -> Result<PurgeOutcome, StorageRoleFailure> {
-        purge::current(self, entry, &cancel).await
+    ) -> Result<PurgeOutcome, PurgeFailure> {
+        purge::current(self, entry, &cancel)
+            .await
+            .map_err(PurgeFailure::from)
     }
 
     /// Deletes listed non-directory entries. Results correspond one-for-one, in input order;

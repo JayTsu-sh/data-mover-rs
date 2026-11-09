@@ -8,7 +8,8 @@ use tokio_util::sync::CancellationToken;
 use super::{TestResult, connected};
 use data_mover::model::{FailureClass, ObjectHistory, ObservedEntry, StoragePath, VersionRecord};
 use data_mover::storage::{
-    CollectLimits, ListRequest, PurgeOutcome, Storage, StorageRoleFailure, collect_listing,
+    CollectLimits, ListRequest, PurgeFailure, PurgeOutcome, Storage, StorageRoleFailure,
+    collect_listing,
 };
 
 async fn observed(storage: &Storage, key: &str) -> TestResult<Option<ObservedEntry>> {
@@ -36,18 +37,46 @@ async fn observed(storage: &Storage, key: &str) -> TestResult<Option<ObservedEnt
 
 fn reject_contradictory_listing(
     fault: &str,
-    result: Result<PurgeOutcome, StorageRoleFailure>,
+    result: Result<PurgeOutcome, PurgeFailure>,
 ) -> TestResult {
     let error = result
         .err()
         .ok_or("contradictory listing authorized purge")?;
     assert!(
-        matches!(error, StorageRoleFailure::Entry(ref cause)
+        matches!(error.source.as_ref(), StorageRoleFailure::Entry(cause)
         if cause.class() == FailureClass::Protocol
             && cause.diagnostic().contains("current and historical")),
         "{error:?}"
     );
     println!("contradictory listing refused fault={fault} cause={error:?}");
+    Ok(())
+}
+
+fn reject_batch_fault(fault: &str, result: Result<PurgeOutcome, PurgeFailure>) -> TestResult {
+    let error = result.err().ok_or("batch fault became success")?;
+    assert!(error.version.is_some());
+    assert_eq!(error.additional.len(), 1);
+    let expected = if fault == "partial_denial" {
+        FailureClass::PermissionDenied
+    } else {
+        FailureClass::Protocol
+    };
+    for cause in std::iter::once(error.source.as_ref())
+        .chain(error.additional.iter().map(|(_, cause)| cause))
+    {
+        assert!(
+            matches!(cause, StorageRoleFailure::Entry(cause) if cause.class() == expected)
+                || matches!(cause, StorageRoleFailure::Session(cause) if cause.class() == expected)
+        );
+    }
+    assert_ne!(
+        error.version.as_ref(),
+        error.additional.first().map(|(version, _)| version)
+    );
+    println!(
+        "batch purge fault={fault} primary_version={:?} additional={:?}",
+        error.version, error.additional
+    );
     Ok(())
 }
 
@@ -95,9 +124,9 @@ async fn permanent_source_purge_with_real_requests() -> TestResult {
         mode if mode.starts_with("contradictory_") => reject_contradictory_listing(mode, result)?,
         "flash" | "lost_ack" => {
             if let Err(error) = result {
-                let class = match error {
-                    StorageRoleFailure::Entry(ref cause) => cause.class(),
-                    StorageRoleFailure::Session(ref cause) => cause.class(),
+                let class = match error.source.as_ref() {
+                    StorageRoleFailure::Entry(cause) => cause.class(),
+                    StorageRoleFailure::Session(cause) => cause.class(),
                 };
                 assert!(matches!(
                     class,
@@ -113,6 +142,10 @@ async fn permanent_source_purge_with_real_requests() -> TestResult {
             }
             assert!(observed(&storage, &key).await?.is_none());
         }
+        "partial_denial" | "malformed_batch" => {
+            reject_batch_fault(&fault, result)?;
+            assert_source_retained(&storage, &key, &source).await?;
+        }
         "normal" => {
             assert_eq!(
                 result?,
@@ -126,9 +159,9 @@ async fn permanent_source_purge_with_real_requests() -> TestResult {
             let error = result
                 .err()
                 .ok_or("fault injection unexpectedly succeeded")?;
-            let class = match error {
-                StorageRoleFailure::Entry(ref e) => e.class(),
-                StorageRoleFailure::Session(ref e) => e.class(),
+            let class = match error.source.as_ref() {
+                StorageRoleFailure::Entry(e) => e.class(),
+                StorageRoleFailure::Session(e) => e.class(),
             };
             println!("source purge failure_class={class:?}");
             match fault.as_str() {

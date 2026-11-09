@@ -96,8 +96,8 @@ performance certification is implied by these malformed-listing checks.
 `python3 tests/lab/run-source-purge-local.py --version-batch` exercises the SDK implementation
 of the existing S3Protocol::delete_objects after extending its input with SourceVersion.
 This does not add a public entrypoint or type. Current namespace/artifact callers explicitly
-select Current; source-history purge still uses its serial, current-last route until partial
-failures can be delivered completely by the application. No nfs-rs change is required.
+select Current. At this primitive-only step source-history purge still used its serial,
+current-last route; the later dedicated PurgeFailure integration is documented below. No nfs-rs change is required.
 
 Each isolated case seeds an old null slot, an immutable data version, a delete marker and a
 current data version. Only the three older IDs are submitted; independent reads require the
@@ -163,14 +163,54 @@ were finished before timing.
 Median phase time was 10617.775→230.613 ms; whole-process time 10.68→0.30 s, peak RSS
 28.6875→30.00 MiB. This is a small same-key SDK experiment, not the guarded purge lifecycle,
 ClickHouse/callback, whole-migration throughput/RSS, release, other vendors or 1000+ pagination
-certification. The application is still pinned to its prior Native revision and source purge
-still deletes serially; product-level adoption remains pending complete partial-error delivery.
+certification. At that measurement step the application was pinned to its prior Native revision and source
+purge was still serial; this SDK measurement does not imply product-level adoption.
 Raw logs/results and the fixed binary are in `/tmp/native-exact-bulk-perf/` and
 `/tmp/native-exact-bulk-perf6.log`; SHA-256 is
 `6e5897f390101828714e7cdf802674481b85593d735c9b04a1b47e1d53a6b4ed`.
 All owned containers/volumes were removed. No SDK or new public function/type was needed;
 protocol selection/receipt handling stays in the S3 adapter, source readiness/order in purge,
 and job/error-count/callback policy in the application.
+
+### Dedicated permanent-cleanup failures and protected version batches
+
+The existing Namespace::purge_observed now returns the user-authorized PurgeFailure type.
+It retains an optional exact first selector, a boxed original StorageRoleFailure as the
+standard error source, and each additional (SourceVersion, StorageRoleFailure) in the bounded
+batch. Listing/anchor failures do not invent a version. General entry/session role errors,
+scanning, directory creation and recursive target deletion keep their existing contracts;
+Local/NFS and the default filesystem route only wrap the same original error. No SDK or new
+operation entrypoint is added. The explicit error-source implementation is checked by a
+downcast test, not inferred from the displayed message.
+
+S3 purge submits only old records through the existing delete_objects, at most 100 per batch.
+It re-lists/rechecks the current anchor between batches, never reuses a deletion-shifted page
+cursor, stops after any failed batch and separately deletes the current ID last. All returned
+version failures survive; a malformed result count refuses success and identifies unconfirmed
+requested versions. Cancellation before submission sends no request; in-flight cancellation
+returns the requested version causes with unknown outcomes. Successful sibling deletions are
+not rolled back. Existing exclusivity requirements remain; this is not atomic source fencing
+or an authorization to purge before the caller confirms all required target results.
+
+The S3 suite passed 433 tests (three ignored); core passed 224 tests and its two adapter
+contracts. Four new S3 checks cover 100 mixed typed causes, partial success, missing batch
+results and cancellation timing; core checks the original error source and absence of an
+invented version. Existing Local/NFS/S3 call sites and tests were migrated to the dedicated
+error contract. The complete CI scope passed in 53 sequential steps on Rust 1.98.1, including
+strict Clippy, features, workspace tests, all examples and Local E2E. The first front gate
+stopped on two new doc-markdown backticks; they were corrected and the full scope rerun.
+Existing ignored tests/future-compatibility notes are not counted as runtime passes.
+
+The versioned owned runner now has 13 real cases: the original 11 plus a real bulk response
+with two refused versions/two actually deleted siblings, and a rewritten successful response
+missing one version ID. Independent reads confirm respectively three/final-current-only
+records left, all failed version causes preserved, and the current record/sentinel intact.
+Permission, disconnect, silent timeout, token cancellation, flash/lost-response retry and
+contradictory lists also passed. The seven current-only source cases passed unchanged,
+including exactly one normal HEAD and zero data GETs. Recovery in these fixtures is an
+explicit test retry, not an application retry or unified-budget claim. Application adoption,
+callback pagination, history-target readiness and whole-migration performance require their
+separate product evidence; source/target concurrent-write exclusion still applies.
 
 `--current-source` uses the same contract against a bucket that was never versioned.
 Its observation comes from LIST (milliseconds), whereas the purge guard reads HEAD

@@ -93,7 +93,8 @@ def inside_run():
 
             def handle_request(self):
                 mode = control.read_text().strip()
-                deleting = self.command == "DELETE" and "versionId=" in self.path
+                bulk = self.command == "POST" and "delete" in self.path.partition("?")[2]
+                deleting = (self.command == "DELETE" and "versionId=" in self.path) or bulk
                 if deleting and "version_deletes" in requests:
                     requests["version_deletes"] += 1
                 payload = self.path.partition("?")[0].endswith("/payload")
@@ -140,6 +141,27 @@ def inside_run():
                 upstream = http.client.HTTPConnection("127.0.0.1", 9000, timeout=5)
                 try:
                     body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                    if bulk and mode == "partial_denial":
+                        selected = [{"Key": node.find("{*}Key").text, "VersionId": node.find("{*}VersionId").text}
+                                    for node in ET.fromstring(body) if node.tag.rsplit("}", 1)[-1] == "Object"]
+                        assert len(selected) == 4, selected
+                        actual = client.delete_objects(Bucket=bucket, Delete={"Objects": selected[2:], "Quiet": False})
+                        reply = ET.Element("DeleteResult")
+                        for item in actual["Deleted"]:
+                            node = ET.SubElement(reply, "Deleted")
+                            ET.SubElement(node, "Key").text = item["Key"]
+                            ET.SubElement(node, "VersionId").text = item["VersionId"]
+                        for item in selected[:2]:
+                            node = ET.SubElement(reply, "Error")
+                            ET.SubElement(node, "Key").text = item["Key"]
+                            ET.SubElement(node, "VersionId").text = item["VersionId"]
+                            ET.SubElement(node, "Code").text = "AccessDenied"
+                        payload = ET.tostring(reply)
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
                     upstream.request(self.command, self.path, body=body, headers=dict(self.headers))
                     response = upstream.getresponse()
                     payload = response.read()
@@ -156,6 +178,12 @@ def inside_run():
                         position = list(document).index(latest) + int(mode.endswith("_current_first"))
                         document.insert(position, duplicate)
                         payload = ET.tostring(document, encoding="utf-8")
+                    if bulk and mode == "malformed_batch" and response.status == 200:
+                        reply = ET.fromstring(payload)
+                        first = next(node for node in reply if node.tag.rsplit("}", 1)[-1] == "Deleted")
+                        first.remove(first.find("{*}VersionId"))
+                        payload = ET.tostring(reply)
+                        rewritten = True
                     if deleting and mode == "lost_ack":
                         control.write_text("normal")
                         self.close_connection = True
@@ -179,11 +207,11 @@ def inside_run():
         try:
             modes = ("normal", "readonly", "missing_metadata", "disconnect", "stall", "cancel", "flash", "recover_stall", "alternate") if observing else (("normal", "readonly", "disconnect", "stall", "cancel", "flash", "recover_stall") if reading else ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "lost_ack"))
             if not reading and not current_source:
-                modes += ("contradictory_data_current_first", "contradictory_data_history_first",
+                modes += ("partial_denial", "malformed_batch", "contradictory_data_current_first", "contradictory_data_history_first",
                           "contradictory_marker_current_first", "contradictory_marker_history_first")
             for mode in modes:
                 prefix = f"nightly-local-{mode}"
-                for _ in range(1 if current_source else 3):
+                for _ in range(1 if current_source else 5 if mode == "partial_denial" else 3):
                     client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
                 if mode.startswith("contradictory_marker_"):
                     client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
@@ -217,7 +245,7 @@ def inside_run():
                 remaining = client.list_object_versions(Bucket=bucket, Prefix=f"{prefix}/")
                 records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
                 payload_records = [record for record in records if record["Key"] == f"{prefix}/payload"]
-                expected = 0 if not reading and mode in ("normal", "flash", "lost_ack") else 1 if current_source else 4 if mode.startswith("contradictory_marker_") else 3
+                expected = 0 if not reading and mode in ("normal", "flash", "lost_ack") else 3 if mode == "partial_denial" else 1 if mode == "malformed_batch" or current_source else 4 if mode.startswith("contradictory_marker_") else 3
                 assert len(payload_records) == expected, (mode, payload_records)
                 assert any(record["Key"] == f"{prefix}/sentinel" for record in records)
                 print(f"independent S3 inspection fault={mode} source_records={len(payload_records)} sentinel=retained", flush=True)

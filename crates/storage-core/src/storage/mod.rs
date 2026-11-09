@@ -88,9 +88,10 @@ pub use roles::{
     FailedDataCleanup, FinalDestination, Metadata, MetadataMutation, NameNormalization,
     NameSemantics, Namespace, NamespaceCapabilities, PositionedByteStream, PositionedChunk,
     PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure,
-    PublishRequest, PurgeOutcome, ReadBackMethod, ReadRequest, ReadSource, StagedDestination,
-    StagedMetadataApplicationFailure, StorageRoleFailure, UnpinnedReadReason, UploadDigest,
-    UploadDigestGap, VerificationEvidence, VerificationPoint, VerifyRequest, WriteEvidence,
+    PublishRequest, PurgeFailure, PurgeOutcome, ReadBackMethod, ReadRequest, ReadSource,
+    StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, UnpinnedReadReason,
+    UploadDigest, UploadDigestGap, VerificationEvidence, VerificationPoint, VerifyRequest,
+    WriteEvidence,
 };
 
 pub use crate::runtime::read_budget::ReadBudget;

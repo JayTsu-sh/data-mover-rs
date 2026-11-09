@@ -46,7 +46,7 @@ use crate::storage::artifacts::is_artifact_name;
 use crate::storage::durability::sync_directory;
 use crate::storage::{
     CaseSensitivity, ListRequest, ListingStream, NameNormalization, NameSemantics, Namespace,
-    NamespaceCapabilities, PurgeOutcome, SourceDescriptor, StorageRoleFailure,
+    NamespaceCapabilities, PurgeFailure, PurgeOutcome, SourceDescriptor, StorageRoleFailure,
 };
 use hooks::Hooks;
 #[cfg(any(test, feature = "test-support"))]
@@ -389,17 +389,17 @@ impl Namespace for LocalNamespace {
         &self,
         entry: &ObservedEntry,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<PurgeOutcome, StorageRoleFailure> {
+    ) -> Result<PurgeOutcome, PurgeFailure> {
         if cancel.is_cancelled() {
-            return Err(entry_failure(
-                entry.path(),
-                Operation::Namespace,
-                FailureClass::Cancelled,
-            ));
+            return Err(
+                entry_failure(entry.path(), Operation::Namespace, FailureClass::Cancelled).into(),
+            );
         }
         #[cfg(unix)]
         {
-            self.purge_entry(entry, cancel).await
+            self.purge_entry(entry, cancel)
+                .await
+                .map_err(PurgeFailure::from)
         }
         #[cfg(not(unix))]
         {
@@ -407,7 +407,8 @@ impl Namespace for LocalNamespace {
                 entry.path(),
                 Operation::Namespace,
                 FailureClass::Unsupported,
-            ))
+            )
+            .into())
         }
     }
 

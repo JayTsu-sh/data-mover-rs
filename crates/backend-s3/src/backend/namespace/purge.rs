@@ -9,15 +9,15 @@ use super::super::histories::record;
 use super::super::listing::file_descriptor;
 use super::super::paging::Paging;
 use super::super::source::role_failure;
-use super::super::{S3Protocol, S3Result};
+use super::super::{S3Protocol, S3ProtocolFailure, S3Result};
 use super::{S3Namespace, failure, refuse_artifact};
 use crate::model::{
-    EntryKind, FailureClass, ObservedEntry, Operation, RecordKind, StoragePath, StorageTimestamp,
-    VersionRecord,
+    EntryKind, FailureClass, ObservedEntry, Operation, RecordKind, SourceVersion, StoragePath,
+    StorageTimestamp, Transience, VersionRecord,
 };
-use crate::storage::{PurgeOutcome, StorageRoleFailure};
+use crate::storage::{PurgeFailure, PurgeOutcome, StorageRoleFailure};
 
-const BATCH_RECORDS: usize = 128;
+const BATCH_RECORDS: usize = 100;
 
 struct Batch {
     latest: Option<VersionRecord>,
@@ -78,14 +78,15 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
         &self,
         entry: &ObservedEntry,
         cancel: &CancellationToken,
-    ) -> Result<PurgeOutcome, StorageRoleFailure> {
+    ) -> Result<PurgeOutcome, PurgeFailure> {
         check_cancel(entry.path(), cancel)?;
         if entry.path().as_str().is_empty() {
             return Err(failure(
                 entry.path(),
                 FailureClass::InvalidInput,
                 "cannot purge the storage root",
-            ));
+            )
+            .into());
         }
         let entry = entry.directory_marker_object().unwrap_or(entry);
         if entry.kind() == EntryKind::Directory && entry.history().is_none() {
@@ -123,13 +124,13 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
         entry: &ObservedEntry,
         key: &StoragePath,
         cancel: &CancellationToken,
-    ) -> Result<PurgeOutcome, StorageRoleFailure> {
+    ) -> Result<PurgeOutcome, PurgeFailure> {
         let facts = match request(key, cancel, self.protocol.head(key.as_str())).await {
             Ok(facts) => facts,
             Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
                 return Ok(PurgeOutcome::AlreadyAbsent);
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         let current = file_descriptor(&self.identity, key.clone(), &facts)
             .map_err(StorageRoleFailure::Entry)?;
@@ -141,7 +142,8 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
                 key,
                 FailureClass::Conflict,
                 "source object changed after observation; retained",
-            ));
+            )
+            .into());
         }
         check_cancel(key, cancel)?;
         if self.protocol.bucket_capabilities().versions {
@@ -159,7 +161,7 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
         key: &StoragePath,
         expected: &VersionRecord,
         cancel: &CancellationToken,
-    ) -> Result<PurgeOutcome, StorageRoleFailure> {
+    ) -> Result<PurgeOutcome, PurgeFailure> {
         let mut deleted = 0_u64;
         let mut previous: Option<HashSet<String>> = None;
         loop {
@@ -183,7 +185,8 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
                     key,
                     FailureClass::Conflict,
                     "source history changed after observation; current record retained",
-                ));
+                )
+                .into());
             }
             if batch.older.is_empty() {
                 self.purge_version(key, latest.version_id().unwrap_or("null"), cancel)
@@ -200,12 +203,10 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
                     key,
                     FailureClass::Protocol,
                     "purge listing did not advance after confirmed deletes; current record retained",
-                ));
+                ).into());
             }
-            for version in &batch.older {
-                self.purge_version(key, version, cancel).await?;
-                deleted += 1;
-            }
+            self.purge_older(key, &batch.older, cancel).await?;
+            deleted += batch.older.len() as u64;
             previous = Some(batch.older.into_iter().collect());
             // 删除会改变分页位置；下一批从头列举，不复用已删除记录的游标。
         }
@@ -216,7 +217,7 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
         key: &StoragePath,
         version: &str,
         cancel: &CancellationToken,
-    ) -> Result<(), StorageRoleFailure> {
+    ) -> Result<(), PurgeFailure> {
         check_cancel(key, cancel)?;
         request(
             key,
@@ -224,6 +225,31 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
             self.protocol.delete_version(key.as_str(), version),
         )
         .await
+        .map_err(|source| version_failure(version, source))
+    }
+
+    async fn purge_older(
+        &self,
+        key: &StoragePath,
+        versions: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<(), PurgeFailure> {
+        check_cancel(key, cancel)?;
+        let selected: Vec<_> = versions
+            .iter()
+            .map(|id| (key.as_str().to_owned(), SourceVersion::Id(id.clone())))
+            .collect();
+        let results = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                let cause = cancelled(key, true);
+                selected.iter().map(|_| Err(cause.clone())).collect()
+            }
+            results = self.protocol.delete_objects(&selected) => results.into_iter()
+                .map(|result| result.map_err(|error| role_failure(key, Operation::Namespace, error)))
+                .collect(),
+        };
+        batch_result(key, versions, results)
     }
 
     async fn purge_batch(
@@ -284,6 +310,53 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
     }
 }
 
+fn version_failure(version: &str, source: StorageRoleFailure) -> PurgeFailure {
+    PurgeFailure {
+        version: Some(SourceVersion::Id(version.to_owned())),
+        source: Box::new(source),
+        additional: Vec::new(),
+    }
+}
+
+fn batch_result(
+    key: &StoragePath,
+    versions: &[String],
+    results: Vec<Result<(), StorageRoleFailure>>,
+) -> Result<(), PurgeFailure> {
+    let mismatch = (results.len() != versions.len()).then(|| {
+        role_failure(
+            key,
+            Operation::Namespace,
+            S3ProtocolFailure::protocol(
+                "purge batch result count does not match requested versions; outcomes unknown",
+            ),
+        )
+    });
+    let mut results = results.into_iter();
+    let mut failures = versions.iter().filter_map(|id| {
+        let cause = match results.next() {
+            Some(Err(cause)) => Some(cause),
+            Some(Ok(())) | None => mismatch.clone(),
+        };
+        cause.map(|cause| (SourceVersion::Id(id.clone()), cause))
+    });
+    if let Some(source) = &mismatch {
+        return Err(PurgeFailure {
+            version: None,
+            source: Box::new(source.clone()),
+            additional: failures.collect(),
+        });
+    }
+    let Some((version, source)) = failures.next() else {
+        return Ok(());
+    };
+    Err(PurgeFailure {
+        version: Some(version),
+        source: Box::new(source),
+        additional: failures.collect(),
+    })
+}
+
 /// LIST 的毫秒和 HEAD 的 HTTP 秒按实际较粗精度比较；缺失证据不能与已有时间相等。
 fn same_modified(actual: Option<StorageTimestamp>, expected: Option<StorageTimestamp>) -> bool {
     match (actual, expected) {
@@ -319,13 +392,29 @@ fn same_anchor(actual: &VersionRecord, expected: &VersionRecord) -> bool {
         && (actual.version_id() != Some("null") || actual.modified() == expected.modified())
 }
 
+fn cancelled(key: &StoragePath, submitted: bool) -> StorageRoleFailure {
+    role_failure(
+        key,
+        Operation::Namespace,
+        S3ProtocolFailure::entry(
+            FailureClass::Cancelled,
+            if submitted {
+                Transience::Unknown
+            } else {
+                Transience::Transient
+            },
+            if submitted {
+                "purge cancelled; submitted deletion outcomes may be unknown"
+            } else {
+                "source purge cancelled before request submission"
+            },
+        ),
+    )
+}
+
 fn check_cancel(key: &StoragePath, cancel: &CancellationToken) -> Result<(), StorageRoleFailure> {
     if cancel.is_cancelled() {
-        Err(failure(
-            key,
-            FailureClass::Cancelled,
-            "source purge cancelled",
-        ))
+        Err(cancelled(key, false))
     } else {
         Ok(())
     }
@@ -339,7 +428,7 @@ async fn request<T>(
 ) -> Result<T, StorageRoleFailure> {
     tokio::select! {
         biased;
-        () = cancel.cancelled() => Err(failure(key, FailureClass::Cancelled, "purge request cancelled; sent mutation outcome may be unknown")),
+        () = cancel.cancelled() => Err(cancelled(key, true)),
         result = operation => result.map_err(|error| role_failure(key, Operation::Namespace, error)),
     }
 }
@@ -347,6 +436,7 @@ async fn request<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssertTestError;
     use crate::model::{BackendIdentity, BackendKind, IdentityStrength, SourceIdentity};
 
     type Result = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -414,5 +504,114 @@ mod tests {
     #[test]
     fn delete_marker_cannot_be_both_current_and_historical() -> Result {
         reject_conflicting_current_flag(true)
+    }
+
+    #[test]
+    fn all_batch_causes_keep_their_versions_and_typed_scope() -> Result {
+        let key = StoragePath::new("payload")?;
+        let versions: Vec<_> = (0..100)
+            .map(|index| {
+                if index == 0 {
+                    "null".into()
+                } else {
+                    format!("v{index}")
+                }
+            })
+            .collect();
+        let results: Vec<_> = (0..100)
+            .map(|index| {
+                Err(role_failure(
+                    &key,
+                    Operation::Namespace,
+                    if index % 2 == 0 {
+                        S3ProtocolFailure::entry(
+                            FailureClass::PermissionDenied,
+                            Transience::Permanent,
+                            "AccessDenied",
+                        )
+                    } else {
+                        S3ProtocolFailure::session(
+                            FailureClass::Timeout,
+                            Transience::Unknown,
+                            "lost batch receipt",
+                        )
+                    },
+                ))
+            })
+            .collect();
+        let failure = batch_result(&key, &versions, results).assert_error("batch failed");
+        assert_eq!(failure.version, Some(SourceVersion::Id("null".into())));
+        assert!(
+            matches!(failure.source.as_ref(), StorageRoleFailure::Entry(cause)
+            if cause.class() == FailureClass::PermissionDenied && cause.diagnostic() == "AccessDenied")
+        );
+        assert_eq!(failure.additional.len(), 99);
+        for (index, (version, cause)) in failure.additional.iter().enumerate() {
+            assert_eq!(*version, SourceVersion::Id(format!("v{}", index + 1)));
+            assert_eq!(
+                matches!(cause, StorageRoleFailure::Session(cause)
+                if cause.class() == FailureClass::Timeout && cause.transience() == Transience::Unknown),
+                index % 2 == 0
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_batch_success_does_not_create_extra_failures() -> Result {
+        let key = StoragePath::new("payload")?;
+        let versions = vec!["old".into(), "held".into(), "marker".into()];
+        let denied = failure(&key, FailureClass::PermissionDenied, "held history");
+        let result = batch_result(&key, &versions, vec![Ok(()), Err(denied.clone()), Ok(())]);
+        let error = result.assert_error("held version failed");
+        assert_eq!(error.version, Some(SourceVersion::Id("held".into())));
+        assert_eq!(*error.source, denied);
+        assert!(error.additional.is_empty());
+        assert!(batch_result(&key, &versions, vec![Ok(()), Ok(()), Ok(())]).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn short_batch_results_report_unknown_and_preserve_a_known_denial() -> Result {
+        let key = StoragePath::new("payload")?;
+        let versions = vec!["old".into(), "held".into(), "marker".into()];
+        let error = batch_result(
+            &key,
+            &versions,
+            vec![
+                Ok(()),
+                Err(failure(
+                    &key,
+                    FailureClass::PermissionDenied,
+                    "known denial",
+                )),
+            ],
+        )
+        .assert_error("missing result is not success");
+        assert!(error.version.is_none());
+        assert_eq!(error.additional.len(), 3);
+        assert!(
+            matches!(error.source.as_ref(), StorageRoleFailure::Session(cause)
+            if cause.class() == FailureClass::Protocol && cause.transience() == Transience::Unknown)
+        );
+        assert!(
+            matches!(&error.additional[1].1, StorageRoleFailure::Entry(cause)
+            if cause.class() == FailureClass::PermissionDenied && cause.diagnostic() == "known denial")
+        );
+        assert_eq!(error.additional[2].0, SourceVersion::Id("marker".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_distinguishes_before_submission_and_unknown_inflight_outcome() -> Result {
+        let key = StoragePath::new("payload")?;
+        for (submitted, transience) in [(false, Transience::Transient), (true, Transience::Unknown)]
+        {
+            assert!(
+                matches!(cancelled(&key, submitted), StorageRoleFailure::Entry(cause)
+                if cause.class() == FailureClass::Cancelled && cause.transience() == transience)
+            );
+        }
+        Ok(())
     }
 }

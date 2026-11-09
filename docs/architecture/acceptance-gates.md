@@ -99,6 +99,15 @@ last, or certify all target history; the purge caller owns those gates. Applicat
 requires complete partial-failure reporting and independent verification of remaining source
 versions, target readiness and task/callback statistics.
 
+Namespace::purge_observed uses the dedicated PurgeFailure error contract: the primary typed
+role failure remains the standard source, an optional selector identifies its version, and
+additional bounded version causes remain typed. The S3 implementation sends only old records
+in batches of 100, retains the current anchor until all old batches succeed, and never converts
+partial/unknown outcomes into success. Other role operations keep StorageRoleFailure and its
+entry/session axes. Filesystem cleanup wraps its existing failure without changing mutation
+behavior. Product callers must deliver all final causes without recounting one entry per
+version; this library does not own job statistics or callbacks.
+
 
 ## 4. Parameterized directed matrix gates
 

@@ -22,8 +22,8 @@ use crate::model::{
 };
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::{
-    ListRequest, ListingStream, NameSemantics, Namespace, NamespaceCapabilities, PurgeOutcome,
-    SourceDescriptor, StorageRoleFailure,
+    ListRequest, ListingStream, NameSemantics, Namespace, NamespaceCapabilities, PurgeFailure,
+    PurgeOutcome, SourceDescriptor, StorageRoleFailure,
 };
 
 mod persistence;
@@ -222,7 +222,7 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
         &self,
         entry: &ObservedEntry,
         cancel: CancellationToken,
-    ) -> Result<PurgeOutcome, StorageRoleFailure> {
+    ) -> Result<PurgeOutcome, PurgeFailure> {
         self.purge_entry(entry, &cancel).await
     }
 

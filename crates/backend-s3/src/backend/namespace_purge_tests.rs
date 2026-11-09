@@ -37,7 +37,7 @@ async fn unchanged_listing_after_acknowledged_deletion_stops_before_current_remo
         .store(true, Ordering::Relaxed);
     assert!(
         matches!(namespace.purge_observed(&entry, CancellationToken::new()).await,
-        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Protocol)
+        Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::Protocol))
     );
     assert!(protocol.version_deletes().is_empty());
     assert!(protocol.objects.lock().await.contains_key("key"));
@@ -98,7 +98,7 @@ async fn partial_historical_failure_keeps_the_current_anchor() -> TestResult {
     protocol.lock_version("key", "v0001");
     assert!(
         matches!(namespace.purge_observed(&entry, CancellationToken::new()).await,
-        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::PermissionDenied)
+        Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::PermissionDenied))
     );
     assert_eq!(protocol.version_deletes().len(), 2);
     assert!(
@@ -177,7 +177,7 @@ async fn current_purge_compares_list_and_head_times_at_observed_precision() -> T
             assert_eq!(protocol.version_deletes(), [("key".into(), "null".into())]);
         } else {
             assert!(
-                matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
+                matches!(result, Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::Conflict))
             );
             assert!(protocol.version_deletes().is_empty());
             assert!(protocol.objects.lock().await.contains_key("key"));
@@ -222,12 +222,12 @@ async fn changed_history_and_cancellation_never_authorize_purge() -> TestResult 
     put(&protocol, "key", b"uncopied").await?;
     assert!(
         matches!(namespace.purge_observed(&entry, CancellationToken::new()).await,
-        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
+        Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::Conflict))
     );
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert!(matches!(namespace.purge_observed(&entry, cancel).await,
-        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled));
+        Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::Cancelled)));
     assert!(protocol.version_deletes().is_empty());
     Ok(())
 }
@@ -243,7 +243,7 @@ async fn readonly_history_retains_current_record_and_reports_permission_denied()
     protocol.lock_versions("key");
     assert!(
         matches!(namespace.purge_observed(&entry, CancellationToken::new()).await,
-        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::PermissionDenied)
+        Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::PermissionDenied))
     );
     assert!(protocol.version_deletes().is_empty());
     assert_eq!(
