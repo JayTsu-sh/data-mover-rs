@@ -1521,7 +1521,10 @@ impl NFSStorage {
                 return Err(e);
             }
         };
+        // RPC 根与缓存命名空间必须同时绑定前缀，避免同一 export 的不同根复用相对路径。
+        let cache_fh = build_cache_root_fh(self.server_id, &fh);
         *self.root_fh.write().map_err(|_| root_fh_lock_err())? = fh;
+        *self.cache_root_fh.write().map_err(|_| root_fh_lock_err())? = cache_fh;
         self.root = Arc::new(root_dir);
         Ok(self)
     }

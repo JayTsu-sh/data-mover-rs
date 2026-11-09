@@ -31,6 +31,8 @@ mod nonfile;
 mod persistence;
 #[path = "direct/purge.rs"]
 mod purge;
+#[path = "direct/root_cache.rs"]
+mod root_cache;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires run-nfs-direct-contract.py and its owned NFS prefix"]

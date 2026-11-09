@@ -1291,3 +1291,43 @@ compatibility notes remain. The final architecture review kept cancellation and
 NFS outcome classification together in the metadata adapter, reused its existing
 token and failure mapping, and added neither product policy nor public API.
 Normal whole-migration throughput/RSS is not certified by these backend tests.
+
+### NFS bound-root cache isolation (2026-11-09)
+
+`direct::root_cache::real_nfs_bound_roots_isolate_directory_cache_and_metadata`
+in the prebuilt `nfs_mkdir_contract` binary requires an exclusively prepared
+`LAB_NFS_DIRECT_URL` prefix. It creates only `cache-a/item/body` and
+`cache-b/item/body` below that prefix, connects separate storage instances rooted
+at each child, and writes different modes to the same relative directory `item`.
+The parent-root lookup and independent VM reads must see mode 0711 for A, 0722
+for B, and the distinct original payloads `prefix A` / `prefix B`.
+
+Before the fix, both Linux NFSv3 and v4.1 changed A to 0722 while leaving B at
+0755: the test fails and independent guest stat confirms the wrong-root mutation.
+`attach_root` had changed the RPC root handle without updating the existing cache
+root identifier, so relative paths from different bound prefixes could collide.
+The fix updates both handles during binding through the existing cache-key helper,
+as root refresh already does. It adds no public function/type, per-operation RPC,
+cache-wide clearing, timer, retry, or application policy. Both real protocols now
+pass with independent mode and payload checks. The exact-prefix runner cleans its
+own roots; no export/service/firewall is changed. Red/green raw evidence is at
+`/tmp/native-nfs-prefix-cache-real/` on the development host.
+
+The final architecture review keeps RPC and cache namespace binding together in
+`NFSStorage::attach_root`, preserving shared directory handles only for instances
+with the same actual bound root and endpoint identity. No nfs-rs change is needed.
+The prior application migration recovery failures under ordinary timestamps and
+then fixed atime are retained as separate diagnostic evidence, not counted as
+passing cancellation/recovery runs; complete application revalidation follows
+with this exact dependency revision. This root-isolation check alone does not
+certify whole-migration performance or all storage vendors.
+
+This isolated fix passed the complete CI scope in 53 sequential steps, including
+strict all-target Clippy, architecture/harness/minimal-feature guards, workspace
+and doc tests, every example build, and the four Local E2E assertions. Examples
+were released only after compiler completion to bound the shared build-cache
+footprint; the Local tests reused that already-passed compilation scope. All 16
+real metadata network/cancellation/recovery cases were rerun on the fixed root
+binding and passed with independent payload/attribute checks. The two root
+isolation cases use unmodified current filesystem timestamps and distinct data;
+no atime relaxation or safety-check bypass is part of the production fix.

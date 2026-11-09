@@ -72,6 +72,14 @@ URL 协议版本本身不构成 ACL 能力证明。当前 ACL 自动复制、损
 [元数据协商](metadata-negotiation.md#acl-自动复制与错误报告)。四组合的历史实机结果见
 [验收报告](../../docs/reports/2026-10-28-nfs-acl-four-way-validation.md)，其旧复制开关不属于当前接口。
 
+## 绑定前缀与目录缓存
+
+绑定子目录时，RPC 根文件句柄与既有目录缓存的根标识必须同时切换；缓存根由
+端点身份与实际已绑定根 FH 构成。否则同一 export 的不同前缀可能复用相对路径，
+将元数据修改发到另一个根。根刷新遵循同一规则，不通过清空全部缓存绕过隔离。
+Linux v3/v4.1 的旧错误复现及修复后独立核验见
+[实验室说明](../../tests/lab/README.md#nfs-bound-root-cache-isolation-2026-11-09)。
+
 ## 元数据应用取消
 
 既有 `Metadata::apply` 的令牌覆盖 NFS 元数据写入及 ACL 读回等待，而不只检查调用前状态。
