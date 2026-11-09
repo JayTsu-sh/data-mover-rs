@@ -280,7 +280,7 @@ impl NfsNamespaceAdapter {
         path: &StoragePath,
         fresh: bool,
     ) -> Result<SourceDescriptor, StorageRoleFailure> {
-        checked(path)?;
+        checked_allow_root(path)?;
         let entry = self
             .protocol
             .stat(path, fresh)

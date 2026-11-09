@@ -407,3 +407,7 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 4. 改完跑 `make e2e-nfs` (需测试服务器)。
 
 目录列举的路径句柄解析使用 `role_lookup_fh`，保留原生 LOOKUP 的 Connectivity/Timeout 分类。旧 `lookup_fh` 会把原生错误转成字符串，不能用于扫描角色，否则恢复期间并发目录失败会被误报成 Protocol/Unknown。
+
+### 根目录观察与持久性
+
+现有 Namespace::stat 接受空 StoragePath 所表示的绑定根；persist_observed 仅对根目录放开路径准入，并保留当前身份、ctime／mtime、属性和前后 fresh 前缀复核。根文件、根删除和根创建仍被拒绝，不新增公开函数或类型。真实 v3／v4.1 根元数据回归覆盖 mode 的闪断、持续断连、静默超时、取消、丢确认，以及 owner／time 取消和 v4.1 ACL 写入／读回取消，共 16 例。显式恢复后由服务端独立核验子文件及请求属性，取消返回小于 1 秒；未据此声称整个迁移已有统一 3 秒预算。

@@ -8,6 +8,7 @@ use data_mover::model::{
 use data_mover::storage::{MetadataMutation, Storage, StorageRoleFailure, create_directory_all};
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use super::fault::control;
 use super::{Result, common, connect};
@@ -20,9 +21,32 @@ async fn real_nfs_metadata_fault_contract() -> Result {
         if env::var("LAB_NFS_DIRECT_ONLY").is_ok_and(|selected| selected != mode) {
             continue;
         }
-        timeout(Duration::from_secs(55), exercise(&family, mode)).await??;
+        timeout(Duration::from_secs(55), exercise(&family, mode, false)).await??;
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the metadata-cancel relay with --test-name selecting this root contract"]
+async fn real_nfs_root_metadata_fault_contract() -> Result {
+    let family = env::var("LAB_NFS_METADATA_FAMILY").unwrap_or_else(|_| "mode".into());
+    for mode in ["flash", "disconnect", "stall", "cancel", "lost_ack"] {
+        if env::var("LAB_NFS_DIRECT_ONLY").is_ok_and(|selected| selected != mode) {
+            continue;
+        }
+        timeout(Duration::from_secs(55), exercise(&family, mode, true)).await??;
+    }
+    Ok(())
+}
+
+async fn bound_root(url: &str, path: &StoragePath) -> Result<Storage> {
+    let mut url = Url::parse(url)?;
+    url.set_path(&format!(
+        "{}/{}",
+        url.path().trim_end_matches('/'),
+        path.as_str()
+    ));
+    connect(url.as_str()).await
 }
 
 async fn mutation(storage: &Storage, path: &StoragePath, family: &str) -> Result<MetadataMutation> {
@@ -61,7 +85,16 @@ async fn mutation(storage: &Storage, path: &StoragePath, family: &str) -> Result
     })
 }
 
-async fn exercise(family: &str, mode: &str) -> Result {
+async fn confirm_root(storage: &Storage, path: &StoragePath) -> Result {
+    let descriptor = storage.namespace()?.stat(path).await?;
+    storage
+        .namespace()?
+        .persist_observed(&descriptor, CancellationToken::new())
+        .await?;
+    Ok(())
+}
+
+async fn exercise(family: &str, mode: &str, rooted: bool) -> Result {
     control("normal").await?;
     let target = connect(&env::var("LAB_NFS_DIRECT_PROXY_URL")?).await?;
     let path = StoragePath::new(format!("metadata-{family}-{mode}"))?;
@@ -72,11 +105,22 @@ async fn exercise(family: &str, mode: &str) -> Result {
     std::fs::write(root.path().join(file.as_str()), b"metadata retained body")?;
     let source = common::connect_local(root.path(), 2).await?;
     super::persistence::copy(&source, &target, &file).await?;
-    let mutation = mutation(&target, &path, family).await?;
+    let (mutation_target, mutation_path) = if rooted {
+        (
+            bound_root(&env::var("LAB_NFS_DIRECT_PROXY_URL")?, &path).await?,
+            StoragePath::root(),
+        )
+    } else {
+        (target.clone(), path.clone())
+    };
+    if rooted {
+        confirm_root(&mutation_target, &mutation_path).await?;
+    }
+    let mutation = mutation(&mutation_target, &mutation_path, family).await?;
     control(&format!("commit-{mode}")).await?;
     let token = CancellationToken::new();
-    let metadata = target.metadata()?;
-    let operation = metadata.apply(&path, mutation.clone(), token.clone());
+    let metadata = mutation_target.metadata()?;
+    let operation = metadata.apply(&mutation_path, mutation.clone(), token.clone());
     let started = Instant::now();
     let result = if mode == "cancel" {
         let cancel = async {
@@ -119,11 +163,22 @@ async fn exercise(family: &str, mode: &str) -> Result {
         Ok(()) => assert!(matches!(mode, "flash" | "lost_ack")),
     }
     control("normal").await?;
-    let retry = connect(&env::var("LAB_NFS_DIRECT_URL")?).await?;
+    let retry = if rooted {
+        bound_root(&env::var("LAB_NFS_DIRECT_URL")?, &path).await?
+    } else {
+        connect(&env::var("LAB_NFS_DIRECT_URL")?).await?
+    };
     retry
         .metadata()?
-        .apply(&path, mutation, CancellationToken::new())
+        .apply(&mutation_path, mutation, CancellationToken::new())
         .await?;
+    if rooted {
+        confirm_root(&retry, &mutation_path).await?;
+        assert!(retry.namespace()?.delete(&mutation_path).await.is_err());
+        println!(
+            "NFS root mutation family={family} fault={mode} stat=true persistence=true endpoint_delete_refused=true"
+        );
+    }
     assert_eq!(
         std::fs::read(root.path().join(file.as_str()))?,
         b"metadata retained body"

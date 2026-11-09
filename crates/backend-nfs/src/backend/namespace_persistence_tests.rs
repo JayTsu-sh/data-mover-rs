@@ -405,3 +405,24 @@ async fn non_file_replacement_during_confirmation_is_refused() -> Result {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn root_directory_confirmation_rechecks_binding_and_never_deletes_the_endpoint() -> Result {
+    let (namespace, state, _) = fixture()?;
+    state.kind.store(1, Ordering::Release);
+    let root = StoragePath::root();
+    let expected = namespace.stat(&root).await?;
+    namespace
+        .persist_observed(&expected, CancellationToken::new())
+        .await?;
+    assert_eq!(state.fresh_stats.load(Ordering::Acquire), 2);
+    assert_eq!(state.opened.load(Ordering::Acquire), 0);
+    assert!(namespace.delete(&root).await.is_err());
+    assert!(namespace.create_directory(&root).await.is_err());
+    state.generation.fetch_add(1, Ordering::AcqRel);
+    assert!(
+        matches!(namespace.persist_observed(&expected, CancellationToken::new()).await,
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
+    );
+    Ok(())
+}

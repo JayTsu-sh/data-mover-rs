@@ -4,7 +4,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use super::{NfsNamespaceAdapter, checked};
+use super::{NfsNamespaceAdapter, checked, checked_allow_root};
 use crate::model::{EntryKind, FailureClass, Operation, SourceVersion, StoragePath, Transience};
 use crate::storage::backends::nfs::source::{NfsProtocolFailure, entry_failure, role_failure};
 use crate::storage::backends::nfs::staged::NfsStageFile;
@@ -51,7 +51,11 @@ impl NfsNamespaceAdapter {
     }
 
     fn validate_expected(&self, expected: &SourceDescriptor) -> Result<(), StorageRoleFailure> {
-        checked(&expected.path)?;
+        if expected.kind == EntryKind::Directory {
+            checked_allow_root(&expected.path)?;
+        } else {
+            checked(&expected.path)?;
+        }
         if !matches!(
             expected.kind,
             EntryKind::File | EntryKind::Directory | EntryKind::Symlink
