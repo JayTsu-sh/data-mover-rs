@@ -21,7 +21,7 @@ const BATCH_RECORDS: usize = 100;
 
 struct Batch {
     latest: Option<VersionRecord>,
-    older: Vec<String>,
+    older: Vec<VersionRecord>,
     found: bool,
 }
 
@@ -54,8 +54,12 @@ impl Batch {
             self.latest = Some(version);
         } else if self.older.len() < BATCH_RECORDS {
             let id = version.version_id().unwrap_or("null");
-            if !self.older.iter().any(|seen| seen == id) {
-                self.older.push(id.to_owned());
+            if !self
+                .older
+                .iter()
+                .any(|seen| seen.version_id().unwrap_or("null") == id)
+            {
+                self.older.push(version);
             }
         }
         Ok(())
@@ -64,7 +68,9 @@ impl Batch {
     fn current_and_history_conflict(&self, version: &VersionRecord) -> bool {
         let id = version.version_id().unwrap_or("null");
         if version.is_latest() {
-            self.older.iter().any(|older| older == id)
+            self.older
+                .iter()
+                .any(|older| older.version_id().unwrap_or("null") == id)
         } else {
             self.latest
                 .as_ref()
@@ -196,8 +202,10 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
                 });
             }
             if previous.as_ref().is_some_and(|previous| {
-                previous.len() == batch.older.len()
-                    && batch.older.iter().all(|id| previous.contains(id))
+                batch
+                    .older
+                    .iter()
+                    .any(|record| previous.contains(record.version_id().unwrap_or("null")))
             }) {
                 return Err(failure(
                     key,
@@ -207,7 +215,13 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
             }
             self.purge_older(key, &batch.older, cancel).await?;
             deleted += batch.older.len() as u64;
-            previous = Some(batch.older.into_iter().collect());
+            previous = Some(
+                batch
+                    .older
+                    .iter()
+                    .map(|record| record.version_id().unwrap_or("null").to_owned())
+                    .collect(),
+            );
             // 删除会改变分页位置；下一批从头列举，不复用已删除记录的游标。
         }
     }
@@ -218,7 +232,7 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
         version: &str,
         cancel: &CancellationToken,
     ) -> Result<(), PurgeFailure> {
-        check_cancel(key, cancel)?;
+        check_cancel(key, cancel).map_err(|source| version_failure(version, source))?;
         request(
             key,
             cancel,
@@ -229,6 +243,29 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
     }
 
     async fn purge_older(
+        &self,
+        key: &StoragePath,
+        records: &[VersionRecord],
+        cancel: &CancellationToken,
+    ) -> Result<(), PurgeFailure> {
+        let versions: Vec<_> = records
+            .iter()
+            .filter(|record| !record.is_delete_marker())
+            .map(|record| record.version_id().unwrap_or("null").to_owned())
+            .collect();
+        if !versions.is_empty() {
+            self.purge_older_data(key, &versions, cancel).await?;
+        }
+        // Some stores acknowledge every marker in DeleteObjects but remove only one.
+        // Keep same-key marker mutations separate; the current anchor remains last.
+        for marker in records.iter().filter(|record| record.is_delete_marker()) {
+            self.purge_version(key, marker.version_id().unwrap_or("null"), cancel)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn purge_older_data(
         &self,
         key: &StoragePath,
         versions: &[String],

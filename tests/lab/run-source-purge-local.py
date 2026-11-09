@@ -211,8 +211,12 @@ def inside_run():
                           "contradictory_marker_current_first", "contradictory_marker_history_first")
             for mode in modes:
                 prefix = f"nightly-local-{mode}"
-                for _ in range(1 if current_source else 5 if mode == "partial_denial" else 3):
+                for index in range(1 if current_source else 5 if mode == "partial_denial" else 3):
                     client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
+                    # Two historical markers of the same key catch acknowledged-but-retained
+                    # bulk marker deletes; a single marker does not reproduce the failure.
+                    if not reading and not current_source and mode == "normal" and index < 2:
+                        client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
                 if mode.startswith("contradictory_marker_"):
                     client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
                 client.put_object(Bucket=bucket, Key=f"{prefix}/sentinel", Body=b"retain")
@@ -242,6 +246,8 @@ def inside_run():
                     assert requests["version_deletes"] == before_deletes, (mode, requests)
                 if current_source and mode == "normal":
                     assert requests["payload_heads"] - before_heads == 1, requests
+                if not reading and not current_source and mode == "normal":
+                    assert requests["version_deletes"] - before_deletes == 4, requests
                 remaining = client.list_object_versions(Bucket=bucket, Prefix=f"{prefix}/")
                 records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
                 payload_records = [record for record in records if record["Key"] == f"{prefix}/payload"]

@@ -183,7 +183,8 @@ Local/NFS and the default filesystem route only wrap the same original error. No
 operation entrypoint is added. The explicit error-source implementation is checked by a
 downcast test, not inferred from the displayed message.
 
-S3 purge submits only old records through the existing delete_objects, at most 100 per batch.
+S3 purge keeps at most 100 old records per batch, submits old data versions through the
+existing delete_objects and deletes historical markers separately by exact version ID.
 It re-lists/rechecks the current anchor between batches, never reuses a deletion-shifted page
 cursor, stops after any failed batch and separately deletes the current ID last. All returned
 version failures survive; a malformed result count refuses success and identifies unconfirmed
@@ -191,6 +192,16 @@ requested versions. Cancellation before submission sends no request; in-flight c
 returns the requested version causes with unknown outcomes. Successful sibling deletions are
 not rolled back. Existing exclusivity requirements remain; this is not atomic source fencing
 or an authorization to purge before the caller confirms all required target results.
+
+The normal real fixture contains two historical markers of the same key. Before this marker
+separation, the five-record fixture returned Deleted { records: 6 }: RustFS acknowledged
+both marker IDs in one bulk request but retained one. An independent boto3 probe reproduced
+the same result without data-mover or the fault proxy; the marker remained after two seconds
+and an exact single-version delete removed it. The protected purge now sends same-key marker
+mutations sequentially and rejects any reappearance of the preceding batch's confirmed IDs,
+retaining the current anchor instead of inflating the deletion count. This is a backend
+mechanism change, with no additional public entrypoint. The older SDK timing fixture below
+contains only one marker and cannot certify this multiple-marker path.
 
 The S3 suite passed 433 tests (three ignored); core passed 224 tests and its two adapter
 contracts. Four new S3 checks cover 100 mixed typed causes, partial success, missing batch
