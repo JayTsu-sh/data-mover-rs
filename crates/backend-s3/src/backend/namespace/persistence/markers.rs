@@ -118,19 +118,14 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
                     .map_err(StorageRoleFailure::Entry)?;
                 proof.observe(&expected.path, wanted, current)?;
             }
-            // key marker 已越过精确 key 后，后续页只包含相邻对象。
-            let past_key = page
-                .next
-                .as_ref()
-                .map(|next| next.key_marker.as_str())
-                .is_some_and(|key| key > expected.path.as_str());
+            // continuation 是不透明的服务端 token；只有真实 EOF 才能结束证明。
             cursor = paging.advance_holding(
                 &expected.path,
                 listed,
                 usize::from(proof.latest.is_some()),
                 page.next,
             )?;
-            if cursor.is_none() || past_key {
+            if cursor.is_none() {
                 break;
             }
         }

@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -44,6 +45,37 @@ def isolated_run():
         subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *arguments], check=True)
     finally:
         docker("rm", "-f", "-v", container)
+
+
+
+def marker_version_page(client, bucket, query):
+    """Use real RustFS pagination; the proxy only decorates the opaque continuation."""
+    suffix = "[minio_cache:v2,return:]"
+    request = dict(Bucket=bucket, Prefix=query["prefix"][0], Delimiter="/", MaxKeys=1)
+    if marker := query.get("key-marker", [None])[0]:
+        assert marker.endswith(suffix), marker
+        request["KeyMarker"] = marker.removesuffix(suffix)
+    if version := query.get("version-id-marker", [None])[0]:
+        request["VersionIdMarker"] = version
+    response = client.list_object_versions(**request)
+    root = ET.Element("ListVersionsResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    for key, value in {"Name": bucket, "Prefix": request["Prefix"], "IsTruncated": str(response["IsTruncated"]).lower(),
+                       "MaxKeys": "1", "Delimiter": "/"}.items():
+        ET.SubElement(root, key).text = value
+    if response["IsTruncated"]:
+        ET.SubElement(root, "NextKeyMarker").text = response["NextKeyMarker"] + suffix
+        if value := response.get("NextVersionIdMarker"):
+            ET.SubElement(root, "NextVersionIdMarker").text = value
+    for field, tag in [("Versions", "Version"), ("DeleteMarkers", "DeleteMarker")]:
+        for record in response.get(field, []):
+            child = ET.SubElement(root, tag)
+            values = {"Key": record["Key"], "VersionId": record["VersionId"], "IsLatest": str(record["IsLatest"]).lower(),
+                      "LastModified": record["LastModified"].isoformat(timespec="milliseconds").replace("+00:00", "Z")}
+            if field == "Versions": values.update(ETag=record["ETag"], Size=str(record["Size"]))
+            for key, value in values.items(): ET.SubElement(child, key).text = value
+    for prefix in response.get("CommonPrefixes", []):
+        ET.SubElement(ET.SubElement(root, "CommonPrefixes"), "Prefix").text = prefix["Prefix"]
+    return ET.tostring(root)
 
 
 def inside_run():
@@ -82,6 +114,7 @@ def inside_run():
         raise ValueError("--current-source is only for source purge")
     alternating = [0]
     requests = {"data_get": 0, "writes": 0}
+    marker_pages = {"calls": 0, "opaque_seen": 0}
     if not reading and not current_source:
         requests["version_deletes"] = 0
     if current_source:
@@ -107,6 +140,16 @@ def inside_run():
                 if mode.startswith("list_"):
                     probing = listing_marker
                     mode = mode.removeprefix("list_")
+                paged = listing_marker and mode.startswith("paged_")
+                if paged:
+                    marker_pages["calls"] += 1
+                    query = urllib.parse.parse_qs(self.path.partition("?")[2], keep_blank_values=True)
+                    if query.get("key-marker"):
+                        assert query["key-marker"][0].endswith("[minio_cache:v2,return:]")
+                        marker_pages["opaque_seen"] += 1
+                        if mode == "paged_disconnect":
+                            mode = "disconnect"
+                            probing = True
                 affected = deleting or probing
                 if marker_persist and probing and mode in ("replaced", "missing"):
                     if mode == "replaced":
@@ -159,6 +202,14 @@ def inside_run():
                             stopped.wait(30)
                     self.close_connection = True
                     self.connection.shutdown(socket.SHUT_RDWR)
+                    return
+                if paged:
+                    body = marker_version_page(client, bucket, query)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/xml")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                     return
                 upstream = http.client.HTTPConnection("127.0.0.1", 9000, timeout=5)
                 try:
@@ -239,11 +290,12 @@ def inside_run():
                 modes += ("partial_denial", "malformed_batch", "contradictory_data_current_first", "contradictory_data_history_first",
                           "contradictory_marker_current_first", "contradictory_marker_history_first")
             if marker_persist:
-                modes += ("list_disconnect", "list_stall", "list_cancel", "missing_id", "wrong_id", "invalid_type", "replaced", "missing")
+                modes += ("list_disconnect", "list_stall", "list_cancel", "missing_id", "wrong_id", "invalid_type", "replaced", "missing", "paged_disconnect", "paged_normal")
             if null_source:
                 modes = ("normal", "nullchanged")
             for mode in modes:
-                prefix = f"nightly-local-{mode}"
+                prefix = ("zz-" if mode.startswith("paged_") else "") + f"nightly-local-{mode}"
+                marker_pages.update(calls=0, opaque_seen=0)
                 for index in range(1 if current_source or null_source else 5 if mode == "partial_denial" else 3):
                     client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
                     # Two historical markers of the same key catch acknowledged-but-retained
@@ -286,6 +338,9 @@ def inside_run():
                 before_heads = requests.get("payload_heads", 0)
                 before_deletes = requests.get("version_deletes", 0)
                 subprocess.run(command, env=environment, check=True)
+                if mode.startswith("paged_"):
+                    assert marker_pages == ({"calls": 6, "opaque_seen": 5} if mode == "paged_normal" else {"calls": 2, "opaque_seen": 1}), (mode, marker_pages)
+                    print(f"marker pagination fault={mode} actual_pages={marker_pages} opaque_token_forwarded=true", flush=True)
                 if mode.startswith("contradictory_"):
                     assert requests["version_deletes"] == before_deletes, (mode, requests)
                 if current_source and mode == "normal":

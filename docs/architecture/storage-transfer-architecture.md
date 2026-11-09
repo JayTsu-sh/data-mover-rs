@@ -1024,8 +1024,10 @@ Semantics the procedure relies on:
   selected marker with one exact-version HEAD. It preserves both historical and current records.
   For a marker descriptor whose selector is changed to `Current`, it additionally lists the exact
   key and requires the same marker to be its unique latest record. Pagination retains at most
-  one current record and conflict flags plus the existing bounded continuation tracker, and stops
-  once the ordered key cursor has passed the key.
+  one current record and conflict flags plus the existing bounded continuation tracker. Every
+  continuation is passed back unchanged until real stream EOF; it is opaque and cannot be
+  compared with a relative key or stripped of its storage prefix. Confirmation reads the filtered
+  prefix, including any neighboring names; a later page failure cannot authorize readiness.
   The outer cancellation token cancels HEAD and LIST. A null marker requires modification-time
   evidence; NAS, foreign/incomplete evidence, contradictory latest records, missing identity or
   changed current bindings fail closed. These are read-only checks, not writer exclusion locks;

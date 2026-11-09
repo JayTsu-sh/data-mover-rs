@@ -262,7 +262,7 @@ independent version/mutation checks. The test binary uses the existing `LAB_S3_P
 environment to address the owned prefix and arm faults.
 `python3 tests/lab/run-source-purge-local.py --marker-persistence` covers selected deletion
 markers through the same public `describe_version` and `persist_observed` operations. The owned
-fixture has four data versions, two markers and an unrelated sentinel per case. Fifteen modes
+fixture has four data versions, two markers and an unrelated sentinel per case. The original fifteen modes
 cover normal exact-marker HEAD and current-binding LIST, denied reads, disconnect/stall/cancel
 at both HEAD and LIST, explicit recovery after flash/stall, missing/wrong version headers,
 invalid marker type, actual current replacement and actual permanent marker removal. The
@@ -272,6 +272,20 @@ version inspection and proxy counters confirmed no payload GET or mutation by th
 operations; only the named replacement/removal was performed by fixture control. The plain
 marker descriptor cannot be read as empty data. This verifies the storage contract on RustFS,
 not task source purge, other vendors or a unified network-jitter recovery budget.
+
+The marker fixture now includes seventeen modes: `paged_normal` and `paged_disconnect`
+exercise one-record real RustFS pages through the SDK, with an explicit `zz-` storage
+prefix and a MinIO-shaped opaque continuation decoration. The read-only proxy obtains
+actual `MaxKeys=1` pages with boto3 and round-trips decorated tokens; no new data or
+version facts are invented. A later-page fault first reproduced the old wrong `Ok(())`
+result in both the deterministic MemoryS3 seam and the real SDK. Confirmation now
+consumes continuations unchanged until actual EOF, never comparing a token to a
+relative key. The normal case confirmed six pages/five returned opaque tokens; the
+faulted case surfaced typed Connectivity on page two, retained all six records and
+sent no mutation. Full seventeen-mode evidence is
+`/tmp/native-marker-pagination-{red,green}-real.log`; unit red/green logs have the
+same prefix. This confirms marker persistence pagination, not more-than-1000-version
+source enumeration or every vendor's actual pagination behavior.
 
 `python3 tests/lab/run-source-purge-local.py --null-source` and `--null-marker`
 check the mutable null slot on a real suspended RustFS bucket. Each runs an unchanged

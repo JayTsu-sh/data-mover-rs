@@ -93,7 +93,7 @@ async fn faulted_confirmation(
         elapsed.as_millis()
     );
     match fault.as_str() {
-        "normal" => result?,
+        "normal" | "paged_normal" => result?,
         "flash" | "recover_stall" => {
             if let Err(error) = result {
                 assert!(matches!(
@@ -116,7 +116,7 @@ async fn faulted_confirmation(
             assert_eq!(failure_class(result), FailureClass::Cancelled);
             assert!(elapsed < Duration::from_secs(1));
         }
-        "disconnect" | "stall" | "list_disconnect" | "list_stall" => {
+        "disconnect" | "stall" | "list_disconnect" | "list_stall" | "paged_disconnect" => {
             assert!(matches!(
                 failure_class(result),
                 FailureClass::Connectivity | FailureClass::Timeout

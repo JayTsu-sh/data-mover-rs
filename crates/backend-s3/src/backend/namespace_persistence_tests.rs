@@ -416,3 +416,47 @@ async fn mutable_null_marker_requires_time_evidence_and_rechecks_it() -> TestRes
     assert!(protocol.version_deletes().is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn current_marker_must_observe_a_later_page_failure_after_an_opaque_cursor() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    put(&protocol, "key", b"old").await?;
+    let marker = protocol
+        .write_delete_marker("key")
+        .await
+        .map_err(|error| format!("{error:?}"))?
+        .version_id
+        .ok_or("missing marker receipt")?;
+    let storage = connect(protocol.clone(), identity(), None)?;
+    let mut expected = storage
+        .read_source()?
+        .describe_version(&path("key"), &SourceVersion::Id(marker))
+        .await?;
+    expected.version = SourceVersion::Current;
+    {
+        let mut pages = protocol.listing();
+        pages.page_size = 1;
+        pages.minio_markers = true;
+        pages.failing_calls.push((
+            1,
+            S3ProtocolFailure::session(
+                FailureClass::Connectivity,
+                Transience::Transient,
+                "later marker page disconnected",
+            ),
+        ));
+    }
+    let result = storage
+        .namespace()?
+        .persist_observed(&expected, CancellationToken::new())
+        .await;
+    assert!(
+        matches!(result, Err(StorageRoleFailure::Session(ref error))
+        if error.class() == FailureClass::Connectivity),
+        "the first page cannot authorize readiness: {result:?}"
+    );
+    assert!(protocol.version_deletes().is_empty());
+    assert_eq!(protocol.versions.lock().await.len(), 2);
+    Ok(())
+}
