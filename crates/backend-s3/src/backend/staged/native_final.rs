@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::S3WriteFacts;
 use super::super::source::{cancelled, classified_entry, role_failure};
 use super::super::{S3NativeCopyEvidence, S3NativeCopySource, S3Protocol, S3ProtocolFailure};
-use super::completion::completed_object;
+use super::completion::{completed_object, observed_facts};
 use super::final_upload::FinalUpload;
 use super::native::{NativeFillFailure, native_role_failure};
 use super::parts::UploadedParts;
@@ -409,7 +409,8 @@ pub(super) async fn send_copy<P: S3Protocol>(
         }
         Err(failure) => match adapter.protocol.head(path.as_str()).await {
             Ok(head) if head.size == source.size && same_etag(&head.etag, &source.etag) => {
-                S3WriteFacts::new(head.etag, head.version_id)
+                tracing::warn!(path = %path.as_str(), ?failure, "S3 CopyObject response unconfirmed; matching data reconciled without a created-version receipt");
+                observed_facts(head.etag, head.version_id)
             }
             _ => return Err(changed(role_failure(path, Operation::Publish, failure))),
         },
@@ -425,17 +426,9 @@ pub(super) async fn send_copy<P: S3Protocol>(
     Ok(facts)
 }
 
-/// The version a `CopyObject` made when its reply named none although the bucket has versioning
-/// enabled (DXN's Ceph RGW sends no `x-amz-version-id` for a copy): settled as an ambiguous
-/// completion is (ADR-0006 C17) — the key's **latest** version, when it has our size and the
-/// `ETag` the copy returned, is claimed. Under the caller contract (one writer per key) nothing
-/// was written after the copy; a later identical write by another writer would be claimed too.
-/// The same holds for an identical earlier copy of the same source to the key if the store's
-/// listing lags behind the copy: the bytes are ours either way, only the version may be older.
-/// Only then is anything asked: a reply that names a version (AWS, `MinIO`), or `"null"`
-/// (suspended), or an unversioned bucket costs no request. When none can be claimed (the
-/// listing fails or its latest entry is not the copy) the copy still succeeded, and is reported
-/// without a version.
+/// `CopyObject` 缺少版本头时，LIST／HEAD 只能提供本次读回的观察锚点。
+/// 即使内容相同，也可能命中已有版本；返回的 `reported_version` 保持 None。
+/// 有原始版本回执或未启用版本的正常路径不增加请求。
 async fn settle_copy_version<P: S3Protocol>(
     protocol: &P,
     path: &StoragePath,

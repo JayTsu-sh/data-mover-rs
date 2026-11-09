@@ -266,17 +266,22 @@ async fn stored(protocol: &MemoryS3, key: &str, id: &str) -> Option<Bytes> {
     versions.get(&(key.to_string(), id.to_string())).cloned()?
 }
 
-/// A native multipart copy whose completion reply is lost claims the version it made, as a
-/// streamed one does.
+/// 原生 multipart 丢回执时仍核验内容和单版本结果，但不能把观察版本当作创建回执。
 #[tokio::test]
-async fn an_ambiguous_native_completion_claims_the_version_it_made() -> TestResult {
+async fn an_ambiguous_native_completion_keeps_data_without_claiming_a_created_version() -> TestResult
+{
     let data = payload(3 * PART, 14);
     let protocol = bucket(Versioning::Enabled, &[("s1", &data)], &["ambiguous-native"]).await;
     *protocol.complete_commits_then_fails.lock().await = true;
     let outcome = transfer(native(&protocol, "ambiguous-native")?).await?;
     assert_eq!(outcome.route, TransferRoute::Native);
     assert_eq!(*protocol.completes.lock().await, 1);
-    clean_versions(&protocol, "ambiguous-native", 1, Some(version(&outcome)?)).await?;
+    assert!(outcome.destination_version.is_none());
+    clean_versions(&protocol, "ambiguous-native", 1, None).await?;
+    assert_eq!(
+        protocol.objects.lock().await.get("ambiguous-native"),
+        Some(&data)
+    );
     Ok(())
 }
 
@@ -581,11 +586,9 @@ async fn a_held_hash_checkpoint_requires_cleanup_after_the_hold_is_removed() -> 
     Ok(())
 }
 
-/// A `CopyObject` reply without a version in a versioned bucket (DXN) claims the key's latest
-/// version, which holds the copy — one listing; a reply that names its version, and a bucket
-/// without versioning, list nothing.
+/// 缺少 `CopyObject` 版本头时，一次 LIST 只提供读取锚点，不能提供创建版本证明。
 #[tokio::test]
-async fn a_copy_reply_without_a_version_claims_the_latest_version() -> TestResult {
+async fn a_copy_reply_without_a_version_does_not_invent_a_creation_receipt() -> TestResult {
     for (mode, omitted, lists) in [
         (Versioning::Enabled, true, 1),
         (Versioning::Enabled, false, 0),
@@ -599,19 +602,20 @@ async fn a_copy_reply_without_a_version_claims_the_latest_version() -> TestResul
         assert_eq!(*protocol.native_copies.lock().await, 1);
         let label = format!("{mode:?} omitted={omitted}");
         assert_eq!(*protocol.version_lists.lock().await, lists, "{label}");
-        if mode == Versioning::Enabled {
+        if mode == Versioning::Enabled && !omitted {
             clean_versions(&protocol, "copied", 1, Some(version(&outcome)?)).await?;
         } else {
             assert_eq!(outcome.destination_version, None, "{label}");
+            clean_versions(&protocol, "copied", 1, None).await?;
         }
+        assert_eq!(protocol.objects.lock().await.get("copied"), Some(&data));
     }
     Ok(())
 }
 
-/// Direct 缺少本次完成回执时只确认数据存在，不把推断版本公开为本次创建的版本。
-/// Checkpointed 的既有推断契约在后续独立处理；两种路径均核验实际版本、内容和产物。
+/// 缺少本次完成回执时，Direct 和 Checkpointed 都不能把读取锚点当成创建证明。
 #[tokio::test]
-async fn ambiguous_completion_keeps_data_without_inventing_a_direct_version_receipt() -> TestResult
+async fn ambiguous_completion_keeps_data_without_inventing_a_created_version_receipt() -> TestResult
 {
     for (final_key, policy) in [
         ("ambiguous", TransferPolicy::Checkpointed),
@@ -622,13 +626,8 @@ async fn ambiguous_completion_keeps_data_without_inventing_a_direct_version_rece
         *protocol.complete_commits_then_fails.lock().await = true;
         let outcome = transfer(request(&protocol, final_key, policy)?).await?;
         assert_eq!(*protocol.completes.lock().await, 1, "{final_key}");
-        let reported = if policy == TransferPolicy::Direct {
-            assert!(outcome.destination_version.is_none());
-            None
-        } else {
-            Some(version(&outcome)?)
-        };
-        clean_versions(&protocol, final_key, 1, reported).await?;
+        assert!(outcome.destination_version.is_none());
+        clean_versions(&protocol, final_key, 1, None).await?;
         let actual = entries(&protocol, final_key).await?;
         assert_eq!(
             stored(&protocol, final_key, &actual[0].version_id).await,

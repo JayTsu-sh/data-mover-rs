@@ -37,7 +37,9 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use super::super::source::{cancelled, classified_entry, entry, role_failure};
-use super::super::{S3Protocol, S3ProtocolFailure, S3StreamedPut, S3WriteFacts};
+use super::super::{
+    S3Protocol, S3ProtocolFailure, S3StreamedPut, S3WriteFacts, is_real_version_id,
+};
 use super::direct_cleanup::DirectCleanup;
 use super::settle::{Previous, Settling, settle_unknown_write};
 use super::single::{changed, definite_refusal, same_etag, unchanged};
@@ -561,7 +563,9 @@ pub(super) async fn publish<P: S3Protocol>(
     Ok(PublicationEvidence::new(
         path.clone(),
         PublicationDisposition::Published,
-        facts.version_id,
+        facts
+            .reported_version
+            .filter(|version| is_real_version_id(version)),
     ))
 }
 

@@ -386,7 +386,9 @@ pub(super) async fn publish<P: S3Protocol>(
     Ok(PublicationEvidence::new(
         path.clone(),
         PublicationDisposition::Published,
-        facts.version_id,
+        facts
+            .reported_version
+            .filter(|version| is_real_version_id(version)),
     ))
 }
 

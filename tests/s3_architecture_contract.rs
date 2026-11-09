@@ -13,6 +13,8 @@ use data_mover::transfer::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "s3_architecture_contract/checkpoint_version.rs"]
+mod checkpoint_version;
 #[path = "s3_architecture_contract/direct_cleanup.rs"]
 mod direct_cleanup;
 #[path = "s3_architecture_contract/direct_native.rs"]

@@ -75,11 +75,12 @@ pub fn is_real_version_id(version: &str) -> bool {
     !version.is_empty() && version != "null"
 }
 
-/// What a write that created an object reported about it.
+/// 最终对象的读取锚点与本次写响应分别记录，观察到版本不等于有创建回执。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct S3WriteFacts {
     pub etag: String,
-    /// The version the write created; `None` when the response named no real version.
+    /// A real version used to pin reads, reported by the write or observed during reconciliation.
+    /// An inferred read pin alone does not prove this attempt created the version.
     pub version_id: Option<String>,
     /// The version id exactly as the response spelled it — `"null"` included, which a bucket with
     /// versioning suspended reports — or `None` when it named none (an unversioned bucket). In a

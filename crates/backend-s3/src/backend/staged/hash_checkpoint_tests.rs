@@ -17,7 +17,7 @@ use super::final_upload;
 use super::upload_pointer::{self, accepted};
 use super::*;
 use crate::model::{EntryKind, IdentityStrength, SourceIdentity};
-use crate::storage::backends::s3::tests::{MemoryS3, content_md5, identity};
+use crate::storage::backends::s3::tests::{MemoryS3, Versioning, content_md5, identity};
 use crate::storage::checkpoint::{CheckpointData, CheckpointPhase};
 use crate::storage::pointer::DestinationPointer;
 use crate::storage::range_hash::RangeHash;
@@ -302,6 +302,7 @@ async fn a_replaced_committed_part_receipt_fails_before_takeover() -> TestResult
 #[tokio::test]
 async fn a_published_checkpoint_resumes_without_creating_another_upload() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
     let adapter = destination(&protocol);
     let data = Bytes::from(vec![4; PART + 17]);
     let stage = prepare(&adapter, data.len()).await?;
@@ -312,7 +313,7 @@ async fn a_published_checkpoint_resumes_without_creating_another_upload() -> Tes
         .await?;
     stage.checkpoint_set_phase(CheckpointPhase::ReadyToPublish);
     adapter.persist_hash_checkpoint(&stage).await?;
-    adapter
+    let published = adapter
         .publish(
             &stage,
             PublishRequest {
@@ -326,7 +327,14 @@ async fn a_published_checkpoint_resumes_without_creating_another_upload() -> Tes
     let begins = *protocol.multipart_begins.lock().await;
     let parts = *protocol.part_uploads.lock().await;
     let resumed = adapter.prepare_at_destination(request(data.len())?).await?;
-    assert!(resumed.recovered_publication().is_some());
+    assert!(published.version.is_some());
+    assert_eq!(
+        resumed
+            .recovered_publication()
+            .as_ref()
+            .and_then(|proof| proof.version.as_deref()),
+        published.version.as_deref()
+    );
     assert_eq!(resumed.write_offset(), data.len() as u64);
     assert_eq!(*protocol.multipart_begins.lock().await, begins);
     assert_eq!(*protocol.part_uploads.lock().await, parts);
@@ -369,6 +377,7 @@ async fn verify_recovered(
 #[tokio::test]
 async fn complete_before_a_failed_published_pointer_put_resumes_from_ready() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
     let adapter = destination(&protocol);
     let data = Bytes::from(vec![6; PART + 19]);
     let stage = prepare(&adapter, data.len()).await?;
@@ -399,7 +408,25 @@ async fn complete_before_a_failed_published_pointer_put_resumes_from_ready() -> 
     );
     drop(stage);
     let resumed = adapter.prepare_at_destination(request(data.len())?).await?;
-    assert!(resumed.recovered_publication().is_some());
+    let publication = resumed
+        .recovered_publication()
+        .as_ref()
+        .ok_or("recovered publication")?;
+    assert!(
+        publication.version.is_none(),
+        "a ready checkpoint has no saved creation receipt"
+    );
+    let facts = final_upload::of(&resumed)
+        .ok_or("resumed upload")?
+        .lock()
+        .published
+        .clone()
+        .ok_or("observed final")?;
+    assert!(
+        facts.version_id.is_some(),
+        "the read pin must still be retained"
+    );
+    assert!(facts.reported_version.is_none());
     verify_recovered(&adapter, &resumed, &data).await?;
     adapter.release_hash_checkpoint(&resumed).await?;
     assert_eq!(*protocol.completes.lock().await, 1);

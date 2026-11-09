@@ -23,9 +23,9 @@
 //! publication.
 //!
 //! In a versioned bucket (ADR-0006 C17) the pointer is deleted by the version its write reported,
-//! a resume deletes the version of the pointer it replaced, and a completion whose reply was lost
-//! is settled through the key's versions, claiming the version it made (see
-//! [`completion`](super::completion)).
+//! a resume deletes the version of the pointer it replaced. A lost completion reply may be
+//! reconciled against matching content; its observed version pins reads but is not a creation
+//! receipt (see [`completion`](super::completion)).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -34,7 +34,9 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::super::source::{cancelled, classified_entry, entry, role_failure};
-use super::super::{S3Protocol, S3ProtocolFailure, S3WriteFacts, composite_etag};
+use super::super::{
+    S3Protocol, S3ProtocolFailure, S3WriteFacts, composite_etag, is_real_version_id,
+};
 use super::completion::completed_object;
 use super::direct::is_composite;
 use super::final_upload::FinalUpload;
@@ -586,7 +588,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         Ok(PublicationEvidence::new(
             path.clone(),
             PublicationDisposition::Published,
-            facts.version_id,
+            facts
+                .reported_version
+                .filter(|version| is_real_version_id(version)),
         ))
     }
 
@@ -659,14 +663,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         }
     }
 
-    /// Settles a failed completion. Only a refusal the service answered before it could commit
-    /// (a 4xx such as `InvalidPart`, `EntityTooSmall`, `AccessDenied`) leaves the final key
-    /// unchanged. Any other failure may still complete on the server — a completion whose reply
-    /// timed out can finish after `ListParts` still lists the upload — so an upload still listed,
-    /// or one that cannot be listed, reports the final key changed. One that is gone
-    /// (`NoSuchUpload`) completed if the key's latest version has our size and composite `ETag`,
-    /// and that version is claimed (ADR-0006 C17; none in an unversioned bucket); otherwise
-    /// something else happened to the key (`Conflict`, changed).
+    /// 确定未提交的拒绝保留原语义；其他失败可能已在服务器完成。
+    /// 已消失的 upload 和匹配内容只允许恢复读取锚点，不证明本次创建了该版本。
     async fn settle_completion(
         &self,
         path: &StoragePath,
@@ -689,6 +687,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         };
         match completed {
             Some(facts) => {
+                tracing::warn!(path = %key, ?error, "S3 multipart completion response unconfirmed; matching data reconciled without a created-version receipt");
                 let aborted = self.protocol.abort_multipart(key, &upload.upload_id).await;
                 if let Err(error) = cleanup_result(path, aborted) {
                     tracing::warn!(path = %key, ?error, "could not abort a reconciled S3 upload");

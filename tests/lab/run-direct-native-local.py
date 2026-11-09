@@ -25,6 +25,12 @@ def docker(*args):
 
 
 def isolated():
+    policies = ("direct", "atomic-replace", "checkpointed") if "--all-policies" in sys.argv else ("direct",)
+    for policy in policies:
+        isolated_policy(policy)
+
+
+def isolated_policy(policy):
     container = docker(
         "run", "-d", "--name", f"dm-nightly-direct-native-{uuid.uuid4().hex[:12]}",
         "--network", "none", "--memory=768m", "--cpus=1", "--tmpfs", "/data:rw,size=128m,mode=1777",
@@ -35,7 +41,8 @@ def isolated():
     try:
         print(f"Direct native image={docker('inspect', container, '--format', '{{.Image}}')}", flush=True)
         pid = docker("inspect", container, "--format", "{{.State.Pid}}")
-        subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside"], cwd=ROOT, check=True)
+        subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside"], cwd=ROOT,
+                       env=dict(os.environ, LAB_DIRECT_NATIVE_POLICY=policy), check=True)
     finally:
         docker("rm", "-f", "-v", container)
 
@@ -61,8 +68,10 @@ def inside():
     client.create_bucket(Bucket=bucket)
     client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     body = b"Z" * 1024
+    policy = os.environ.get("LAB_DIRECT_NATIVE_POLICY", "direct")
+    modes = [mode for mode in MODES if policy == "direct" or mode not in ("tags_quick", "tags_full", "cancel")]
     original_targets = {}
-    for mode in MODES:
+    for mode in modes:
         if mode.startswith("same_"):
             original_targets[mode] = client.put_object(Bucket=bucket, Key=f"{mode}/target/payload", Body=body, Tagging="generation=source")["VersionId"]
         client.put_object(Bucket=bucket, Key=f"{mode}/src/payload", Body=body, Tagging="generation=source")
@@ -130,16 +139,21 @@ def inside():
         proxy.daemon_threads = True
         threading.Thread(target=proxy.serve_forever, daemon=True).start()
         try:
-            for mode in MODES:
+            for mode in modes:
                 environment = dict(os.environ, S3_CONNECT_TIMEOUT="1", S3_READ_TIMEOUT="1", S3_OPERATION_TIMEOUT="2")
                 environment.update({
                     "LAB_DIRECT_NATIVE_URL": f"s3://native-test:native-isolated-only@{bucket}.127.0.0.1:{proxy.server_port}",
                     "LAB_DIRECT_NATIVE_MODE": mode, "LAB_DIRECT_NATIVE_CONTROL": str(control),
                 })
-                subprocess.run([
+                tested = subprocess.run([
                     "cargo", "test", "--offline", "--locked", "--test", "s3_architecture_contract",
                     "direct_native::direct_native_with_real_requests", "--", "--ignored", "--exact", "--nocapture",
-                ], cwd=ROOT, env=environment, check=True)
+                ], cwd=ROOT, env=environment, capture_output=True, text=True)
+                print(tested.stdout, end="", flush=True)
+                print(tested.stderr, end="", file=sys.stderr, flush=True)
+                assert tested.returncode == 0, (policy, mode, tested.returncode)
+                if mode in ("lost_ack", "same_disconnect", "same_lost_ack"):
+                    assert "reconciled without a created-version receipt" in tested.stdout and "Connectivity" in tested.stdout, (policy, mode, tested.stdout)
                 records = client.list_object_versions(Bucket=bucket, Prefix=f"{mode}/")
                 assert not records.get("DeleteMarkers"), records
                 versions = records.get("Versions", [])
@@ -157,8 +171,8 @@ def inside():
                 assert not any(method in ("POST", "DELETE") or (method == "PUT" and not copying and not tagging) for method, _, copying, tagging in selected), (mode, selected)
                 payload_reads = sum(method == "GET" and "payload" in path and "tagging" not in path for method, path, _, _ in selected)
                 assert payload_reads == (2 if mode.endswith("full") else 0), (mode, payload_reads)
-                print(f"independent Direct native fault={mode} source=retained target_versions={len(targets)} payload_GET={payload_reads}", flush=True)
-            assert all(faults.get(mode, 0) >= 1 for mode in MODES if mode not in ("quick", "full")), faults
+                print(f"independent Native policy={policy} fault={mode} source=retained target_versions={len(targets)} payload_GET={payload_reads}", flush=True)
+            assert all(faults.get(mode, 0) >= 1 for mode in modes if mode not in ("quick", "full")), faults
             assert not client.list_multipart_uploads(Bucket=bucket).get("Uploads")
         finally:
             control.write_text("normal")

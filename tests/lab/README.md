@@ -986,3 +986,60 @@ These results certify the tested Direct RustFS path, not AtomicReplace/Checkpoin
 publication identity, application history purge or other vendors. No SDK or public API
 is added, and all owned containers are removed. Application ClickHouse/callback and
 normal-path resource measurements are separate acceptance gates.
+
+## S3 publication version evidence across policies
+
+`run-direct-native-local.py --all-policies` reuses the existing private fixture for
+Direct, AtomicReplace and Checkpointed. Thirty-three real cases passed: the original
+thirteen Direct cases and ten each for the other policies. Non-Direct metadata
+refusal and in-flight cancellation are not included in this version-proof gate;
+their existing stage/error/budget semantics are separate work. Normal acknowledgments
+report a version. A failed request against an identical old object, a committed copy
+with a lost reply, and a successful reply with its version header removed report no
+created-version ID across all policies. Independent reads verify source and old
+versions, data/tags, exact version counts and no extra quick-path payload reads.
+Reconciled network failures are captured in actual warning output with their original
+Connectivity cause; test retries after faults remain explicit. Retrying the non-Direct
+fixture requires its existing cleanup_for_policy and releasing the failure's stage
+lease first, which the fixture now does.
+
+`python3 tests/lab/run-checkpoint-version-local.py` uses five separate isolated
+RustFS containers, generated 9 MiB payloads, the existing public checkpoint roles,
+and independent boto3 inspection. Each initial transfer creates exactly one upload,
+two parts and one completion; reconnecting creates no new upload or data part.
+
+| Case | Recovered created-version evidence | Independent target / root result |
+| --- | --- | --- |
+| Saved successful write receipt | Original version retained | One body; source roots released after verification |
+| Complete forwarded, successful response lost | None; observed pin retained | One body; source roots released after verification |
+| Published pointer PUT denied after data completed | None from the saved Ready state | One body; source roots released after verification |
+| Reconciled completion then identical-body replacement | Conflict | Both versions and original source root retained |
+| Acknowledged completion then identical-body replacement | Conflict | Both versions and original source root retained |
+
+All original/final body bytes and the sentinel are independently read; no deletion
+markers or open uploads remain. Replaced cases deliberately retain the checkpoint
+root as unresolved state. The fixture destroys only its own container after those
+checks. It verifies target storage-role behavior with generated source bytes, not
+an application migration, external source backend, ClickHouse/callback, vendor
+certification, power-cut behavior or a whole-job network budget.
+
+The private current checkpoint record is DMS3CP02, bounded to 4 KiB and preserving
+both observed version and raw write receipt. Previous/future layouts and conflicting
+receipt/pin values are rejected; no compatibility reader is added. Codec regression
+first reproduced losing the observed pin, and the cross-policy regression first
+reproduced returning a preexisting version as newly created. Backend library tests
+passed 414 with two ignored; transfer library tests passed 329 with one ignored.
+Saved-ack versus Ready-only recovery tests use a versioned fixture and verify the
+original receipt or its absence as well as the independent read pin and no reupload.
+These results do not authorize application historical source purge by themselves.
+
+The complete CI scope passed on Rust 1.98.1: architecture/harness/feature guards,
+workspace all-targets strict Clippy, and the 52 sequential workspace-library,
+integration, test-enabled-example, doctest, example-build and Local E2E steps.
+Strict checks first caught new rustdoc markup and a fixture function-size limit;
+the final checks passed after correcting those test/documentation issues. Ignored
+external environments remain ignored outside the explicitly executed matrices.
+The existing sixty Direct failed-data cleanup cases were rerun and passed after
+this change. Architecture review confirms that read pins, raw write receipts and
+checkpoint serialization stay in the S3 backend; application readiness and callback
+policy remain outside it. No public functions/types or SDK revisions were added.

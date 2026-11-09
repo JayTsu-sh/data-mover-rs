@@ -1,10 +1,11 @@
 //! Resume after Complete consumed the upload, retaining source H and the final object's pin.
 
 use super::super::source::{classified_entry, role_failure};
-use super::super::{S3ObjectFacts, S3Protocol, S3WriteFacts};
+use super::super::{S3ObjectFacts, S3Protocol, S3WriteFacts, is_real_version_id};
 use super::S3StagedDestination;
 use super::at_destination::{Fence, taken_over};
 use super::checkpoint_record::CheckpointRecord;
+use super::completion::observed_facts;
 use super::final_upload::FinalUpload;
 use super::single;
 use super::upload_pointer::{self, StoredPointer};
@@ -76,7 +77,7 @@ pub(super) async fn observe_final<P: S3Protocol>(
     } else {
         verify_source_root(protocol, path, &current, &data).await?;
     }
-    Ok(S3WriteFacts::new(current.etag, current.version_id))
+    Ok(observed_facts(current.etag, current.version_id))
 }
 
 fn same_object(current: &S3ObjectFacts, published: &S3WriteFacts) -> bool {
@@ -155,7 +156,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         stage.set_recovered_publication(Some(PublicationEvidence::new(
             path.clone(),
             PublicationDisposition::Published,
-            facts.version_id,
+            facts
+                .reported_version
+                .filter(|version| is_real_version_id(version)),
         )));
         let upload = super::final_upload::of(&stage)
             .ok_or_else(|| conflict(path, "missing S3 upload state"))?;

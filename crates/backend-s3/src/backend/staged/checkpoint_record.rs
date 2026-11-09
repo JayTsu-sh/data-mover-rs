@@ -2,14 +2,15 @@
 
 use bytes::Bytes;
 
-use super::super::S3WriteFacts;
+use super::super::{S3WriteFacts, is_real_version_id};
 use super::final_upload::FinalUpload;
 use super::hash_checkpoint::part_range;
 use super::upload_pointer::UploadRecord;
 use crate::storage::checkpoint::missing_ranges;
 use crate::storage::{PreparedStage, StorageRoleFailure};
 
-const MAGIC: &[u8; 8] = b"DMS3CP01";
+const MAGIC: &[u8; 8] = b"DMS3CP02";
+const MAX_EXTENSION_BYTES: usize = 4096;
 
 pub(super) struct CheckpointRecord {
     pub(super) upload: UploadRecord,
@@ -29,16 +30,26 @@ impl CheckpointRecord {
         )?;
         out.push(u8::from(self.published.is_some()));
         if let Some(facts) = &self.published {
+            if !valid_facts(facts) {
+                return None;
+            }
             put(&mut out, facts.etag.as_bytes())?;
+            put(
+                &mut out,
+                facts.version_id.as_deref().unwrap_or("").as_bytes(),
+            )?;
             put(
                 &mut out,
                 facts.reported_version.as_deref().unwrap_or("").as_bytes(),
             )?;
         }
-        (out.len() <= 4096).then(|| Bytes::from(out))
+        (out.len() <= MAX_EXTENSION_BYTES).then(|| Bytes::from(out))
     }
 
     pub(super) fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > MAX_EXTENSION_BYTES {
+            return None;
+        }
         let mut bytes = bytes.strip_prefix(MAGIC)?;
         let upload = UploadRecord::decode(take(&mut bytes)?)?;
         let receipts = bytes.get(..32)?.try_into().ok()?;
@@ -49,17 +60,7 @@ impl CheckpointRecord {
         bytes = bytes.get(1..)?;
         let published = match flag {
             0 => None,
-            1 => {
-                let etag = std::str::from_utf8(take(&mut bytes)?).ok()?.to_string();
-                if etag.is_empty() {
-                    return None;
-                }
-                let version = std::str::from_utf8(take(&mut bytes)?).ok()?;
-                Some(S3WriteFacts::new(
-                    etag,
-                    (!version.is_empty()).then(|| version.to_string()),
-                ))
-            }
+            1 => Some(take_facts(&mut bytes)?),
             _ => return None,
         };
         bytes.is_empty().then_some(Self {
@@ -69,6 +70,31 @@ impl CheckpointRecord {
             published,
         })
     }
+}
+
+fn valid_facts(facts: &S3WriteFacts) -> bool {
+    let observed = facts.version_id.as_deref();
+    !facts.etag.is_empty()
+        && observed.is_none_or(is_real_version_id)
+        && match facts.reported_version.as_deref() {
+            None => true,
+            Some("null") => observed.is_none(),
+            Some(reported) => is_real_version_id(reported) && observed == Some(reported),
+        }
+}
+
+fn take_facts(bytes: &mut &[u8]) -> Option<S3WriteFacts> {
+    let etag = std::str::from_utf8(take(bytes)?).ok()?.to_owned();
+    let observed = std::str::from_utf8(take(bytes)?).ok()?;
+    let version_id = (!observed.is_empty()).then(|| observed.to_owned());
+    let reported = std::str::from_utf8(take(bytes)?).ok()?;
+    let reported_version = (!reported.is_empty()).then(|| reported.to_owned());
+    let facts = S3WriteFacts {
+        etag,
+        version_id,
+        reported_version,
+    };
+    valid_facts(&facts).then_some(facts)
 }
 
 fn put(out: &mut Vec<u8>, bytes: &[u8]) -> Option<()> {
@@ -212,4 +238,74 @@ pub(super) fn extension(
         published,
     };
     record.encode().ok_or_else(invalid)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use super::*;
+
+    #[test]
+    fn checkpoint_preserves_observed_pin_without_inventing_a_write_receipt()
+    -> Result<(), Box<dyn Error>> {
+        let facts = S3WriteFacts {
+            etag: "\"read-pin\"".into(),
+            version_id: Some("observed-version".into()),
+            reported_version: None,
+        };
+        let record = CheckpointRecord {
+            upload: UploadRecord {
+                nonce: [4; 16],
+                part_size: 5 * 1024 * 1024,
+                upload_id: "owned-upload".into(),
+            },
+            receipts: [7; 32],
+            completion_etag: None,
+            published: Some(facts.clone()),
+        };
+        let encoded = record.encode().ok_or("valid current record")?;
+        let restored = CheckpointRecord::decode(&encoded).ok_or("current record decodes")?;
+        assert_eq!(restored.published, Some(facts));
+        Ok(())
+    }
+
+    #[test]
+    fn current_record_rejects_old_versions_and_conflicting_acknowledgments()
+    -> Result<(), Box<dyn Error>> {
+        let mut record = CheckpointRecord {
+            upload: UploadRecord {
+                nonce: [4; 16],
+                part_size: 5 * 1024 * 1024,
+                upload_id: "owned-upload".into(),
+            },
+            receipts: [7; 32],
+            completion_etag: None,
+            published: Some(S3WriteFacts::new(
+                "\"owned\"".into(),
+                Some("created-version".into()),
+            )),
+        };
+        let encoded = record.encode().ok_or("valid acknowledged record")?;
+        assert_eq!(
+            CheckpointRecord::decode(&encoded)
+                .ok_or("decode")?
+                .published,
+            record.published
+        );
+        for magic in [b"DMS3CP01", b"DMS3CP03"] {
+            let mut other = encoded.to_vec();
+            other[..8].copy_from_slice(magic);
+            assert!(CheckpointRecord::decode(&other).is_none());
+        }
+        let facts = record.published.as_mut().ok_or("facts")?;
+        facts.reported_version = Some("different-version".into());
+        assert!(
+            record.encode().is_none(),
+            "a read pin cannot contradict its acknowledgment"
+        );
+        assert!(CheckpointRecord::decode(&vec![0; MAX_EXTENSION_BYTES + 1]).is_none());
+        assert!(CheckpointRecord::decode(&encoded[..encoded.len() - 1]).is_none());
+        Ok(())
+    }
 }

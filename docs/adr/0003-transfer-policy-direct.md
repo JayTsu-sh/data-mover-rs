@@ -88,3 +88,28 @@ This change applies to Direct single/native, multipart and streamed paths. Exist
 AtomicReplace/Checkpointed inference and checkpoint recovery are a separate remaining
 step before enabling application-wide historical source purge. It adds no normal
 storage request or retained per-entry state; publication reads the existing bounded claim.
+
+## All S3 publication policies and checkpoint evidence
+
+The same created-version rule now applies to AtomicReplace, Checkpointed and
+checkpoint recovery. Existing S3WriteFacts fields keep separate meanings:
+version_id can pin a read after reconciliation, while reported_version records
+only the original write response. A HEAD/LIST match never manufactures a receipt.
+Publication exports only an acknowledged real version; content reconciliation can
+still satisfy an ordinary current copy with no created-version ID.
+
+The private checkpoint extension stores both the observed read pin and the raw
+receipt separately. Its current format rejects old/unknown layouts, conflicting
+acknowledgments, truncation and oversized input. A saved acknowledged publication
+restores its receipt. A Ready checkpoint, or a completion with a lost reply,
+restores only its read pin and cannot claim a created version. A later identical
+body under a different version is still a replacement and fails recovery.
+No public type/function or protocol SDK is added, and normal publication adds no
+storage request. Existing pending-source roots, metadata binding and identity
+checks remain; the record stays bounded to 4 KiB.
+
+Reconciled failed write/copy/completion responses retain their original typed cause
+in warning logs; a recovered ordinary copy does not become a callback failure.
+Historical applications require the created-version mapping separately and retain
+source data if it is missing. Application-wide historical purge remains a distinct
+readiness and ownership decision. See [the real evidence](../../tests/lab/README.md#s3-publication-version-evidence-across-policies).

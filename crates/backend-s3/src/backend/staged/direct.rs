@@ -347,11 +347,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         }
     }
 
-    /// Settles a failed completion by aborting the upload first. One already gone (`NoSuchUpload`)
-    /// completed: the object is ours when it is the key's latest version with our size and
-    /// composite `ETag`, and that version is claimed (ADR-0006 C17). One that could still be
-    /// aborted — or whose abort failed — may never have completed, and an identical earlier object
-    /// would match as well: it counts as written, but no version is claimed.
+    /// 先终止仍在的 upload，再按期望内容核对最终对象。
+    /// `NoSuchUpload` 允许观察最新版本作读取锚点，但也可能来自先前中止；不产生创建回执。
     async fn settle_direct_completion(
         &self,
         path: &StoragePath,
@@ -378,6 +375,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             Some(expected) => completed_object(&*self.protocol, path, size, expected, gone).await,
             None => None,
         };
+        if found.is_some() {
+            tracing::warn!(path = %path.as_str(), ?failure, "S3 Direct completion response unconfirmed; matching data reconciled without a created-version receipt");
+        }
         found.ok_or_else(|| role_failure(path, Operation::Write, failure))
     }
 
