@@ -679,8 +679,11 @@ pub(super) fn path_bytes(
 
 fn checked_relative(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure> {
     let relative = PathBuf::from(path.as_str());
-    let invalid = relative.as_os_str().is_empty()
-        || relative.is_absolute()
+    // 空的 StoragePath 表示已绑定的根能力；元数据操作允许观察和修改根属性。
+    if relative.as_os_str().is_empty() {
+        return Ok(PathBuf::from("."));
+    }
+    let invalid = relative.is_absolute()
         || relative.components().any(|component| {
             matches!(
                 component,

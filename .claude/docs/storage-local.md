@@ -200,3 +200,7 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
 3. 保留能力目录约束和阻塞执行器边界。
 4. 调 `backend-specialist` agent 传 `local`。
 5. 验证：`make e2e-local` (任何机器都能跑) + `make test`。
+
+### 根目录元数据
+
+现有 Metadata 角色将空的 StoragePath 根路径映射到已绑定能力的 `.`，支持根目录的原值观察、mode／owner、时间戳、ACL 和 xattr 应用。路径越界检查以及 Namespace 对根删除、根创建的拒绝保持有效。此操作不创建或删除端点，不提供并发改名排除；调用方须结合既有 persist_observed 核对当前根绑定和持久性。Linux 实际文件回归覆盖根属性读写、取消与子文件保留；未据此认证 Windows 根 ACL 或网络挂载。
