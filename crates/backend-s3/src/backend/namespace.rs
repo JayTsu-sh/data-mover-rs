@@ -17,8 +17,8 @@ use super::source::role_failure;
 use super::traversal_listing::produce as produce_traversal;
 use super::{S3Protocol, S3ProtocolFailure};
 use crate::model::{
-    BackendIdentity, EntryOperationFailure, FailureClass, ObservedEntry, Operation, StoragePath,
-    SymlinkTarget, Transience,
+    BackendIdentity, EntryOperationFailure, FailureClass, ObservedEntry, Operation, SourceVersion,
+    StoragePath, SymlinkTarget, Transience,
 };
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::{
@@ -250,7 +250,10 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
             }
             return results;
         }
-        let keys: Vec<_> = paths.iter().map(|path| path.as_str().to_owned()).collect();
+        let keys: Vec<_> = paths
+            .iter()
+            .map(|path| (path.as_str().to_owned(), SourceVersion::Current))
+            .collect();
         self.protocol
             .delete_objects(&keys)
             .await

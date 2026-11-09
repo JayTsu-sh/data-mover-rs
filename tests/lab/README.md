@@ -93,6 +93,85 @@ unrelated work. Local E2E and the seven current-only fault cases passed, complet
 scope. No application-level callback, source-key fencing, other vendor, or full-migration
 performance certification is implied by these malformed-listing checks.
 
+`python3 tests/lab/run-source-purge-local.py --version-batch` exercises the SDK implementation
+of the existing S3Protocol::delete_objects after extending its input with SourceVersion.
+This does not add a public entrypoint or type. Current namespace/artifact callers explicitly
+select Current; source-history purge still uses its serial, current-last route until partial
+failures can be delivered completely by the application. No nfs-rs change is required.
+
+Each isolated case seeds an old null slot, an immutable data version, a delete marker and a
+current data version. Only the three older IDs are submitted; independent reads require the
+current payload and sentinel unchanged, no new markers or uploads. Twelve exact-version cases cover normal
+success, partial denial, absent/wrong/duplicated version receipts, whole-request refusal,
+disconnect, silent timeout, cancellation by dropping the caller's wait, flash recovery and lost
+response recovery. The partial case performs a real upstream DeleteObjects for two siblings
+and synthesizes AccessDenied for the retained third; malformed receipt cases rewrite a real
+successful response. These are controlled proxy faults, not server defects. Flash/lost-response
+recovery is an explicit exact-ID test retry; it does not certify application automatic retry
+or a unified fault budget. Caller-wait cancellation is not a new typed protocol cancellation API.
+
+Seven more Current cases exercise the existing quiet SDK path: normal, refusal, disconnect,
+timeout, dropped caller wait, flash retry and lost response. Successful Current deletion adds
+one current delete marker while preserving all four original records and the independent
+sentinel. Lost Current responses are not blindly retried; the fixture confirms exactly one
+marker. A transient transport classification says nothing about mutation replay safety.
+
+The deterministic contract keeps all individual PermissionDenied results, matches shuffled
+same-key versions including null, refuses ambiguous selectors and NAS version requests before
+mutation, verifies 100+1 request boundaries and stops the second batch on partial failure.
+A malformed batch cannot replace an already recognized denial's typed class or original code;
+missing receipts remain Protocol/Unknown. Unsubmitted results identify that no later request
+was sent. The old current-only 101-key regression remains covered. Oversized receipt lists cannot
+amplify the additional classification state or diagnostics beyond the request batch; the SDK
+response parsing allocation itself is outside this check. Remote codes use existing bounded
+sanitization and never append unsafe raw code text back to diagnostics.
+
+The final S3 backend suite passed 429 tests (three ignored); the new ignored SDK contract
+was then run explicitly for all 19 cases. The original 11 exact-version source-purge cases
+also passed. Under explicit 1-second read / 2-second operation settings, silent loss returned
+in about 1.003 seconds; the dropped caller wait returned in about 301–302 ms including its
+50 ms observation delay. A lost exact-ID response was retried against the same IDs, while
+lost Current responses were not replayed. Independent checks confirmed the expected actual
+remaining versions in each case, not just the Rust result. These are functional profiles,
+not production-wide recovery budgets, typed cancellation or power-cut guarantees.
+
+The full CI scope passed in 53 sequential steps covering fmt, architecture/harness gates,
+minimal features, strict Clippy, workspace library/integration/example/doc tests, all example
+binaries and Local E2E (Rust 1.98.1, existing binrw future-compatibility note retained).
+The first pass stopped at the new real fixture's 107-line Clippy limit; extracting its result
+assertion fixed that. After final receipt-bound/sanitization and mixed-selector refinements,
+workspace library tests, the final 429-test backend suite and all-target strict Clippy passed.
+The final 19-case run used one fixed test binary; no runtime changes followed those checks.
+
+`--version-batch-perf` requires the same existing LAB_S3_PURGE_TEST_BINARY override pointing
+to an already built private backend test binary. It times serial delete_version versus the
+extended delete_objects in the same binary, with serial/bulk/bulk/serial/serial/bulk ordering.
+Each case seeds a new 128-record key including a null slot and marker, submits exactly 127
+older IDs, and retains the latest version and sentinel. The proxy confirms 127 serial requests
+versus two bulk requests of 100 and 27 selectors, with no current-version deletion or upload.
+The owned RustFS container uses one CPU / 768 MiB; both branches use Rust 1.98.1 dev debug=0,
+incremental=0. Seeding and initial connection/listing are outside phase timing; whole-process
+wall/RSS additionally include test/runtime/connection setup. Own builds and functional fixtures
+were finished before timing.
+
+| Pair | Serial delete phase / ms | Bulk delete phase / ms | Serial process peak / KiB | Bulk process peak / KiB |
+| --- | --- | --- | --- | --- |
+| 1 | 10538.232 | 250.980 | 29184 | 30912 |
+| 2 | 10617.775 | 224.598 | 29376 | 30336 |
+| 3 | 10682.400 | 230.613 | 29568 | 30720 |
+
+Median phase time was 10617.775→230.613 ms; whole-process time 10.68→0.30 s, peak RSS
+28.6875→30.00 MiB. This is a small same-key SDK experiment, not the guarded purge lifecycle,
+ClickHouse/callback, whole-migration throughput/RSS, release, other vendors or 1000+ pagination
+certification. The application is still pinned to its prior Native revision and source purge
+still deletes serially; product-level adoption remains pending complete partial-error delivery.
+Raw logs/results and the fixed binary are in `/tmp/native-exact-bulk-perf/` and
+`/tmp/native-exact-bulk-perf6.log`; SHA-256 is
+`6e5897f390101828714e7cdf802674481b85593d735c9b04a1b47e1d53a6b4ed`.
+All owned containers/volumes were removed. No SDK or new public function/type was needed;
+protocol selection/receipt handling stays in the S3 adapter, source readiness/order in purge,
+and job/error-count/callback policy in the application.
+
 `--current-source` uses the same contract against a bucket that was never versioned.
 Its observation comes from LIST (milliseconds), whereas the purge guard reads HEAD
 (whole HTTP seconds). The guard compares at the coarser observed precision while

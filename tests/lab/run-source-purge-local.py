@@ -40,7 +40,7 @@ def isolated_run():
     try:
         print(f"isolated source-purge image={docker('inspect', container, '--format', '{{.Image}}')}", flush=True)
         pid = docker("inspect", container, "--format", "{{.State.Pid}}")
-        arguments = [flag for flag in ("--namespace-read", "--source-observation", "--namespace-persistence", "--current-source") if flag in sys.argv]
+        arguments = [flag for flag in ("--namespace-read", "--source-observation", "--namespace-persistence", "--current-source", "--version-batch", "--version-batch-perf") if flag in sys.argv]
         subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *arguments], check=True)
     finally:
         docker("rm", "-f", "-v", container)
@@ -65,6 +65,9 @@ def inside_run():
     )
     bucket = f"source-purge-{uuid.uuid4().hex[:12]}"
     client.create_bucket(Bucket=bucket)
+    if "--version-batch" in sys.argv or "--version-batch-perf" in sys.argv:
+        from source_version_batch import run
+        return run(client, bucket, performance="--version-batch-perf" in sys.argv)
     current_source = "--current-source" in sys.argv
     if not current_source:
         client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})

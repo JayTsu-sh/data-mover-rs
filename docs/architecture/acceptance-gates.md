@@ -88,6 +88,18 @@ storage root; portable recursive deletion continues to report individual entries
 The namespace regression gate covers these distinctions, source preservation after failed
 S3 copy, metadata/tag preservation for both S3 rename forms, and bounded bulk-delete requests.
 
+S3Protocol::delete_objects also accepts existing SourceVersion selectors. Current retains the
+namespace behavior above; Id (including literal null) permanently removes only that exact
+version or marker. Inputs are validated before mutation, version receipts match key plus ID,
+and missing/unknown/duplicate receipts cannot confirm success. SDK requests contain at most
+100 selectors; a failed version batch prevents subsequent submissions and preserves every
+returned entry failure. The fallback protocol uses exact single-version deletes and stops
+at its first failure. This primitive does not itself authorize source cleanup, enforce current
+last, or certify all target history; the purge caller owns those gates. Application adoption
+requires complete partial-failure reporting and independent verification of remaining source
+versions, target readiness and task/callback statistics.
+
+
 ## 4. Parameterized directed matrix gates
 
 For each `gate_key` in `directed-transfer-matrix.yaml`, the following three independent

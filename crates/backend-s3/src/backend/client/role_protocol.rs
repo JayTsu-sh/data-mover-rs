@@ -5,7 +5,7 @@ use bytes::Bytes;
 
 use super::{CompletedPart, ProvideErrorMetadata, S3Storage, build_copy_source, transport};
 
-use crate::model::{FailureClass, Transience};
+use crate::model::{FailureClass, SourceVersion, Transience};
 use crate::storage::backends::s3::{
     S3NativeCopySource, S3ObjectPage, S3Protocol as _, S3ProtocolFailure, S3Result, S3VersionFacts,
     S3VersionMarker, S3VersionPage, S3WriteFacts,
@@ -452,8 +452,8 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         native::upload_part_copy(self, source, key, upload_id, part_number, range).await
     }
 
-    async fn delete_objects(&self, keys: &[String]) -> Vec<S3Result<()>> {
-        delete_batch::delete(self, keys).await
+    async fn delete_objects(&self, objects: &[(String, SourceVersion)]) -> Vec<S3Result<()>> {
+        delete_batch::delete(self, objects).await
     }
 
     fn namespace_rename_support(&self) -> Result<(), &'static str> {
