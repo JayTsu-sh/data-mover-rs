@@ -526,6 +526,9 @@ fn in_parent<T>(
     let (Some(parent), Some(leaf)) = (native.parent(), native.file_name()) else {
         return Err(io::ErrorKind::InvalidInput.into());
     };
+    if parent.as_os_str().is_empty() {
+        return work(root, leaf);
+    }
     work(&open_directory(root, parent)?, leaf)
 }
 
