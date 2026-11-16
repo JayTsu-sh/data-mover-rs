@@ -493,7 +493,7 @@ async fn confirm_vanished(
     }
     // A throttled confirmation is no confirmation, and never the traversal's end (P7 §8).
     let confirmed = namespace
-        .stat(path)
+        .stat(path, false)
         .await
         .map_err(|failure| throttling_scoped_to(path, Operation::Observe, failure));
     match confirmed {

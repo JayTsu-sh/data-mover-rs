@@ -126,7 +126,7 @@ async fn exercise_parked(
             return Err(format!("a first page of {} children", first.children.len()).into());
         }
         drop(stream);
-        namespace.stat(&path(dir)?).await?;
+        namespace.stat(&path(dir)?, false).await?;
     }
     for name in &names {
         namespace.delete(&path(&format!("{dir}/{name}"))?).await?;
@@ -152,7 +152,7 @@ async fn exercise(namespace: &dyn Namespace, share: &smb_domain::Share, dir: &st
 
 async fn exercise_directory(namespace: &dyn Namespace, dir: &str) -> Result {
     namespace.create_directory(&path(dir)?).await?;
-    let stat = namespace.stat(&path(dir)?).await?;
+    let stat = namespace.stat(&path(dir)?, false).await?;
     assert_eq!(
         stat.kind,
         EntryKind::Directory,
@@ -178,7 +178,7 @@ async fn exercise_listing(namespace: &dyn Namespace, dir: &str, file: &str) -> R
     );
     // A transfer validates a traversal observation against a fresh describe, so the identity a
     // listing produces has to equal the identity stat produces for the same unchanged entry.
-    let stat = namespace.stat(&path(file)?).await?;
+    let stat = namespace.stat(&path(file)?, false).await?;
     assert_eq!(
         listed[0].source_identity.identity_key(),
         stat.source_identity.identity_key(),
@@ -207,27 +207,30 @@ async fn exercise_listing(namespace: &dyn Namespace, dir: &str, file: &str) -> R
         IdentityStrength::StableWithinBackend,
         "session is not using file ids (see the connect-time identity-probe warning)"
     );
-    let directory = namespace.stat(&path(dir)?).await?;
+    let directory = namespace.stat(&path(dir)?, false).await?;
     assert_eq!(directory.kind, EntryKind::Directory);
     Ok(())
 }
 
 /// Rename moves `from` onto `to`, replacing an existing destination like the NFS and HDFS roles.
 async fn exercise_rename(namespace: &dyn Namespace, from: &str, to: &str) -> Result {
-    let before = namespace.stat(&path(from)?).await?;
+    let before = namespace.stat(&path(from)?, false).await?;
     namespace.rename(&path(from)?, &path(to)?).await?;
-    let after = namespace.stat(&path(to)?).await?;
+    let after = namespace.stat(&path(to)?, false).await?;
     assert_eq!(
         before.source_identity.identity_key(),
         after.source_identity.identity_key(),
         "a rename must not change the identity — this is the property rename detection relies on"
     );
     expect_class(
-        namespace.stat(&path(from)?).await,
+        namespace.stat(&path(from)?, false).await,
         FailureClass::NotFound,
         "stat of the renamed-away source",
     )?;
-    assert_eq!(namespace.stat(&path(to)?).await?.kind, EntryKind::File);
+    assert_eq!(
+        namespace.stat(&path(to)?, false).await?.kind,
+        EntryKind::File
+    );
     Ok(())
 }
 
@@ -235,13 +238,13 @@ async fn exercise_refusals(namespace: &dyn Namespace, dir: &str) -> Result {
     let moved = format!("{dir}-moved");
     namespace.rename(&path(dir)?, &path(&moved)?).await?;
     expect_class(
-        namespace.stat(&path(dir)?).await,
+        namespace.stat(&path(dir)?, false).await,
         FailureClass::NotFound,
         "stat of the renamed-away directory",
     )?;
     namespace.rename(&path(&moved)?, &path(dir)?).await?;
     assert_eq!(
-        namespace.stat(&path(dir)?).await?.kind,
+        namespace.stat(&path(dir)?, false).await?.kind,
         EntryKind::Directory,
         "directory renamed back keeps its kind"
     );
@@ -294,7 +297,7 @@ async fn exercise_paging(
     }
     namespace.delete(&path(&paged)?).await?;
     expect_class(
-        namespace.stat(&path(&paged)?).await,
+        namespace.stat(&path(&paged)?, false).await,
         FailureClass::NotFound,
         "stat of the deleted paged directory",
     )
@@ -309,7 +312,7 @@ async fn exercise_delete(namespace: &dyn Namespace, dir: &str, file: &str) -> Re
     )?;
     namespace.delete(&path(dir)?).await?;
     expect_class(
-        namespace.stat(&path(dir)?).await,
+        namespace.stat(&path(dir)?, false).await,
         FailureClass::NotFound,
         "stat of the deleted directory",
     )

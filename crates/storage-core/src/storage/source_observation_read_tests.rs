@@ -56,7 +56,11 @@ fn failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {
 
 #[async_trait]
 impl Namespace for Source {
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         let call = self.stat_calls.fetch_add(1, Ordering::SeqCst);
         if self.first_stat_fails && call == 0 {
             return Err(failure(path, FailureClass::Connectivity));

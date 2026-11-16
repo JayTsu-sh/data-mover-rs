@@ -39,6 +39,7 @@ use crate::transfer_concurrency::{
 use crate::{MB, Result};
 
 mod attributes;
+mod namespace_lookup;
 mod owner;
 mod role_create;
 mod role_delete;
@@ -152,6 +153,36 @@ fn invalidate_subtree_cache(prefix: PathBuf, root_fh: Bytes) {
         // always safe, just slower.
         GLOBAL_CACHE.invalidate_all();
     }
+}
+
+/// 只整理这次按名确认的目录；同一 FH 不失效、不重复写缓存，也不增加 LOOKUP。
+fn reconcile_namespace_cache(
+    path: PathBuf,
+    root: Bytes,
+    bound_root: &Bytes,
+    handle: &Bytes,
+    directory: bool,
+) -> bool {
+    if path.as_os_str().is_empty() {
+        // 根仍是原绑定锚点；不通过缓存偷偷切换后续写入根。
+        if handle != bound_root {
+            invalidate_subtree_cache(path, root);
+        }
+        return handle == bound_root;
+    }
+    let key = (path.clone(), root.clone());
+    let previous = GLOBAL_CACHE.get(&key);
+    if directory && previous.as_ref() == Some(handle) {
+        return true;
+    }
+    if directory || previous.is_some() {
+        // 父目录被替换时，后代 FH 也可能仍然存活，不能继续优先命中它们。
+        invalidate_subtree_cache(path, root);
+    }
+    if directory {
+        NFSStorage::cache_directory(key, handle);
+    }
+    true
 }
 
 /// `nfs_url` → `server_id` 映射表。
@@ -1138,23 +1169,27 @@ impl NFSStorage {
         }
     }
 
-    /// Optimized role-only lookup. nfs-rs already folds GETATTR into LOOKUP on every supported
-    /// dialect, so reuse those attributes instead of paying a second metadata RPC. Directory-cache
-    /// hits can lack attributes and deliberately fall back to one GETATTR.
+    /// Normal role reads keep the existing cache-backed lookup and its GETATTR fallback.
+    /// Strong namespace reads guard the configured root and resolve every relative component
+    /// from the held root FH, reconciling the observed ancestor chain for later metadata reads.
+    /// The latter costs one root query plus one LOOKUP per component, within the caller's
+    /// existing operation budget; it never rebinds the root or fences concurrent external writes.
     async fn role_lookup_with_attrs(
         &self,
         path: &crate::model::StoragePath,
         fresh: bool,
     ) -> std::result::Result<(Bytes, Attr), NfsProtocolFailure> {
-        let object = if fresh {
-            let relative = format!("{}/{}", self.root, path.as_str());
-            self.mount
-                .lookup_path(&relative)
-                .await
-                .map_err(crate::storage::backends::nfs::protocol::classify_error)?
-        } else {
-            self.role_lookup_fh(Path::new(path.as_str())).await?
-        };
+        if fresh {
+            return namespace_lookup::lookup(
+                self.mount.as_ref().as_ref(),
+                &self.root,
+                &self.rpc_root_fh(),
+                &self.get_root_fh(),
+                path,
+            )
+            .await;
+        }
+        let object = self.role_lookup_fh(Path::new(path.as_str())).await?;
         let file_handle = object.fh;
         let attrs = if let Some(attrs) = object.attr {
             attrs
@@ -2500,3 +2535,11 @@ mod tests {
         assert!(!is_retryable_with_invalidation(&err));
     }
 }
+
+#[cfg(test)]
+#[path = "client/namespace_freshness_tests.rs"]
+mod namespace_freshness_tests;
+
+#[cfg(test)]
+#[path = "client/namespace_lookup_tests.rs"]
+mod namespace_lookup_tests;

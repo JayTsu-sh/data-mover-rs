@@ -491,13 +491,14 @@ impl Namespace for GuardedNamespace {
     async fn stat(
         &self,
         path: &StoragePath,
+        fresh: bool,
     ) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
         let inner = self.inner.clone();
         let owned_path = path.clone();
         let value = self
             .guard
             .operation(&ScanRead::Stat, path, async move {
-                inner.stat(&owned_path).await
+                inner.stat(&owned_path, fresh).await
             })
             .await?;
         self.guard.record_success(&ScanRead::Stat, path, false);

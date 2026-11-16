@@ -82,7 +82,7 @@ pub(super) async fn current(
             "this namespace cannot permanently purge object history",
         ));
     }
-    let current = match namespace.stat(path).await {
+    let current = match namespace.stat(path, false).await {
         Ok(current) => current,
         Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
             return Ok(PurgeOutcome::AlreadyAbsent);

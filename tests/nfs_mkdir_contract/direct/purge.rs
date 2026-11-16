@@ -25,7 +25,7 @@ fn path(name: &str) -> Result<StoragePath> {
 async fn observed(source: &Storage, name: &str) -> Result<ObservedEntry> {
     Ok(observe_descriptor(
         source,
-        source.namespace()?.stat(&path(name)?).await?,
+        source.namespace()?.stat(&path(name)?, false).await?,
         ObservationPlan::default()
             .with_timestamps(ObservationMode::InlineOnly)
             .with_ownership_mode(ObservationMode::InlineOnly),
@@ -77,7 +77,7 @@ async fn deleted(source: &Storage, entry: &ObservedEntry) -> Result {
         PurgeOutcome::Deleted { records: 1 }
     ));
     assert!(
-        matches!(source.namespace()?.stat(entry.path()).await, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)
+        matches!(source.namespace()?.stat(entry.path(), false).await, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)
     );
     Ok(())
 }
@@ -178,7 +178,7 @@ async fn rewrite(
     assert_eq!(
         source
             .namespace()?
-            .stat(&path(name)?)
+            .stat(&path(name)?, false)
             .await?
             .source_identity,
         *entry.source_identity()
@@ -355,7 +355,7 @@ async fn purge_fault(mode: &str) -> Result {
         .await?;
     } else {
         assert!(
-            matches!(source.namespace()?.stat(&path(&name)?).await, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)
+            matches!(source.namespace()?.stat(&path(&name)?, false).await, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)
         );
     }
     assert_eq!(
@@ -433,13 +433,15 @@ async fn protect_replacement(
 ) -> Result {
     // 代理未转发的请求保留原项；丢失删除响应时源可能已删。两者都不能盲重试同名项。
     if already_removed {
-        assert!(matches!(source.namespace()?.stat(&path(name)?).await,
-            Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound));
+        assert!(
+            matches!(source.namespace()?.stat(&path(name)?, false).await,
+            Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)
+        );
     } else {
         assert_eq!(
             source
                 .namespace()?
-                .stat(&path(name)?)
+                .stat(&path(name)?, false)
                 .await?
                 .source_identity,
             *entry.source_identity()

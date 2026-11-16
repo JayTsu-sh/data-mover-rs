@@ -617,3 +617,30 @@ async fn mock_pipeline() {
         task.await.assert_value("consumer contract fixture");
     }
 }
+
+#[tokio::test]
+async fn actor_failure_notification_cannot_steal_session_settlement_wakeup() {
+    let (mut session, state, sender, _completion) = pair(1, 1, 1);
+    let receipt = state
+        .send(&sender, entry(0), false)
+        .await
+        .assert_value("issued work");
+    let mut feedback = Vec::new();
+    let work = id(session
+        .next_item(&mut feedback)
+        .await
+        .assert_value("issued work"));
+    let mut settled = Box::pin(state.settled());
+    let mut failed = Box::pin(state.failed());
+    assert!(futures::poll!(&mut settled).is_pending());
+    assert!(futures::poll!(&mut failed).is_pending());
+    feedback.push((work, true));
+    state.submit(&mut feedback);
+    assert!(receipt.await.assert_value("receipt"));
+    assert!(futures::poll!(&mut settled).is_ready());
+    assert!(futures::poll!(&mut failed).is_pending());
+    state.record_failure(TraversalTerminalFailure::Internal);
+    assert!(futures::poll!(&mut failed).is_ready());
+    // A later actor waiter observes the cached cause without requiring another notification.
+    assert!(state.failed().now_or_never().is_some());
+}

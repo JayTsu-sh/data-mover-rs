@@ -1,38 +1,47 @@
 //! Consumer-completed subtrees, with independent snapshot, parked-page and work bounds.
 //! Parent listings remain open: this scheduler never relists a released subtree.
 
-use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+#[cfg(test)]
 use futures::{FutureExt as _, StreamExt as _};
 use tokio::sync::{Semaphore, oneshot};
 
 use super::statistics::DirectoryAccumulator;
-use super::stream::Arrival;
 use super::{DirectoryWork, Shared, StorageTraversalSource, root_work};
-use crate::model::{BackendIdentity, EntryKind, EntrySnapshot, FailureClass, ObservedEntry};
+use crate::model::{BackendIdentity, EntryKind, EntrySnapshot, FailureClass};
 use crate::storage::{ListRequest, ListingStream, StorageRoleFailure};
 use crate::traversal::channel::{self, ItemSender};
 use crate::traversal::consumer::ConsumerState;
 use crate::traversal::{
-    BlockCounts, ListingOutcome, Resumable, ScanFailure, ScanTotals, TraversalCompletion,
-    TraversalConfigurationError, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest,
-    TraversalSession, TraversalTerminalFailure,
+    BlockCounts, Resumable, ScanTotals, TraversalCompletion, TraversalConfigurationError,
+    TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession, TraversalTerminalFailure,
 };
 
+mod admission;
+mod arena;
+mod io;
 mod page;
+mod publish;
 pub(super) mod resources;
+mod scheduler;
+#[cfg(test)]
+use crate::traversal::TraversalItem;
+use arena::{Arena, Key, Stage};
 use page::Prepared;
-use resources::{Charge, Held, PageCharge, Resources};
+use publish::{Phase, Sending, Target};
+#[cfg(test)]
+use resources::PageCharge;
+use resources::{Charge, Held, Resources};
 #[cfg(test)]
 #[path = "controlled_tests.rs"]
 mod tests;
 
 type Terminal = Result<TraversalOutcome, TraversalTerminalFailure>;
-type Acknowledged = (usize, Result<bool, oneshot::error::RecvError>);
+type Acknowledged = (Key, Phase, Result<bool, oneshot::error::RecvError>);
 
 pub(super) fn start(
     source: &StorageTraversalSource,
@@ -88,8 +97,9 @@ struct Node {
     work: DirectoryWork,
     boundary: Boundary,
     original: Option<EntrySnapshot>,
+    final_credit: Option<Charge>,
+    next_page_credit: usize,
     page: Prepared,
-    pending: usize,
     counts: BlockCounts,
     statistics: Option<DirectoryAccumulator>,
     charge: Charge,
@@ -100,12 +110,18 @@ struct Runner {
     consumer: Arc<ConsumerState>,
     output: ItemSender,
     identity: BackendIdentity,
-    nodes: Vec<Node>,
+    nodes: Arena,
     acknowledgements: FuturesUnordered<BoxFuture<'static, Acknowledged>>,
+    reads: FuturesUnordered<BoxFuture<'static, io::Read>>,
+    sending: Option<Sending>,
+    continuation: Option<(Target, Held<page::Bundle>)>,
     observations: Arc<Semaphore>,
     resources: Arc<Resources>,
     listing_limit: usize,
+    listings: usize,
+    read_limit: usize,
     page_hint: NonZeroUsize,
+    blocked_error: Option<TraversalTerminalFailure>,
     totals: ScanTotals,
 }
 
@@ -121,12 +137,14 @@ impl Runner {
             .request
             .consumer_completion_budget
             .map_or(0, NonZeroUsize::get);
-        let node_limit = (completion_limit / std::mem::size_of::<Node>()).max(1);
+        let node_limit = (completion_limit / arena::storage_bytes()).max(1);
         Self {
             resources: Resources::new(completion_limit),
             listing_limit: shared
                 .parked_listing_limit
                 .map_or(node_limit, |n| node_limit.min(n)),
+            listings: 0,
+            read_limit: operations,
             page_hint: shared
                 .request
                 .consumer_max_inflight
@@ -136,71 +154,51 @@ impl Runner {
             consumer,
             output,
             identity,
-            nodes: Vec::new(),
+            nodes: Arena::default(),
             acknowledgements: FuturesUnordered::new(),
+            reads: FuturesUnordered::new(),
+            sending: None,
+            continuation: None,
+            blocked_error: None,
             totals: ScanTotals::default(),
         }
     }
 
     async fn run(&mut self) -> Terminal {
         let result = self.walk().await;
-        if self.shared.request.cancel.is_cancelled()
-            && self.consumer.failure().is_none()
-            && matches!(result, Ok(()) | Err(TraversalTerminalFailure::Internal))
-        {
-            return Ok(TraversalOutcome::Cancelled);
-        }
         if let Err(error) = &result {
-            self.consumer.record_failure(error.clone()); // Before diagnostic backpressure/derived cancel.
-            self.flush_diagnostics().await;
+            self.consumer.record_failure(error.clone());
+        }
+        if result.is_err() || self.consumer.stopped.is_cancelled() {
+            // Seal the registered facts before dropping outer page/output futures. Their native
+            // operations follow their existing cleanup paths; late results cannot add facts.
+            self.consumer.close();
+            self.sending = None;
+            self.continuation = None;
+            self.reads.clear();
+            self.acknowledgements.clear();
+            self.nodes = Arena::default();
         }
         if let Some(failure) = self.consumer.failure() {
             return Err(failure);
         }
+        if self.shared.request.cancel.is_cancelled() || self.consumer.stopped.is_cancelled() {
+            return Ok(TraversalOutcome::Cancelled);
+        }
         result.map(|()| TraversalOutcome::Completed(TraversalCompletion::new(self.totals)))
-    }
-
-    async fn walk(&mut self) -> Result<(), TraversalTerminalFailure> {
-        if self.consumer.stopped.is_cancelled() {
-            return Ok(());
-        }
-        self.root().await?;
-        while !self.nodes.is_empty() {
-            if self.consumer.stopped.is_cancelled() {
-                return Ok(());
-            }
-            self.drain_acknowledgements()?;
-            let index = self.nodes.len() - 1;
-            if let Some(failure) = self.nodes[index].page.terminal.take() {
-                return Err(failure);
-            }
-            if let Some(Held { value, charge }) = self.nodes[index].page.items.pop_front() {
-                self.item(index, value).await?;
-                drop(charge);
-            } else if let Some(Held { value, charge }) = self.nodes[index].page.below.pop() {
-                self.push(value, None, Some(charge))?;
-            } else if let Some(Held { value, charge }) = self.nodes[index].page.statistics.take() {
-                self.emit(value).await?;
-                drop(charge);
-            } else {
-                self.read_or_finish(index).await?;
-            }
-        }
-        Ok(())
     }
 
     async fn root(&mut self) -> Result<(), TraversalTerminalFailure> {
         let namespace = self.shared.namespace.clone();
         let path = self.shared.request.root.clone();
         let (sender, receiver) = oneshot::channel();
-        // Never abort an adapter operation while it owns a native handle.
         tokio::spawn(async move {
-            let _ = sender.send(namespace.stat(&path).await);
+            let _ = sender.send(namespace.stat(&path, false).await);
         });
         let descriptor = tokio::select! {
             biased;
-            () = self.consumer.stopped.cancelled() => return Ok(()),
-            result = receiver => result.map_err(|_| TraversalTerminalFailure::Internal)?,
+            ()=self.consumer.stopped.cancelled()=>return Ok(()),
+            result=receiver=>result.map_err(|_|TraversalTerminalFailure::Internal)?,
         }
         .map_err(source_failure)?;
         if descriptor.kind != EntryKind::Directory {
@@ -208,34 +206,26 @@ impl Runner {
                 super::entry_failure(&descriptor.path, FailureClass::Unsupported),
             )));
         }
-        // No root ACL observation/work: the caller owns copy-root metadata.
-        self.push(root_work(&self.shared.request), None, None)
-    }
-
-    fn push(
-        &mut self,
-        work: DirectoryWork,
-        original: Option<EntrySnapshot>,
-        charge: Option<Charge>,
-    ) -> Result<(), TraversalTerminalFailure> {
-        let mut node = self.node(work, original, charge)?;
-        self.open(&mut node)?;
-        self.nodes.push(node);
+        let node = self.node(root_work(&self.shared.request), None, None)?;
+        let key = self.nodes.insert(None, node, Stage::Open)?;
+        self.nodes.queue(key, false);
         Ok(())
     }
 
+    fn node_bytes(work: &DirectoryWork, original: Option<&EntrySnapshot>) -> usize {
+        arena::storage_bytes()
+            .saturating_add(resources::work_bytes(work))
+            .saturating_add(work.path.as_str().len().saturating_mul(2))
+            .saturating_add(original.map_or(0, |raw| raw.as_bytes().len()))
+    }
+
     fn node(
-        &mut self,
+        &self,
         work: DirectoryWork,
         original: Option<EntrySnapshot>,
         prior: Option<Charge>,
     ) -> Result<Node, TraversalTerminalFailure> {
-        // Every root/hidden/policy node has a positive fixed charge. Visible work,
-        // listing/statistics paths, descent hint and first raw value remain held together.
-        let bytes = std::mem::size_of::<Node>()
-            .saturating_add(resources::work_bytes(&work))
-            .saturating_add(work.path.as_str().len().saturating_mul(2))
-            .saturating_add(original.as_ref().map_or(0, |raw| raw.as_bytes().len()));
+        let bytes = Self::node_bytes(&work, original.as_ref());
         let mut charge = match prior {
             Some(charge) => charge,
             None => self.resources.reserve(0)?,
@@ -249,309 +239,68 @@ impl Runner {
         Ok(Node {
             work,
             original,
+            final_credit: None,
+            next_page_credit: std::mem::size_of::<crate::storage::ListingPage>(),
             statistics,
             charge,
             boundary: Boundary::PolicyBoundary,
             page: Prepared::default(),
-            pending: 0,
             counts: BlockCounts::default(),
         })
     }
 
-    fn open(&mut self, node: &mut Node) -> Result<(), TraversalTerminalFailure> {
-        self.check_listing_room()?;
-        let work = &node.work;
-        let stream = self.shared.namespace.list_for_traversal(
-            ListRequest::new(work.path.clone(), self.consumer.stopped.child_token())
-                .with_descent_hint(work.hint.clone())
-                .with_page_hint(self.page_hint),
-            self.shared
-                .request
-                .root_object_diagnostics_at(work.child_depth),
-        );
-        node.boundary = Boundary::Listing(stream);
-        Ok(())
-    }
-
-    fn check_listing_room(&self) -> Result<(), TraversalTerminalFailure> {
-        let parked = self
-            .nodes
-            .iter()
-            .filter(|node| matches!(node.boundary, Boundary::Listing(_)))
-            .count();
-        if parked >= self.listing_limit {
-            return Err(TraversalTerminalFailure::ConsumerListingLimitExceeded {
-                limit: self.listing_limit,
-            });
-        }
-        Ok(())
-    }
-
-    async fn item(
-        &mut self,
-        index: usize,
-        item: TraversalItem,
-    ) -> Result<(), TraversalTerminalFailure> {
-        match item {
-            TraversalItem::Entry(entry) if entry.kind() == EntryKind::Directory => {
-                self.directory(index, entry).await
-            }
-            TraversalItem::Entry(entry) => {
-                let charge = self.phase_charge()?;
-                let result = self
-                    .consumer
-                    .send(&self.output, entry, false)
-                    .await
-                    .map_err(|()| self.stopped())?;
-                self.nodes[index].pending += 1;
-                self.acknowledgements.push(
-                    async move {
-                        let done = result.await;
-                        drop(charge);
-                        (index, done)
-                    }
-                    .boxed(),
-                );
-                Ok(())
-            }
-            TraversalItem::Failure(failure) => {
-                let error =
-                    TraversalTerminalFailure::ConsumerSource(Box::new(failure.failure.clone()));
-                self.consumer.record_failure(error.clone());
-                self.emit(TraversalItem::Failure(failure)).await?;
-                Err(error)
-            }
-            other => self.emit(other).await,
-        }
-    }
-
-    async fn directory(
-        &mut self,
-        index: usize,
-        entry: Box<ObservedEntry>,
-    ) -> Result<(), TraversalTerminalFailure> {
-        let position = self.nodes[index]
-            .page
-            .below
-            .iter()
-            .position(|work| &work.value.path == entry.path());
-        if position.is_some() {
-            self.check_listing_room()?;
-        }
-        let snapshot = entry
-            .try_encode_snapshot()
-            .map_err(|_| TraversalTerminalFailure::Internal)?;
-        let Held {
-            value: work,
-            charge,
-        } = if let Some(position) = position {
-            self.nodes[index].page.below.remove(position)
-        } else {
-            self.resources.hold(
-                DirectoryWork {
-                    path: entry.path().clone(),
-                    child_depth: self.nodes[index].work.child_depth.saturating_add(1),
-                    filter_children: false,
-                    hint: None,
+    fn open(&mut self, key: Key) -> Result<bool, TraversalTerminalFailure> {
+        if self.listings >= self.listing_limit {
+            self.park(
+                key,
+                TraversalTerminalFailure::ConsumerListingLimitExceeded {
+                    limit: self.listing_limit,
                 },
-                0,
-            )?
-        };
-        let mut node = self.node(work, Some(snapshot), Some(charge))?;
-        if position.is_none() {
-            node.statistics = None;
+            );
+            return Ok(false);
         }
-        let _phase = self.phase_charge()?;
-        let result = self
-            .consumer
-            .send(&self.output, entry, false)
-            .await
-            .map_err(|()| self.stopped())?;
-        self.wait_acknowledgement(result).await?; // Prepare must succeed before any descendant.
-        if position.is_some() {
-            self.open(&mut node)?;
-        }
-        self.nodes.push(node);
-        Ok(())
+        let live = self
+            .nodes
+            .get_mut(key)
+            .ok_or(TraversalTerminalFailure::Internal)?;
+        let node = live
+            .node
+            .as_mut()
+            .ok_or(TraversalTerminalFailure::Internal)?;
+        node.boundary = Boundary::Listing(
+            self.shared.namespace.list_for_traversal(
+                ListRequest::new(node.work.path.clone(), self.consumer.stopped.child_token())
+                    .with_descent_hint(node.work.hint.clone())
+                    .with_page_hint(self.page_hint),
+                self.shared
+                    .request
+                    .root_object_diagnostics_at(node.work.child_depth),
+            ),
+        );
+        self.listings += 1;
+        live.stage = Stage::Ready;
+        self.nodes.queue(key, false);
+        Ok(true)
     }
 
-    async fn read_or_finish(&mut self, index: usize) -> Result<(), TraversalTerminalFailure> {
-        let next = match &mut self.nodes[index].boundary {
-            Boundary::Listing(stream) => tokio::select! {
-                biased;
-                () = self.consumer.stopped.cancelled() => return Ok(()),
-                page = stream.next() => page,
-            },
-            Boundary::PolicyBoundary => None,
-        };
-        match next {
-            Some(Ok(page)) => {
-                let node = &mut self.nodes[index];
-                node.page = page::prepare(
-                    &self.shared,
-                    &self.observations,
-                    &self.consumer,
-                    node,
-                    page,
-                    PageCharge::new(self.resources.reserve(0)?),
-                )
-                .await?;
-                Ok(())
-            }
-            Some(Err(failure)) => self.listing_failed(index, failure).await,
-            None => self.finish_node(index).await,
-        }
-    }
-
-    async fn listing_failed(
-        &mut self,
-        index: usize,
-        failure: StorageRoleFailure,
-    ) -> Result<(), TraversalTerminalFailure> {
-        match super::stream::failed(&self.nodes[index].work.path, failure) {
-            Arrival::Failed(failure) => {
-                let error = TraversalTerminalFailure::ConsumerSource(Box::new(failure.clone()));
-                let node = &self.nodes[index];
-                let item = TraversalItem::Failure(Box::new(ScanFailure::listing(
-                    node.work.path.clone(),
-                    failure,
-                    node.counts.listed,
-                )));
-                self.consumer
-                    .record_observation(vec![item.clone()], Some(error.clone()));
-                self.emit(item).await?;
-                Err(error)
-            }
-            Arrival::Terminal(failure) => Err(failure),
-            Arrival::Page(_) | Arrival::End => Err(TraversalTerminalFailure::Internal),
-        }
-    }
-
-    async fn finish_node(&mut self, index: usize) -> Result<(), TraversalTerminalFailure> {
-        while self.nodes[index].pending != 0 {
-            let done = tokio::select! {
-                biased;
-                () = self.consumer.stopped.cancelled() => return Err(self.stopped()),
-                done = self.acknowledgements.next() => done.ok_or(TraversalTerminalFailure::Internal)?,
-            };
-            self.acknowledged(done)?;
-        }
-        let Node {
-            work,
-            boundary,
-            original,
-            counts,
-            statistics,
-            charge,
-            ..
-        } = self.nodes.pop().ok_or(TraversalTerminalFailure::Internal)?;
-        drop(boundary); // Physical EOF or an explicit policy boundary; no stream is reopened.
-        self.totals.absorb(&counts);
-        if let Some(mut statistics) = statistics {
-            self.emit(statistics.snapshot(&work.path, Some(ListingOutcome::Complete), false))
-                .await?;
-        }
-        if let Some(original) = original {
-            self.finalize(original).await?;
-        }
-        drop(charge);
-        Ok(())
-    }
-
-    async fn finalize(&mut self, original: EntrySnapshot) -> Result<(), TraversalTerminalFailure> {
-        let entry = ObservedEntry::decode_snapshot(original.as_bytes(), &self.identity)
-            .map_err(|_| TraversalTerminalFailure::Internal)?;
-        let entry_charge = self.resources.reserve(resources::entry_bytes(&entry))?;
-        let _phase = self.phase_charge()?;
-        let result = self
-            .consumer
-            .send(&self.output, Box::new(entry), true)
-            .await
-            .map_err(|()| self.stopped())?;
-        drop(entry_charge); // Payload moved to the consumer; first raw remains charged.
-        self.wait_acknowledgement(result).await?;
-        Ok(())
+    fn phase_bytes() -> usize {
+        std::mem::size_of::<Acknowledged>()
+            + std::mem::size_of::<oneshot::Receiver<bool>>()
+            + std::mem::size_of::<Charge>()
     }
 
     fn phase_charge(&self) -> Result<Charge, TraversalTerminalFailure> {
-        self.resources.reserve(
-            std::mem::size_of::<Acknowledged>()
-                + std::mem::size_of::<oneshot::Receiver<bool>>()
-                + std::mem::size_of::<Charge>(),
-        )
+        self.resources.reserve(Self::phase_bytes())
     }
 
-    async fn wait_acknowledgement(
-        &mut self,
-        result: oneshot::Receiver<bool>,
-    ) -> Result<(), TraversalTerminalFailure> {
-        tokio::select! {
-            biased;
-            () = self.consumer.stopped.cancelled() => Err(self.stopped()),
-            result = result => match result {
-                Ok(true) => Ok(()), Ok(false) => Err(TraversalTerminalFailure::ConsumerFailed), Err(_) => Err(self.stopped()),
-            },
-        }
+    fn park(&mut self, key: Key, error: TraversalTerminalFailure) {
+        self.blocked_error = Some(error);
+        self.nodes.block(key);
     }
-
-    fn drain_acknowledgements(&mut self) -> Result<(), TraversalTerminalFailure> {
-        while let Some(Some(done)) = self.acknowledgements.next().now_or_never() {
-            self.acknowledged(done)?;
-        }
-        Ok(())
-    }
-
-    fn acknowledged(
-        &mut self,
-        (index, result): Acknowledged,
-    ) -> Result<(), TraversalTerminalFailure> {
-        match result {
-            Ok(true) => {
-                let node = self
-                    .nodes
-                    .get_mut(index)
-                    .ok_or(TraversalTerminalFailure::Internal)?;
-                node.pending = node
-                    .pending
-                    .checked_sub(1)
-                    .ok_or(TraversalTerminalFailure::Internal)?;
-                Ok(())
-            }
-            Ok(false) => Err(TraversalTerminalFailure::ConsumerFailed),
-            Err(_) => Err(self.stopped()),
-        }
-    }
-
     fn stopped(&self) -> TraversalTerminalFailure {
         self.consumer
             .failure()
             .unwrap_or(TraversalTerminalFailure::Internal)
-    }
-
-    async fn emit(&mut self, item: TraversalItem) -> Result<(), TraversalTerminalFailure> {
-        tokio::select! {
-            biased;
-            () = self.consumer.stopped.cancelled() => Err(self.stopped()),
-            sent = self.output.send_one(item) => sent.map_err(|_| self.stopped()),
-        }
-    }
-
-    async fn flush_diagnostics(&mut self) {
-        let mut diagnostics = VecDeque::new();
-        for node in &mut self.nodes {
-            diagnostics.extend(node.page.items.drain(..).filter(|item| {
-                matches!(
-                    item.value,
-                    TraversalItem::Failure(_) | TraversalItem::ObservationFailure(_)
-                )
-            }));
-        }
-        for Held { value, charge } in diagnostics {
-            if self.emit(value).await.is_err() {
-                break;
-            }
-            drop(charge);
-        }
     }
 }
 

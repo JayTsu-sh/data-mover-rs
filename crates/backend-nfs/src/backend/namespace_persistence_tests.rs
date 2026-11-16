@@ -234,7 +234,7 @@ fn fixture() -> Result<(NfsNamespaceAdapter, Arc<State>, StoragePath)> {
 #[tokio::test]
 async fn published_file_commits_with_fresh_binding_checks_without_reading_data() -> Result {
     let (namespace, state, path) = fixture()?;
-    let expected = namespace.stat(&path).await?;
+    let expected = namespace.stat(&path, false).await?;
     namespace
         .persist_observed(&expected, CancellationToken::new())
         .await?;
@@ -248,7 +248,7 @@ async fn published_file_commits_with_fresh_binding_checks_without_reading_data()
 #[tokio::test]
 async fn stale_facts_and_missing_required_metadata_are_refused_before_open() -> Result {
     let (namespace, state, path) = fixture()?;
-    let expected = namespace.stat(&path).await?;
+    let expected = namespace.stat(&path, false).await?;
     for mode in 0..5 {
         let mut changed = expected.clone();
         match mode {
@@ -286,7 +286,7 @@ async fn stale_facts_and_missing_required_metadata_are_refused_before_open() -> 
 async fn replacements_during_open_and_commit_cannot_confirm_persistence() -> Result {
     for at_open in [true, false] {
         let (namespace, state, path) = fixture()?;
-        let expected = namespace.stat(&path).await?;
+        let expected = namespace.stat(&path, false).await?;
         if at_open {
             state.replace_on_open.store(true, Ordering::Release);
         } else {
@@ -309,7 +309,7 @@ async fn replacements_during_open_and_commit_cannot_confirm_persistence() -> Res
 #[tokio::test]
 async fn commit_and_close_failures_keep_both_diagnostics() -> Result {
     let (namespace, state, path) = fixture()?;
-    let expected = namespace.stat(&path).await?;
+    let expected = namespace.stat(&path, false).await?;
     state.fail_commit.store(true, Ordering::Release);
     state.fail_close.store(true, Ordering::Release);
     let error = namespace
@@ -326,7 +326,7 @@ async fn commit_and_close_failures_keep_both_diagnostics() -> Result {
 #[tokio::test(start_paused = true)]
 async fn failed_close_has_a_three_second_budget() -> Result {
     let (namespace, state, path) = fixture()?;
-    let expected = namespace.stat(&path).await?;
+    let expected = namespace.stat(&path, false).await?;
     state.stall_close.store(true, Ordering::Release);
     let error = tokio::time::timeout(
         Duration::from_secs(4),
@@ -344,7 +344,7 @@ async fn failed_close_has_a_three_second_budget() -> Result {
 #[tokio::test]
 async fn cancellation_interrupts_inflight_commit_and_pre_cancel_opens_nothing() -> Result {
     let (namespace, state, path) = fixture()?;
-    let expected = namespace.stat(&path).await?;
+    let expected = namespace.stat(&path, false).await?;
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert!(namespace.persist_observed(&expected, cancel).await.is_err());
@@ -374,7 +374,7 @@ async fn directory_and_symlink_confirmation_never_open_or_commit_a_file() -> Res
         let (mut namespace, state, path) = fixture()?;
         namespace.persistence = None;
         state.kind.store(kind, Ordering::Release);
-        let expected = namespace.stat(&path).await?;
+        let expected = namespace.stat(&path, false).await?;
         namespace
             .persist_observed(&expected, CancellationToken::new())
             .await?;
@@ -391,7 +391,7 @@ async fn non_file_replacement_during_confirmation_is_refused() -> Result {
     for kind in [1, 2] {
         let (namespace, state, path) = fixture()?;
         state.kind.store(kind, Ordering::Release);
-        let expected = namespace.stat(&path).await?;
+        let expected = namespace.stat(&path, false).await?;
         state.replace_on_second_fresh.store(true, Ordering::Release);
         let error = namespace
             .persist_observed(&expected, CancellationToken::new())
@@ -411,7 +411,7 @@ async fn root_directory_confirmation_rechecks_binding_and_never_deletes_the_endp
     let (namespace, state, _) = fixture()?;
     state.kind.store(1, Ordering::Release);
     let root = StoragePath::root();
-    let expected = namespace.stat(&root).await?;
+    let expected = namespace.stat(&root, false).await?;
     namespace
         .persist_observed(&expected, CancellationToken::new())
         .await?;

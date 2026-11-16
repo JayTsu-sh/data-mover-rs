@@ -264,7 +264,7 @@ async fn refuse_upload(
     assert!(!failure.final_destination_changed(), "final path touched");
     assert!(!failure.has_unpublished_stage(), "a stage was left behind");
     expect_class(
-        namespace.stat(&path(&target)?).await,
+        namespace.stat(&path(&target)?, false).await,
         FailureClass::NotFound,
         "stat of the refused upload",
     )

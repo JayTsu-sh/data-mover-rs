@@ -473,7 +473,11 @@ async fn nightly_lab_validates_factory_root_lifecycle() -> TestResult {
     assert!(connect_backend(config(false)).await.is_err());
     let storage = connect_backend(config(true)).await?;
     assert_eq!(
-        storage.namespace()?.stat(&StoragePath::root()).await?.kind,
+        storage
+            .namespace()?
+            .stat(&StoragePath::root(), false)
+            .await?
+            .kind,
         EntryKind::Directory
     );
     raw.delete(parsed.root(), true).await?;
@@ -513,7 +517,9 @@ async fn nightly_lab_lists_exactly_one_directory() -> TestResult {
         names.sort();
         assert_eq!(names, expected);
     }
-    let file = namespace.stat(&StoragePath::new("混合/file.txt")?).await?;
+    let file = namespace
+        .stat(&StoragePath::new("混合/file.txt")?, false)
+        .await?;
     assert_eq!(file.kind, EntryKind::File);
     assert_eq!(file.size, Some(7));
     let mut invalid = namespace.list(ListRequest::new(file.path, CancellationToken::new()));
@@ -554,7 +560,7 @@ async fn nightly_lab_namespace_rename_delete_and_artifacts() -> TestResult {
     assert_eq!(raw_read(&raw, "tree/target").await?, b"new"[..]);
     assert!(
         namespace
-            .stat(&StoragePath::new("tree/nested/file")?)
+            .stat(&StoragePath::new("tree/nested/file")?, false)
             .await
             .is_err()
     );
@@ -878,7 +884,7 @@ async fn nightly_lab_confines_independent_roots_and_cleanup() -> TestResult {
     let escape = StoragePath::new("../confine-right/sentinel")?;
     let sentinel = StoragePath::new("sentinel")?;
     let attempts = [
-        namespace.stat(&escape).await.map(|_| ()),
+        namespace.stat(&escape, false).await.map(|_| ()),
         namespace.delete(&escape).await,
         namespace.rename(&escape, &sentinel).await,
         namespace.rename(&sentinel, &escape).await,

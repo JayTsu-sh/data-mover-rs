@@ -56,15 +56,8 @@ impl Resources {
         Ok(charge)
     }
 
-    pub(super) fn hold<T>(
-        self: &Arc<Self>,
-        value: T,
-        bytes: usize,
-    ) -> Result<Held<T>, TraversalTerminalFailure> {
-        Ok(Held {
-            value,
-            charge: self.reserve(bytes)?,
-        })
+    pub(super) fn available(&self) -> usize {
+        self.limit.saturating_sub(*self.held.lock())
     }
 
     #[cfg(test)]
@@ -74,6 +67,27 @@ impl Resources {
 }
 
 impl Charge {
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(super) fn split(&mut self, bytes: usize) -> Result<Self, TraversalTerminalFailure> {
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or(TraversalTerminalFailure::Internal)?;
+        Ok(Self {
+            resources: Arc::clone(&self.resources),
+            bytes,
+        })
+    }
+
+    pub(super) fn absorb(&mut self, mut other: Self) {
+        debug_assert!(Arc::ptr_eq(&self.resources, &other.resources));
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        other.bytes = 0;
+    }
+
     pub(super) fn resize(&mut self, bytes: usize) -> Result<(), TraversalTerminalFailure> {
         let mut held = self.resources.held.lock();
         let required = held.saturating_sub(self.bytes).saturating_add(bytes);
@@ -100,6 +114,10 @@ impl Drop for Charge {
 impl PageCharge {
     pub(super) fn new(charge: Charge) -> Self {
         Self(Arc::new(Mutex::new(charge)))
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.0.lock().bytes()
     }
 
     pub(super) fn resize(&self, bytes: usize) -> Result<(), TraversalTerminalFailure> {

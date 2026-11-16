@@ -64,7 +64,7 @@ async fn rename_evidence_agrees_across_list_stat_observe_and_read_describe() -> 
     assert!(failures.is_empty());
     assert_eq!(entries.len(), 1);
     let stat = namespace
-        .stat(&path("file"))
+        .stat(&path("file"), false)
         .await
         .map_err(|error| format!("{error:?}"))?;
     let observed = adapter

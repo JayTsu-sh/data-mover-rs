@@ -77,6 +77,10 @@ pub enum NamespaceReadOutcome {
 /// Required 属性缺失或失败不会变成成功观察，BestEffort 保留失败事实。
 /// 只有初始 stat 的 `NotFound` 表示缺失，后续属性或链接读取的 `NotFound` 明确失败。
 /// 不发出写入或后台任务；调用方自行决定是否授权清理。
+/// 两个分支的初始 stat 都按当前名字重新解析，不使用本库的旧目录句柄；根绑定改变
+/// 必须保留后端冲突，不能在同一次观察中拼接新根身份与旧锚点属性。
+/// NFS 为此需要配置根查询及每级相对路径 LOOKUP；所有步骤共享本次检测／恢复预算，
+/// 不表示这些请求形成原子快照。
 ///
 /// # Errors
 /// 保留首末有类型原因；权限／认证等明确错误不重试，恢复不重置整个窗口。
@@ -108,7 +112,7 @@ pub async fn read_namespace_entry(
             policy,
             cancel,
             || async {
-                match namespace.stat(path).await {
+                match namespace.stat(path, true).await {
                     Ok(descriptor) => Ok(Some(descriptor)),
                     Err(StorageRoleFailure::Entry(error))
                         if error.class() == FailureClass::NotFound =>
@@ -136,7 +140,7 @@ async fn observe_current(
     let namespace = storage
         .namespace()
         .map_err(|error| NamespaceReadCause::Observation(Arc::new(error.into())))?;
-    let descriptor = match namespace.stat(path).await {
+    let descriptor = match namespace.stat(path, true).await {
         Ok(descriptor) => descriptor,
         Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
             return Ok(None);
@@ -350,3 +354,7 @@ fn observation_diagnostic(error: &EntryObservationFailure) -> &str {
         _ => "source observation could not be captured",
     }
 }
+
+#[cfg(test)]
+#[path = "namespace_read_freshness_tests.rs"]
+mod freshness_tests;

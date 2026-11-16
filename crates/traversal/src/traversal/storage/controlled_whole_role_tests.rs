@@ -2,7 +2,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::*;
-use crate::model::{EntryOperationFailure, MetadataFamily, ObservationPlan, SourceVersion};
+use crate::model::{
+    EntryOperationFailure, MetadataFamily, ObservationPlan, ObservedEntry, SourceVersion,
+};
 use crate::storage::backends::local::connect_backend;
 use crate::storage::{LocalBackendConfig, ReadRequest, Storage};
 
@@ -229,8 +231,9 @@ impl Namespace for NoInline {
     async fn stat(
         &self,
         path: &StoragePath,
+        fresh: bool,
     ) -> Result<crate::storage::SourceDescriptor, StorageRoleFailure> {
-        self.0.stat(path).await
+        self.0.stat(path, fresh).await
     }
     fn list(&self, request: ListRequest) -> ListingStream {
         let path = request.path.clone();
@@ -491,8 +494,9 @@ impl Namespace for RefusedLink {
     async fn stat(
         &self,
         path: &StoragePath,
+        fresh: bool,
     ) -> Result<crate::storage::SourceDescriptor, StorageRoleFailure> {
-        self.0.stat(path).await
+        self.0.stat(path, fresh).await
     }
     fn list(&self, request: ListRequest) -> ListingStream {
         self.0.list(request)

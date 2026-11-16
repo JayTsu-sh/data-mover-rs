@@ -240,7 +240,12 @@ fn refuse_artifacts(paths: &[&StoragePath]) -> Result<(), StorageRoleFailure> {
 
 #[async_trait]
 impl Namespace for CifsNamespace {
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    // 协议实现每次按 share path 发出 CREATE/OPEN 并使用响应属性，不复用旧目录 FH。
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         refuse_artifacts(&[path])?;
         self.stat_entry(path).await
     }

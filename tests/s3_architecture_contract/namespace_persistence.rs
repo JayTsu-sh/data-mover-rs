@@ -14,7 +14,7 @@ use data_mover::storage::StorageRoleFailure;
 async fn published_object_persistence_with_real_requests() -> TestResult {
     let storage = connected(&env::var("LAB_S3_PURGE_URL")?).await?;
     let namespace = storage.namespace()?;
-    let expected = namespace.stat(&StoragePath::new("payload")?).await?;
+    let expected = namespace.stat(&StoragePath::new("payload")?, false).await?;
     let pinned = storage.read_source()?.describe(&expected.path).await?;
     let control = env::var("LAB_S3_PURGE_CONTROL")?;
     let fault = env::var("LAB_S3_PURGE_FAULT")?;
@@ -73,7 +73,7 @@ async fn published_object_persistence_with_real_requests() -> TestResult {
     namespace
         .persist_observed(&pinned, CancellationToken::new())
         .await?;
-    assert_eq!(namespace.stat(&expected.path).await?, expected);
+    assert_eq!(namespace.stat(&expected.path, false).await?, expected);
     Ok(())
 }
 

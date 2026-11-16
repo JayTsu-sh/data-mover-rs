@@ -36,7 +36,7 @@ async fn current_local_descriptor_preserves_facts_and_shared_payload() -> TestRe
     let storage = local(root.path()).await?;
     let descriptor = storage
         .namespace()?
-        .stat(&StoragePath::new("file")?)
+        .stat(&StoragePath::new("file")?, false)
         .await?;
     let pointer = descriptor
         .backend_fact
@@ -69,7 +69,7 @@ async fn current_symlink_observation_retains_the_exact_target() -> TestResult {
     let storage = local(root.path()).await?;
     let descriptor = storage
         .namespace()?
-        .stat(&StoragePath::new("link")?)
+        .stat(&StoragePath::new("link")?, false)
         .await?;
     let observed = observe_descriptor(&storage, descriptor, ObservationPlan::default()).await?;
     assert_eq!(observed.kind(), EntryKind::Symlink);

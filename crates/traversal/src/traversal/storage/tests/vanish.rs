@@ -118,7 +118,11 @@ impl Namespace for VanishingTree {
 
     /// What a child's observation `NotFound` is confirmed with: gone for everything this tree
     /// makes vanish, there for `xattr-gone` (whose `NotFound` was about an attribute).
-    async fn stat(&self, at: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        at: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         match at.as_str() {
             "xattr-gone" => Ok(descriptor(at.as_str(), EntryKind::File)),
             "busy-stat" => Err(throttled()),

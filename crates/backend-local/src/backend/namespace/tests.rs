@@ -262,7 +262,7 @@ async fn stat_describes_one_entry_and_reports_missing_ones() -> Result {
     std::fs::write(temp.path().join("file"), b"abcd")?;
     let (namespace, _) = roles(temp.path())?;
     let entry = namespace
-        .stat(&path("file"))
+        .stat(&path("file"), false)
         .await
         .map_err(|error| format!("{error:?}"))?;
     assert_eq!(entry.size, Some(4));

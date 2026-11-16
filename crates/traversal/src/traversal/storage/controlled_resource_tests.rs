@@ -3,7 +3,7 @@ use super::*;
 use crate::model::{AclEncoding, AclMetadata, MetadataProvenance};
 use crate::storage::SourceDescriptor;
 
-fn manual_runner(
+pub(super) fn manual_runner(
     source: &StorageTraversalSource,
     request: TraversalRequest,
 ) -> (Runner, TraversalSession) {
@@ -87,7 +87,7 @@ async fn acquired_page_releases_each_transferred_payload_and_all_state_on_drop()
         .get();
     let (mut runner, _session) = manual_runner(&source, request);
     let resources = runner.resources.clone();
-    assert_eq!(runner.listing_limit, limit / std::mem::size_of::<Node>());
+    assert_eq!(runner.listing_limit, limit / arena::storage_bytes());
     runner
         .root()
         .await
@@ -95,13 +95,36 @@ async fn acquired_page_releases_each_transferred_payload_and_all_state_on_drop()
     let node_only = resources.held();
     assert_eq!(runner.nodes.len(), 1, "internal root is charged");
     assert!(node_only >= std::mem::size_of::<Node>());
+    let key = runner.nodes.next().assert_value("root ready key");
+    runner.open(key).assert_value("controlled resource fixture");
     runner
-        .read_or_finish(0)
-        .await
+        .advance(key)
         .assert_value("controlled resource fixture");
-    assert_eq!(runner.nodes[0].page.items.len(), 4);
+    let page = runner
+        .reads
+        .next()
+        .await
+        .assert_value("controlled resource page");
+    runner
+        .read(page)
+        .assert_value("controlled resource fixture");
+    assert_eq!(
+        runner
+            .nodes
+            .get(key)
+            .and_then(|live| live.node.as_ref())
+            .assert_value("root page")
+            .page
+            .items
+            .len(),
+        4
+    );
     let full = resources.held();
-    let item = runner.nodes[0]
+    let item = runner
+        .nodes
+        .get_mut(key)
+        .and_then(|live| live.node.as_mut())
+        .assert_value("root page")
         .page
         .items
         .pop_front()

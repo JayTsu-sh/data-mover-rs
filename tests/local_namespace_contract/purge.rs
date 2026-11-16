@@ -15,7 +15,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::time::Duration;
 
 async fn observed(storage: &Storage, name: &str) -> Result<ObservedEntry> {
-    let descriptor = storage.namespace()?.stat(&path(name)?).await?;
+    let descriptor = storage.namespace()?.stat(&path(name)?, false).await?;
     Ok(observe_descriptor(
         storage,
         descriptor,

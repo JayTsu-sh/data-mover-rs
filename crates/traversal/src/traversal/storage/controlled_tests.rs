@@ -53,6 +53,7 @@ struct ReadOnlyNamespace {
     objects: bool,
     block: bool,
     fail_root_after_page: bool,
+    fail_root_release: CancellationToken,
     started: CancellationToken,
     closed: CancellationToken,
 }
@@ -66,6 +67,7 @@ impl ReadOnlyNamespace {
             objects: false,
             block: false,
             fail_root_after_page: false,
+            fail_root_release: CancellationToken::new(),
             started: CancellationToken::new(),
             closed: CancellationToken::new(),
         }
@@ -83,8 +85,12 @@ impl Namespace for ReadOnlyNamespace {
     fn parked_listing_limit(&self) -> Option<NonZeroUsize> {
         self.parked
     }
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
-        self.inner.stat(path).await
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
+        self.inner.stat(path, fresh).await
     }
     async fn read_link(&self, path: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
         self.inner.read_link(path).await
@@ -101,6 +107,7 @@ impl Namespace for ReadOnlyNamespace {
         }
         if self.fail_root_after_page && request.path.as_str().is_empty() {
             let path = request.path.clone();
+            let release = self.fail_root_release.clone();
             let mut stream = self.inner.list(request);
             return ListingStream::from_producer(path.clone(), move |sink| async move {
                 if let Some(Ok(page)) = stream.next().await
@@ -108,6 +115,7 @@ impl Namespace for ReadOnlyNamespace {
                 {
                     return;
                 }
+                release.cancelled().await;
                 sink.fail(StorageRoleFailure::Entry(
                     crate::model::EntryOperationFailure::new(
                         path,
@@ -282,7 +290,8 @@ async fn policy_boundaries_finalize_without_listing_and_hidden_directories_keep_
 }
 
 #[tokio::test]
-async fn snapshot_and_parked_stream_exhaustion_fail_typed_without_relisting_or_hanging() {
+async fn snapshot_exhaustion_is_typed_and_single_stream_slot_is_reused_after_eof_without_relisting()
+{
     let root = tempfile::tempdir().assert_value("controlled traversal fixture");
     std::fs::create_dir(root.path().join("dir")).assert_value("controlled traversal fixture");
     for raw_budget in [true, false] {
@@ -297,7 +306,7 @@ async fn snapshot_and_parked_stream_exhaustion_fail_typed_without_relisting_or_h
         let source = StorageTraversalSource::with_roles(namespace.clone(), metadata)
             .identified(storage.identity().clone());
         let mut request = configured();
-        let budget = std::mem::size_of::<Node>() + 1;
+        let budget = arena::storage_bytes() + 1;
         if raw_budget {
             request.consumer_completion_budget = NonZeroUsize::new(budget);
         }
@@ -307,18 +316,31 @@ async fn snapshot_and_parked_stream_exhaustion_fail_typed_without_relisting_or_h
         )
         .await
         .assert_value("controlled traversal fixture");
-        assert!(items.is_empty());
         if raw_budget {
+            assert!(items.is_empty());
             assert!(
                 matches!(outcome, Err(TraversalTerminalFailure::ConsumerCompletionBudgetExceeded { limit, required }) if limit == budget && required > limit)
             );
         } else {
+            assert!(
+                matches!(outcome, Ok(TraversalOutcome::Completed(_))),
+                "single handle slot must be reused after parent EOF: {outcome:?}"
+            );
             assert_eq!(
-                outcome,
-                Err(TraversalTerminalFailure::ConsumerListingLimitExceeded { limit: 1 })
+                items
+                    .iter()
+                    .filter(|item| matches!(item, TraversalItem::SubtreeReady(_)))
+                    .count(),
+                1
             );
         }
-        assert_eq!(&*namespace.calls.lock(), &[String::new()]);
+        if raw_budget {
+            assert_eq!(&*namespace.calls.lock(), &[String::new()]);
+        } else {
+            let calls = namespace.calls.lock();
+            assert_eq!(calls.len(), 2);
+            assert!(calls.contains(&String::new()) && calls.contains(&"dir".to_owned()));
+        }
     }
 }
 
@@ -331,6 +353,7 @@ async fn source_failure_is_delivered_with_ack_outstanding_and_survives_derived_c
             .assert_value("controlled traversal fixture");
     let mut namespace = ReadOnlyNamespace::new(namespace);
     namespace.fail_root_after_page = true;
+    let release = namespace.fail_root_release.clone();
     let source = StorageTraversalSource::with_roles(Arc::new(namespace), metadata)
         .identified(storage.identity().clone())
         .output_capacity(NonZeroUsize::MIN);
@@ -342,6 +365,7 @@ async fn source_failure_is_delivered_with_ack_outstanding_and_survives_derived_c
         session.next_item(&mut feedback).await,
         Some(TraversalItem::ConsumerEntry(_))
     ));
+    release.cancel(); // The source fails only after a real file phase is issued and held.
     let item = tokio::time::timeout(Duration::from_secs(3), session.next_item(&mut feedback))
         .await
         .assert_value("controlled traversal fixture")
@@ -566,6 +590,10 @@ async fn wide_tree_releases_directory_snapshots_before_admitting_more_siblings()
     )
     .await
     .assert_value("controlled traversal fixture");
+    assert!(
+        matches!(outcome, Ok(TraversalOutcome::Completed(_))),
+        "bounded wide tree: {outcome:?}"
+    );
     assert_eq!(
         items
             .iter()
@@ -721,3 +749,6 @@ mod resources;
 
 #[path = "controlled_whole_role_tests.rs"]
 mod whole_role;
+
+#[path = "controlled_parallel_tests.rs"]
+mod parallel;

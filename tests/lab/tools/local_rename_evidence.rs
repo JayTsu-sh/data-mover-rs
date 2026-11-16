@@ -151,7 +151,7 @@ async fn consistent(storage: &Storage, name: &str, present: bool) -> Result<Obse
         .await?
         .remove(name)
         .ok_or("file absent from scan")?;
-    let stat = storage.namespace()?.stat(&path).await?;
+    let stat = storage.namespace()?.stat(&path, false).await?;
     let described = storage.read_source()?.describe(&path).await?;
     assert_eq!(listed.rename_evidence(), stat.rename_evidence());
     assert_eq!(listed.rename_evidence(), described.rename_evidence());

@@ -65,7 +65,11 @@ async fn fault(mode: &'static str) -> Result {
             CancellationToken::new(),
         )
         .await?;
-    let owned = target.namespace()?.stat(&path).await?.source_identity;
+    let owned = target
+        .namespace()?
+        .stat(&path, false)
+        .await?
+        .source_identity;
     let written = Arc::new(Notify::new());
     let wake = written.clone();
     stage.set_write_observer(Some(WriteProgressObserver::new(move |event| {
@@ -127,7 +131,7 @@ async fn fault(mode: &'static str) -> Result {
             if cleaned.is_err() {
                 // 测试记录未知关闭，不把它冒充自动清理成功；只重置已确认归属的夹具。
                 let inspector = connect(&env::var("LAB_NFS_DIRECT_URL")?).await?;
-                let current = inspector.namespace()?.stat(&path).await?;
+                let current = inspector.namespace()?.stat(&path, false).await?;
                 assert_eq!(current.source_identity.stable_bytes(), owned.stable_bytes());
                 inspector.namespace()?.delete(&path).await?;
             }

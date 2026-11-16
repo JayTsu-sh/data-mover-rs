@@ -126,7 +126,12 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
             .map_err(|e| role_failure(&StoragePath::root(), Operation::Observe, e))
     }
 
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    // 非根路径每次执行 HEAD／前缀查询；虚拟根及 PathScoped 身份语义不因 fresh 改变。
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         refuse_artifact(path)?;
         self.stat_entry(path).await
     }

@@ -128,7 +128,7 @@ async fn suspended_and_never_versioned_buckets_delete_exact_null_record() -> Tes
             let storage = connect(protocol.clone(), identity(), None)?;
             observe_descriptor(
                 &storage,
-                namespace.stat(&path("key")).await?,
+                namespace.stat(&path("key"), false).await?,
                 ObservationPlan::default(),
             )
             .await?

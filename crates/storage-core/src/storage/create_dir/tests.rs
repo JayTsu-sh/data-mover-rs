@@ -228,6 +228,7 @@ impl Namespace for FakeNamespace {
     async fn stat(
         &self,
         path: &StoragePath,
+        _fresh: bool,
     ) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
         self.record(format!("stat {}", path.as_str()));
         if let Some(failure) = self.stat_failure {
@@ -598,6 +599,7 @@ async fn a_session_scoped_refusal_is_not_probed() -> Result {
         async fn stat(
             &self,
             path: &StoragePath,
+            _fresh: bool,
         ) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
             // Were it probed, the level would pass as an existing directory.
             descriptor(path, EntryKind::Directory).map_err(|_| unsupported())

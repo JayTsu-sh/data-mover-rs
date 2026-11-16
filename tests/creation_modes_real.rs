@@ -34,7 +34,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 async fn assert_mode(storage: &Storage, relative: &str, expected: u32) -> TestResult {
     let path = StoragePath::new(relative)?;
-    let entry = storage.namespace()?.stat(&path).await?;
+    let entry = storage.namespace()?.stat(&path, false).await?;
     let actual = storage.metadata()?.permissions(&entry).await?.mode;
     assert_eq!(
         actual.map(|mode| mode & 0o7777),

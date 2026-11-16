@@ -37,7 +37,7 @@ async fn real_nfs_bound_roots_isolate_directory_cache_and_metadata() -> Result {
     for (prefix, mode) in [("cache-a", 0o711), ("cache-b", 0o722)] {
         let observed = root
             .namespace()?
-            .stat(&StoragePath::new(format!("{prefix}/item"))?)
+            .stat(&StoragePath::new(format!("{prefix}/item"))?, false)
             .await?;
         assert_eq!(
             observed.inline_mode().map(|value| value & 0o7777),

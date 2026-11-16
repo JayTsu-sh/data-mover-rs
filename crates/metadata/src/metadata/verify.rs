@@ -121,7 +121,7 @@ impl MetadataPlan {
                 None => target
                     .namespace()
                     .map_err(MetadataVerificationError::Capability)?
-                    .stat(path)
+                    .stat(path, false)
                     .await
                     .map_err(MetadataVerificationError::Read)?,
             },

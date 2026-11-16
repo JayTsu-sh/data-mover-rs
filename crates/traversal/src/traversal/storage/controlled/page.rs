@@ -17,9 +17,60 @@ use crate::storage::{ListingPage, SourceDescriptor};
 use crate::traversal::consumer::ConsumerState;
 use crate::traversal::{TraversalItem, TraversalTerminalFailure};
 
+/// A single child's facts and work are published without another child's prefix in between.
+pub(super) enum Bundle {
+    One(Option<TraversalItem>),
+    Many(VecDeque<TraversalItem>),
+}
+
+impl Bundle {
+    pub(super) fn iter(&self) -> impl Iterator<Item = &TraversalItem> {
+        let (one, many) = match self {
+            Self::One(item) => (item.as_ref(), None),
+            Self::Many(items) => (None, Some(items)),
+        };
+        one.into_iter()
+            .chain(many.into_iter().flat_map(|items| items.iter()))
+    }
+    pub(super) fn pop(&mut self) -> Option<TraversalItem> {
+        match self {
+            Self::One(item) => item.take(),
+            Self::Many(items) => items.pop_front(),
+        }
+    }
+    pub(super) fn is_empty(&self) -> bool {
+        self.iter().next().is_none()
+    }
+    pub(super) fn entries(&self) -> usize {
+        self.iter()
+            .filter(|item| matches!(item, TraversalItem::Entry(_)))
+            .count()
+    }
+    pub(super) fn entry(&self) -> Option<&ObservedEntry> {
+        self.iter().find_map(|item| {
+            if let TraversalItem::Entry(entry) = item {
+                Some(&**entry)
+            } else {
+                None
+            }
+        })
+    }
+    fn bytes(&self) -> usize {
+        let storage = match self {
+            Self::One(_) => 0,
+            Self::Many(items) => items
+                .capacity()
+                .saturating_mul(std::mem::size_of::<TraversalItem>()),
+        };
+        self.iter()
+            .map(resources::item_bytes)
+            .fold(storage, usize::saturating_add)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Prepared {
-    pub(super) items: VecDeque<Held<TraversalItem>>,
+    pub(super) items: VecDeque<Held<Bundle>>,
     pub(super) below: Vec<Held<DirectoryWork>>,
     pub(super) statistics: Option<Held<TraversalItem>>,
     pub(super) terminal: Option<TraversalTerminalFailure>,
@@ -71,7 +122,11 @@ pub(super) async fn prepare(
     // Preserve admitted facts before awaiting any additional observation. On success the
     // ordinary output copy retires them; cancellation/aggregation failure drains them.
     consumer.record_observation(
-        preparation.items.clone(),
+        preparation
+            .items
+            .iter()
+            .flat_map(|items| items.iter().cloned())
+            .collect(),
         preparation.prepared.terminal.clone(),
     );
     for child in &children {
@@ -99,6 +154,7 @@ pub(super) async fn prepare(
     let initial = preparation.bytes(&children).max(raw_bytes);
     // No extra observation starts until the acquired page and all inline facts fit.
     // Acquisition/inline preparation are a documented transient, not an allocator cap.
+    node_next_credit(&mut preparation, initial);
     charge.resize(initial)?;
     let settled = observe(
         shared,
@@ -110,9 +166,14 @@ pub(super) async fn prepare(
     )
     .await?;
     for child in settled {
-        preparation.child(child)?;
+        preparation.child(child, consumer)?;
     }
+    node_next_credit(&mut preparation, charge.bytes());
     preparation.finish(charge)
+}
+
+fn node_next_credit(preparation: &mut Preparation<'_>, bytes: usize) {
+    preparation.node.next_page_credit = preparation.node.next_page_credit.max(bytes);
 }
 
 struct Preparation<'a> {
@@ -120,7 +181,7 @@ struct Preparation<'a> {
     node: &'a mut Node,
     prepared: Draft,
     hints: HashMap<u64, Option<crate::storage::DescentHint>>,
-    items: Vec<TraversalItem>,
+    items: Vec<Bundle>,
 }
 
 impl<'a> Preparation<'a> {
@@ -156,7 +217,11 @@ impl<'a> Preparation<'a> {
         );
     }
 
-    fn child(&mut self, child: Settled) -> Result<(), TraversalTerminalFailure> {
+    fn child(
+        &mut self,
+        child: Settled,
+        consumer: &ConsumerState,
+    ) -> Result<(), TraversalTerminalFailure> {
         let (result, deferred, kind) = match child {
             Settled::Filtered(failures) => {
                 self.count(ChildItem::ObservationFailures(failures), None, None);
@@ -165,16 +230,32 @@ impl<'a> Preparation<'a> {
             Settled::Observed(result, deferred, kind) => (result, deferred, kind),
             Settled::Pending(_, _) => return Err(TraversalTerminalFailure::Internal),
         };
+        // A role's Cancelled result with no caller cancellation still becomes a child
+        // ScanFailure below. It was deliberately not a fatal signal in page_io; retain
+        // this newly resolved fact before the actor seals its failure cutoff.
+        if !consumer.stopped.is_cancelled()
+            && let Err(error) = &result
+            && let crate::storage::StorageRoleFailure::Entry(failure) = &error.failure
+            && failure.class() == crate::model::FailureClass::Cancelled
+        {
+            consumer.record_observation(
+                vec![TraversalItem::Failure(Box::new(
+                    crate::traversal::ScanFailure::child(failure.clone()),
+                ))],
+                None,
+            );
+        }
         match resolve(self.shared, result, deferred) {
             Ok(resolved) => self.resolved(resolved, deferred, kind),
             Err(error) => {
                 self.prepared.terminal.get_or_insert(error.terminal);
-                self.items.extend(
+                self.items.push(Bundle::Many(
                     error
                         .observations
                         .into_iter()
-                        .map(|failure| TraversalItem::ObservationFailure(Box::new(failure))),
-                );
+                        .map(|failure| TraversalItem::ObservationFailure(Box::new(failure)))
+                        .collect(),
+                ));
             }
         }
         Ok(())
@@ -211,20 +292,26 @@ impl<'a> Preparation<'a> {
         if let Some(counts) = self.node.statistics.as_mut() {
             counts.child(&item, kind, descent);
         }
-        tally_child(
+        let tallied = tally_child(
             &mut self.node.counts,
             item,
             descent,
             self.shared.probe.history_segment(),
-        )
-        .push_into(&mut self.items);
+        );
+        match tallied {
+            super::super::output::Tallied::Nothing => {}
+            super::super::output::Tallied::One(item) => self.items.push(Bundle::One(Some(item))),
+            super::super::output::Tallied::Many(items) => {
+                self.items.push(Bundle::Many(items.into()));
+            }
+        }
     }
 
     fn bytes(&self, children: &VecDeque<Child>) -> usize {
         let storage = self
             .items
             .capacity()
-            .saturating_mul(std::mem::size_of::<TraversalItem>())
+            .saturating_mul(std::mem::size_of::<Bundle>())
             .saturating_add(
                 self.prepared
                     .below
@@ -243,7 +330,7 @@ impl<'a> Preparation<'a> {
                 std::mem::size_of::<Settled>()
                     + std::mem::size_of::<(usize, Box<SourceDescriptor>)>(),
             ));
-        let items = self.items.iter().map(resources::item_bytes);
+        let items = self.items.iter().map(Bundle::bytes);
         let below = self.prepared.below.iter().map(resources::work_bytes);
         let children = children.iter().map(|child| match child {
             Child::Filtered(failures) => failures
@@ -291,7 +378,7 @@ impl<'a> Preparation<'a> {
         let mut below = Vec::with_capacity(self.prepared.below.len());
         let fixed = items
             .capacity()
-            .saturating_mul(std::mem::size_of::<Held<TraversalItem>>())
+            .saturating_mul(std::mem::size_of::<Held<Bundle>>())
             .saturating_add(
                 below
                     .capacity()
@@ -306,14 +393,14 @@ impl<'a> Preparation<'a> {
         let payload = self
             .items
             .iter()
-            .map(resources::item_bytes)
+            .map(Bundle::bytes)
             .chain(self.prepared.below.iter().map(resources::work_bytes))
             .chain(statistics.iter().map(resources::item_bytes))
             .fold(fixed, usize::saturating_add);
         charge.resize(payload)?;
-        for item in self.items {
-            let bytes = resources::item_bytes(&item);
-            items.push_back(charge.take(item, bytes)?);
+        for bundle in self.items {
+            let bytes = bundle.bytes();
+            items.push_back(charge.take(bundle, bytes)?);
         }
         for work in self.prepared.below {
             let bytes = resources::work_bytes(&work);

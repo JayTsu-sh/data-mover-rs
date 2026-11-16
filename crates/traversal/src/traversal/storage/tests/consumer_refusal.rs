@@ -7,7 +7,11 @@ struct CountingNamespace(Arc<AtomicUsize>);
 
 #[async_trait]
 impl Namespace for CountingNamespace {
-    async fn stat(&self, _path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        _path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Err(not_found())
     }

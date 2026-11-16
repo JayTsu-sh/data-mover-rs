@@ -25,18 +25,18 @@ async fn files_directories_and_later_metadata_are_persisted_without_body_replay(
     let namespace = namespace(&root)?;
     for name in ["tree/file", "tree", ""] {
         let path = crate::model::StoragePath::new(name)?;
-        let before = namespace.stat(&path).await?;
+        let before = namespace.stat(&path, false).await?;
         namespace
             .persist_observed(&before, CancellationToken::new())
             .await?;
-        assert_eq!(before, namespace.stat(&path).await?);
+        assert_eq!(before, namespace.stat(&path, false).await?);
     }
     std::fs::set_permissions(
         root.join("tree/file"),
         std::fs::Permissions::from_mode(0o640),
     )?;
     let before = namespace
-        .stat(&crate::model::StoragePath::new("tree/file")?)
+        .stat(&crate::model::StoragePath::new("tree/file")?, false)
         .await?;
     namespace
         .persist_observed(&before, CancellationToken::new())
@@ -64,7 +64,7 @@ async fn stale_data_and_replaced_inodes_are_refused() -> TestResult {
     let namespace = namespace(root.path())?;
     std::fs::write(root.path().join("file"), b"before")?;
     let path = crate::model::StoragePath::new("file")?;
-    let before = namespace.stat(&path).await?;
+    let before = namespace.stat(&path, false).await?;
     std::fs::write(root.path().join("file"), b"after!")?;
     assert!(
         namespace
@@ -72,7 +72,7 @@ async fn stale_data_and_replaced_inodes_are_refused() -> TestResult {
             .await
             .is_err()
     );
-    let current = namespace.stat(&path).await?;
+    let current = namespace.stat(&path, false).await?;
     std::fs::rename(root.path().join("file"), root.path().join("old"))?;
     std::fs::write(root.path().join("file"), b"after!")?;
     assert!(
@@ -92,7 +92,7 @@ async fn file_and_directory_sync_failures_and_cancellation_never_confirm() -> Te
     std::fs::write(root.path().join("file"), b"payload")?;
     let namespace = namespace(root.path())?;
     let before = namespace
-        .stat(&crate::model::StoragePath::new("file")?)
+        .stat(&crate::model::StoragePath::new("file")?, false)
         .await?;
     let anchor = namespace.persistence.as_ref().ok_or("missing anchor")?;
     anchor.fail_directory_sync.store(true, Ordering::SeqCst);
@@ -139,7 +139,7 @@ async fn symlink_substitution_never_follows_or_modifies_an_unrelated_target() ->
     std::fs::write(outside.path().join("file"), b"unrelated")?;
     let namespace = namespace(root.path())?;
     let before = namespace
-        .stat(&crate::model::StoragePath::new("tree/file")?)
+        .stat(&crate::model::StoragePath::new("tree/file")?, false)
         .await?;
     std::fs::rename(root.path().join("tree"), root.path().join("held"))?;
     symlink(outside.path(), root.path().join("tree"))?;
@@ -151,7 +151,7 @@ async fn symlink_substitution_never_follows_or_modifies_an_unrelated_target() ->
     );
     std::fs::write(root.path().join("flat"), b"owned")?;
     let flat = namespace
-        .stat(&crate::model::StoragePath::new("flat")?)
+        .stat(&crate::model::StoragePath::new("flat")?, false)
         .await?;
     std::fs::rename(root.path().join("flat"), root.path().join("held-flat"))?;
     symlink(outside.path().join("file"), root.path().join("flat"))?;
@@ -163,7 +163,7 @@ async fn symlink_substitution_never_follows_or_modifies_an_unrelated_target() ->
     );
     symlink(outside.path().join("file"), root.path().join("link"))?;
     let link = namespace
-        .stat(&crate::model::StoragePath::new("link")?)
+        .stat(&crate::model::StoragePath::new("link")?, false)
         .await?;
     assert!(
         matches!(namespace.persist_observed(&link, CancellationToken::new()).await,
@@ -183,7 +183,7 @@ async fn replacing_the_root_before_or_after_its_first_confirmation_is_refused() 
         std::fs::write(root.join("file"), b"owned")?;
         let namespace = namespace(&root)?;
         let before = namespace
-            .stat(&crate::model::StoragePath::new("file")?)
+            .stat(&crate::model::StoragePath::new("file")?, false)
             .await?;
         if confirm_first {
             namespace
@@ -213,7 +213,7 @@ async fn moving_the_same_root_away_and_back_still_syncs_all_ancestors() -> TestR
     std::fs::write(root.join("file"), b"payload")?;
     let namespace = namespace(&root)?;
     let before = namespace
-        .stat(&crate::model::StoragePath::new("file")?)
+        .stat(&crate::model::StoragePath::new("file")?, false)
         .await?;
     namespace
         .persist_observed(&before, CancellationToken::new())
@@ -229,7 +229,7 @@ async fn moving_the_same_root_away_and_back_still_syncs_all_ancestors() -> TestR
     assert_eq!(
         before,
         namespace
-            .stat(&crate::model::StoragePath::new("file")?)
+            .stat(&crate::model::StoragePath::new("file")?, false)
             .await?
     );
     namespace

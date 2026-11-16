@@ -66,7 +66,11 @@ impl StalledTarget {
 
 #[async_trait]
 impl Namespace for StalledTarget {
-    async fn stat(&self, _: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        _: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         self.stall(ReadPhase::Stat).await;
         Ok(self.descriptor.clone())
     }

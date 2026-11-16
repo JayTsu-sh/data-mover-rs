@@ -23,6 +23,7 @@ pub(super) struct ConsumerState {
     ledger: Mutex<Ledger>,
     room: Arc<Semaphore>,
     changed: Notify,
+    failure_changed: Notify,
     pub(super) stopped: CancellationToken,
 }
 
@@ -75,6 +76,7 @@ impl ConsumerState {
             ledger: Mutex::new(Ledger::default()),
             room: Arc::new(Semaphore::new(window.get().min(Semaphore::MAX_PERMITS))),
             changed: Notify::new(),
+            failure_changed: Notify::new(),
             stopped: cancel.child_token(),
         })
     }
@@ -218,12 +220,17 @@ impl ConsumerState {
         if ledger.closed {
             return;
         }
+        let failed = failure.is_some();
         if let Some(failure) = failure {
             ledger.failure.get_or_insert(failure);
         }
         ledger
             .diagnostics
             .extend(diagnostics.into_iter().filter(is_diagnostic));
+        drop(ledger);
+        if failed {
+            self.failure_changed.notify_one();
+        }
     }
 
     /// The output copy has reached its caller; remove exactly its pending fallback copy.
@@ -254,6 +261,17 @@ impl ConsumerState {
         self.room.close();
         self.stopped.cancel();
         self.changed.notify_one();
+    }
+
+    /// A dedicated actor notification cannot steal the session's ACK/EOF wake-up.
+    pub(super) async fn failed(&self) {
+        loop {
+            let changed = self.failure_changed.notified();
+            if self.failure().is_some() {
+                return;
+            }
+            changed.await;
+        }
     }
 
     pub(super) async fn settled(&self) {

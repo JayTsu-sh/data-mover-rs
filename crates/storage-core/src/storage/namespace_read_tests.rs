@@ -33,7 +33,11 @@ struct Fault {
 
 #[async_trait]
 impl Namespace for Fault {
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         let calls = self.calls.fetch_add(1, Ordering::SeqCst);
         if self.stall {
             sleep(Duration::from_secs(100)).await;

@@ -43,7 +43,7 @@ async fn real_nfs_published_file_persistence_contract() -> Result {
         std::fs::write(root.path().join(name), bytes)?;
         let path = StoragePath::new(name)?;
         copy(&source, &target, &path).await?;
-        let expected = target.namespace()?.stat(&path).await?;
+        let expected = target.namespace()?.stat(&path, false).await?;
         target
             .namespace()?
             .persist_observed(&expected, CancellationToken::new())
@@ -56,7 +56,7 @@ async fn real_nfs_published_file_persistence_contract() -> Result {
                 CancellationToken::new(),
             )
             .await?;
-        let readonly = target.namespace()?.stat(&path).await?;
+        let readonly = target.namespace()?.stat(&path, false).await?;
         target
             .namespace()?
             .persist_observed(&readonly, CancellationToken::new())
@@ -95,7 +95,7 @@ async fn replacement(source: &Storage, target: &Storage, root: &std::path::Path)
     let path = StoragePath::new("persist-replaced")?;
     std::fs::write(root.join(path.as_str()), b"original")?;
     copy(source, target, &path).await?;
-    let expected = target.namespace()?.stat(&path).await?;
+    let expected = target.namespace()?.stat(&path, false).await?;
     target
         .namespace()?
         .rename(&path, &StoragePath::new("persist-held")?)
@@ -120,7 +120,7 @@ async fn parent_replacement(source: &Storage, target: &Storage, root: &std::path
     let path = StoragePath::new("persist-parent/file")?;
     create_directory_all(target, &StoragePath::new("persist-parent")?).await?;
     copy(source, target, &path).await?;
-    let expected = target.namespace()?.stat(&path).await?;
+    let expected = target.namespace()?.stat(&path, false).await?;
     target
         .namespace()?
         .rename(
@@ -171,7 +171,7 @@ async fn persistence_fault(mode: &'static str) -> Result {
     std::fs::write(root.path().join(path.as_str()), b"headtail")?;
     let source = common::connect_local(root.path(), 2).await?;
     copy(&source, &target, &path).await?;
-    let expected = target.namespace()?.stat(&path).await?;
+    let expected = target.namespace()?.stat(&path, false).await?;
     control(&format!("commit-{mode}")).await?;
     let cancel = CancellationToken::new();
     let started = Instant::now();
@@ -207,7 +207,7 @@ async fn persistence_fault(mode: &'static str) -> Result {
     }
     control("normal").await?;
     let retry = connect(&env::var("LAB_NFS_DIRECT_URL")?).await?;
-    let current = retry.namespace()?.stat(&path).await?;
+    let current = retry.namespace()?.stat(&path, false).await?;
     retry
         .namespace()?
         .persist_observed(&current, CancellationToken::new())

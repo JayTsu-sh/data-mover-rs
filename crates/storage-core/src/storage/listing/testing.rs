@@ -72,7 +72,7 @@ pub trait Perform {
 impl<N: Namespace + ?Sized> Perform for N {
     async fn perform(&self, verb: Verb) -> Result<(), StorageRoleFailure> {
         match verb {
-            Verb::Stat(path) => self.stat(&path).await.map(drop),
+            Verb::Stat(path) => self.stat(&path, false).await.map(drop),
             Verb::List(path) => listed(self, &path).await.map(drop),
             Verb::ReadLink(path) => self.read_link(&path).await.map(drop),
             Verb::CreateDirectory(path) => self.create_directory(&path).await,

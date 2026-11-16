@@ -75,7 +75,7 @@ async fn real_nfs_create_directory_all_passes_existing_levels_it_may_not_write()
     let scratch = format!("dm-mkdir-{nanos}");
     let namespace = owner.namespace()?;
     // Never adopt an existing directory: everything this test deletes, it created.
-    if namespace.stat(&path(&scratch)?).await.is_ok() {
+    if namespace.stat(&path(&scratch)?, false).await.is_ok() {
         return Err(format!("{scratch} already exists").into());
     }
     let outcome = exercise(&url, &owner, &scratch).await;
@@ -123,7 +123,7 @@ async fn exercise(url: &str, owner: &Storage, scratch: &str) -> Result {
     create_directory_all(&caller, &path(&new_below_writable)?)
         .await
         .map_err(|error| format!("create_directory_all({new_below_writable}): {error:?}"))?;
-    let created = namespace.stat(&path(&new_below_writable)?).await?;
+    let created = namespace.stat(&path(&new_below_writable)?, false).await?;
     if created.kind != EntryKind::Directory {
         return Err(format!("{new_below_writable} is a {:?}", created.kind).into());
     }
@@ -131,7 +131,7 @@ async fn exercise(url: &str, owner: &Storage, scratch: &str) -> Result {
 
     let refused = format!("{ro}/new");
     expect_refused(&caller, &refused, &refused).await?;
-    let absent = namespace.stat(&path(&refused)?).await;
+    let absent = namespace.stat(&path(&refused)?, false).await;
     if !matches!(&absent, Err(StorageRoleFailure::Entry(failure)) if failure.class() == FailureClass::NotFound)
     {
         return Err(format!("{refused} must not exist: {absent:?}").into());
@@ -246,7 +246,7 @@ async fn renames_refused_at_their_level(caller: &Storage, ro: &str, writable: &s
         (moving, true),
         (gone, false),
     ] {
-        let found = match namespace.stat(&path(&name)?).await {
+        let found = match namespace.stat(&path(&name)?, false).await {
             Ok(_) => true,
             Err(StorageRoleFailure::Entry(failure))
                 if failure.class() == FailureClass::NotFound =>
@@ -304,7 +304,7 @@ async fn rebuild_deleted_cached_directories(
         .await
         .map_err(|error| format!("create_directory_all({below}) after deletion: {error:?}"))?;
     let namespace = caller.namespace()?;
-    if namespace.stat(&path(&below)?).await?.kind != EntryKind::Directory {
+    if namespace.stat(&path(&below)?, false).await?.kind != EntryKind::Directory {
         return Err(format!("{below} is not a directory").into());
     }
     eprintln!(
@@ -357,7 +357,7 @@ async fn read_only_file_system(storage: &Storage, scratch: &str) -> Result {
     }
     let existing = existing.replace("{scratch}", scratch);
     let namespace = storage.namespace()?;
-    let found = namespace.stat(&path(&existing)?).await?;
+    let found = namespace.stat(&path(&existing)?, false).await?;
     if found.kind != EntryKind::Directory {
         return Err(format!("{existing} is a {:?}, not a directory", found.kind).into());
     }

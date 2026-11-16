@@ -115,10 +115,10 @@ async fn main() -> Result<()> {
                     "metadata-loop requires ready-file".to_string(),
                 )
             })?;
-            storage.namespace()?.stat(&path).await?;
+            storage.namespace()?.stat(&path, false).await?;
             tokio::fs::write(ready, b"ready\n").await?;
             for _ in 0..300 {
-                let entry = storage.namespace()?.stat(&path).await?;
+                let entry = storage.namespace()?.stat(&path, false).await?;
                 if entry.size != Some(FIXTURE_SIZE) {
                     return Err(data_mover::error::StorageError::OperationError(
                         "HA fixture size changed during failover".to_string(),

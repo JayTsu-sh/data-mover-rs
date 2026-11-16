@@ -86,7 +86,7 @@ async fn mutation(storage: &Storage, path: &StoragePath, family: &str) -> Result
 }
 
 async fn confirm_root(storage: &Storage, path: &StoragePath) -> Result {
-    let descriptor = storage.namespace()?.stat(path).await?;
+    let descriptor = storage.namespace()?.stat(path, false).await?;
     storage
         .namespace()?
         .persist_observed(&descriptor, CancellationToken::new())

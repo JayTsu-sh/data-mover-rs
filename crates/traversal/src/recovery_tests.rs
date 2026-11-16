@@ -80,7 +80,11 @@ impl Namespace for Fixture {
         }
     }
 
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         Ok(descriptor(path.clone(), EntryKind::Directory))
     }
 

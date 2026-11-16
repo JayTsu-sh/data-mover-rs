@@ -33,6 +33,7 @@ impl Namespace for NfsProbeNamespace {
     async fn stat(
         &self,
         _: &StoragePath,
+        _fresh: bool,
     ) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
         Err(denied(FailureClass::InvalidInput))
     }

@@ -62,7 +62,7 @@ impl RecoveryTarget {
     ) -> Result<(), StorageRoleFailure> {
         let path = &self.path;
         match &self.read {
-            ScanRead::Stat => namespace.stat(path).await.map(|_| ()),
+            ScanRead::Stat => namespace.stat(path, false).await.map(|_| ()),
             ScanRead::ReadLink => namespace.read_link(path).await.map(|_| ()),
             ScanRead::Listing {
                 page,
@@ -96,7 +96,7 @@ impl RecoveryTarget {
         metadata: &GuardedMetadata,
         plan: ObservationPlan,
     ) -> Result<(), StorageRoleFailure> {
-        let descriptor = namespace.stat(&self.path).await?;
+        let descriptor = namespace.stat(&self.path, false).await?;
         let matches = self.inline_descriptor.as_ref().is_some_and(|original| {
             original.source_identity == descriptor.source_identity
                 && original.version == descriptor.version
@@ -118,7 +118,7 @@ impl RecoveryTarget {
     }
 
     async fn target_changed(&self, namespace: &GuardedNamespace) -> bool {
-        let Ok(current) = namespace.stat(&self.path).await else {
+        let Ok(current) = namespace.stat(&self.path, false).await else {
             return false;
         };
         match &self.read {

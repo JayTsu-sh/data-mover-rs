@@ -40,12 +40,26 @@ pub trait Namespace: Send + Sync {
     /// Performs a fresh connectivity operation. Object stores override this with a bucket
     /// request because their root descriptor is synthetic.
     async fn check_connectivity(&self) -> Result<(), StorageRoleFailure> {
-        self.stat(&StoragePath::root()).await.map(|_| ())
+        self.stat(&StoragePath::root(), false).await.map(|_| ())
     }
 
     /// Describes one entry itself, without following a symlink in its last segment (a link is
     /// described as the link). A missing entry is an `Entry` failure of class `NotFound`.
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    /// `fresh=false` permits this library's existing namespace/handle caches. `fresh=true`
+    /// resolves the current name from the namespace root instead of inspecting an old cached
+    /// handle, including when an ancestor name was replaced. A fresh failure must not fall
+    /// back to cached success. Backends without such caches already resolve the name normally.
+    /// This does not upgrade weak identities, change virtual-root semantics, bypass the
+    /// filesystem/server's consistency model, rebind a held root, or exclude a subsequent
+    /// rename. Callers still apply their cancellation and recovery budgets around this call.
+    /// An adapter that discovers its configured root name now resolves to another held-root
+    /// identity refuses with `Conflict`; it must not combine that new identity with metadata
+    /// or writes still using the original anchor.
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         Err(unsupported(
             path,
             Operation::Observe,

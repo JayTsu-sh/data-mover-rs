@@ -208,7 +208,8 @@ pub trait NfsNamespaceProtocol: Send + Sync {
             Transience::Permanent,
         ))
     }
-    /// fresh=true 从端点根重新解析祖先，不复用目录句柄缓存。
+    /// fresh=true 先按配置根名字复核原绑定，再从原根 FH 逐级 LOOKUP，不复用祖先缓存。
+    /// 根替换或缺失是 Conflict，不重新绑定；成本为一次根查询加每级 LOOKUP（缺属性再 GETATTR）。
     async fn stat(
         &self,
         path: &StoragePath,
@@ -329,8 +330,12 @@ impl Namespace for NfsNamespaceAdapter {
             .await
             .map_err(|error| role_failure(&request.path, Operation::Namespace, error))
     }
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
-        self.describe(path, false).await
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
+        self.describe(path, fresh).await
     }
 
     async fn persist_observed(
@@ -961,3 +966,7 @@ pub(in crate::backend) mod purge;
 #[cfg(test)]
 #[path = "namespace_purge_tests.rs"]
 mod purge_tests;
+
+#[cfg(test)]
+#[path = "namespace_freshness_tests.rs"]
+mod freshness_tests;

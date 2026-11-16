@@ -26,7 +26,11 @@ impl Namespace for ErrorNamespace {
         );
         ListingStream::from_pages(request.path, [Ok(page)])
     }
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         Err(StorageRoleFailure::Entry(entry_failure(
             path,
             FailureClass::NotFound,

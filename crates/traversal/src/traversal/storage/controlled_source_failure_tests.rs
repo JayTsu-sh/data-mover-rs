@@ -77,12 +77,16 @@ async fn returned_session_failure_survives_cancel_with_sibling_metadata_still_in
     let mut session = source.traverse(request);
     let mut feedback = Vec::new();
     let mut next = Box::pin(session.next_item(&mut feedback));
-    tokio::select! {
-        item = &mut next => panic!("unexpected early traversal output {item:?}"),
-        () = async { metadata.failed.cancelled().await; metadata.blocked.cancelled().await; } => {}
-    }
+    let ended = tokio::select! {
+        item = &mut next => {assert!(item.is_none(), "source fatal cannot issue data work: {item:?}");true},
+        () = async { metadata.failed.cancelled().await; metadata.blocked.cancelled().await; } => false,
+    };
     cancel.cancel();
-    assert!(next.await.is_none());
+    if ended {
+        drop(next);
+    } else {
+        assert!(next.await.is_none());
+    }
     let terminal = session.finish().await;
     metadata.release.cancel();
     tokio::time::timeout(Duration::from_secs(3), metadata.closed.cancelled())
@@ -98,7 +102,11 @@ struct DiagnosticPage {
 
 #[async_trait]
 impl Namespace for DiagnosticPage {
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         assert!(
             path.as_str().is_empty(),
             "fixture needs no confirmation/reobservation"
@@ -222,11 +230,14 @@ async fn diagnostic_source(
     let (storage, namespace, _) =
         test_traversal_storage(root.path(), "diagnostic-page").assert_value("local roles");
     let path = StoragePath::root();
-    let descriptor = namespace.stat(&path).await.assert_value("root shape");
+    let descriptor = namespace
+        .stat(&path, false)
+        .await
+        .assert_value("root shape");
     let mut page = ListingPage::default();
     for name in names {
         let child = namespace
-            .stat(&StoragePath::new(*name).assert_value("child path"))
+            .stat(&StoragePath::new(*name).assert_value("child path"), false)
             .await
             .assert_value("bound descriptor");
         page.push_descriptor(&path, child, None);

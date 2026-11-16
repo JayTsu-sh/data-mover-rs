@@ -305,7 +305,12 @@ impl Namespace for LocalNamespace {
         &self.listing_resume_key
     }
 
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    // 每次经目录能力句柄重新解析相对路径；没有本库目录 FH 缓存需要绕过。
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         self.stat_entry(path).await
     }
 

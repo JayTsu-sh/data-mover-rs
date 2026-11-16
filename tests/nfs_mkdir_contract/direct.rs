@@ -149,7 +149,7 @@ async fn replacement(source: &Storage, target: &Storage, root: &std::path::Path)
     assert!(
         matches!(error, StorageRoleFailure::Entry(error) if error.class() == FailureClass::Conflict)
     );
-    assert_eq!(target.namespace()?.stat(&path).await?.size, Some(21));
+    assert_eq!(target.namespace()?.stat(&path, false).await?.size, Some(21));
     println!("real NFS Direct replacement protected=true original_fh_held=true");
     Ok(())
 }
@@ -206,7 +206,7 @@ async fn source_failure(source: &Storage, target: &Storage, root: &std::path::Pa
     );
     destination.remove_failed_direct(stage).await?;
     assert!(
-        matches!(target.namespace()?.stat(&path).await, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)
+        matches!(target.namespace()?.stat(&path, false).await, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound)
     );
     assert_eq!(
         std::fs::read(root.join(path.as_str()))?,
@@ -237,7 +237,7 @@ async fn metadata_refusal(url: &str, source: &Storage, root: &std::path::Path) -
     assert!(error.published_data().is_some(), "{error}");
     let error = error.cleanup_for_policy(TransferPolicy::Direct).await;
     assert!(error.cleanup_failure().is_none(), "{error}");
-    assert_eq!(target.namespace()?.stat(&path).await?.size, Some(29));
+    assert_eq!(target.namespace()?.stat(&path, false).await?.size, Some(29));
     assert_eq!(
         std::fs::read(root.join(path.as_str()))?,
         b"metadata failure retains data"
@@ -298,7 +298,7 @@ async fn readonly_parent(
     )
     .await?;
     assert_eq!(
-        writer.namespace()?.stat(&path).await?.size,
+        writer.namespace()?.stat(&path, false).await?.size,
         Some(b"writable file in readonly parent".len() as u64)
     );
     println!("real NFS Direct readonly parent overwrite=true");

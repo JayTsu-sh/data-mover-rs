@@ -19,7 +19,7 @@ async fn persistence_confirms_current_empty_and_slash_objects_with_one_head() ->
     let protocol = bucket(&[("key", b"bytes"), ("empty", b""), ("slash/", b"content")]).await?;
     let namespace = namespace(&protocol)?;
     for key in ["key", "empty", "slash/"] {
-        let expected = namespace.stat(&path(key)).await?;
+        let expected = namespace.stat(&path(key), false).await?;
         let objects = protocol.objects.lock().await.clone();
         let before = protocol.head_versions.lock().await.len();
         namespace
@@ -38,7 +38,7 @@ async fn persistence_confirms_current_empty_and_slash_objects_with_one_head() ->
 async fn persistence_refuses_replacement_size_time_and_missing_target() -> TestResult {
     let protocol = bucket(&[("key", b"before")]).await?;
     let namespace = namespace(&protocol)?;
-    let expected = namespace.stat(&path("key")).await?;
+    let expected = namespace.stat(&path("key"), false).await?;
     for replacement in [b"after!".as_slice(), b"longer replacement"] {
         protocol
             .objects
@@ -61,7 +61,7 @@ async fn persistence_refuses_replacement_size_time_and_missing_target() -> TestR
         1_000_000_000,
         TimePrecision::Seconds,
     )?);
-    let timed = namespace.stat(&path("key")).await?;
+    let timed = namespace.stat(&path("key"), false).await?;
     *protocol.last_modified.lock().await = Some(StorageTimestamp::new(
         2_000_000_000,
         TimePrecision::Seconds,
@@ -86,7 +86,7 @@ async fn persistence_refuses_replacement_size_time_and_missing_target() -> TestR
 async fn persistence_rejects_incomplete_foreign_and_synthetic_evidence_without_io() -> TestResult {
     let protocol = bucket(&[("key", b"bytes"), ("dir/child", b"child")]).await?;
     let namespace = namespace(&protocol)?;
-    let expected = namespace.stat(&path("key")).await?;
+    let expected = namespace.stat(&path("key"), false).await?;
     let mut missing_etag = expected.clone();
     missing_etag.content_version = None;
     let mut missing_size = expected.clone();
@@ -99,8 +99,8 @@ async fn persistence_rejects_incomplete_foreign_and_synthetic_evidence_without_i
     )?;
     let mut listed = expected.clone();
     listed.listing.listing_only = true;
-    let directory = namespace.stat(&path("dir")).await?;
-    let root = namespace.stat(&StoragePath::root()).await?;
+    let directory = namespace.stat(&path("dir"), false).await?;
+    let root = namespace.stat(&StoragePath::root(), false).await?;
     let before = protocol.head_versions.lock().await.len();
     for rejected in [missing_etag, missing_size, foreign, listed, directory, root] {
         assert_class(
@@ -118,7 +118,7 @@ async fn persistence_rejects_incomplete_foreign_and_synthetic_evidence_without_i
 async fn persistence_preserves_typed_head_failures_and_pre_cancel_makes_no_request() -> TestResult {
     let protocol = bucket(&[("key", b"bytes")]).await?;
     let namespace = namespace(&protocol)?;
-    let expected = namespace.stat(&path("key")).await?;
+    let expected = namespace.stat(&path("key"), false).await?;
     *protocol.head_failure.lock().await = Some((
         "key".into(),
         S3ProtocolFailure::entry(
@@ -198,7 +198,7 @@ async fn nas_publication_without_a_verified_persistence_contract_remains_unsuppo
     let protocol = Arc::new(MemoryS3::nas_bucket());
     put(&protocol, "key", b"bytes").await?;
     let namespace = namespace(&protocol)?;
-    let expected = namespace.stat(&path("key")).await?;
+    let expected = namespace.stat(&path("key"), false).await?;
     let before = protocol.head_versions.lock().await.len();
     assert_class(
         namespace

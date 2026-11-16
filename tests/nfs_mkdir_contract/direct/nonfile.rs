@@ -21,7 +21,7 @@ fn path(value: &str) -> Result<StoragePath> {
 }
 
 async fn confirm(target: &Storage, name: &str) -> Result {
-    let expected = target.namespace()?.stat(&path(name)?).await?;
+    let expected = target.namespace()?.stat(&path(name)?, false).await?;
     target
         .namespace()?
         .persist_observed(&expected, CancellationToken::new())
@@ -112,7 +112,7 @@ async fn real_nfs_directory_and_symlink_persistence_contract() -> Result {
         assert_eq!(
             target
                 .namespace()?
-                .stat(&path(name)?)
+                .stat(&path(name)?, false)
                 .await?
                 .inline_timestamps()
                 .and_then(|times| times.modified),
@@ -121,7 +121,7 @@ async fn real_nfs_directory_and_symlink_persistence_contract() -> Result {
     }
     let expected = target
         .namespace()?
-        .stat(&path("nonfile-directory")?)
+        .stat(&path("nonfile-directory")?, false)
         .await?;
     target
         .namespace()?
@@ -142,7 +142,10 @@ async fn real_nfs_directory_and_symlink_persistence_contract() -> Result {
     );
     link(&target, "nonfile-link", "../opaque/missing").await?;
     confirm(&target, "nonfile-link").await?;
-    let expected = target.namespace()?.stat(&path("nonfile-link")?).await?;
+    let expected = target
+        .namespace()?
+        .stat(&path("nonfile-link")?, false)
+        .await?;
     assert_eq!(expected.kind, EntryKind::Symlink);
     target
         .namespace()?
@@ -207,7 +210,7 @@ async fn nonfile_fault(directory: bool, mode: &'static str) -> Result {
         link(&target, &name, "../opaque/missing").await?;
     }
     let namespace = target.namespace()?;
-    let expected = namespace.stat(&path(&name)?).await?;
+    let expected = namespace.stat(&path(&name)?, false).await?;
     // 控制接口按 runner 配置的 lookup_path tag 武装，不向目录或链接发送 COMMIT。
     control(&format!("commit-{mode}")).await?;
     let cancel = CancellationToken::new();
