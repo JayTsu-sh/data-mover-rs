@@ -68,6 +68,7 @@ async fn target_tags_are_read_back_as_a_complete_set() -> TestResult {
             &path,
             &SourceVersion::Current,
             Some("v1"),
+            None,
             CancellationToken::new(),
         )
         .await?;
@@ -86,6 +87,7 @@ async fn target_tags_are_read_back_as_a_complete_set() -> TestResult {
         &path,
         &SourceVersion::Current,
         Some("v1"),
+        None,
         CancellationToken::new(),
     )
     .await?;
@@ -102,7 +104,7 @@ async fn target_tags_are_read_back_as_a_complete_set() -> TestResult {
         )
         .await?;
     assert!(matches!(
-        plan.verify_published(&storage, &path, &SourceVersion::Current, Some("v1"), CancellationToken::new()).await,
+        plan.verify_published(&storage, &path, &SourceVersion::Current, Some("v1"), None, CancellationToken::new()).await,
         Err(MetadataVerificationError::Mismatch { families, .. }) if families == [MetadataFamily::Tags]
     ));
     Ok(())
@@ -127,6 +129,7 @@ async fn publication_version_and_cancellation_are_checked_before_accepting_metad
             &path,
             &SourceVersion::Current,
             Some("v1"),
+            None,
             CancellationToken::new()
         )
         .await,
@@ -135,8 +138,15 @@ async fn publication_version_and_cancellation_are_checked_before_accepting_metad
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert!(matches!(
-        plan.verify_published(&storage, &path, &SourceVersion::Current, Some("v2"), cancel)
-            .await,
+        plan.verify_published(
+            &storage,
+            &path,
+            &SourceVersion::Current,
+            Some("v2"),
+            None,
+            cancel
+        )
+        .await,
         Err(MetadataVerificationError::Cancelled)
     ));
     Ok(())
@@ -171,6 +181,7 @@ async fn historical_verification_preserves_an_independent_current_publication_gu
                 &path,
                 &version,
                 expected_current,
+                None,
                 CancellationToken::new(),
             )
             .await?;
@@ -182,6 +193,7 @@ async fn historical_verification_preserves_an_independent_current_publication_gu
             &path,
             &version,
             Some("v1"),
+            None,
             CancellationToken::new()
         )
         .await,

@@ -138,7 +138,7 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
 | 动词 | 行为 |
 |---|---|
 | `List` | **逐页流式** (P7 C5，`namespace/listing.rs`)：打开目录后 `entries()`，每页一次 `spawn_blocking`，把打开的 `ReadDir` 带进带出，读至多 `page_hint` 个子项 (描述成功 + 子项失败；隐藏的 artifact 不占名额) 就交出；两页之间只占一个目录 fd、不占 blocking 线程。每页之前与等待交出时看取消令牌，取消时先关 fd 再报 `Cancelled` 信号；消费方 drop 流后下一次交出失败即退出、关 fd，**不读到底**。读目录本身出错 (`getdents`) 结束列举：先交出已读到的子项，再报列举失败 (遍历记 `Interrupted { delivered }`，一项未交出则 `Unreadable`；`NotConnected` / `BrokenPipe` 仍升会话)；不可续读 (rustix 出错后不再给条目)。下钻不带提示，子目录按名字从根逐段重新打开。逐子项 `DirEntry::metadata()` (fstatat，不跟随)：描述符的身份、backend fact、content version、时间戳与观察角色同源；unix 上 `inline_mode = mode & 0o7777`，另带 `inline_ownership`（uid / gid / 完整 mode，与观察角色同源的 lstat；`observe_listed` 据此回答只要 ownership / timestamps 的计划，遍历不再每条目再 lstat 一次，P7 C0）。过滤 `.data-mover-*` 传输临时文件（计入页的 `internal_hidden`）。子项路径按契约拼成“请求的目录 + `/` + 名字”，不做规范化（`./d` 列出 `./d/x`，P7 C1）。子项拼不成 `StoragePath` (非 UTF-8、超长) → 无名子项失败 (`ChildFailure::unnamed`，带原始字节)；读目录到 lstat 之间消失的子项报 `ChildFailure::vanished` (遍历计入 `vanished`、不发项，P7 Q12)。`delete_tree` 整目录收集：读目录中途出错时整个列举失败 (此前记成目录上的子项失败、已读到的子项照常处理) |
-| `Stat` | 父目录句柄里 `symlink_metadata`；根用 `dir_metadata` |
+| `Stat` | 父目录句柄里 `symlink_metadata`；根用 `dir_metadata`。Unix 的 `stat(true)` 还附带同次观察确认的 `permissions`；`stat(false)`／listing 保持原形态 |
 | `ReadLink` | `read_link_contents` (原样返回链接文本；`read_link` 会把绝对目标当越界拒绝) |
 | `CreateDirectory` | 只建一级；已存在 → `Conflict`，父缺失 → `NotFound`；之后同步父目录 |
 | `Delete` | 父目录句柄里先不跟随判类型：目录 `remove_dir` (只删空目录，非空 → `Conflict`)，文件/链接 `remove_file`；Windows 上目录链接回退 `remove_dir`。**从不递归**。不做目录同步 —— `delete_tree` 否则每个条目付一次 fsync |
@@ -204,3 +204,18 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
 ### 根目录元数据
 
 现有 Metadata 角色将空的 StoragePath 根路径映射到已绑定能力的 `.`，支持根目录的原值观察、mode／owner、时间戳、ACL 和 xattr 应用。路径越界检查以及 Namespace 对根删除、根创建的拒绝保持有效。此操作不创建或删除端点，不提供并发改名排除；调用方须结合既有 persist_observed 核对当前根绑定和持久性。Linux 实际文件回归覆盖根属性读写、取消与子文件保留；未据此认证 Windows 根 ACL 或网络挂载。
+
+
+### 目录最终元数据核验的内联事实
+
+Unix Local 的 `Namespace::stat(path, true)` 仅用本次已有 stat 的 numeric uid／gid 与
+`mode & 0o7777` 提供权威 `permissions: Some`，不新增权限查询；已有权限值优先，
+`stat(false)`、listing 与非 Unix 行为保持原样。该描述与旧 `Metadata::permissions`
+结果等价，Local 已发布条目持久化仍按类型、身份、大小及 content version 核验。
+
+`MetadataPlan::verify_published` 的可选 `current_anchor` 只用于无当前版本约束的
+Current 稳定目录。旧描述仅是内联资格提示，最终值取自真实末尾 fresh 描述；需要额外属性或
+权限读取时，先绑定同一身份读取，再实际 fresh 并核对身份，随后纯比较。需要 ownership
+而 pre 描述没有权威 permissions 时保守回退，不从 inline ownership／mode 猜测或补齐，
+因此 Some 不保证最少读取次数。None 保持原有当前／历史版本读取语义。本批不改变 NFS 的
+权限形态或持久化规则，也不提供原子命名空间修改排除。

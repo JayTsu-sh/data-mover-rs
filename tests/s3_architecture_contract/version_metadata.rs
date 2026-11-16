@@ -72,7 +72,7 @@ async fn cancel_read_only_verification() -> TestResult {
     let start = Instant::now();
     let result = timeout(
         Duration::from_secs(2),
-        plan.verify_published(&storage, &path, &selected, expected, cancel),
+        plan.verify_published(&storage, &path, &selected, expected, None, cancel),
     )
     .await;
     let elapsed = start.elapsed();
@@ -147,7 +147,14 @@ async fn exact_version_metadata_with_real_requests() -> TestResult {
         .await?;
     }
     let verified = plan
-        .verify_published(&storage, &path, &selected, None, CancellationToken::new())
+        .verify_published(
+            &storage,
+            &path,
+            &selected,
+            None,
+            None,
+            CancellationToken::new(),
+        )
         .await?;
     assert_eq!(verified.size, Some(3));
     let empty = captured_plan(Vec::new())?;
@@ -160,7 +167,14 @@ async fn exact_version_metadata_with_real_requests() -> TestResult {
         )
         .await?;
     empty
-        .verify_published(&storage, &path, &selected, None, CancellationToken::new())
+        .verify_published(
+            &storage,
+            &path,
+            &selected,
+            None,
+            None,
+            CancellationToken::new(),
+        )
         .await?;
     plan.apply(
         metadata.as_ref(),
@@ -175,6 +189,7 @@ async fn exact_version_metadata_with_real_requests() -> TestResult {
             &path,
             &SourceVersion::Current,
             Some(&version),
+            None,
             CancellationToken::new()
         )
         .await,

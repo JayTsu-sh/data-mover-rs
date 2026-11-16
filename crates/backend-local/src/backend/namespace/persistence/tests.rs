@@ -2,8 +2,10 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::sync::atomic::Ordering;
 
 use super::*;
-use crate::storage::Namespace;
+use crate::storage::backends::local::observation::LocalObservationAdapter;
 use crate::storage::backends::local::test_identity;
+use crate::storage::listing::testing::listed;
+use crate::storage::{Metadata, Namespace};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -240,5 +242,39 @@ async fn moving_the_same_root_away_and_back_still_syncs_all_ancestors() -> TestR
         first * 2
     );
     assert_eq!(std::fs::read(root.join("file"))?, b"payload");
+    Ok(())
+}
+
+#[tokio::test]
+async fn fresh_permissions_match_existing_role_and_preserve_false_listing_and_persistence()
+-> TestResult {
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir(root.path().join("tree"))?;
+    std::fs::write(root.path().join("tree/file"), b"payload")?;
+    let namespace = namespace(root.path())?;
+    let metadata =
+        LocalObservationAdapter::from_root(Arc::clone(&namespace.root), namespace.identity.clone());
+    for name in ["", "tree", "tree/file"] {
+        let path = StoragePath::new(name)?;
+        let ordinary = namespace.stat(&path, false).await?;
+        assert!(ordinary.permissions.is_none());
+        let original_permissions = metadata.permissions(&ordinary).await?;
+        let fresh = namespace.stat(&path, true).await?;
+        assert_eq!(fresh.permissions.as_deref(), Some(&original_permissions));
+        assert_eq!(fresh.source_identity, ordinary.source_identity);
+        assert_eq!(fresh.content_version, ordinary.content_version);
+        namespace
+            .persist_observed(&ordinary, CancellationToken::new())
+            .await?;
+        namespace
+            .persist_observed(&fresh, CancellationToken::new())
+            .await?;
+    }
+    for directory in ["", "tree"] {
+        let (children, failures) = listed(&namespace, &StoragePath::new(directory)?).await?;
+        assert!(failures.is_empty());
+        assert!(children.iter().all(|child| child.permissions.is_none()));
+    }
+    assert_eq!(std::fs::read(root.path().join("tree/file"))?, b"payload");
     Ok(())
 }

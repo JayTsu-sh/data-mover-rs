@@ -205,7 +205,14 @@ async fn cancellation_drops_each_in_flight_verification_read() -> TestResult {
         let start = Instant::now();
         let result = timeout(
             Duration::from_secs(1),
-            plan.verify_published(&storage, &role.descriptor.path, &version, expected, cancel),
+            plan.verify_published(
+                &storage,
+                &role.descriptor.path,
+                &version,
+                expected,
+                None,
+                cancel,
+            ),
         )
         .await;
         watcher.await?;

@@ -36,12 +36,12 @@ use super::observation::{
     timestamp_metadata,
 };
 use super::rename;
-#[cfg(unix)]
-use crate::model::OwnershipMode;
 use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
     ObservedEntry, Operation, RenameContext, StoragePath, SymlinkTarget, Transience,
 };
+#[cfg(unix)]
+use crate::model::{OwnershipMode, PermissionFacts, PrincipalIdentity};
 #[cfg(unix)]
 use crate::storage::InlineOwnership;
 use crate::storage::artifacts::is_artifact_name;
@@ -220,7 +220,11 @@ impl LocalNamespace {
             .map_err(|_| entry_failure(path, operation, FailureClass::Internal))?
     }
 
-    async fn stat_entry(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat_entry(
+        &self,
+        path: &StoragePath,
+        fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         let native = checked(path, Operation::Observe, true)?;
         let target = path.clone();
         let root_device = self.root_device;
@@ -231,7 +235,27 @@ impl LocalNamespace {
                 in_parent(root, &native, |parent, leaf| parent.symlink_metadata(leaf))
             }
             .map_err(|error| io_failure(&target, Operation::Observe, &error))?;
-            describe(identity, target, &metadata, Operation::Observe, root_device)
+            let descriptor =
+                describe(identity, target, &metadata, Operation::Observe, root_device)?;
+            // 仅 Unix fresh 描述附带同一次 stat 已确认的真实权限，不额外访问路径。
+            #[cfg(unix)]
+            let descriptor = if fresh && descriptor.permissions.is_none() {
+                match descriptor.inline_ownership {
+                    Some(InlineOwnership::Known(owner)) => {
+                        descriptor.with_permissions(PermissionFacts {
+                            owner: Some(PrincipalIdentity::Numeric(owner.uid)),
+                            group: Some(PrincipalIdentity::Numeric(owner.gid)),
+                            mode: Some(owner.mode & 0o7777),
+                        })
+                    }
+                    _ => descriptor,
+                }
+            } else {
+                descriptor
+            };
+            #[cfg(not(unix))]
+            let _ = fresh;
+            Ok(descriptor)
         })
         .await
     }
@@ -311,9 +335,9 @@ impl Namespace for LocalNamespace {
     async fn stat(
         &self,
         path: &StoragePath,
-        _fresh: bool,
+        fresh: bool,
     ) -> Result<SourceDescriptor, StorageRoleFailure> {
-        self.stat_entry(path).await
+        self.stat_entry(path, fresh).await
     }
 
     #[cfg(unix)]
