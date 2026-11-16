@@ -22,6 +22,20 @@ Finalization adds no second entry count. Metadata failures remain in observation
 events and the final snapshot; prepare success does not erase them. A failed consumer stage
 blocks ancestor finalization without fabricating errors for those ancestors.
 
+In consumer mode only, a whole asynchronous metadata-role `Entry(PermissionDenied)` may
+retain a known listed descriptor for a data attempt when every family in that call's actual
+I/O plan is BestEffort and no still-missing filter dependency is involved. The existing inline
+merge preserves Value/NotApplicable and marks each requested but unobtained family Failed.
+Known Unsupported and InlineOnly families are not relabelled. No metadata request is repeated.
+The first failed snapshot remains unchanged at finalization; a caller must still decide its
+consumer result from the actual data and target-metadata outcomes.
+
+Ordinary `None`, Required I/O, inline-role errors, other entry classes, session errors, and link
+read errors keep their existing paths. This does not make the source readable: later describe,
+expected-source identity and actual read checks remain mandatory and can fail independently.
+Family events retain only path/family/class/transience; the original redacted whole-role
+message is logged, not added to the model or promised as typed callback text.
+
 Feed back `(id, success)` via the Vec passed to `next_item`. IDs bind a session, execution and
 independent phase sequence. Unknown/unissued, duplicate, cross-session and late feedback cannot
 settle current work. Submission commits synchronously on first poll before clearing the Vec

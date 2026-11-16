@@ -78,6 +78,7 @@ async fn run(
     let metadata = shared.metadata.as_ref();
     let (budget, halt) = (&budget, &halt);
     let consumer = consumer.as_ref();
+    let retention = consumer.map(|_| shared.policy.requirements);
     let charge = charge.as_ref();
     let mut pending: FuturesUnordered<_> = jobs
         .into_iter()
@@ -87,7 +88,16 @@ async fn run(
             if halt.is_cancelled() || consumer.is_some_and(|state| state.failure().is_some()) {
                 return None;
             }
-            let result = observe(namespace, metadata, *descriptor, plan, latest_only, halt).await;
+            let result = observe(
+                namespace,
+                metadata,
+                *descriptor,
+                plan,
+                latest_only,
+                halt,
+                retention,
+            )
+            .await;
             if let Some(consumer) = consumer {
                 record_observation(consumer, result.as_ref());
                 if let Some(charge) = charge

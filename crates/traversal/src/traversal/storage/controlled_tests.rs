@@ -718,3 +718,6 @@ async fn one_observation_slot_and_one_consumer_work_support_multilevel_tree() {
 
 #[path = "controlled_resource_tests.rs"]
 mod resources;
+
+#[path = "controlled_whole_role_tests.rs"]
+mod whole_role;

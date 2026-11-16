@@ -27,9 +27,9 @@ use tokio_util::sync::CancellationToken;
 use super::{Deferred, Shared, entry_failure, throttling_scoped_to};
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, MAX_MODEL_FIELD_BYTES, MetadataObservation,
-    MetadataObservations, MetadataProvenance, ObjectHistory, ObservationMode, ObservationPlan,
-    ObservedEntry, Operation, StoragePath, SymlinkTarget, TimestampMetadata, Transience,
-    VersionRecord,
+    MetadataObservations, MetadataProvenance, MetadataRequirements, ObjectHistory, ObservationMode,
+    ObservationPlan, ObservedEntry, Operation, StoragePath, SymlinkTarget, TimestampMetadata,
+    Transience, VersionRecord,
 };
 use crate::storage::{Metadata, Namespace, SourceDescriptor, StorageRoleFailure};
 use crate::traversal::{ObservationFailure, TraversalTerminalFailure};
@@ -376,6 +376,7 @@ pub(super) async fn observe(
     plan: ObservationPlan,
     latest_only: bool,
     cancel: &CancellationToken,
+    consumer: Option<MetadataRequirements>,
 ) -> Result<ObservedEntry, ObservationError> {
     if let Some(marker) = descriptor.listing.directory_marker.take() {
         return marker::observe(namespace, metadata_role, descriptor, *marker, plan).await;
@@ -391,7 +392,7 @@ pub(super) async fn observe(
         )
         .await;
     }
-    match observe_io(namespace, metadata_role, &descriptor, plan).await {
+    match observe_io(namespace, metadata_role, &descriptor, plan, consumer).await {
         Ok((metadata, target)) => assemble(descriptor, metadata, target),
         Err(mut error) => {
             error.failure = confirm_vanished(namespace, &descriptor.path, error.failure).await;
@@ -406,6 +407,7 @@ async fn observe_io(
     metadata_role: &dyn Metadata,
     descriptor: &SourceDescriptor,
     plan: ObservationPlan,
+    consumer: Option<MetadataRequirements>,
 ) -> Result<(MetadataObservations, Option<SymlinkTarget>), ObservationError> {
     // A throttled request is this child's failure, never the traversal's end (P7 §8).
     let scoped = |failure| throttling_scoped_to(&descriptor.path, Operation::Observe, failure);
@@ -414,10 +416,36 @@ async fn observe_io(
     } else {
         let inline = metadata::inline(metadata_role, descriptor, plan)?;
         let requested = metadata::io_plan(plan, &inline, metadata_role.observation_capabilities());
-        let observed = metadata_role
+        let observed = match metadata_role
             .observe(&descriptor.path, requested)
             .await
-            .map_err(scoped)?;
+            .map_err(scoped)
+        {
+            Ok(observed) => observed,
+            Err(StorageRoleFailure::Entry(failure))
+                if failure.class() == FailureClass::PermissionDenied
+                    && consumer.is_some_and(|dependencies| {
+                        requested.permits_io()
+                            && crate::model::MetadataFamily::ALL.into_iter().all(|family| {
+                                requested.mode(family) == ObservationMode::Omit
+                                    || (requested.mode(family) == ObservationMode::BestEffort
+                                        && !dependencies.contains(family))
+                            })
+                    }) =>
+            {
+                // A metadata-role refusal says nothing about readability of the listed object.
+                // Keep the descriptor/inline successes, with one typed fact per requested family.
+                tracing::warn!(path = %descriptor.path, diagnostic = %failure.diagnostic(),
+                    "source metadata observation denied; retaining listed entry for consumer data attempt");
+                failed_observations(
+                    requested,
+                    &descriptor.path,
+                    failure.class(),
+                    failure.transience(),
+                )?
+            }
+            Err(failure) => return Err(failure.into()),
+        };
         metadata::validate(
             descriptor,
             plan,
@@ -644,7 +672,7 @@ async fn observe_block(
                     let plan = shared.policy.observation_plan_for(&descriptor);
                     inflight.push(async move {
                     let kind = descriptor.kind;
-                    let result = observe(namespace, metadata, *descriptor, plan, latest_only, cancel).await;
+                    let result = observe(namespace, metadata, *descriptor, plan, latest_only, cancel, None).await;
                     (sequence, result.map(Box::new), deferred, kind)
                     });
                 },

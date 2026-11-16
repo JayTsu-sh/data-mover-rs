@@ -187,6 +187,7 @@ async fn decide_pending(
                 plan,
                 shared.request.latest_metadata_only,
                 &shared.request.cancel,
+                None,
             )
             .await
             .map(Box::new)
