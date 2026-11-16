@@ -16,6 +16,7 @@
 //! seen through `List` — removes them with it.
 
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use blake3::Hasher;
 use cap_std::fs::{Dir, Metadata};
+use cap_std::io_lifetimes::AsFilelike as _;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK;
 
@@ -504,16 +506,22 @@ fn listing_key(context: Option<&RenameContext>) -> [u8; 32] {
 /// Opens the directory at `relative` below `root`, one component at a time, refusing a
 /// symlink at every step. An empty path is the root itself.
 fn open_directory(root: &Dir, relative: &Path) -> io::Result<Dir> {
-    let mut current = root.try_clone()?;
-    for component in relative.components() {
+    let mut components = relative.components();
+    let Some(first) = components.next() else {
+        return root.try_clone();
+    };
+    let Component::Normal(name) = first else {
+        return Err(io::ErrorKind::InvalidInput.into());
+    };
+    let parent = root.as_filelike_view::<File>();
+    let mut current = cap_primitives::fs::open_dir_nofollow(&parent, Path::new(name))?;
+    for component in components {
         let Component::Normal(name) = component else {
             return Err(io::ErrorKind::InvalidInput.into());
         };
-        let parent = current.into_std_file();
-        let child = cap_primitives::fs::open_dir_nofollow(&parent, Path::new(name))?;
-        current = Dir::from_std_file(child);
+        current = cap_primitives::fs::open_dir_nofollow(&current, Path::new(name))?;
     }
-    Ok(current)
+    Ok(Dir::from_std_file(current))
 }
 
 /// Runs `work` on the final component of `native` inside its parent, opened without
