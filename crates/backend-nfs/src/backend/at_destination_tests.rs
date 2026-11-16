@@ -473,7 +473,7 @@ fn only_a_collision_at_the_name_is_transient() -> TestResult {
             (class, Transience::Unknown)
         );
         assert_eq!(
-            at_level.level.as_ref().map(StoragePath::as_str),
+            at_level.level.as_deref().map(StoragePath::as_str),
             Some("d/missing")
         );
     }

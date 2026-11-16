@@ -1,8 +1,191 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::super::namespace::{NfsUndescribedChild, undescribed};
+use super::super::protocol::classify_error;
 use super::*;
 use crate::model::{BackendKind, FailureClass, SourceVersion};
+
+#[test]
+fn sdk_readlink_decode_reason_reaches_entry_failure() -> Result<(), Box<dyn std::error::Error>> {
+    let path = StoragePath::new("link")?;
+    let failed = classify_error(nfs_rs::NfsError::Xdr(
+        "READLINK target is not UTF-8: invalid utf-8 sequence of 1 bytes from index 0".into(),
+    ));
+    assert!(
+        failed.status.is_none(),
+        "a decode error is not a server status"
+    );
+    let StorageRoleFailure::Entry(error) = role_failure(&path, Operation::Observe, failed) else {
+        panic!("READLINK decoding remains entry scoped");
+    };
+    assert_eq!(error.class(), FailureClass::Protocol);
+    assert_eq!(error.transience(), Transience::Unknown);
+    assert!(
+        error.diagnostic().contains("READLINK target is not UTF-8"),
+        "{}",
+        error.diagnostic()
+    );
+    Ok(())
+}
+
+#[test]
+fn sdk_failure_keeps_shared_typed_cause() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<NfsProtocolFailure>();
+    let failure = classify_error(nfs_rs::NfsError::Xdr("READLINK target is not UTF-8".into()));
+    let cloned = failure.clone();
+    let (Some(cause), Some(shared)) = (&failure.cause, &cloned.cause) else {
+        panic!("classified SDK failures keep their cause");
+    };
+    assert!(Arc::ptr_eq(cause, shared));
+    assert!(matches!(cause.as_ref(), nfs_rs::NfsError::Xdr(reason) if reason.contains("READLINK")));
+    assert!(NfsProtocolFailure::protocol().cause.is_none());
+}
+
+#[test]
+fn sdk_listing_decode_keeps_specific_cause_and_entry_scope()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = StoragePath::new("dir/link")?;
+    let detail = "READLINK target is not UTF-8";
+    let failure = undescribed(NfsUndescribedChild {
+        path: path.clone(),
+        failure: classify_error(nfs_rs::NfsError::Xdr(detail.into())),
+        reason: "the child attributes could not be decoded",
+        raw_name: None,
+    });
+    assert_eq!(failure.path(), &path);
+    assert_eq!(failure.operation(), Operation::Traverse);
+    assert_eq!(failure.class(), FailureClass::Protocol);
+    assert_eq!(failure.transience(), Transience::Unknown);
+    assert!(
+        failure
+            .diagnostic()
+            .contains("child attributes could not be decoded")
+    );
+    assert!(
+        failure.diagnostic().contains(detail),
+        "{}",
+        failure.diagnostic()
+    );
+    Ok(())
+}
+
+#[test]
+fn sdk_listing_keeps_transport_and_server_causes_entry_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (source, class, transience, detail) in [
+        (
+            nfs_rs::NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "child GETATTR timed out",
+            )),
+            FailureClass::Timeout,
+            Transience::Transient,
+            "child GETATTR timed out",
+        ),
+        (
+            nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_ACCES),
+            FailureClass::PermissionDenied,
+            Transience::Permanent,
+            "NFS3ERR_ACCES",
+        ),
+    ] {
+        let failure = undescribed(NfsUndescribedChild {
+            path: StoragePath::new("dir/child")?,
+            failure: classify_error(source),
+            reason: "the child attributes could not be read",
+            raw_name: None,
+        });
+        assert_eq!(failure.operation(), Operation::Traverse);
+        assert_eq!(failure.class(), class);
+        assert_eq!(failure.transience(), transience);
+        assert!(failure.diagnostic().contains(detail));
+    }
+    Ok(())
+}
+
+#[test]
+fn sdk_transport_reason_reaches_session_failure() -> Result<(), Box<dyn std::error::Error>> {
+    let path = StoragePath::new("file")?;
+    let failure = classify_error(nfs_rs::NfsError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "peer reset while reading response header",
+    )));
+    let StorageRoleFailure::Session(error) = role_failure(&path, Operation::Read, failure) else {
+        panic!("connection reset is session scoped");
+    };
+    assert_eq!(error.class(), FailureClass::Connectivity);
+    assert_eq!(error.transience(), Transience::Transient);
+    assert!(
+        error
+            .diagnostic()
+            .contains("peer reset while reading response header")
+    );
+    Ok(())
+}
+
+#[test]
+fn sdk_failure_diagnostic_is_bounded_redacted_and_nul_free()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = StoragePath::new("file")?;
+    for detail in [
+        "READLINK nfs://alice:p/a#ss@server/export and smb://bob:other-secret@host/share"
+            .to_owned(),
+        format!(
+            "READLINK nfs://alice:{}@server/export",
+            "secret".repeat(2000)
+        ),
+        format!("READLINK invalid UTF-8\0{}", "错误🦀".repeat(2000)),
+    ] {
+        let failure = classify_error(nfs_rs::NfsError::Xdr(detail));
+        let StorageRoleFailure::Entry(error) = role_failure(&path, Operation::Observe, failure)
+        else {
+            panic!("decode failures remain entry scoped");
+        };
+        let text = error.diagnostic();
+        assert!(text.starts_with("NFS role failed"));
+        assert!(text.contains("READLINK"));
+        assert!(text.len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(!text.contains('\0'));
+        for secret in ["alice", "p/a#ss", "bob", "other-secret", "secret"] {
+            assert!(!text.contains(secret), "leaked {secret}: {text}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_status_and_long_parent_context_keep_a_valid_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = StoragePath::new(format!("dir/{}", "长".repeat(4000)))?;
+    let parent = StoragePath::new("dir")?;
+    let mut failure =
+        NfsProtocolFailure::new(FailureClass::PermissionDenied, Transience::Permanent);
+    failure.status = Some(Arc::from(format!("NFS4ERR_PERM\0{}", "拒绝".repeat(4000))));
+    for entry in [failure.clone(), failure.at_level(parent.clone())] {
+        let StorageRoleFailure::Entry(error) = role_failure(&path, Operation::Prepare, entry)
+        else {
+            panic!("permission errors remain entry scoped");
+        };
+        assert_eq!(error.class(), FailureClass::PermissionDenied);
+        assert_eq!(error.transience(), Transience::Permanent);
+        assert!(!error.diagnostic().contains('\0'));
+        assert!(error.diagnostic().len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(error.diagnostic().contains("NFS4ERR_PERM"));
+    }
+    let StorageRoleFailure::Entry(error) = entry_scoped(
+        &StoragePath::new("dir/leaf")?,
+        Operation::Prepare,
+        classify_error(nfs_rs::NfsError::Xdr("READLINK target is not UTF-8".into()))
+            .at_level(parent.clone()),
+    ) else {
+        panic!("parent failures remain entry scoped");
+    };
+    assert_eq!(error.path(), &parent);
+    assert!(error.diagnostic().contains("READLINK target is not UTF-8"));
+    Ok(())
+}
 
 struct FakeProtocol {
     payload: Bytes,

@@ -511,7 +511,7 @@ indicatif = "0.18.4"
 libc = "0.2"
 md-5 = "0.10"
 moka = { version = "0.12.15" }
-nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs", rev = "fdc541ccb461cb9d9404fdf7767f393e9508c276" }
+nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs", rev = "5b1daaf97e8af6be5ff2a137350653971dc5acdf" }
 num-traits = "0.2.19"
 parking_lot = "0.12"
 path-clean = "1.0.1"

@@ -1,4 +1,5 @@
 use std::io::ErrorKind;
+use std::sync::Arc;
 
 use nfs_rs::{Nfs4ErrorCode, NfsError};
 
@@ -20,12 +21,17 @@ pub fn dialect(version: nfs_rs::NFSVersion) -> Result<NfsVersion, NfsDialectErro
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NfsDialectError;
 
-#[allow(clippy::needless_pass_by_value)]
 pub fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
+    let mut failure = classify_failure(&error);
+    failure.cause = Some(Arc::new(error));
+    failure
+}
+
+fn classify_failure(error: &NfsError) -> NfsProtocolFailure {
     if error.is_server_busy() {
         return with_server_status(
             NfsProtocolFailure::new(FailureClass::Throttled, Transience::Transient),
-            &error,
+            error,
         );
     }
     if let Some(outcome) = error.operation_outcome() {
@@ -35,7 +41,7 @@ pub fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
             // `role_failure` promotes both Connectivity failures to session scope (the role
             // listing keeps a `Retry` after its first page to that listing, P7 C7).
             nfs_rs::RecoveryAction::Retry | nfs_rs::RecoveryAction::Remount => {
-                let class = recovery_failure_class(&error);
+                let class = recovery_failure_class(error);
                 (class, Transience::Transient)
             }
             // Reopen remains entry-scoped because the mounted session is usable.
@@ -47,12 +53,12 @@ pub fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
             }
             nfs_rs::RecoveryAction::DoNotRetry => (FailureClass::Protocol, Transience::Permanent),
         };
-        return with_server_status(NfsProtocolFailure::new(class, transience), &error);
+        return with_server_status(NfsProtocolFailure::new(class, transience), error);
     }
-    if let Some((class, transience)) = refused_by_state(&error) {
-        return with_server_status(NfsProtocolFailure::new(class, transience), &error);
+    if let Some((class, transience)) = refused_by_state(error) {
+        return with_server_status(NfsProtocolFailure::new(class, transience), error);
     }
-    let (class, transience) = match &error {
+    let (class, transience) = match error {
         nfs_rs::NfsError::Unsupported(_) => (FailureClass::Unsupported, Transience::Permanent),
         value if value.is_not_found() => (FailureClass::NotFound, Transience::Permanent),
         // A read-only export refuses every mutation the same way whatever the entry's mode: the
@@ -87,7 +93,7 @@ pub fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
         }
         _ => (FailureClass::Protocol, Transience::Unknown),
     };
-    with_server_status(NfsProtocolFailure::new(class, transience), &error)
+    with_server_status(NfsProtocolFailure::new(class, transience), error)
 }
 
 /// 修改或持久化结果未知时保留网络原因，不能将 Unknown 升级为成功。
@@ -218,6 +224,10 @@ mod tests {
             source: Box::new(NfsError::Nfs3(Nfs3ErrorCode::NFS3ERR_JUKEBOX)),
         }));
         let failure = classify_error(busy);
+        assert!(matches!(
+            failure.cause.as_deref(),
+            Some(NfsError::ServerBusy(_))
+        ));
         assert_eq!(failure.class, FailureClass::Throttled);
         assert!(
             failure
@@ -323,6 +333,7 @@ mod tests {
             ),
         ] {
             let failure = classify_error(error);
+            assert!(failure.cause.is_some());
             assert_eq!(failure.class, class);
             assert_eq!(failure.transience, transience);
         }
@@ -525,9 +536,35 @@ mod tests {
         ));
         assert_eq!(failure.class, FailureClass::Timeout);
         assert_eq!(failure.transience, Transience::Unknown);
+        assert!(matches!(
+            failure.cause.as_deref(),
+            Some(NfsError::OperationOutcome(_))
+        ));
         let failure = classify_mutation_error(NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_ACCESS));
         assert_eq!(failure.class, FailureClass::PermissionDenied);
         assert_eq!(failure.transience, Transience::Permanent);
+    }
+
+    #[test]
+    fn wrapped_readlink_decode_keeps_detail_without_a_server_status() {
+        let failed = classify_error(wrapped(
+            RecoveryAction::DoNotRetry,
+            NfsError::Xdr("READLINK target is not UTF-8".into()),
+        ));
+        assert_eq!(failed.class, FailureClass::Protocol);
+        assert_eq!(failed.transience, Transience::Permanent);
+        assert!(failed.status.is_none());
+        assert!(matches!(
+            failed.cause.as_deref(),
+            Some(NfsError::OperationOutcome(_))
+        ));
+        let path = crate::model::StoragePath::new("link").unwrap_or_else(|error| panic!("{error}"));
+        let crate::storage::StorageRoleFailure::Entry(error) =
+            role_failure(&path, crate::model::Operation::Observe, failed)
+        else {
+            panic!("READLINK decode error remains entry scoped");
+        };
+        assert!(error.diagnostic().contains("READLINK target is not UTF-8"));
     }
 
     #[test]

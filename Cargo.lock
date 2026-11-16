@@ -2989,8 +2989,8 @@ dependencies = [
 
 [[package]]
 name = "nfs-rs"
-version = "0.11.3"
-source = "git+https://github.com/JayTsu-sh/nfs-rs?rev=fdc541ccb461cb9d9404fdf7767f393e9508c276#fdc541ccb461cb9d9404fdf7767f393e9508c276"
+version = "0.12.0"
+source = "git+https://github.com/JayTsu-sh/nfs-rs?rev=5b1daaf97e8af6be5ff2a137350653971dc5acdf#5b1daaf97e8af6be5ff2a137350653971dc5acdf"
 dependencies = [
  "async-trait",
  "byteorder",

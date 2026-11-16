@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::staged::NfsStagedProtocol;
 
-use super::source::{NfsProtocolFailure, role_failure};
+use super::source::{NfsProtocolFailure, diagnostic, role_failure};
 use crate::model::{
     BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
     ObservedEntry, Operation, OwnershipMode, SourceIdentity, SourceVersion, StoragePath,
@@ -299,10 +299,10 @@ pub(super) fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
         reason,
         ..
     } = child;
-    let diagnostic = match failure.status.as_deref() {
-        Some(status) => format!("NFS listing could not describe the entry: {reason}: {status}"),
-        None => format!("NFS listing could not describe the entry: {reason}"),
-    };
+    let diagnostic = diagnostic(
+        format_args!("NFS listing could not describe the entry: {reason}"),
+        &failure,
+    );
     EntryOperationFailure::new(
         path,
         Operation::Traverse,
@@ -310,7 +310,7 @@ pub(super) fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
         failure.transience,
         diagnostic,
     )
-    .unwrap_or_else(|_| unreachable!("the NFS listing diagnostic is non-blank"))
+    .unwrap_or_else(|_| unreachable!("the bounded NFS listing diagnostic is nonblank and NUL-free"))
 }
 
 #[async_trait]
