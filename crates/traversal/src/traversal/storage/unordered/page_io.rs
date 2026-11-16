@@ -16,10 +16,13 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::super::Shared;
+use super::super::controlled::resources::PageCharge;
 use super::super::observe::{ObservationError, observe};
-use crate::model::ObservedEntry;
-use crate::storage::SourceDescriptor;
-use crate::traversal::TraversalTerminalFailure;
+use super::super::output::observation_failures;
+use crate::model::{FailureClass, ObservedEntry};
+use crate::storage::{SourceDescriptor, StorageRoleFailure};
+use crate::traversal::consumer::ConsumerState;
+use crate::traversal::{ScanFailure, TraversalItem, TraversalTerminalFailure};
 
 /// One child to observe, by its place in the page.
 pub(super) type Job = (usize, Box<SourceDescriptor>);
@@ -31,11 +34,13 @@ pub(super) type Done = (usize, Result<Box<ObservedEntry>, ObservationError>);
 ///
 /// # Errors
 /// `Internal` when the task stopped without handing its results over (it panicked).
-pub(super) async fn observe_page(
+pub(in crate::traversal::storage) async fn observe_page(
     shared: &Arc<Shared>,
     budget: &Arc<Semaphore>,
     halt: &CancellationToken,
     jobs: Vec<Job>,
+    consumer: Option<Arc<ConsumerState>>,
+    charge: Option<PageCharge>,
 ) -> Result<Option<Vec<Done>>, TraversalTerminalFailure> {
     let (sender, receiver) = oneshot::channel();
     let task = run(
@@ -43,6 +48,8 @@ pub(super) async fn observe_page(
         Arc::clone(budget),
         halt.clone(),
         jobs,
+        consumer,
+        charge,
         sender,
     );
     // Detached, never aborted: see the module docs.
@@ -61,6 +68,8 @@ async fn run(
     budget: Arc<Semaphore>,
     halt: CancellationToken,
     jobs: Vec<Job>,
+    consumer: Option<Arc<ConsumerState>>,
+    charge: Option<PageCharge>,
     results: oneshot::Sender<Vec<Done>>,
 ) {
     let plan = shared.policy.observation_plan;
@@ -68,15 +77,26 @@ async fn run(
     let namespace = shared.namespace.as_ref();
     let metadata = shared.metadata.as_ref();
     let (budget, halt) = (&budget, &halt);
+    let consumer = consumer.as_ref();
+    let charge = charge.as_ref();
     let mut pending: FuturesUnordered<_> = jobs
         .into_iter()
         .map(|(place, descriptor)| async move {
             // A closed budget cannot happen (nothing closes it); treat it like a halt.
             let permit = budget.acquire().await.ok()?;
-            if halt.is_cancelled() {
+            if halt.is_cancelled() || consumer.is_some_and(|state| state.failure().is_some()) {
                 return None;
             }
             let result = observe(namespace, metadata, *descriptor, plan, latest_only, halt).await;
+            if let Some(consumer) = consumer {
+                record_observation(consumer, result.as_ref());
+                if let Some(charge) = charge
+                    && let Err(failure) = charge.observation(result.as_ref())
+                {
+                    consumer.record_failure(failure);
+                    return None;
+                }
+            }
             drop(permit);
             Some((place, result.map(Box::new)))
         })
@@ -87,4 +107,49 @@ async fn run(
     }
     // The worker is gone once the traversal halted: the results are simply dropped.
     let _ = results.send(done);
+}
+
+/// Commit a returned cause before cancellation can win the page aggregation select.
+pub(in crate::traversal::storage) fn record_observation(
+    consumer: &ConsumerState,
+    result: Result<&ObservedEntry, &ObservationError>,
+) {
+    let Err(error) = result else {
+        if let Ok(entry) = result {
+            consumer.record_observation(
+                observation_failures(entry)
+                    .into_iter()
+                    .map(|failure| TraversalItem::ObservationFailure(Box::new(failure)))
+                    .collect(),
+                None,
+            );
+        }
+        return;
+    };
+    let mut diagnostics: Vec<_> = error
+        .observations
+        .iter()
+        .cloned()
+        .map(|failure| TraversalItem::ObservationFailure(Box::new(failure)))
+        .collect();
+    let terminal = match &error.failure {
+        StorageRoleFailure::Entry(failure)
+            if !matches!(
+                failure.class(),
+                FailureClass::NotFound | FailureClass::Cancelled
+            ) =>
+        {
+            diagnostics.push(TraversalItem::Failure(Box::new(ScanFailure::child(
+                failure.clone(),
+            ))));
+            Some(TraversalTerminalFailure::ConsumerSource(Box::new(
+                failure.clone(),
+            )))
+        }
+        StorageRoleFailure::Session(failure) if failure.class() != FailureClass::Cancelled => {
+            Some(TraversalTerminalFailure::Session(failure.clone()))
+        }
+        _ => None,
+    };
+    consumer.record_observation(diagnostics, terminal);
 }

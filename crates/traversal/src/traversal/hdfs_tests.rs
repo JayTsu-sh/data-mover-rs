@@ -16,6 +16,7 @@ use crate::storage::listing::DEFAULT_PAGE_HINT;
 #[tokio::test]
 async fn hdfs_facts_survive_snapshot_without_backend_requery()
 -> Result<(), Box<dyn std::error::Error>> {
+    let mut traversal_completed = Vec::new();
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
         .insert("source", Bytes::from_static(b"payload"))
@@ -28,7 +29,8 @@ async fn hdfs_facts_survive_snapshot_without_backend_requery()
             .max_inflight_operations(NonZeroUsize::new(2).ok_or("invalid inflight")?)
             .cancel(CancellationToken::new()),
     );
-    let Some(TraversalItem::Entry(entry)) = session.next_item().await else {
+    let Some(TraversalItem::Entry(entry)) = session.next_item(&mut traversal_completed).await
+    else {
         return Err("HDFS traversal did not return an entry".into());
     };
     let rebuilt = ObservedEntry::decode_snapshot(
@@ -36,7 +38,7 @@ async fn hdfs_facts_survive_snapshot_without_backend_requery()
         entry.source_identity().backend(),
     )?;
     assert_eq!(*entry, rebuilt);
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         assert!(crate::traversal::is_marker(&item));
     }
     session.finish().await?;
@@ -49,6 +51,7 @@ async fn hdfs_facts_survive_snapshot_without_backend_requery()
 #[tokio::test]
 async fn an_undescribable_child_is_a_child_failure_in_a_complete_listing()
 -> Result<(), Box<dyn std::error::Error>> {
+    let mut traversal_completed = Vec::new();
     let protocol = Arc::new(MemoryHdfs::default());
     for name in ["a", "bad", "c"] {
         protocol.insert(name, Bytes::from_static(b"payload")).await;
@@ -65,8 +68,11 @@ async fn an_undescribable_child_is_a_child_failure_in_a_complete_listing()
     let mut entries = Vec::new();
     let mut failures = Vec::new();
     let mut listing = None;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
+            TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+                panic!("ordinary scan emitted consumer work")
+            }
             TraversalItem::Entry(entry) => entries.push(entry.path().to_string()),
             TraversalItem::Failure(failure) => {
                 failures.push((failure.scope, failure.path.to_string()));
@@ -104,6 +110,7 @@ async fn an_undescribable_child_is_a_child_failure_in_a_complete_listing()
 #[tokio::test]
 async fn a_listing_failing_after_the_first_page_is_interrupted()
 -> Result<(), Box<dyn std::error::Error>> {
+    let mut traversal_completed = Vec::new();
     // The failure falls in the second page of the traversal's listings.
     let fail_at = DEFAULT_PAGE_HINT.get() + 26;
     let protocol = Arc::new(MemoryHdfs::default());
@@ -122,8 +129,11 @@ async fn a_listing_failing_after_the_first_page_is_interrupted()
             .cancel(CancellationToken::new()),
     );
     let (mut entries, mut failures, mut outcome) = (0_usize, Vec::new(), None);
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
+            TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+                panic!("ordinary scan emitted consumer work")
+            }
             TraversalItem::Entry(_) => entries += 1,
             TraversalItem::Failure(failure) => failures.push((failure.scope, failure.delivered)),
             TraversalItem::DirectoryListed(listed) => outcome = Some(listed.outcome),

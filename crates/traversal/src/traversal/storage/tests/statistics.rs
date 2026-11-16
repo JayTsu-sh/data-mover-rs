@@ -100,9 +100,10 @@ fn snapshots(items: &[TraversalItem]) -> Vec<&DirectoryStatistics> {
 }
 
 async fn collect(source: &StorageTraversalSource, request: TraversalRequest) -> Vec<TraversalItem> {
+    let mut traversal_completed = Vec::new();
     let mut session = source.traverse(request);
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     assert!(matches!(
@@ -228,11 +229,12 @@ async fn checkpoint_partial(
     source: &StorageTraversalSource,
     request: TraversalRequest,
 ) -> (Checkpoint, DirectoryStatistics) {
+    let mut traversal_completed = Vec::new();
     let cancel = request.cancel.clone();
     let mut session = source.traverse(request);
     let mut partial = None;
     let mut checkpoint = None;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::DirectoryStatistics(counts) => {
                 partial = Some(*counts);
@@ -299,6 +301,7 @@ async fn a_reordered_replay_opens_a_new_absolute_pass_in_both_orders() {
 }
 
 async fn raw_totals(source: &StorageTraversalSource, enabled: bool) -> (ScanTotals, usize) {
+    let mut traversal_completed = Vec::new();
     let mut session = source.traverse(
         request(CancellationToken::new())
             .directory_statistics(enabled)
@@ -308,7 +311,7 @@ async fn raw_totals(source: &StorageTraversalSource, enabled: bool) -> (ScanTota
             })),
     );
     let mut extra = 0;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         extra += usize::from(matches!(item, TraversalItem::DirectoryStatistics(_)));
     }
     let TraversalOutcome::Completed(completion) = session.finish().await.unwrap() else {

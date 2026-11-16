@@ -58,10 +58,11 @@ async fn local(root: &Path) -> TestResult<Storage> {
 }
 
 async fn scan(storage: &Storage, order: TraversalOrder) -> TestResult<Vec<ObservedEntry>> {
+    let mut traversal_completed = Vec::new();
     let request = TraversalRequest::new(StoragePath::root()).order(order);
     let mut session = StorageTraversalSource::new(storage)?.traverse(request);
     let mut entries = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => entries.push(*entry),
             TraversalItem::Failure(failure) => return Err(format!("{failure:?}").into()),

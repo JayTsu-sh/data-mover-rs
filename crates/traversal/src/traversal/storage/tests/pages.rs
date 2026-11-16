@@ -180,6 +180,7 @@ async fn every_item(
     inline: bool,
     request: TraversalRequest,
 ) -> (Vec<TraversalItem>, TraversalOutcome, usize) {
+    let mut traversal_completed = Vec::new();
     let (source, observers) = StorageTraversalSource::with_roles_counting(
         Arc::new(MixedNamespace {
             inline,
@@ -189,7 +190,7 @@ async fn every_item(
     );
     let mut session = source.traverse(request);
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     let outcome = session
@@ -224,6 +225,7 @@ async fn children_observed_in_the_listing_task_are_indistinguishable_from_role_o
 /// Under the default plan nothing but listings reaches the backend, and no child costs a task.
 #[tokio::test]
 async fn children_needing_no_io_start_no_observation_task() {
+    let mut traversal_completed = Vec::new();
     let mut request = mixed_request(TraversalOrder::Blocks, 8, false);
     request.observation_plan = ObservationPlan::default();
     let (source, observers) = StorageTraversalSource::with_roles_counting(
@@ -233,7 +235,7 @@ async fn children_needing_no_io_start_no_observation_task() {
     );
     let mut session = source.traverse(request);
     let mut entries = 0;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         entries += usize::from(matches!(item, TraversalItem::Entry(_)));
     }
     assert!(matches!(
@@ -279,6 +281,7 @@ async fn children_needing_io_cost_one_task_per_block() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finished_observation_tasks_do_not_accumulate() {
     const DIRECTORIES: usize = 300;
+    let mut traversal_completed = Vec::new();
     let (source, observers) = StorageTraversalSource::with_roles_counting(
         Arc::new(SymlinkPerDirectory {
             directories: DIRECTORIES,
@@ -289,7 +292,7 @@ async fn finished_observation_tasks_do_not_accumulate() {
     request.observation_plan = ObservationPlan::default();
     let mut session = source.traverse(request);
     let mut links = 0;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         links += usize::from(
             matches!(&item, TraversalItem::Entry(entry) if entry.kind() == EntryKind::Symlink),
         );
@@ -350,6 +353,7 @@ impl Namespace for SymlinkPerDirectory {
 /// subdirectory's decision waits. The first test proves both give the same items.
 #[tokio::test]
 async fn a_filter_needing_modified_decides_at_once_when_the_listing_carries_it() {
+    let mut traversal_completed = Vec::new();
     let mut waited = Vec::new();
     for inline in [true, false] {
         let metadata = Arc::new(TimesMetadata::default());
@@ -361,7 +365,7 @@ async fn a_filter_needing_modified_decides_at_once_when_the_listing_carries_it()
             Arc::clone(&metadata) as Arc<dyn Metadata>,
         );
         let mut session = source.traverse(mixed_request(TraversalOrder::Blocks, 8, true));
-        while session.next_item().await.is_some() {}
+        while session.next_item(&mut traversal_completed).await.is_some() {}
         assert!(matches!(
             session.finish().await,
             Ok(TraversalOutcome::Completed(_))
@@ -383,6 +387,7 @@ async fn a_filter_needing_modified_decides_at_once_when_the_listing_carries_it()
 /// the filter still applying below it — in its place among siblings decided at once.
 #[tokio::test]
 async fn an_observation_failing_in_the_listing_task_still_lists_the_directory_in_order() {
+    let mut traversal_completed = Vec::new();
     let source = StorageTraversalSource::with_roles(
         Arc::new(OversizedFact),
         Arc::new(TimesMetadata::default()),
@@ -391,8 +396,11 @@ async fn an_observation_failing_in_the_listing_task_still_lists_the_directory_in
     request.filter = Some(Arc::new(EveryModified));
     let mut session = source.traverse(request);
     let (mut listed, mut failures, mut entries) = (Vec::new(), Vec::new(), Vec::new());
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
+            TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+                panic!("ordinary scan emitted consumer work")
+            }
             TraversalItem::Entry(entry) => entries.push(entry.path().as_str().to_owned()),
             TraversalItem::Failure(failure) => failures.push(failure.path.as_str().to_owned()),
             TraversalItem::DirectoryListed(done) => listed.push(done.path.as_str().to_owned()),

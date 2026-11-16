@@ -55,8 +55,9 @@ fn request(cancel: CancellationToken, inflight: usize) -> TraversalRequest {
 }
 
 async fn drain(session: &mut TraversalSession) -> Vec<TraversalItem> {
+    let mut traversal_completed = Vec::new();
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     items
@@ -82,6 +83,9 @@ fn entry_paths(items: &[TraversalItem]) -> Vec<String> {
     items
         .iter()
         .filter_map(|item| match item {
+            TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+                panic!("ordinary scan emitted consumer work")
+            }
             TraversalItem::Entry(entry) => Some(entry.path().as_str().to_owned()),
             TraversalItem::Failure(_)
             | TraversalItem::ObservationFailure(_)
@@ -165,6 +169,7 @@ async fn traversal_applies_one_optional_metadata_plan_to_each_entry() -> io::Res
 
 #[tokio::test]
 async fn cancellation_is_a_terminal_not_an_entry_failure() -> io::Result<()> {
+    let mut traversal_completed = Vec::new();
     let root = tempfile::tempdir()?;
     for index in 0..32 {
         std::fs::write(root.path().join(format!("file-{index}")), b"x")?;
@@ -174,7 +179,7 @@ async fn cancellation_is_a_terminal_not_an_entry_failure() -> io::Result<()> {
         .source
         .output_capacity(NonZeroUsize::MIN)
         .traverse(request(cancel.clone(), 1));
-    assert!(session.next_item().await.is_some());
+    assert!(session.next_item(&mut traversal_completed).await.is_some());
     cancel.cancel();
     let items = drain(&mut session).await;
     assert!(items.is_empty());

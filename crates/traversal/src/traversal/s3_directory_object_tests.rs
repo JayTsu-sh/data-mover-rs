@@ -69,10 +69,11 @@ async fn traverse(
     protocol: &Arc<MemoryS3>,
     request: TraversalRequest,
 ) -> TestResult<(Vec<TraversalItem>, TraversalOutcome)> {
+    let mut traversal_completed = Vec::new();
     let storage = connect(protocol.clone(), identity(), None)?;
     let mut session = StorageTraversalSource::new(&storage)?.traverse(request);
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     Ok((items, session.finish().await?))
@@ -268,6 +269,7 @@ async fn a_content_leaf_is_one_file_and_only_real_children_add_a_directory() -> 
 /// key, including a suspended null version. Snapshots and segments must retain that mapping.
 #[tokio::test]
 async fn directory_marker_history_keeps_its_raw_key_metadata_and_segments() -> TestResult {
+    let mut traversal_completed = Vec::new();
     for order in ORDERS {
         let protocol = marker_with_null_history().await?;
         protocol.listing().page_size = 1;
@@ -276,7 +278,7 @@ async fn directory_marker_history_keeps_its_raw_key_metadata_and_segments() -> T
         let plan = ObservationPlan::default().with_tags(ObservationMode::BestEffort);
         let mut session = source.traverse(request("", order)?.observation_plan(plan));
         let mut found = Vec::new();
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             if let TraversalItem::Entry(entry) = item {
                 found.push(entry);
             } else {
@@ -507,6 +509,7 @@ async fn a_specified_prefix_never_lists_the_bucket_root_or_siblings() -> TestRes
 async fn checkpoints_bind_directory_marker_semantics() -> TestResult {
     use super::checkpoint::{FrontierEntry, encode, fingerprint};
     use super::{ResumeRefusal, TraversalTerminalFailure};
+    let mut traversal_completed = Vec::new();
 
     for order in ORDERS {
         for histories in [false, true] {
@@ -524,7 +527,7 @@ async fn checkpoints_bind_directory_marker_semantics() -> TestResult {
             }];
             let checkpoint = encode(order, &old, &frontier).ok_or("checkpoint too large")?;
             let mut session = source.traverse(request.resume_from(checkpoint));
-            assert!(session.next_item().await.is_none());
+            assert!(session.next_item(&mut traversal_completed).await.is_none());
             assert!(matches!(
                 session.finish().await,
                 Err(TraversalTerminalFailure::Resume(ResumeRefusal::Mismatch))

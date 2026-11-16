@@ -143,14 +143,18 @@ async fn an_ancestor_gone_since_is_counted_vanished() {
 /// root, the position before the first item not delivered, and resuming from one loses nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_checkpoint_is_the_position_before_what_was_delivered() {
+    let mut traversal_completed = Vec::new();
     let (tree, gate) = Tree::generate(3, 3, 2, 2).with_gated_link();
     let setup = setup(tree, false);
     let full = setup.tree.all_entries();
     let make = || request(TraversalOrder::Blocks, 64);
     let mut session = setup.source.traverse(make().resumable(every_chance()));
     let mut held = Vec::new();
-    while let Ok(Some(item)) =
-        tokio::time::timeout(Duration::from_millis(300), session.next_item()).await
+    while let Ok(Some(item)) = tokio::time::timeout(
+        Duration::from_millis(300),
+        session.next_item(&mut traversal_completed),
+    )
+    .await
     {
         held.push(item);
     }
@@ -169,7 +173,7 @@ async fn a_checkpoint_is_the_position_before_what_was_delivered() {
         assert_eq!(paths, [""], "a checkpoint ran ahead of the output");
     }
     gate.add_permits(1024);
-    while session.next_item().await.is_some() {}
+    while session.next_item(&mut traversal_completed).await.is_some() {}
     let (_, checkpoint) = saved.last().cloned().unwrap_or_else(|| unreachable!());
     let (resumed, _) = run(&setup.source, make().resume_from(checkpoint), None).await;
     let resumed: BTreeSet<String> = entry_paths(&resumed).into_iter().collect();

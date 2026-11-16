@@ -144,10 +144,11 @@ async fn peak_of(
     namespace: Arc<dyn Namespace>,
     request: TraversalRequest,
 ) -> super::super::residency::Residency {
+    let mut traversal_completed = Vec::new();
     let (source, peak) =
         StorageTraversalSource::with_roles_probed(namespace, Arc::new(FakeMetadata));
     let mut session = source.traverse(request);
-    while session.next_item().await.is_some() {}
+    while session.next_item(&mut traversal_completed).await.is_some() {}
     session
         .finish()
         .await

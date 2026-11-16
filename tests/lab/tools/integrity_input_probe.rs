@@ -83,12 +83,13 @@ struct Args {
 }
 
 async fn observed(storage: &Storage, key: &StoragePath) -> Result<ObservedEntry, Box<dyn Error>> {
+    let mut traversal_completed = Vec::new();
     let request = TraversalRequest::new(StoragePath::root())
         .max_depth(NonZeroUsize::new(1))
         .cancel(CancellationToken::new());
     let mut session = StorageTraversalSource::new(storage)?.traverse(request);
     let mut found = None;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) if entry.path() == key => {
                 let previous = found.replace(*entry);

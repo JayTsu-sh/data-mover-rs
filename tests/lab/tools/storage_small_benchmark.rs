@@ -99,11 +99,12 @@ fn measurement(mut latencies: Vec<Duration>) -> Result<Measurement> {
 }
 
 async fn scan(source: &Storage) -> Result<Measurement> {
+    let mut traversal_completed = Vec::new();
     let source = StorageTraversalSource::new(source)?;
     let mut session = source.traverse(TraversalRequest::new(StoragePath::root()));
     let mut latencies = Vec::new();
     let mut previous = Instant::now();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(_) => {
                 let now = Instant::now();
@@ -119,10 +120,11 @@ async fn scan(source: &Storage) -> Result<Measurement> {
 }
 
 async fn copy(source: &Storage, destination: &Storage, _chunk_bytes: u64) -> Result<Measurement> {
+    let mut traversal_completed = Vec::new();
     let traversal = StorageTraversalSource::new(source)?;
     let mut session = traversal.traverse(TraversalRequest::new(StoragePath::root()));
     let mut pending = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) if entry.kind() == EntryKind::File => {
                 pending.push(entry.path().clone());

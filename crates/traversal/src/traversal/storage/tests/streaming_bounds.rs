@@ -59,6 +59,7 @@ impl Namespace for WideListing {
 async fn a_wide_directory_is_held_a_few_pages_at_a_time() {
     const TOTAL: usize = 100_000;
     const PAGE: usize = 100;
+    let mut traversal_completed = Vec::new();
     let produced = Arc::new(AtomicUsize::new(0));
     let (source, peak) = StorageTraversalSource::with_roles_probed(
         Arc::new(WideListing {
@@ -72,7 +73,7 @@ async fn a_wide_directory_is_held_a_few_pages_at_a_time() {
         .output_capacity(NonZeroUsize::MIN)
         .traverse(paged_request(4));
     let (mut received, mut ahead) = (0_usize, 0_usize);
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         received += usize::from(matches!(item, TraversalItem::Entry(_)));
         ahead = ahead.max(produced.load(Ordering::SeqCst).saturating_sub(received));
         if received % 1_000 == 0 {
@@ -149,6 +150,7 @@ impl Namespace for ManyWide {
 async fn prefetched_listings_stop_after_their_first_page() {
     const PAGE: usize = 50;
     const WINDOW: usize = 4;
+    let mut traversal_completed = Vec::new();
     let produced = Arc::new(Mutex::new(HashMap::new()));
     let (source, peak) = StorageTraversalSource::with_roles_probed(
         Arc::new(ManyWide {
@@ -164,7 +166,7 @@ async fn prefetched_listings_stop_after_their_first_page() {
         .traverse(paged_request(WINDOW));
     let mut received: HashMap<String, usize> = HashMap::new();
     let mut ahead = 0;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if let TraversalItem::Entry(entry) = &item
             && let Some((directory, _)) = entry.path().as_str().split_once('/')
         {

@@ -47,6 +47,16 @@ pub enum TraversalItem {
     /// 故障和诊断累计不回退。
     Resumed(Box<TraversalResume>),
     Entry(Box<ObservedEntry>),
+    /// Consumer work for one observed entry. Feed back this stage ID through
+    /// [`super::TraversalSession::next_item`]; success proves only this stage.
+    /// A directory's stage prepares its target before descendants; its final metadata stage
+    /// remains outstanding in Native directory state. The traversal root is never emitted.
+    ConsumerEntry(Box<([u8; 32], ObservedEntry)>),
+    /// A separately acknowledged directory finalization stage retaining its original
+    /// observation. A listing boundary alone never implies this event.
+    /// All selected descendants succeeded. This can be a real direct-listing EOF or a
+    /// `max_depth`/pruning policy boundary, which does not assert physical completeness.
+    SubtreeReady(Box<([u8; 32], ObservedEntry)>),
     /// A child that could not be observed, or a directory that could not be listed; see
     /// [`ScanFailure::scope`].
     Failure(Box<ScanFailure>),

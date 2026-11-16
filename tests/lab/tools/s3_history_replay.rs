@@ -118,13 +118,14 @@ fn at_or_above(key: &str, path: &str) -> bool {
 /// the key's entries, segment after segment (none when the key is not listed at all). A key without
 /// a history (the bucket keeps none), or whose segments do not end with a complete one, is an error.
 async fn records(source: &Storage, key: &str) -> Result<(Vec<VersionRecord>, HistoryOrder)> {
+    let mut traversal_completed = Vec::new();
     let (parent, depth) = listed_at(key);
     let request = TraversalRequest::new(StoragePath::new(parent)?)
         .max_depth(NonZeroUsize::new(depth))
         .cancel(CancellationToken::new());
     let mut session = StorageTraversalSource::new(source)?.traverse(request);
     let mut segments: Vec<ObservedEntry> = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry)
                 if entry

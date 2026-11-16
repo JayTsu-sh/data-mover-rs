@@ -484,10 +484,11 @@ async fn shared_expert_source_rejects_replaced_empty_objects_before_producing() 
 }
 
 async fn scanned(storage: &Storage, path: &str) -> TestResult<Arc<ObservedEntry>> {
+    let mut traversal_completed = Vec::new();
     let mut scan =
         StorageTraversalSource::new(storage)?.traverse(TraversalRequest::new(StoragePath::root()));
     let mut found = None;
-    while let Some(item) = scan.next_item().await {
+    while let Some(item) = scan.next_item(&mut traversal_completed).await {
         if let TraversalItem::Entry(entry) = item
             && entry.path().as_str() == path
         {

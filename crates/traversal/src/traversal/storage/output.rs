@@ -410,7 +410,9 @@ pub(super) fn terminal_errors(item: ChildItem, batch: &mut Vec<TraversalItem>) {
             observation_items(observations, Tallied::Nothing).push_into(batch);
         }
         ChildItem::Item(
-            TraversalItem::DirectoryListed(_)
+            TraversalItem::ConsumerEntry(_)
+            | TraversalItem::SubtreeReady(_)
+            | TraversalItem::DirectoryListed(_)
             | TraversalItem::DirectoryStatistics(_)
             | TraversalItem::Resumed(_)
             | TraversalItem::Checkpoint(_),
@@ -492,6 +494,8 @@ pub(super) fn tally_child(
         // Naming both rather than wildcarding makes the next variant added to `TraversalItem` a
         // compile error at this tally.
         TraversalItem::Failure(_)
+        | TraversalItem::ConsumerEntry(_)
+        | TraversalItem::SubtreeReady(_)
         | TraversalItem::ObservationFailure(_)
         | TraversalItem::DirectoryListed(_)
         | TraversalItem::DirectoryStatistics(_)

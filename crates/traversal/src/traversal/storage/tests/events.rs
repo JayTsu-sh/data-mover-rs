@@ -45,6 +45,9 @@ pub(super) fn render_counts(counts: &BlockCounts) -> String {
 /// One line per item, so a whole event sequence can be asserted at once.
 pub(super) fn render(item: &TraversalItem) -> String {
     match item {
+        TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+            panic!("ordinary scan emitted consumer work")
+        }
         TraversalItem::Resumed(_) => panic!("raw traversal cannot resume an attempt"),
         TraversalItem::Entry(entry) => format!("entry {}", name(entry.path())),
         TraversalItem::Failure(failure) => format!(
@@ -74,8 +77,9 @@ pub(super) fn render(item: &TraversalItem) -> String {
 }
 
 pub(super) async fn drain(mut session: TraversalSession) -> (Vec<TraversalItem>, TraversalOutcome) {
+    let mut traversal_completed = Vec::new();
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     let outcome = session
@@ -112,6 +116,9 @@ pub(super) fn assert_well_formed(items: &[TraversalItem], outcome: &TraversalOut
     let mut listing_failure: Option<&str> = None;
     for item in items {
         match item {
+            TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+                panic!("ordinary scan emitted consumer work")
+            }
             TraversalItem::Resumed(_) => panic!("raw traversal cannot resume an attempt"),
             TraversalItem::Entry(_) => emitted += 1,
             TraversalItem::Failure(failure) => match failure.scope {
@@ -490,6 +497,7 @@ async fn an_undescribable_child_is_a_child_failure_in_a_complete_listing() {
 /// be read as a complete account.
 #[tokio::test]
 async fn cancellation_leaves_no_totals() {
+    let mut traversal_completed = Vec::new();
     let cancel = tokio_util::sync::CancellationToken::new();
     let source = StorageTraversalSource::with_roles(
         Arc::new(FakeNamespace),
@@ -498,7 +506,7 @@ async fn cancellation_leaves_no_totals() {
     let mut session = source.traverse(request(cancel.clone()));
 
     let mut lines = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         let line = render(&item);
         let root_listed = line.starts_with("listed <root>");
         lines.push(line);
@@ -507,7 +515,7 @@ async fn cancellation_leaves_no_totals() {
             break;
         }
     }
-    while session.next_item().await.is_some() {}
+    while session.next_item(&mut traversal_completed).await.is_some() {}
 
     assert!(
         lines.iter().any(|line| line.starts_with("listed <root>")),

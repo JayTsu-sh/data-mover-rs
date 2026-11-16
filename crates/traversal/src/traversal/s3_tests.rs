@@ -59,10 +59,11 @@ pub(super) async fn traverse(
     protocol: &Arc<MemoryS3>,
     request: TraversalRequest,
 ) -> TestResult<(Vec<TraversalItem>, TraversalOutcome)> {
+    let mut traversal_completed = Vec::new();
     let storage = connect(protocol.clone(), identity(), None)?;
     let mut session = StorageTraversalSource::new(&storage)?.traverse(request);
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     Ok((items, session.finish().await?))
@@ -83,6 +84,9 @@ pub(super) fn entries(items: &[TraversalItem]) -> Vec<&ObservedEntry> {
 /// record), `failure scope path`, `listed path outcome [set counts]`.
 pub(super) fn render(item: &TraversalItem) -> String {
     match item {
+        TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+            panic!("ordinary scan emitted consumer work")
+        }
         TraversalItem::Resumed(_) => panic!("raw traversal cannot resume an attempt"),
         TraversalItem::Entry(entry) => {
             let history = entry.history().map_or(String::new(), |history| {
@@ -311,6 +315,7 @@ async fn an_absent_root_is_not_an_empty_source() -> TestResult {
 /// rather than left paging through a large directory in the background.
 #[tokio::test]
 async fn cancellation_stops_an_s3_listing_between_pages() -> TestResult {
+    let mut traversal_completed = Vec::new();
     let protocol = Arc::new(MemoryS3::default());
     for index in 0..40 {
         put(&protocol, &format!("k{index:02}"), b"1").await?;
@@ -327,7 +332,7 @@ async fn cancellation_stops_an_s3_listing_between_pages() -> TestResult {
     let mut session = StorageTraversalSource::new(&storage)?.traverse(listing);
     sleep(Duration::from_millis(70)).await;
     cancel.cancel();
-    while session.next_item().await.is_some() {}
+    while session.next_item(&mut traversal_completed).await.is_some() {}
     assert_eq!(session.finish().await?, TraversalOutcome::Cancelled);
     let at_cancel = protocol.listing().calls.len();
     sleep(Duration::from_millis(200)).await;

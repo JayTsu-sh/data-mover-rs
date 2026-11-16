@@ -236,6 +236,7 @@ async fn sibling_chains_are_listed_in_parallel_while_the_cursor_is_deep() {
 
 #[tokio::test]
 async fn cancellation_lets_inflight_listings_finish() {
+    let mut traversal_completed = Vec::new();
     let children: Vec<(String, EntryKind)> = (0..8)
         .map(|index| (format!("dir-{index}"), EntryKind::Directory))
         .collect();
@@ -261,7 +262,7 @@ async fn cancellation_lets_inflight_listings_finish() {
     .unwrap_or_else(|_| panic!("subdirectory listings never started"));
 
     cancel.cancel();
-    while session.next_item().await.is_some() {}
+    while session.next_item(&mut traversal_completed).await.is_some() {}
     assert_eq!(session.finish().await, Ok(TraversalOutcome::Cancelled));
 
     let blocked = started();

@@ -25,6 +25,7 @@ use crate::storage::{
 };
 
 mod blocks;
+mod controlled;
 mod cursor;
 mod observe;
 mod output;
@@ -223,6 +224,9 @@ fn refuse(request: &TraversalRequest, failure: TraversalTerminalFailure) -> Trav
 
 impl TraversalSource for StorageTraversalSource {
     fn traverse(&self, request: TraversalRequest) -> TraversalSession {
+        if request.consumer_completion_budget.is_some() {
+            return controlled::start(self, request);
+        }
         let capabilities = self.metadata.observation_capabilities();
         let requirements = match super::configuration::validate(&request, capabilities) {
             Ok(requirements) => requirements,

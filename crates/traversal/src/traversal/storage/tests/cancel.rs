@@ -47,6 +47,7 @@ impl Metadata for HandleMetadata {
 
 #[tokio::test]
 async fn cancellation_lets_inflight_observations_finish_and_close_their_handles() {
+    let mut traversal_completed = Vec::new();
     let metadata = Arc::new(HandleMetadata::default());
     let source = StorageTraversalSource::with_roles(
         Arc::new(FakeNamespace),
@@ -65,7 +66,7 @@ async fn cancellation_lets_inflight_observations_finish_and_close_their_handles(
     .unwrap_or_else(|_| panic!("no observation started"));
 
     cancel.cancel();
-    while session.next_item().await.is_some() {}
+    while session.next_item(&mut traversal_completed).await.is_some() {}
     assert_eq!(session.finish().await, Ok(TraversalOutcome::Cancelled));
 
     // Cancellation is reported promptly; the observations already holding a handle still run

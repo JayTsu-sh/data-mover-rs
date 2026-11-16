@@ -74,6 +74,9 @@ impl<'a, 'd> Reader<'a, 'd> {
                 return Err("item after directory boundary");
             }
             match item {
+                TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+                    return Err("consumer phases are not scan blocks");
+                }
                 TraversalItem::Entry(entry) => self.entry(entry)?,
                 TraversalItem::Failure(failure) => self.failure(failure)?,
                 TraversalItem::DirectoryListed(listed) => {

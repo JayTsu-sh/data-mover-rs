@@ -8,13 +8,14 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    BackendSessionFailure, EntryKind, MetadataObservations, MetadataRequirements, ObservationPlan,
-    StoragePath, StorageTimestamp,
+    BackendSessionFailure, EntryKind, EntryOperationFailure, MetadataObservations,
+    MetadataRequirements, ObservationPlan, StoragePath, StorageTimestamp,
 };
 
 mod channel;
 mod checkpoint;
 mod configuration;
+mod consumer;
 mod counts;
 mod events;
 pub mod pairing;
@@ -217,6 +218,16 @@ pub struct TraversalRequest {
     pub root: StoragePath,
     pub order: TraversalOrder,
     pub max_inflight_operations: NonZeroUsize,
+    /// Logical byte reservations for actor-owned directory state, first raw snapshots,
+    /// paths/hints, acquired pages and additional observation results, including root/hidden
+    /// topology. Payload credit follows ownership and is released on transfer or drop.
+    /// `None` preserves ordinary scanning. This is not allocator, total RSS or backend-buffer
+    /// accounting: opaque stream state/read-ahead and a newly returned oversized value can
+    /// exist before it is measured and rejected. See `docs/design/consumer-completed-traversal.md`.
+    pub consumer_completion_budget: Option<NonZeroUsize>,
+    /// Issued consumer phases not yet acknowledged, independent of listing concurrency and
+    /// directory state waiting between prepare and finalize. Defaults to 64.
+    pub consumer_max_inflight: NonZeroUsize,
     /// Observations requested by the caller. A filter dependency must be enabled here;
     /// `InlineOnly` uses listed information without additional metadata I/O.
     pub observation_plan: ObservationPlan,
@@ -348,6 +359,8 @@ impl TraversalRequest {
             root,
             order: TraversalOrder::default(),
             max_inflight_operations: DEFAULT_MAX_INFLIGHT,
+            consumer_completion_budget: None,
+            consumer_max_inflight: DEFAULT_MAX_INFLIGHT,
             observation_plan: ObservationPlan::default(),
             latest_metadata_only: false,
             directory_object_metadata: DirectoryObjectMetadata::Requested,
@@ -387,10 +400,13 @@ impl TraversalRequest {
         self
     }
 
-    /// Operations in flight at once. Unordered: directories listed at once (at most 64, and at
-    /// most the namespace's parked-listing limit: CIFS, 8) and observations that need I/O at
-    /// once. Blocks: entries admitted and not yet delivered, and listings read ahead of the cursor
-    /// (at most 64).
+    /// Ordinary Unordered: directories listed at once (at most 64 and the namespace's
+    /// parked-listing limit), and additional metadata observations at once. Blocks: admitted
+    /// entries not yet delivered, and listings read ahead (at most 64).
+    /// With consumer completion enabled this limits additional metadata observations (at most
+    /// 64), not resident ancestor listings: their count follows the completion-byte budget and
+    /// the namespace's real parked-listing limit. Backend listing read-ahead is independent,
+    /// so this does not cap all backend I/O in consumer mode.
     #[must_use]
     pub const fn max_inflight_operations(mut self, limit: NonZeroUsize) -> Self {
         self.max_inflight_operations = limit;
@@ -514,6 +530,24 @@ pub enum TraversalOutcome {
 pub enum TraversalTerminalFailure {
     Session(BackendSessionFailure),
     Internal,
+    /// A consumer reported an unsuccessful stage. This does not prove that the target
+    /// was unchanged; the application retains the operation's typed cause.
+    ConsumerFailed,
+    /// One feedback poll exceeded the consumer window's protocol bound.
+    ConsumerFeedbackLimitExceeded {
+        limit: usize,
+    },
+    /// An unsafe source entry/listing prevents consumer subtree completion.
+    ConsumerSource(Box<EntryOperationFailure>),
+    /// The active path cannot retain its next node/path/original directory snapshot.
+    ConsumerCompletionBudgetExceeded {
+        limit: usize,
+        required: usize,
+    },
+    /// Descending would park more streams than the configured/native handle bound.
+    ConsumerListingLimitExceeded {
+        limit: usize,
+    },
     /// The request cannot resume from its checkpoint, or cannot be resumable at all; returned
     /// before any I/O.
     Resume(ResumeRefusal),
@@ -526,6 +560,20 @@ impl fmt::Display for TraversalTerminalFailure {
         match self {
             Self::Session(error) => error.fmt(formatter),
             Self::Internal => formatter.write_str("traversal runtime failed"),
+            Self::ConsumerFailed => formatter.write_str("traversal consumer work failed"),
+            Self::ConsumerFeedbackLimitExceeded { limit } => write!(
+                formatter,
+                "consumer feedback exceeds its {limit} item window"
+            ),
+            Self::ConsumerSource(error) => error.fmt(formatter),
+            Self::ConsumerCompletionBudgetExceeded { limit, required } => write!(
+                formatter,
+                "consumer directory state requires {required} bytes, exceeding {limit}"
+            ),
+            Self::ConsumerListingLimitExceeded { limit } => write!(
+                formatter,
+                "consumer traversal cannot safely park more than {limit} listings"
+            ),
             Self::Resume(refusal) => write!(formatter, "cannot resume the traversal: {refusal}"),
             Self::Configuration(error) => error.fmt(formatter),
         }
@@ -545,6 +593,8 @@ pub struct TraversalSession {
     /// Cancellation drains rather than drops (a resumable traversal, [`Resumable::On`]).
     drain_on_cancel: bool,
     exhausted: bool,
+    consumer: Option<Arc<consumer::ConsumerState>>,
+    terminal: Option<Result<TraversalOutcome, TraversalTerminalFailure>>,
 }
 
 /// Bounded producer paired with a [`TraversalSession`] for external traversal implementations.
@@ -559,6 +609,12 @@ impl TraversalProducer {
     /// # Errors
     /// Returns the item when the consumer has already closed the session.
     pub async fn send(&self, item: TraversalItem) -> Result<(), TraversalItem> {
+        if matches!(
+            item,
+            TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_)
+        ) {
+            return Err(item); // The ordinary producer has no authority to issue phase IDs.
+        }
         self.items.send_one(item).await
     }
 
@@ -598,17 +654,53 @@ impl TraversalSession {
             cancel,
             drain_on_cancel,
             exhausted: false,
+            consumer: None,
+            terminal: None,
         }
+    }
+
+    fn controlled(
+        items: channel::ItemReceiver,
+        completion: oneshot::Receiver<Result<TraversalOutcome, TraversalTerminalFailure>>,
+        request: &TraversalRequest,
+        execution: u64,
+    ) -> (Self, Arc<consumer::ConsumerState>) {
+        let consumer =
+            consumer::ConsumerState::new(request.consumer_max_inflight, execution, &request.cancel);
+        let mut session = Self::new(items, completion, request.cancel.clone(), false);
+        session.consumer = Some(consumer.clone());
+        (session, consumer)
     }
 
     /// Receives the next ordered item with consumer-driven backpressure.
     ///
-    /// Once the traversal is cancelled this returns `None` at once, dropping whatever was
+    /// Reuse an empty Vec for ordinary scans. In consumer mode, feedback is committed
+    /// synchronously on first poll, before the Vec is cleared and before any await.
+    /// Dropping an unpolled future leaves feedback untouched; cancelling after submission
+    /// never rolls it back. Unknown/unissued/duplicate/late IDs do not settle current work.
+    /// A `true` result proves only that requested phase, while `false` is terminal and does
+    /// not prove that the target was unchanged. The application retains its typed cause.
+    /// A feedback Vec larger than `consumer_max_inflight` is a terminal protocol error;
+    /// its confirmations are not applied. No ACK timeout is imposed.
+    ///
+    /// In consumer mode, cancellation stops work immediately but drains already registered
+    /// `ObservationFailure`/`Failure` facts before `None`. Continue polling to deliver them;
+    /// no unknown I/O is awaited and detached results after the cutoff are ignored.
+    ///
+    /// For ordinary scans, once cancelled this returns `None` at once, dropping whatever was
     /// buffered — unless the traversal emits checkpoints ([`Resumable::On`]): then it keeps
     /// returning what the traversal had produced, its final [`TraversalItem::Checkpoint`] last
     /// (see [`Resumable::On`] for when there is none), and then `None`, so that everything before
     /// the checkpoint reached the consumer.
-    pub async fn next_item(&mut self) -> Option<TraversalItem> {
+    pub async fn next_item(
+        &mut self,
+        completed: &mut Vec<([u8; 32], bool)>,
+    ) -> Option<TraversalItem> {
+        if let Some(consumer) = self.consumer.clone() {
+            consumer.submit(completed);
+            return self.next_consumer_item(&consumer).await;
+        }
+        completed.clear();
         if self.drain_on_cancel {
             let item = self.items.recv().await;
             self.exhausted |= item.is_none();
@@ -626,22 +718,101 @@ impl TraversalSession {
         item
     }
 
+    async fn next_consumer_item(
+        &mut self,
+        consumer: &consumer::ConsumerState,
+    ) -> Option<TraversalItem> {
+        let item = tokio::select! {
+            biased;
+            () = consumer.stopped.cancelled() => None,
+            item = self.items.recv() => item,
+        };
+        if let Some(item) = item {
+            let id = match &item {
+                TraversalItem::ConsumerEntry(work) | TraversalItem::SubtreeReady(work) => {
+                    Some(&work.0)
+                }
+                _ => None,
+            };
+            if id.is_none_or(|id| consumer.issue(id)) {
+                consumer.delivered_diagnostic(&item);
+                return Some(item); // No await between taking output and returning it.
+            }
+            consumer.fail(TraversalTerminalFailure::Internal);
+        } else {
+            self.consumer_eof(consumer).await;
+        }
+        consumer.close();
+        self.items.close();
+        if let Some(diagnostic) = consumer.next_diagnostic() {
+            return Some(diagnostic);
+        }
+        self.exhausted = true;
+        None
+    }
+
+    async fn consumer_eof(&mut self, consumer: &consumer::ConsumerState) {
+        if let Some(failure) = consumer.failure() {
+            consumer.fail(failure);
+            return;
+        }
+        if self.terminal.is_none() {
+            tokio::select! {
+                biased;
+                terminal = &mut self.completion => {
+                    self.terminal = Some(terminal.unwrap_or(Err(TraversalTerminalFailure::Internal)));
+                }
+                () = consumer.settled() => return,
+            }
+        }
+        match &self.terminal {
+            Some(Ok(TraversalOutcome::Completed(_))) => consumer.settled().await,
+            Some(Err(failure)) => consumer.fail(failure.clone()),
+            Some(Ok(TraversalOutcome::Cancelled)) => consumer.close(),
+            None => consumer.fail(TraversalTerminalFailure::Internal),
+        }
+    }
+
     /// Returns positive completion evidence or the unique terminal failure.
     ///
     /// # Errors
-    /// Returns `Internal` if called before EOF or if the producer disappears without evidence.
-    pub async fn finish(self) -> Result<TraversalOutcome, TraversalTerminalFailure> {
+    /// Positive completion requires EOF. Returns `Internal` before EOF or when the producer
+    /// disappears without evidence, except that an already known consumer/source failure is
+    /// returned immediately so cancellation cannot replace its cause.
+    pub async fn finish(mut self) -> Result<TraversalOutcome, TraversalTerminalFailure> {
+        if let Some(consumer) = &self.consumer {
+            if let Some(failure) = consumer.failure() {
+                return Err(failure);
+            }
+            if self.cancel.is_cancelled() {
+                return Ok(TraversalOutcome::Cancelled);
+            }
+        }
         if !self.exhausted {
             return Err(TraversalTerminalFailure::Internal);
         }
-        self.completion
+        if let Some(terminal) = self.terminal.take() {
+            return terminal;
+        }
+        (&mut self.completion)
             .await
             .unwrap_or(Err(TraversalTerminalFailure::Internal))
     }
 }
 
+impl Drop for TraversalSession {
+    fn drop(&mut self) {
+        if let Some(consumer) = &self.consumer {
+            consumer.close();
+        }
+    }
+}
+
 /// Backend-neutral traversal source.
 pub trait TraversalSource: Send + Sync {
+    /// Sources implementing only ordinary scanning must explicitly refuse
+    /// `consumer_completion_budget: Some(_)` with `ConsumerCompletionUnsupported`.
+    /// The public `bounded`/producer pair supplies ordinary output, not phase IDs.
     fn traverse(&self, request: TraversalRequest) -> TraversalSession;
 }
 
@@ -651,6 +822,7 @@ mod producer_tests {
 
     #[tokio::test]
     async fn bounded_pair_delivers_items_before_completion_evidence() {
+        let mut traversal_completed = Vec::new();
         let (producer, mut session) = TraversalSession::bounded(
             NonZeroUsize::new(1).unwrap_or_else(|| unreachable!()),
             CancellationToken::new(),
@@ -670,10 +842,10 @@ mod producer_tests {
             ))));
         });
         assert!(matches!(
-            session.next_item().await,
+            session.next_item(&mut traversal_completed).await,
             Some(TraversalItem::Failure(failure)) if failure.scope == FailureScope::Child
         ));
-        assert!(session.next_item().await.is_none());
+        assert!(session.next_item(&mut traversal_completed).await.is_none());
         assert!(matches!(
             session.finish().await,
             Ok(TraversalOutcome::Completed(_))
@@ -684,12 +856,13 @@ mod producer_tests {
 
     #[tokio::test]
     async fn producer_drop_without_evidence_is_a_terminal_failure() {
+        let mut traversal_completed = Vec::new();
         let (producer, mut session) = TraversalSession::bounded(
             NonZeroUsize::new(1).unwrap_or_else(|| unreachable!()),
             CancellationToken::new(),
         );
         drop(producer);
-        assert!(session.next_item().await.is_none());
+        assert!(session.next_item(&mut traversal_completed).await.is_none());
         assert_eq!(
             session.finish().await,
             Err(TraversalTerminalFailure::Internal)

@@ -343,7 +343,9 @@ impl Worker {
         }
         if !jobs.is_empty() {
             let expected = jobs.len();
-            let done = page_io::observe_page(&self.shared, &self.budget, &self.stop, jobs).await?;
+            let done =
+                page_io::observe_page(&self.shared, &self.budget, &self.stop, jobs, None, None)
+                    .await?;
             let Some(done) = done else { return Ok(None) };
             if done.len() != expected {
                 // Observations are skipped only once the traversal halted; anything else short

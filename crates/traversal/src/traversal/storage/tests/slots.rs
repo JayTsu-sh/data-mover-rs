@@ -154,6 +154,7 @@ async fn spelled(
     root: &str,
     listings: &[(&str, &[(&str, EntryKind)])],
 ) -> (Vec<TraversalItem>, Vec<String>) {
+    let mut traversal_completed = Vec::new();
     let namespace = Arc::new(SpellingNamespace::new(listings));
     let role = Arc::clone(&namespace) as Arc<dyn Namespace>;
     let source = StorageTraversalSource::with_roles(role, Arc::new(FakeMetadata));
@@ -166,7 +167,7 @@ async fn spelled(
             .cancel(tokio_util::sync::CancellationToken::new()),
     );
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     let outcome = match session.finish().await {

@@ -46,7 +46,7 @@ use crate::traversal::{
     TraversalTerminalFailure,
 };
 
-mod page_io;
+pub(super) mod page_io;
 mod pool;
 mod worker;
 

@@ -288,12 +288,13 @@ pub(super) async fn run(
     request: TraversalRequest,
     cancel_after: Option<usize>,
 ) -> Run {
+    let mut traversal_completed = Vec::new();
     let cancel = request.cancel.clone();
     let mut session = source.traverse(request);
     let drained = tokio::time::timeout(Duration::from_secs(30), async {
         let mut items = Vec::new();
         let mut entries = 0;
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             entries += usize::from(matches!(item, TraversalItem::Entry(_)));
             items.push(item);
             if cancel_after.is_some_and(|after| entries == after) {
@@ -437,6 +438,7 @@ async fn a_filter_decides_alike_after_resuming() {
 /// either. Each period that passes yields one.
 #[tokio::test]
 async fn checkpoints_come_once_per_period_and_never_when_off() {
+    let mut traversal_completed = Vec::new();
     for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
         let mut setup = setup(Tree::generate(3, 3, 2, 2), false);
         setup.source = setup.source.output_capacity(NonZeroUsize::MIN);
@@ -454,7 +456,7 @@ async fn checkpoints_come_once_per_period_and_never_when_off() {
         // Two periods pass while the consumer takes its 5th and its 40th entry.
         let mut session = setup.source.traverse(on());
         let mut items = Vec::new();
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             let entries = entry_paths(&items).len();
             if matches!(item, TraversalItem::Entry(_)) && (entries == 4 || entries == 39) {
                 setup.clock.advance(every);

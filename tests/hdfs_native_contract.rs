@@ -386,6 +386,7 @@ async fn nightly_lab_cleanup_confined_run_root() -> Result<(), Box<dyn std::erro
 #[ignore = "requires the nightly lab HDFS cluster"]
 async fn nightly_lab_streams_recursive_scan_with_depth_limit()
 -> Result<(), Box<dyn std::error::Error>> {
+    let mut traversal_completed = Vec::new();
     let (hdfs, roles) = fixture("scan").await?;
     for directory in ["甲", "甲/乙", "甲/乙/丙", "并列"] {
         let path = hdfs.path(directory);
@@ -402,7 +403,7 @@ async fn nightly_lab_streams_recursive_scan_with_depth_limit()
         .max_inflight_operations(NonZeroUsize::new(3).ok_or("nonzero")?);
     let mut session = StorageTraversalSource::new(&roles)?.traverse(request.clone());
     let mut paths = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => {
                 paths.push(std::path::PathBuf::from(entry.path().as_str()));
@@ -430,7 +431,7 @@ async fn nightly_lab_streams_recursive_scan_with_depth_limit()
         DslTraversalFilter::parse(Some("extension == \"txt\""), None)?,
     )));
     let mut filtered = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => {
                 filtered.push(std::path::PathBuf::from(entry.path().as_str()));

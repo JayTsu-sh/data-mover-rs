@@ -26,6 +26,7 @@ async fn local(root: &Path) -> TestResult<Storage> {
 
 #[tokio::test]
 async fn scanned_files_keep_their_relative_paths_between_different_roots() -> TestResult {
+    let mut traversal_completed = Vec::new();
     for observed in [false, true] {
         for policy in [TransferPolicy::Checkpointed, TransferPolicy::AtomicReplace] {
             let temp = tempfile::tempdir()?;
@@ -41,7 +42,7 @@ async fn scanned_files_keep_their_relative_paths_between_different_roots() -> Te
             let mut scan = StorageTraversalSource::new(&source)?
                 .traverse(TraversalRequest::new(StoragePath::root()));
             let mut copied = Vec::new();
-            while let Some(item) = scan.next_item().await {
+            while let Some(item) = scan.next_item(&mut traversal_completed).await {
                 let TraversalItem::Entry(entry) = item else {
                     return Err(format!("unexpected scan item: {item:?}").into());
                 };

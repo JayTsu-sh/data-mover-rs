@@ -27,14 +27,18 @@ struct Scan {
 }
 
 async fn scan(root: &Path, request: TraversalRequest) -> io::Result<Scan> {
+    let mut traversal_completed = Vec::new();
     let (storage, _, _) = test_traversal_storage(root, "local-filter-test")
         .map_err(|error| io::Error::other(error.to_string()))?;
     let source = StorageTraversalSource::new(&storage).map_err(io::Error::other)?;
     let mut session = source.traverse(request);
     let mut paths = Vec::new();
     let mut saved = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
+            TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+                panic!("ordinary scan emitted consumer work")
+            }
             TraversalItem::Entry(entry) => paths.push(entry.path().as_str().to_owned()),
             TraversalItem::Checkpoint(checkpoint) => saved.push((paths.clone(), *checkpoint)),
             TraversalItem::DirectoryListed(_)

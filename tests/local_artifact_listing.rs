@@ -55,6 +55,7 @@ async fn roles(root: &Path) -> TestResult<Storage> {
 
 #[tokio::test]
 async fn role_traversal_hides_artifacts() -> TestResult {
+    let mut traversal_completed = Vec::new();
     let root = fixture()?;
     let storage = roles(root.path()).await?;
     let slots = NonZeroUsize::new(2).ok_or("non-zero")?;
@@ -64,7 +65,7 @@ async fn role_traversal_hides_artifacts() -> TestResult {
             .filter(Arc::new(DslTraversalFilter::parse(expression, None)?));
         let mut session = StorageTraversalSource::new(&storage)?.traverse(request);
         let mut traversed = Vec::new();
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             match item {
                 TraversalItem::Entry(entry) => traversed.push(entry.path().as_str().to_owned()),
                 other => return Err(format!("unexpected traversal item: {other:?}").into()),

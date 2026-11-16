@@ -69,6 +69,7 @@ async fn traverse_with_totals(
     fake: &Arc<FakeNfs>,
     concurrency: usize,
 ) -> Result<(Vec<TraversalItem>, ScanTotals)> {
+    let mut traversal_completed = Vec::new();
     let source =
         StorageTraversalSource::with_roles(Arc::new(fake.namespace()), Arc::new(NoMetadata));
     let slots = NonZeroUsize::new(concurrency).ok_or("concurrency is not zero")?;
@@ -79,7 +80,7 @@ async fn traverse_with_totals(
             .cancel(CancellationToken::new()),
     );
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     match session.finish().await? {

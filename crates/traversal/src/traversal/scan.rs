@@ -668,6 +668,8 @@ impl Metadata for GuardedMetadata {
 /// Setup failures are distinct from a remote operation failing after traversal started.
 #[derive(Debug, thiserror::Error)]
 pub enum ScanSetupError {
+    #[error(transparent)]
+    Configuration(#[from] super::TraversalConfigurationError),
     #[error("scan operation timeout must be positive")]
     InvalidDeadline,
     #[error(transparent)]

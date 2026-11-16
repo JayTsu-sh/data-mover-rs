@@ -81,10 +81,11 @@ fn evidence(entry: &ObservedEntry) -> Option<String> {
     entry.rename_evidence().map(|value| hex(value.as_bytes()))
 }
 async fn scan(storage: &Storage) -> Result<BTreeMap<String, ObservedEntry>> {
+    let mut traversal_completed = Vec::new();
     let source = StorageTraversalSource::new(storage)?;
     let mut session = source.traverse(TraversalRequest::new(StoragePath::root()));
     let mut entries = BTreeMap::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => {
                 entries.insert(entry.path().as_str().to_owned(), *entry);

@@ -148,17 +148,25 @@ pub(super) fn paged_source(tree: PagedTree) -> (StorageTraversalSource, Arc<Page
 
 /// The next item, which must arrive: waits generously, so a loaded machine does not fail it.
 async fn next_now(session: &mut TraversalSession) -> Option<TraversalItem> {
-    tokio::time::timeout(Duration::from_secs(5), session.next_item())
-        .await
-        .ok()
-        .flatten()
+    let mut traversal_completed = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        session.next_item(&mut traversal_completed),
+    )
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Whether nothing arrives for a while: what a held-back page must cause.
 async fn nothing_soon(session: &mut TraversalSession) -> bool {
-    tokio::time::timeout(Duration::from_millis(100), session.next_item())
-        .await
-        .is_err()
+    let mut traversal_completed = Vec::new();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        session.next_item(&mut traversal_completed),
+    )
+    .await
+    .is_err()
 }
 
 /// The root's first page is delivered while the rest of its listing is held back: the block is
@@ -445,6 +453,7 @@ async fn not_found_after_a_page_is_an_interruption_not_a_vanish() {
 /// failure.
 #[tokio::test]
 async fn a_session_failure_after_a_page_ends_the_traversal() {
+    let mut traversal_completed = Vec::new();
     let session_failure = StorageRoleFailure::Session(
         BackendSessionFailure::new(
             Operation::Traverse,
@@ -462,7 +471,7 @@ async fn a_session_failure_after_a_page_ends_the_traversal() {
         },
     )]));
     let mut session = source.traverse(paged_request(4));
-    while session.next_item().await.is_some() {}
+    while session.next_item(&mut traversal_completed).await.is_some() {}
     assert!(matches!(
         session.finish().await,
         Err(TraversalTerminalFailure::Session(failure))
@@ -660,6 +669,7 @@ impl TraversalFilter for PanicsAt {
 /// traversal waiting for a page that cannot come.
 #[tokio::test]
 async fn a_listing_task_that_breaks_ends_the_traversal() {
+    let mut traversal_completed = Vec::new();
     let (source, _) = paged_source(PagedTree::new(vec![(
         "",
         pages(vec![
@@ -669,7 +679,7 @@ async fn a_listing_task_that_breaks_ends_the_traversal() {
     )]));
     let mut session = source.traverse(paged_request(4).filter(Arc::new(PanicsAt("boom"))));
     let finished = tokio::time::timeout(Duration::from_secs(5), async {
-        while session.next_item().await.is_some() {}
+        while session.next_item(&mut traversal_completed).await.is_some() {}
         session.finish().await
     })
     .await

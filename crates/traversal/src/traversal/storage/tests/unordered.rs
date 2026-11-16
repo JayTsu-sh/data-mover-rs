@@ -27,10 +27,11 @@ type Run = (
 );
 
 async fn run(source: &StorageTraversalSource, request: TraversalRequest) -> Run {
+    let mut traversal_completed = Vec::new();
     let mut session = source.traverse(request);
     let drained = tokio::time::timeout(Duration::from_secs(20), async {
         let mut items = Vec::new();
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             items.push(item);
         }
         (items, session.finish().await)
@@ -396,6 +397,7 @@ async fn terminal_failures_end_the_traversal_without_a_hang() {
 /// promptly, and never a listing failure for a listing the cancellation stopped (R10).
 #[tokio::test]
 async fn cancellation_ends_the_traversal_as_cancelled() {
+    let mut traversal_completed = Vec::new();
     let cancel = tokio_util::sync::CancellationToken::new();
     let source =
         StorageTraversalSource::with_roles(Arc::new(FakeNamespace), Arc::new(BlockingMetadata));
@@ -404,7 +406,7 @@ async fn cancellation_ends_the_traversal_as_cancelled() {
     let mut session = source.traverse(traversal);
     tokio::time::sleep(Duration::from_millis(20)).await;
     cancel.cancel();
-    assert!(session.next_item().await.is_none());
+    assert!(session.next_item(&mut traversal_completed).await.is_none());
     let ended = tokio::time::timeout(Duration::from_secs(2), session.finish()).await;
     assert_eq!(
         ended.unwrap_or_else(|_| panic!("the cancelled traversal did not end")),
@@ -419,12 +421,12 @@ async fn cancellation_ends_the_traversal_as_cancelled() {
     let mut session = source.0.output_capacity(window(1)).traverse(request);
     let mut items = Vec::new();
     for _ in 0..5 {
-        items.extend(session.next_item().await);
+        items.extend(session.next_item(&mut traversal_completed).await);
     }
     // Let the workers fill the channel and stop on it.
     tokio::time::sleep(Duration::from_millis(20)).await;
     cancel.cancel();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     let ended = tokio::time::timeout(Duration::from_secs(2), session.finish()).await;
@@ -451,11 +453,12 @@ async fn cancellation_ends_the_traversal_as_cancelled() {
 /// A consumer that drops the session part way: every worker stops and every listing is dropped.
 #[tokio::test]
 async fn a_consumer_that_walks_away_stops_every_listing() {
+    let mut traversal_completed = Vec::new();
     let (source, counts) = synthetic(4, 4, 6, false);
     let request = TraversalRequest::new(StoragePath::root()).max_inflight_operations(window(16));
     let mut session = source.output_capacity(window(2)).traverse(request);
     for _ in 0..10 {
-        let _ = session.next_item().await;
+        let _ = session.next_item(&mut traversal_completed).await;
     }
     drop(session);
     tokio::time::timeout(Duration::from_secs(2), async {

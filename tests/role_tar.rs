@@ -42,6 +42,7 @@ async fn entry(storage: &Storage, name: &str) -> Result<ObservedEntry> {
     use data_mover::traversal::{
         StorageTraversalSource, TraversalItem, TraversalRequest, TraversalSource,
     };
+    let mut traversal_completed = Vec::new();
     let mut session = StorageTraversalSource::new(storage)?.traverse(
         TraversalRequest::new(StoragePath::root()).observation_plan(
             ObservationPlan::default()
@@ -50,7 +51,7 @@ async fn entry(storage: &Storage, name: &str) -> Result<ObservedEntry> {
         ),
     );
     let mut found = None;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) if entry.path().as_str() == name => found = Some(*entry),
             TraversalItem::Entry(_) => {}

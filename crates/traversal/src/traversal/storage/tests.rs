@@ -181,6 +181,7 @@ impl Metadata for BlockingMetadata {
 
 #[tokio::test]
 async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
+    let mut traversal_completed = Vec::new();
     let source =
         StorageTraversalSource::with_roles(Arc::new(FakeNamespace), Arc::new(FakeMetadata));
     let mut session = source.traverse(
@@ -192,7 +193,7 @@ async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
             .cancel(tokio_util::sync::CancellationToken::new()),
     );
     let mut observed = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if crate::traversal::is_marker(&item) {
             continue;
         }
@@ -241,13 +242,14 @@ fn request(cancel: tokio_util::sync::CancellationToken) -> TraversalRequest {
 
 #[tokio::test]
 async fn entry_failures_are_items_while_session_failures_are_terminal() {
+    let mut traversal_completed = Vec::new();
     let source = StorageTraversalSource::with_roles(
         Arc::new(FakeNamespace),
         Arc::new(FailingMetadata(MetadataFailureMode::Entry)),
     );
     let mut session = source.traverse(request(tokio_util::sync::CancellationToken::new()));
     let mut failures = 0;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if crate::traversal::is_marker(&item) {
             continue;
         }
@@ -277,7 +279,7 @@ async fn entry_failures_are_items_while_session_failures_are_terminal() {
         Arc::new(FailingMetadata(MetadataFailureMode::Session)),
     );
     let mut session = source.traverse(request(tokio_util::sync::CancellationToken::new()));
-    while session.next_item().await.is_some() {}
+    while session.next_item(&mut traversal_completed).await.is_some() {}
     assert!(matches!(
         session.finish().await,
         Err(TraversalTerminalFailure::Session(error))
@@ -287,17 +289,19 @@ async fn entry_failures_are_items_while_session_failures_are_terminal() {
 
 #[tokio::test]
 async fn precancelled_traversal_has_a_distinct_cancelled_outcome() {
+    let mut traversal_completed = Vec::new();
     let cancel = tokio_util::sync::CancellationToken::new();
     cancel.cancel();
     let source =
         StorageTraversalSource::with_roles(Arc::new(FakeNamespace), Arc::new(FakeMetadata));
     let mut session = source.traverse(request(cancel));
-    assert!(session.next_item().await.is_none());
+    assert!(session.next_item(&mut traversal_completed).await.is_none());
     assert_eq!(session.finish().await, Ok(TraversalOutcome::Cancelled));
 }
 
 #[tokio::test]
 async fn cancellation_while_inflight_is_full_terminates_without_spinning() {
+    let mut traversal_completed = Vec::new();
     let cancel = tokio_util::sync::CancellationToken::new();
     let source =
         StorageTraversalSource::with_roles(Arc::new(FakeNamespace), Arc::new(BlockingMetadata));
@@ -307,7 +311,7 @@ async fn cancellation_while_inflight_is_full_terminates_without_spinning() {
     let mut session = source.traverse(traversal_request);
     tokio::task::yield_now().await;
     cancel.cancel();
-    assert!(session.next_item().await.is_none());
+    assert!(session.next_item(&mut traversal_completed).await.is_none());
     assert_eq!(
         tokio::time::timeout(std::time::Duration::from_secs(1), session.finish())
             .await
@@ -317,8 +321,9 @@ async fn cancellation_while_inflight_is_full_terminates_without_spinning() {
 }
 
 async fn collect(mut session: TraversalSession) -> (Vec<String>, TraversalOutcome) {
+    let mut traversal_completed = Vec::new();
     let mut paths = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if crate::traversal::is_marker(&item) {
             continue;
         }
@@ -359,6 +364,7 @@ impl Namespace for PartialListingNamespace {
 
 #[tokio::test]
 async fn an_undescribable_child_is_a_failure_item_without_hiding_its_siblings() {
+    let mut traversal_completed = Vec::new();
     let source = StorageTraversalSource::with_roles(
         Arc::new(PartialListingNamespace),
         Arc::new(FakeMetadata),
@@ -368,8 +374,11 @@ async fn an_undescribable_child_is_a_failure_item_without_hiding_its_siblings() 
     let mut session = source.traverse(request);
     let mut entries = Vec::new();
     let mut failures = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
+            TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+                panic!("ordinary scan emitted consumer work")
+            }
             TraversalItem::Entry(entry) => entries.push(entry.path().as_str().to_owned()),
             TraversalItem::Failure(failure) => failures.push(failure.path.as_str().to_owned()),
             TraversalItem::DirectoryListed(_)
@@ -448,6 +457,7 @@ impl Metadata for SlowFirstMetadata {
 
 #[tokio::test]
 async fn the_admission_window_bounds_entries_waiting_to_be_emitted_not_only_inflight_ones() {
+    let mut traversal_completed = Vec::new();
     let metadata = Arc::new(SlowFirstMetadata::default());
     let source = StorageTraversalSource::with_roles(
         Arc::new(WideNamespace),
@@ -462,7 +472,7 @@ async fn the_admission_window_bounds_entries_waiting_to_be_emitted_not_only_infl
     // already settled must still count against the window.
     assert!(metadata.started.load(std::sync::atomic::Ordering::SeqCst) <= 3);
     let mut emitted = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if crate::traversal::is_marker(&item) {
             continue;
         }
@@ -502,3 +512,5 @@ mod streaming_bounds;
 mod terminal_errors;
 mod unordered;
 mod vanish;
+
+mod consumer_refusal;
