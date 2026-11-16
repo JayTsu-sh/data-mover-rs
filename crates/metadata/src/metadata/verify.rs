@@ -151,12 +151,22 @@ impl MetadataPlan {
             return Ok(descriptor);
         }
         let (facts, permissions) = self.verification_facts(target, &descriptor).await?;
+        self.verify_facts(descriptor, &facts, &permissions, &cancel)
+    }
+
+    fn verify_facts(
+        &self,
+        descriptor: SourceDescriptor,
+        facts: &MetadataObservations,
+        permissions: &PermissionFacts,
+        cancel: &CancellationToken,
+    ) -> Result<SourceDescriptor, MetadataVerificationError> {
         let mut families = Vec::new();
         for (family, expected) in &self.mutations {
             if cancel.is_cancelled() {
                 return Err(MetadataVerificationError::Cancelled);
             }
-            if !matches_mutation(expected, &facts, &permissions)? && !families.contains(family) {
+            if !matches_mutation(expected, facts, permissions)? && !families.contains(family) {
                 families.push(*family);
             }
         }
