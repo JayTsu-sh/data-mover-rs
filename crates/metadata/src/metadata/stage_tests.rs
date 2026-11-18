@@ -1,14 +1,14 @@
-//! `apply_to_stage` is the path real transfers take: one ordered batch per stage, resumed after
-//! a refusal. It shares its rules with `apply` but not its code, so it needs its own fake
-//! destination.
+//! Ordered metadata batches for staged and identity-bound directory targets.
 
 use bytes::Bytes;
 
 use super::*;
-use crate::model::{BackendIdentity, BackendKind, BackendSessionFailure};
+use crate::model::{
+    BackendIdentity, BackendKind, BackendSessionFailure, IdentityStrength, SourceIdentity,
+};
 use crate::storage::{
     ByteStream, CheckpointObservation, DestinationPrepareRequest, FinalDestination,
-    PublicationEvidence, PublicationFailure, PublishRequest, StagedMetadataApplicationFailure,
+    MetadataBatchFailure, PublicationEvidence, PublicationFailure, PublishRequest,
     VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
@@ -33,6 +33,8 @@ enum Refusal {
     CancelledAsProtocol,
     /// The session is lost while the refused mutation is in flight.
     SessionLost,
+    DirectoryReplaced,
+    DirectoryWriteUnconfirmed,
     /// Applies the whole batch and then fails its persistence barrier, as Local's durable
     /// `sync_all` can: no single mutation failed, the batch did.
     BarrierFailed,
@@ -94,6 +96,17 @@ impl ScriptedStage {
                 )
                 .unwrap(),
             )),
+            Refusal::DirectoryReplaced => Some(refusal(FailureClass::Conflict)),
+            Refusal::DirectoryWriteUnconfirmed => Some(StorageRoleFailure::Entry(
+                EntryOperationFailure::new(
+                    StoragePath::new("file").unwrap(),
+                    Operation::Metadata,
+                    FailureClass::Timeout,
+                    Transience::Unknown,
+                    "the target did not confirm the write",
+                )
+                .unwrap(),
+            )),
             Refusal::BarrierFailed
             | Refusal::StageUnavailable
             | Refusal::RefusedThenBarrierFailed => Some(refusal(FailureClass::Protocol)),
@@ -134,8 +147,8 @@ fn batch_failure(
     failed_index: usize,
     completed: usize,
     error: Option<StorageRoleFailure>,
-) -> StagedMetadataApplicationFailure {
-    StagedMetadataApplicationFailure {
+) -> MetadataBatchFailure {
+    MetadataBatchFailure {
         failed_index,
         completed,
         error,
@@ -168,6 +181,52 @@ impl Metadata for ScriptedStage {
     }
 }
 
+struct ScriptedDirectory<'a>(&'a ScriptedStage);
+
+#[async_trait]
+impl Metadata for ScriptedDirectory<'_> {
+    async fn observe(
+        &self,
+        path: &StoragePath,
+        plan: crate::model::ObservationPlan,
+    ) -> Result<MetadataObservations, StorageRoleFailure> {
+        self.0.observe(path, plan).await
+    }
+
+    async fn apply(
+        &self,
+        _path: &StoragePath,
+        _mutation: MetadataMutation,
+        _cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        panic!("a bound directory plan must not use a path-only write")
+    }
+
+    async fn apply_bound_directory(
+        &self,
+        path: &StoragePath,
+        expected: EntryIdentityKey,
+        mutations: Vec<MetadataMutation>,
+        cancel: CancellationToken,
+    ) -> Result<(), MetadataBatchFailure> {
+        assert_eq!(path.as_str(), "file");
+        assert_eq!(expected, directory_identity());
+        self.0
+            .apply_metadata_batch(&stage(), mutations, cancel)
+            .await
+    }
+}
+
+fn directory_identity() -> EntryIdentityKey {
+    SourceIdentity::new(
+        BackendIdentity::new(BackendKind::Local, "destination").unwrap(),
+        IdentityStrength::StableWithinBackend,
+        b"directory",
+    )
+    .unwrap()
+    .identity_key()
+}
+
 #[async_trait]
 impl StagedDestination for ScriptedStage {
     async fn apply_metadata_batch(
@@ -175,14 +234,14 @@ impl StagedDestination for ScriptedStage {
         _stage: &PreparedStage,
         mutations: Vec<MetadataMutation>,
         cancel: CancellationToken,
-    ) -> Result<(), StagedMetadataApplicationFailure> {
+    ) -> Result<(), MetadataBatchFailure> {
         if cancel.is_cancelled() {
             return Err(batch_failure(0, 0, None));
         }
         let len = mutations.len();
         match self.refusal {
-            Refusal::StageUnavailable => {
-                return Err(StagedMetadataApplicationFailure::whole_batch(
+            Refusal::StageUnavailable | Refusal::DirectoryReplaced => {
+                return Err(MetadataBatchFailure::whole_batch(
                     len,
                     0,
                     self.refusal_error(&cancel),
@@ -190,7 +249,7 @@ impl StagedDestination for ScriptedStage {
             }
             Refusal::BarrierFailed => {
                 self.applied.lock().unwrap().extend(mutations);
-                return Err(StagedMetadataApplicationFailure::whole_batch(
+                return Err(MetadataBatchFailure::whole_batch(
                     len,
                     len,
                     self.refusal_error(&cancel),
@@ -207,7 +266,7 @@ impl StagedDestination for ScriptedStage {
                 .lock()
                 .unwrap()
                 .extend(mutations.into_iter().take(index));
-            return Err(StagedMetadataApplicationFailure::whole_batch(
+            return Err(MetadataBatchFailure::whole_batch(
                 len,
                 index,
                 self.refusal_error(&cancel),
@@ -602,4 +661,86 @@ async fn a_cancelled_application_says_so() {
         .await
         .unwrap_err();
     assert_eq!(failure.kind(), ApplicationFailureKind::Cancelled);
+}
+
+#[tokio::test]
+async fn directory_mutation_refusal_only_resends_unapplied_families() {
+    let target = ScriptedStage::new(Refusal::InOrder);
+    let failure = plan(all_exact())
+        .apply_bound_directory(
+            &ScriptedDirectory(&target),
+            &StoragePath::new("file").unwrap(),
+            directory_identity(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failed_families(&failure), [MetadataFamily::Acl]);
+    assert_only_the_acl_was_lost(&target, failure.report());
+}
+
+#[tokio::test]
+async fn directory_replacement_or_unsupported_role_refuses_the_whole_batch() {
+    for (mode, class) in [
+        (Refusal::DirectoryReplaced, FailureClass::Conflict),
+        (Refusal::InOrder, FailureClass::Unsupported),
+    ] {
+        let target = ScriptedStage::new(mode);
+        let bound = ScriptedDirectory(&target);
+        let role: &dyn Metadata = if matches!(mode, Refusal::DirectoryReplaced) {
+            &bound
+        } else {
+            &target
+        };
+        let failure = plan(all_exact())
+            .apply_bound_directory(
+                role,
+                &StoragePath::new("file").unwrap(),
+                directory_identity(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind(), ApplicationFailureKind::BatchFailed);
+        assert!(
+            matches!(failure.storage_error(), Some(StorageRoleFailure::Entry(error)) if error.class() == class)
+        );
+        assert!(target.applied_families().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn directory_uncertain_write_or_cancellation_preserves_prefix_and_stops() {
+    for (mode, class, kind) in [
+        (
+            Refusal::DirectoryWriteUnconfirmed,
+            FailureClass::Timeout,
+            ApplicationFailureKind::WriteUnconfirmed,
+        ),
+        (
+            Refusal::CancelledDuring,
+            FailureClass::Cancelled,
+            ApplicationFailureKind::Cancelled,
+        ),
+    ] {
+        let target = ScriptedStage::new(mode);
+        let failure = plan(all_exact())
+            .apply_bound_directory(
+                &ScriptedDirectory(&target),
+                &StoragePath::new("file").unwrap(),
+                directory_identity(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(failure.storage_error(), Some(StorageRoleFailure::Entry(error)) if error.class() == class)
+        );
+        assert_eq!(failure.kind(), kind);
+        assert_eq!(target.applied_families(), [MetadataFamily::OwnershipMode]);
+        assert_eq!(
+            outcome_for(failure.report(), MetadataFamily::OwnershipMode),
+            ApplicationOutcome::Applied
+        );
+    }
 }

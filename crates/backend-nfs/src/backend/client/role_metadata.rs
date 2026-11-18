@@ -3,12 +3,14 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     MAX_STALE_RETRIES, NFSFileHandle, NFSStorage, classify_role_error, invalidate_path_cache,
     is_retryable_with_invalidation,
 };
 use crate::model::{AclEncoding, AclMetadata, FailureClass, StoragePath, Transience};
+use crate::storage::MetadataMutation;
 use crate::storage::backends::nfs::acl;
 use crate::storage::backends::nfs::metadata::{NfsMetadataInline, NfsMetadataProtocol};
 use crate::storage::backends::nfs::protocol::{classify_error, classify_mutation_error};
@@ -96,6 +98,34 @@ impl NfsMetadataProtocol for NFSStorage {
             &attrs,
             self.owners_are_strings(),
         ))
+    }
+
+    fn supports_bound_directory_metadata(&self) -> bool {
+        true
+    }
+
+    async fn resolve_bound_directory(
+        &self,
+        path: &StoragePath,
+    ) -> Result<Bytes, NfsProtocolFailure> {
+        let (handle, attrs) = self.role_lookup_with_attrs(path, true).await?;
+        if attrs.type_ != super::FType3::NF3DIR as u32 {
+            return Err(NfsProtocolFailure::new(
+                FailureClass::Conflict,
+                Transience::Permanent,
+            ));
+        }
+        Ok(handle)
+    }
+
+    async fn apply_to_bound_directory(
+        &self,
+        file_handle: &Bytes,
+        mutation: MetadataMutation,
+        cancel: &CancellationToken,
+    ) -> Result<(), NfsProtocolFailure> {
+        self.apply_bound_directory_mutation(file_handle, mutation, cancel)
+            .await
     }
 
     fn supports_acl(&self) -> bool {
@@ -323,6 +353,6 @@ impl NfsMetadataProtocol for NFSStorage {
     }
 }
 
-fn invalid_acl() -> NfsProtocolFailure {
+pub(super) fn invalid_acl() -> NfsProtocolFailure {
     NfsProtocolFailure::new(FailureClass::InvalidInput, Transience::Permanent)
 }

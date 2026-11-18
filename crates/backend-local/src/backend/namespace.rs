@@ -27,6 +27,10 @@ use async_trait::async_trait;
 use blake3::Hasher;
 use cap_std::fs::{Dir, Metadata};
 use cap_std::io_lifetimes::AsFilelike as _;
+#[cfg(unix)]
+use rustix::fs::{Mode, OFlags, openat};
+#[cfg(unix)]
+use rustix::io::Errno;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK;
 
@@ -546,6 +550,38 @@ fn open_directory(root: &Dir, relative: &Path) -> io::Result<Dir> {
         current = cap_primitives::fs::open_dir_nofollow(&current, Path::new(name))?;
     }
     Ok(Dir::from_std_file(current))
+}
+
+/// Opens the directory object for descriptor-based metadata writes without following links.
+#[cfg(unix)]
+pub(super) fn open_metadata_directory(
+    root: &Dir,
+    path: &StoragePath,
+) -> Result<Dir, StorageRoleFailure> {
+    let relative = checked(path, Operation::Metadata, true)?;
+    let open = |parent: &Dir, leaf: &OsStr| -> io::Result<Dir> {
+        // On Linux the traversal handle uses O_PATH, which cannot write metadata.
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        Ok(Dir::from_std_file(
+            openat(parent, leaf, flags, Mode::empty())?.into(),
+        ))
+    };
+    let result = if relative.as_os_str().is_empty() {
+        open(root, OsStr::new("."))
+    } else {
+        in_parent(root, &relative, open)
+    };
+    result.map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        ) || error.raw_os_error() == Some(Errno::LOOP.raw_os_error())
+        {
+            entry_failure(path, Operation::Metadata, FailureClass::Conflict)
+        } else {
+            io_failure(path, Operation::Metadata, &error)
+        }
+    })
 }
 
 /// Runs `work` on the final component of `native` inside its parent, opened without

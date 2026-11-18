@@ -332,7 +332,7 @@ async fn anchored(
         &anchor.path,
         &SourceVersion::Current,
         None,
-        Some(anchor),
+        Some(anchor.source_identity.identity_key()),
         CancellationToken::new(),
     )
     .await
@@ -563,7 +563,7 @@ async fn existing_partial_permissions_are_never_completed_from_inline_ownership(
         anchored(&storage, &anchor, &plan).await,
         Err(MetadataVerificationError::Mismatch { .. })
     ));
-    assert_eq!(role.trace(), [Call::Stat(false), Call::Stat(true)]);
+    assert_eq!(role.trace(), [Call::Stat(true), Call::Stat(true)]);
     Ok(())
 }
 
@@ -621,33 +621,9 @@ async fn empty_plan_still_freshens_with_anchor_without_requiring_a_metadata_role
 async fn invalid_anchor_combinations_are_rejected_before_any_read() -> TestResult {
     let (storage, role, anchor, plan) = fixture(BackendKind::Local, false)?;
     let path = anchor.path.clone();
-    for (version, expected, changed) in [
-        (SourceVersion::Id("v1".into()), None, anchor.clone()),
-        (SourceVersion::Current, Some("v1"), anchor.clone()),
-        (SourceVersion::Current, None, {
-            let mut value = anchor.clone();
-            value.path = StoragePath::new("other")?;
-            value
-        }),
-        (SourceVersion::Current, None, {
-            let mut value = anchor.clone();
-            value.kind = EntryKind::File;
-            value
-        }),
-        (SourceVersion::Current, None, {
-            let mut value = anchor.clone();
-            value.version = SourceVersion::Id("v1".into());
-            value
-        }),
-        (SourceVersion::Current, None, {
-            let mut value = anchor.clone();
-            value.source_identity = SourceIdentity::new(
-                value.source_identity.backend().clone(),
-                IdentityStrength::PathScoped,
-                b"dir",
-            )?;
-            value
-        }),
+    for (version, expected) in [
+        (SourceVersion::Id("v1".into()), None),
+        (SourceVersion::Current, Some("v1")),
     ] {
         assert!(matches!(
             plan.verify_published(
@@ -655,7 +631,7 @@ async fn invalid_anchor_combinations_are_rejected_before_any_read() -> TestResul
                 &path,
                 &version,
                 expected,
-                Some(&changed),
+                Some(anchor.source_identity.identity_key()),
                 CancellationToken::new()
             )
             .await,
@@ -691,7 +667,7 @@ async fn cancellation_drops_each_anchored_read_and_prevents_the_next_one() -> Te
                 &anchor.path,
                 &SourceVersion::Current,
                 None,
-                Some(&anchor),
+                Some(anchor.source_identity.identity_key()),
                 cancel,
             ),
         )
@@ -716,7 +692,7 @@ async fn known_ownership_without_permissions_uses_the_complete_fallback() -> Tes
         assert_eq!(anchored(&storage, &anchor, &plan).await?, role.actual);
         assert_eq!(
             role.trace(),
-            [Call::Stat(false), Call::Permissions, Call::Stat(true)]
+            [Call::Stat(true), Call::Permissions, Call::Stat(true)]
         );
     }
     Ok(())
@@ -736,7 +712,7 @@ async fn known_inline_ownership_never_bypasses_overridden_permission_facts() -> 
     ));
     assert_eq!(
         role.trace(),
-        [Call::Stat(false), Call::Permissions, Call::Stat(true)]
+        [Call::Stat(true), Call::Permissions, Call::Stat(true)]
     );
     Ok(())
 }

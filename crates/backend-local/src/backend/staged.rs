@@ -27,10 +27,10 @@ use crate::model::{
 use crate::storage::artifacts::{ArtifactKind, is_artifact_native};
 use crate::storage::durability::sync_directory;
 use crate::storage::{
-    ByteStream, CheckpointObservation, DestinationPrepareRequest, MetadataMutation,
-    PositionedByteStream, PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure,
-    PublishRequest, SourceDescriptor, StagedDestination, StagedMetadataApplicationFailure,
-    StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, DestinationPrepareRequest, MetadataBatchFailure,
+    MetadataMutation, PositionedByteStream, PrepareRequest, PreparedStage, PublicationEvidence,
+    PublicationFailure, PublishRequest, SourceDescriptor, StagedDestination, StorageRoleFailure,
+    VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 mod at_destination;
@@ -1239,7 +1239,7 @@ impl StagedDestination for LocalStagedDestination {
         stage: &PreparedStage,
         mutations: Vec<MetadataMutation>,
         cancel: CancellationToken,
-    ) -> Result<(), StagedMetadataApplicationFailure> {
+    ) -> Result<(), MetadataBatchFailure> {
         if mutations.is_empty() {
             return Ok(());
         }
@@ -1248,7 +1248,7 @@ impl StagedDestination for LocalStagedDestination {
             return published_recovery::validate(self, stage)
                 .await
                 .map_err(|error| {
-                    StagedMetadataApplicationFailure::whole_batch(mutations.len(), 0, Some(error))
+                    MetadataBatchFailure::whole_batch(mutations.len(), 0, Some(error))
                 });
         }
         let file = self
@@ -1260,9 +1260,7 @@ impl StagedDestination for LocalStagedDestination {
                     .any(|mutation| matches!(mutation, MetadataMutation::Acl(_))),
             )
             .await
-            .map_err(|error| {
-                StagedMetadataApplicationFailure::whole_batch(mutations.len(), 0, Some(error))
-            })?;
+            .map_err(|error| MetadataBatchFailure::whole_batch(mutations.len(), 0, Some(error)))?;
         let path = stage.final_destination().path().clone();
         let durable = Self::needs_stage_barrier(stage);
         let count = mutations.len();
@@ -1277,19 +1275,17 @@ impl StagedDestination for LocalStagedDestination {
         .await
         .map_err(|_| {
             // Nothing says how far the lost task got, so nothing is claimed applied.
-            StagedMetadataApplicationFailure::whole_batch(
+            MetadataBatchFailure::whole_batch(
                 count,
                 0,
                 Some(failure(&path, Operation::Metadata, FailureClass::Internal)),
             )
         })?
-        .map_err(
-            |(failed_index, completed, error)| StagedMetadataApplicationFailure {
-                failed_index,
-                completed,
-                error: error.map(|error| io_failure(&path, Operation::Metadata, &error)),
-            },
-        )
+        .map_err(|(failed_index, completed, error)| MetadataBatchFailure {
+            failed_index,
+            completed,
+            error: error.map(|error| io_failure(&path, Operation::Metadata, &error)),
+        })
     }
 
     async fn publish(
@@ -1414,9 +1410,9 @@ fn refuse_before_applying(
     stage: &PreparedStage,
     mutations: &[MetadataMutation],
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<(), StagedMetadataApplicationFailure> {
+) -> Result<(), MetadataBatchFailure> {
     if cancel.is_cancelled() {
-        return Err(StagedMetadataApplicationFailure {
+        return Err(MetadataBatchFailure {
             failed_index: 0,
             completed: 0,
             error: None,
@@ -1426,7 +1422,7 @@ fn refuse_before_applying(
         .iter()
         .position(|mutation| !local_metadata_supported(mutation))
     {
-        Some(index) => Err(StagedMetadataApplicationFailure {
+        Some(index) => Err(MetadataBatchFailure {
             failed_index: index,
             completed: 0,
             error: Some(failure(
@@ -1440,7 +1436,7 @@ fn refuse_before_applying(
 }
 
 /// Where a blocking Local metadata batch stopped, as `(failed_index, completed, error)`: the
-/// fields of `StagedMetadataApplicationFailure` before the error is mapped.
+/// fields of `MetadataBatchFailure` before the error is mapped.
 type LocalBatchStop = (usize, usize, Option<io::Error>);
 
 /// Applies a staged metadata batch in order and makes it durable.
@@ -1459,21 +1455,35 @@ fn apply_local_batch(
     fail_sync: bool,
 ) -> Result<(), LocalBatchStop> {
     let count = mutations.len();
-    for (index, mutation) in mutations.into_iter().enumerate() {
-        if cancel.is_cancelled() {
-            // Cancelled work is never published, so what it applied need not be durable.
-            return Err((index, index, None));
-        }
-        if let Err(error) = apply_local_metadata(file, mutation) {
-            return Err((index, index, Some(error)));
-        }
-    }
+    // Cancelled work is never published, so what it applied need not be durable.
+    apply_local_mutations(file, mutations, cancel)
+        .map_err(|(index, error)| (index, index, error.map(|failure| failure.error)))?;
     let synced = match (durable, fail_sync) {
         (false, _) => Ok(()),
         (true, true) => Err(io::Error::other("injected metadata sync failure")),
         (true, false) => file.sync_all(),
     };
     synced.map_err(|error| (count, count, Some(error)))
+}
+
+pub(super) fn apply_local_mutations(
+    file: &std::fs::File,
+    mutations: Vec<MetadataMutation>,
+    cancel: &CancellationToken,
+) -> Result<(), (usize, Option<LocalMutationFailure>)> {
+    for (index, mutation) in mutations.into_iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err((index, None));
+        }
+        if !local_metadata_supported(&mutation) {
+            return Err((
+                index,
+                Some(io::Error::from(io::ErrorKind::Unsupported).into()),
+            ));
+        }
+        apply_local_metadata_tracked(file, mutation).map_err(|error| (index, Some(error)))?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1504,54 +1514,96 @@ pub(super) fn local_metadata_supported(_mutation: &MetadataMutation) -> bool {
     false
 }
 
+pub(super) struct LocalMutationFailure {
+    pub(super) error: io::Error,
+    #[cfg(unix)]
+    pub(super) changed: bool,
+}
+
+impl From<io::Error> for LocalMutationFailure {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            #[cfg(unix)]
+            changed: false,
+        }
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn apply_local_metadata(
     file: &std::fs::File,
     mutation: MetadataMutation,
 ) -> io::Result<()> {
+    apply_local_metadata_tracked(file, mutation).map_err(|failure| failure.error)
+}
+
+#[cfg(not(unix))]
+fn apply_local_metadata_tracked(
+    file: &std::fs::File,
+    mutation: MetadataMutation,
+) -> Result<(), LocalMutationFailure> {
+    apply_local_metadata(file, mutation).map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn apply_local_metadata_tracked(
+    file: &std::fs::File,
+    mutation: MetadataMutation,
+) -> Result<(), LocalMutationFailure> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{PermissionsExt as _, fchown};
     use xattr::FileExt as _;
 
     match mutation {
         MetadataMutation::Acl(acl) => {
-            set_optional_xattr(file, "system.posix_acl_access", acl.access())?;
+            let changed = set_optional_xattr(file, "system.posix_acl_access", acl.access())?;
             set_optional_xattr(file, "system.posix_acl_default", acl.default_acl())
+                .map(|_| ())
+                .map_err(|error| LocalMutationFailure { error, changed })
         }
         MetadataMutation::Xattrs(values) => {
-            for value in values {
+            for (index, value) in values.into_iter().enumerate() {
                 let name = std::ffi::OsStr::from_bytes(value.name());
-                file.set_xattr(name, value.value())?;
+                file.set_xattr(name, value.value())
+                    .map_err(|error| LocalMutationFailure {
+                        error,
+                        changed: index > 0,
+                    })?;
             }
             Ok(())
         }
-        MetadataMutation::Mode(mode) => {
-            file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
-        }
+        MetadataMutation::Mode(mode) => file
+            .set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
+            .map_err(Into::into),
         MetadataMutation::NumericOwnership(value) => {
             fchown(file, Some(value.uid), Some(value.gid))?;
             file.set_permissions(std::fs::Permissions::from_mode(value.mode))
+                .map_err(|error| LocalMutationFailure {
+                    error,
+                    changed: true,
+                })
         }
         MetadataMutation::Timestamps(value) => {
             let atime = value.accessed.map(local_file_time).transpose()?;
             let mtime = value.modified.map(local_file_time).transpose()?;
-            filetime::set_file_handle_times(file, atime, mtime)
+            filetime::set_file_handle_times(file, atime, mtime).map_err(Into::into)
         }
         MetadataMutation::Tags(_) | MetadataMutation::MappedOwnership(_) => {
-            Err(io::Error::from(io::ErrorKind::Unsupported))
+            Err(io::Error::from(io::ErrorKind::Unsupported).into())
         }
     }
 }
 
 #[cfg(unix)]
-fn set_optional_xattr(file: &std::fs::File, name: &str, value: Option<&[u8]>) -> io::Result<()> {
+fn set_optional_xattr(file: &std::fs::File, name: &str, value: Option<&[u8]>) -> io::Result<bool> {
     use xattr::FileExt as _;
 
     match value {
-        Some(value) => file.set_xattr(name, value),
+        Some(value) => file.set_xattr(name, value).map(|()| true),
         None => match file.remove_xattr(name) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         },
     }
