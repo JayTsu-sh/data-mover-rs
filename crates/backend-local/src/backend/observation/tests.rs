@@ -41,6 +41,153 @@ fn adapter(root: &Path) -> Result<LocalObservationAdapter, StorageRoleFailure> {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn bound_configured_root_removal_or_replacement_is_conflict_for_write_and_fresh_stat()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::num::NonZeroUsize;
+
+    use crate::backend::connect_backend;
+    use crate::storage::LocalBackendConfig;
+
+    for replacement in ["missing", "directory", "file", "symlink"] {
+        let temporary = tempfile::tempdir()?;
+        let configured = temporary.path().join("target");
+        let held = temporary.path().join("held");
+        let unrelated = temporary.path().join("unrelated");
+        for directory in [&configured, &unrelated] {
+            fs::create_dir(directory)?;
+            fs::set_permissions(directory, Permissions::from_mode(0o711))?;
+        }
+        let storage = connect_backend(LocalBackendConfig {
+            root: configured.clone(),
+            rename_context: None,
+            read_concurrency: NonZeroUsize::MIN,
+            write_concurrency: NonZeroUsize::MIN,
+            read_chunk_bytes: None,
+            write_chunk_bytes: None,
+        })?;
+        let namespace = storage.namespace()?;
+        let metadata = storage.metadata()?;
+        let root = StoragePath::root();
+        let key = namespace
+            .stat(&root, true)
+            .await?
+            .source_identity
+            .identity_key();
+        let cancel = CancellationToken::new();
+        assert!(
+            metadata
+                .apply_bound_directory(
+                    &root,
+                    key,
+                    vec![MetadataMutation::Mode(0o751)],
+                    cancel.clone()
+                )
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            namespace
+                .stat(&root, true)
+                .await?
+                .source_identity
+                .identity_key(),
+            key
+        );
+        fs::rename(&configured, &held)?;
+        match replacement {
+            "directory" => {
+                fs::create_dir(&configured)?;
+                fs::set_permissions(&configured, Permissions::from_mode(0o713))?;
+            }
+            "file" => fs::write(&configured, b"keep")?,
+            "symlink" => symlink(&unrelated, &configured)?,
+            _ => {}
+        }
+        for path in [root, StoragePath::new(".")?] {
+            let write = metadata
+                .apply_bound_directory(
+                    &path,
+                    key,
+                    vec![MetadataMutation::Mode(0o755)],
+                    cancel.clone(),
+                )
+                .await;
+            let read = namespace.stat(&path, true).await;
+            assert!(
+                matches!(&write, Err(batch) if batch.completed == 0 && matches!(
+                    batch.error.as_ref(), Some(StorageRoleFailure::Entry(error))
+                        if error.class() == FailureClass::Conflict && error.operation() == Operation::Metadata
+                )),
+                "{replacement} {write:?}"
+            );
+            assert!(
+                matches!(&read, Err(StorageRoleFailure::Entry(error))
+                    if error.class() == FailureClass::Conflict && error.operation() == Operation::Observe
+                ),
+                "{replacement} {read:?}"
+            );
+        }
+        assert_eq!(fs::metadata(&held)?.permissions().mode() & 0o777, 0o751);
+        assert_eq!(
+            fs::metadata(&unrelated)?.permissions().mode() & 0o777,
+            0o711
+        );
+        if replacement == "directory" {
+            assert_eq!(
+                fs::metadata(&configured)?.permissions().mode() & 0o777,
+                0o713
+            );
+        }
+        if replacement == "file" {
+            assert_eq!(fs::read(&configured)?, b"keep");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_handle_only_root_cannot_attest_current_name() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::backend::namespace::LocalNamespace;
+    use crate::storage::Namespace;
+
+    let root = tempfile::tempdir()?;
+    fs::create_dir(root.path().join("child"))?;
+    let named = adapter(root.path())?;
+    let namespace = LocalNamespace::from_root(named.root.clone(), named.identity.clone());
+    let handle_only =
+        LocalObservationAdapter::from_root(named.root.clone(), named.identity.clone());
+
+    for path in [StoragePath::root(), StoragePath::new(".")?] {
+        let key = namespace
+            .stat(&path, false)
+            .await?
+            .source_identity
+            .identity_key();
+        assert!(matches!(
+            namespace.stat(&path, true).await,
+            Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Unsupported
+        ));
+        assert!(matches!(
+            handle_only.apply_bound_directory(
+                &path, key, vec![MetadataMutation::Mode(0o755)], CancellationToken::new()
+            ).await,
+            Err(failure) if matches!(failure.error.as_ref(), Some(StorageRoleFailure::Entry(error))
+                if error.class() == FailureClass::Unsupported)
+        ));
+    }
+    assert_eq!(
+        namespace
+            .stat(&StoragePath::new("child")?, true)
+            .await?
+            .kind,
+        EntryKind::Directory
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
 #[test]
 fn dropping_a_queued_bound_write_prevents_late_mutation() -> io::Result<()> {
     tokio::runtime::Builder::new_current_thread()
@@ -251,7 +398,8 @@ async fn bound_directory_metadata_validates_empty_root_and_reports_prefix() -> i
     let namespace = super::super::namespace::LocalNamespace::from_root(
         adapter.root.clone(),
         adapter.identity.clone(),
-    );
+    )
+    .with_persistence_root(fs::canonicalize(&root.0)?);
     let expected = crate::storage::Namespace::stat(&namespace, &path, true)
         .await
         .map_err(io::Error::other)?

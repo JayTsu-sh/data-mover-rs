@@ -20,7 +20,7 @@ use crate::storage::StorageRoleFailure;
 use crate::storage::backends::local::observation::{content_version, entry_kind, source_identity};
 use crate::storage::durability::open_directory as open_for_sync;
 
-pub(super) struct RootAnchor {
+pub(in crate::backend) struct RootAnchor {
     path: PathBuf,
     #[cfg(test)]
     directory_sync_calls: AtomicUsize,
@@ -31,7 +31,7 @@ pub(super) struct RootAnchor {
 }
 
 impl RootAnchor {
-    pub(super) fn new(path: PathBuf) -> Self {
+    pub(in crate::backend) fn new(path: PathBuf) -> Self {
         Self {
             path,
             #[cfg(test)]
@@ -63,7 +63,11 @@ impl RootAnchor {
         Ok(directories)
     }
 
-    fn verified_chain(&self, root: &Dir, cancel: &CancellationToken) -> io::Result<Vec<Dir>> {
+    fn verified_chain(
+        &self,
+        root: &Dir,
+        cancel: &CancellationToken,
+    ) -> io::Result<(Vec<Dir>, Metadata)> {
         // 每次重验根绑定；同 inode 移走再移回也不能复用旧目录项的持久性。
         let directories = self.open_chain(cancel)?;
         check_cancelled(cancel)?;
@@ -79,7 +83,18 @@ impl RootAnchor {
                 "configured endpoint root no longer matches the opened capability",
             ));
         }
-        Ok(directories)
+        Ok((directories, visible))
+    }
+
+    /// 核对配置路径当前指向的根，并返回同一次解析得到的目录与描述。
+    pub(in crate::backend) fn visible_root(
+        &self,
+        root: &Dir,
+        cancel: &CancellationToken,
+    ) -> io::Result<(Dir, Metadata)> {
+        let (mut chain, metadata) = self.verified_chain(root, cancel)?;
+        let directory = chain.pop().ok_or(io::ErrorKind::InvalidInput)?;
+        Ok((directory, metadata))
     }
 
     // 生产构建没有故障注入状态。
@@ -157,7 +172,7 @@ fn persist_at_root(
     cancel: &CancellationToken,
 ) -> io::Result<()> {
     check_cancelled(cancel)?;
-    let ancestors = anchor.verified_chain(root, cancel)?;
+    let (ancestors, _) = anchor.verified_chain(root, cancel)?;
     let parents = resolve_parents(root, relative, cancel)?;
     let parent = parents.last().ok_or(io::ErrorKind::InvalidInput)?;
     persist_leaf(

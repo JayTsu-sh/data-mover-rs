@@ -35,6 +35,7 @@ enum Refusal {
     SessionLost,
     DirectoryReplaced,
     DirectoryWriteUnconfirmed,
+    DirectoryCancelledAfterBatch,
     /// Applies the whole batch and then fails its persistence barrier, as Local's durable
     /// `sync_all` can: no single mutation failed, the batch did.
     BarrierFailed,
@@ -75,7 +76,7 @@ impl ScriptedStage {
             Refusal::InOrder | Refusal::UpFront | Refusal::Partway => {
                 Some(refusal(FailureClass::Unsupported))
             }
-            Refusal::CancelledBetween => {
+            Refusal::CancelledBetween | Refusal::DirectoryCancelledAfterBatch => {
                 cancel.cancel();
                 None
             }
@@ -247,7 +248,7 @@ impl StagedDestination for ScriptedStage {
                     self.refusal_error(&cancel),
                 ));
             }
-            Refusal::BarrierFailed => {
+            Refusal::DirectoryCancelledAfterBatch | Refusal::BarrierFailed => {
                 self.applied.lock().unwrap().extend(mutations);
                 return Err(MetadataBatchFailure::whole_batch(
                     len,
@@ -740,6 +741,27 @@ async fn directory_uncertain_write_or_cancellation_preserves_prefix_and_stops() 
         assert_eq!(target.applied_families(), [MetadataFamily::OwnershipMode]);
         assert_eq!(
             outcome_for(failure.report(), MetadataFamily::OwnershipMode),
+            ApplicationOutcome::Applied
+        );
+    }
+}
+
+#[tokio::test]
+async fn directory_cancelled_after_last_write_reports_all_confirmed_families() {
+    let target = ScriptedStage::new(Refusal::DirectoryCancelledAfterBatch);
+    let failure = plan(all_exact())
+        .apply_bound_directory(
+            &ScriptedDirectory(&target),
+            &StoragePath::new("file").unwrap(),
+            directory_identity(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind(), ApplicationFailureKind::Cancelled);
+    for family in target.applied_families() {
+        assert_eq!(
+            outcome_for(failure.report(), family),
             ApplicationOutcome::Applied
         );
     }

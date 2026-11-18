@@ -1456,14 +1456,22 @@ fn apply_local_batch(
 ) -> Result<(), LocalBatchStop> {
     let count = mutations.len();
     // Cancelled work is never published, so what it applied need not be durable.
-    apply_local_mutations(file, mutations, cancel)
-        .map_err(|(index, error)| (index, index, error.map(|failure| failure.error)))?;
+    apply_local_mutations(file, mutations, cancel).map_err(|(index, error)| {
+        let error = error
+            .filter(|failure| !failure.cancelled)
+            .map(|failure| failure.error);
+        (index, index, error)
+    })?;
     let synced = match (durable, fail_sync) {
         (false, _) => Ok(()),
         (true, true) => Err(io::Error::other("injected metadata sync failure")),
         (true, false) => file.sync_all(),
     };
-    synced.map_err(|error| (count, count, Some(error)))
+    synced.map_err(|error| (count, count, Some(error)))?;
+    if cancel.is_cancelled() {
+        return Err((count, count, None));
+    }
+    Ok(())
 }
 
 pub(super) fn apply_local_mutations(
@@ -1471,6 +1479,8 @@ pub(super) fn apply_local_mutations(
     mutations: Vec<MetadataMutation>,
     cancel: &CancellationToken,
 ) -> Result<(), (usize, Option<LocalMutationFailure>)> {
+    let count = mutations.len();
+    let check_cancel = |changed| check_local_metadata_cancel(cancel, changed);
     for (index, mutation) in mutations.into_iter().enumerate() {
         if cancel.is_cancelled() {
             return Err((index, None));
@@ -1481,7 +1491,11 @@ pub(super) fn apply_local_mutations(
                 Some(io::Error::from(io::ErrorKind::Unsupported).into()),
             ));
         }
-        apply_local_metadata_tracked(file, mutation).map_err(|error| (index, Some(error)))?;
+        apply_local_metadata_tracked(file, mutation, check_cancel)
+            .map_err(|error| (index, Some(error)))?;
+    }
+    if cancel.is_cancelled() {
+        return Err((count, None));
     }
     Ok(())
 }
@@ -1518,6 +1532,7 @@ pub(super) struct LocalMutationFailure {
     pub(super) error: io::Error,
     #[cfg(unix)]
     pub(super) changed: bool,
+    pub(super) cancelled: bool,
 }
 
 impl From<io::Error> for LocalMutationFailure {
@@ -1526,8 +1541,24 @@ impl From<io::Error> for LocalMutationFailure {
             error,
             #[cfg(unix)]
             changed: false,
+            cancelled: false,
         }
     }
+}
+
+fn check_local_metadata_cancel(
+    cancel: &CancellationToken,
+    #[cfg_attr(not(unix), allow(unused_variables))] changed: bool,
+) -> Result<(), LocalMutationFailure> {
+    if cancel.is_cancelled() {
+        return Err(LocalMutationFailure {
+            error: io::ErrorKind::Interrupted.into(),
+            #[cfg(unix)]
+            changed,
+            cancelled: true,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1535,14 +1566,16 @@ pub(super) fn apply_local_metadata(
     file: &std::fs::File,
     mutation: MetadataMutation,
 ) -> io::Result<()> {
-    apply_local_metadata_tracked(file, mutation).map_err(|failure| failure.error)
+    apply_local_metadata_tracked(file, mutation, |_| Ok(())).map_err(|failure| failure.error)
 }
 
 #[cfg(not(unix))]
 fn apply_local_metadata_tracked(
     file: &std::fs::File,
     mutation: MetadataMutation,
+    check_cancel: impl Fn(bool) -> Result<(), LocalMutationFailure>,
 ) -> Result<(), LocalMutationFailure> {
+    check_cancel(false)?;
     apply_local_metadata(file, mutation).map_err(Into::into)
 }
 
@@ -1550,25 +1583,36 @@ fn apply_local_metadata_tracked(
 fn apply_local_metadata_tracked(
     file: &std::fs::File,
     mutation: MetadataMutation,
+    check_cancel: impl Fn(bool) -> Result<(), LocalMutationFailure>,
 ) -> Result<(), LocalMutationFailure> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{PermissionsExt as _, fchown};
     use xattr::FileExt as _;
 
+    check_cancel(false)?;
     match mutation {
         MetadataMutation::Acl(acl) => {
             let changed = set_optional_xattr(file, "system.posix_acl_access", acl.access())?;
+            check_cancel(changed)?;
             set_optional_xattr(file, "system.posix_acl_default", acl.default_acl())
                 .map(|_| ())
-                .map_err(|error| LocalMutationFailure { error, changed })
+                .map_err(|error| LocalMutationFailure {
+                    error,
+                    changed,
+                    cancelled: false,
+                })
         }
         MetadataMutation::Xattrs(values) => {
             for (index, value) in values.into_iter().enumerate() {
+                if index > 0 {
+                    check_cancel(true)?;
+                }
                 let name = std::ffi::OsStr::from_bytes(value.name());
                 file.set_xattr(name, value.value())
                     .map_err(|error| LocalMutationFailure {
                         error,
                         changed: index > 0,
+                        cancelled: false,
                     })?;
             }
             Ok(())
@@ -1578,10 +1622,12 @@ fn apply_local_metadata_tracked(
             .map_err(Into::into),
         MetadataMutation::NumericOwnership(value) => {
             fchown(file, Some(value.uid), Some(value.gid))?;
+            check_cancel(true)?;
             file.set_permissions(std::fs::Permissions::from_mode(value.mode))
                 .map_err(|error| LocalMutationFailure {
                     error,
                     changed: true,
+                    cancelled: false,
                 })
         }
         MetadataMutation::Timestamps(value) => {

@@ -575,8 +575,7 @@ fn resume_after<'a>(
     cancel: &CancellationToken,
     target: &BatchApplicationTarget<'_>,
 ) -> Option<Vec<&'a (MetadataFamily, MetadataMutation)>> {
-    // A batch that failed as a whole is charged to the last mutation it applied without making
-    // durable — the first one when it applied none — which is the family a caller has to look at.
+    // Attribute a whole-batch failure to the last completed family, or the first if none ran.
     let whole_batch = failure.failed_index >= pending.len();
     let failed_index = if whole_batch {
         failure.completed.saturating_sub(1)
@@ -587,13 +586,19 @@ fn resume_after<'a>(
     // A backend may reject the batch before applying any of it, so what precedes the failed index
     // is not necessarily applied: only `completed` says that.
     let completed = failure.completed.min(failed_index);
-    // After a failed barrier nothing in this batch is durable, so none of it is claimed.
-    let durably_applied = if whole_batch { 0 } else { completed };
-    for (family, _) in &pending[..durably_applied] {
+    let cancelled = cancel.is_cancelled() || failure.error.as_ref().is_none_or(is_cancellation);
+    // 暂存批次的屏障失败不能确认属性。已发布目录在取消前完成的写入仍可确认。
+    let applied = match (whole_batch, target) {
+        (false, _) => completed,
+        (true, BatchApplicationTarget::Directory { .. }) if cancelled => {
+            failure.completed.min(pending.len())
+        }
+        (true, _) => 0,
+    };
+    for (family, _) in &pending[..applied] {
         set_outcome(outcomes, *family, ApplicationOutcome::Applied);
     }
     let family = pending[failed_index].0;
-    let cancelled = cancel.is_cancelled() || failure.error.as_ref().is_none_or(is_cancellation);
     if !cancelled {
         set_outcome(outcomes, family, ApplicationOutcome::Failed);
     }

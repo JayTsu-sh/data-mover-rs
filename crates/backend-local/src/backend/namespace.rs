@@ -31,6 +31,8 @@ use cap_std::io_lifetimes::AsFilelike as _;
 use rustix::fs::{Mode, OFlags, openat};
 #[cfg(unix)]
 use rustix::io::Errno;
+#[cfg(unix)]
+use tokio_util::sync::CancellationToken;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK;
 
@@ -67,7 +69,7 @@ pub struct LocalNamespace {
     rename_context: Option<RenameContext>,
     listing_resume_key: [u8; 32],
     #[cfg(unix)]
-    persistence: Option<Arc<persistence::RootAnchor>>,
+    persistence: Option<Arc<RootAnchor>>,
     #[cfg(any(test, feature = "test-support"))]
     probe: Arc<ListProbe>,
 }
@@ -103,8 +105,13 @@ impl LocalNamespace {
     #[cfg(unix)]
     #[must_use]
     pub fn with_persistence_root(mut self, root: PathBuf) -> Self {
-        self.persistence = Some(Arc::new(persistence::RootAnchor::new(root)));
+        self.persistence = Some(Arc::new(RootAnchor::new(root)));
         self
+    }
+
+    #[cfg(unix)]
+    pub(super) fn root_anchor(&self) -> Option<Arc<RootAnchor>> {
+        self.persistence.clone()
     }
 
     #[must_use]
@@ -232,13 +239,37 @@ impl LocalNamespace {
         let native = checked(path, Operation::Observe, true)?;
         let target = path.clone();
         let root_device = self.root_device;
+        #[cfg(unix)]
+        let anchor = if fresh && native.as_os_str().is_empty() {
+            self.root_anchor()
+        } else {
+            None
+        };
         self.blocking(path, Operation::Observe, move |root, identity| {
             let metadata = if native.as_os_str().is_empty() {
+                #[cfg(unix)]
+                if fresh {
+                    let anchor = anchor.ok_or_else(|| {
+                        entry_failure(&target, Operation::Observe, FailureClass::Unsupported)
+                    })?;
+                    let cancel = CancellationToken::new();
+                    anchor
+                        .visible_root(root, &cancel)
+                        .map(|(_, metadata)| metadata)
+                        .map_err(|error| {
+                            root_binding_failure(&target, Operation::Observe, &error, &cancel)
+                        })?
+                } else {
+                    root.dir_metadata()
+                        .map_err(|error| io_failure(&target, Operation::Observe, &error))?
+                }
+                #[cfg(not(unix))]
                 root.dir_metadata()
+                    .map_err(|error| io_failure(&target, Operation::Observe, &error))?
             } else {
                 in_parent(root, &native, |parent, leaf| parent.symlink_metadata(leaf))
-            }
-            .map_err(|error| io_failure(&target, Operation::Observe, &error))?;
+                    .map_err(|error| io_failure(&target, Operation::Observe, &error))?
+            };
             let descriptor =
                 describe(identity, target, &metadata, Operation::Observe, root_device)?;
             // 仅 Unix fresh 描述附带同一次 stat 已确认的真实权限，不额外访问路径。
@@ -552,11 +583,38 @@ fn open_directory(root: &Dir, relative: &Path) -> io::Result<Dir> {
     Ok(Dir::from_std_file(current))
 }
 
+#[cfg(unix)]
+fn root_binding_failure(
+    path: &StoragePath,
+    operation: Operation,
+    error: &io::Error,
+    cancel: &CancellationToken,
+) -> StorageRoleFailure {
+    if error.kind() == io::ErrorKind::Interrupted && cancel.is_cancelled() {
+        return StorageRoleFailure::Entry(entry_failure_value(
+            path,
+            operation,
+            FailureClass::Cancelled,
+            Transience::Transient,
+        ));
+    }
+    if matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    ) || error.raw_os_error() == Some(Errno::LOOP.raw_os_error())
+    {
+        return entry_failure(path, operation, FailureClass::Conflict);
+    }
+    io_failure(path, operation, error)
+}
+
 /// Opens the directory object for descriptor-based metadata writes without following links.
 #[cfg(unix)]
 pub(super) fn open_metadata_directory(
     root: &Dir,
     path: &StoragePath,
+    anchor: Option<&RootAnchor>,
+    cancel: &CancellationToken,
 ) -> Result<Dir, StorageRoleFailure> {
     let relative = checked(path, Operation::Metadata, true)?;
     let open = |parent: &Dir, leaf: &OsStr| -> io::Result<Dir> {
@@ -567,7 +625,12 @@ pub(super) fn open_metadata_directory(
         ))
     };
     let result = if relative.as_os_str().is_empty() {
-        open(root, OsStr::new("."))
+        let anchor = anchor
+            .ok_or_else(|| entry_failure(path, Operation::Metadata, FailureClass::Unsupported))?;
+        let (visible, _) = anchor
+            .visible_root(root, cancel)
+            .map_err(|error| root_binding_failure(path, Operation::Metadata, &error, cancel))?;
+        open(&visible, OsStr::new("."))
     } else {
         in_parent(root, &relative, open)
     };
@@ -801,6 +864,8 @@ mod tests;
 
 #[cfg(unix)]
 mod persistence;
+#[cfg(unix)]
+pub(super) use persistence::RootAnchor;
 
 #[cfg(unix)]
 mod purge;
