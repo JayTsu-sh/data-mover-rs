@@ -5,11 +5,11 @@ use std::fmt;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    AclEncoding, FailureClass, MappedOwnership, MetadataObservations, OwnershipMode, SourceVersion,
-    StoragePath, TimePrecision,
+    AclEncoding, EntryIdentityKey, FailureClass, MappedOwnership, MetadataObservations,
+    OwnershipMode, SourceVersion, StoragePath, TimePrecision, Transience,
 };
 use crate::storage::{
-    Metadata, MetadataMutation, PreparedStage, StagedDestination, StagedMetadataApplicationFailure,
+    Metadata, MetadataBatchFailure, MetadataMutation, PreparedStage, StagedDestination,
     StorageRoleFailure,
 };
 
@@ -365,6 +365,32 @@ impl MetadataPlan {
             .await
     }
 
+    /// Applies the planned mutations in order to the published directory with the expected identity.
+    ///
+    /// Uses the backend's identity-bound write capability. An empty plan does not write; callers
+    /// still verify the current name with [`Self::verify_published`].
+    ///
+    /// # Errors
+    /// Returns a typed conflict or unsupported operation before writes, and preserves confirmed
+    /// progress and the storage error if application is interrupted after writes begin.
+    pub async fn apply_bound_directory(
+        &self,
+        target: &dyn Metadata,
+        path: &StoragePath,
+        expected: EntryIdentityKey,
+        cancel: CancellationToken,
+    ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
+        self.apply_batch(
+            BatchApplicationTarget::Directory {
+                target,
+                path,
+                expected,
+            },
+            cancel,
+        )
+        .await
+    }
+
     /// Applies planned metadata before the destination publishes its prepared stage.
     ///
     /// # Errors
@@ -373,6 +399,15 @@ impl MetadataPlan {
         &self,
         target: &dyn StagedDestination,
         stage: &PreparedStage,
+        cancel: CancellationToken,
+    ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
+        self.apply_batch(BatchApplicationTarget::Stage { target, stage }, cancel)
+            .await
+    }
+
+    async fn apply_batch(
+        &self,
+        target: BatchApplicationTarget<'_>,
         cancel: CancellationToken,
     ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
         let mut outcomes = self.planned_outcomes();
@@ -389,17 +424,20 @@ impl MetadataPlan {
                 .iter()
                 .map(|(_, mutation)| mutation.clone())
                 .collect::<Vec<_>>();
-            let Err(failure) = target
-                .apply_metadata_batch(stage, mutations, cancel.clone())
-                .await
-            else {
+            let Err(failure) = target.apply(mutations, cancel.clone()).await else {
                 for (family, _) in &pending {
                     set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
                 }
                 break;
             };
-            let Some(next) = resume_after(&pending, failure, &mut outcomes, &mut failures, &cancel)
-            else {
+            let Some(next) = resume_after(
+                &pending,
+                failure,
+                &mut outcomes,
+                &mut failures,
+                &cancel,
+                &target,
+            ) else {
                 return Err(self.failed(failures, outcomes));
             };
             pending = next;
@@ -531,13 +569,13 @@ impl MetadataPlan {
 /// writes either cannot succeed or would not be trustworthy.
 fn resume_after<'a>(
     pending: &[&'a (MetadataFamily, MetadataMutation)],
-    failure: StagedMetadataApplicationFailure,
+    failure: MetadataBatchFailure,
     outcomes: &mut [FamilyApplication],
     failures: &mut Vec<FamilyFailure>,
     cancel: &CancellationToken,
+    target: &BatchApplicationTarget<'_>,
 ) -> Option<Vec<&'a (MetadataFamily, MetadataMutation)>> {
-    // A batch that failed as a whole is charged to the last mutation it applied without making
-    // durable — the first one when it applied none — which is the family a caller has to look at.
+    // Attribute a whole-batch failure to the last completed family, or the first if none ran.
     let whole_batch = failure.failed_index >= pending.len();
     let failed_index = if whole_batch {
         failure.completed.saturating_sub(1)
@@ -548,23 +586,41 @@ fn resume_after<'a>(
     // A backend may reject the batch before applying any of it, so what precedes the failed index
     // is not necessarily applied: only `completed` says that.
     let completed = failure.completed.min(failed_index);
-    // After a failed barrier nothing in this batch is durable, so none of it is claimed.
-    let durably_applied = if whole_batch { 0 } else { completed };
-    for (family, _) in &pending[..durably_applied] {
+    let cancelled = cancel.is_cancelled() || failure.error.as_ref().is_none_or(is_cancellation);
+    // 暂存批次的屏障失败不能确认属性。已发布目录在取消前完成的写入仍可确认。
+    let applied = match (whole_batch, target) {
+        (false, _) => completed,
+        (true, BatchApplicationTarget::Directory { .. }) if cancelled => {
+            failure.completed.min(pending.len())
+        }
+        (true, _) => 0,
+    };
+    for (family, _) in &pending[..applied] {
         set_outcome(outcomes, *family, ApplicationOutcome::Applied);
     }
     let family = pending[failed_index].0;
-    let cancelled = cancel.is_cancelled() || failure.error.as_ref().is_none_or(is_cancellation);
     if !cancelled {
         set_outcome(outcomes, family, ApplicationOutcome::Failed);
     }
-    let stop = cancelled || whole_batch || !failure.error.as_ref().is_some_and(is_refusal);
+    let error = failure.error.as_ref();
+    let refusal = error.is_some_and(|error| target.is_refusal(error));
+    let kind = match target {
+        BatchApplicationTarget::Directory { .. }
+            if !cancelled
+                && !whole_batch
+                && !refusal
+                && matches!(error, Some(StorageRoleFailure::Entry(_))) =>
+        {
+            ApplicationFailureKind::WriteUnconfirmed
+        }
+        _ => ApplicationFailureKind::of(error, cancelled, whole_batch),
+    };
     failures.push(FamilyFailure {
         family,
-        kind: ApplicationFailureKind::of(failure.error.as_ref(), cancelled, whole_batch),
+        kind,
         error: failure.error.map(Box::new),
     });
-    if stop {
+    if cancelled || whole_batch || !refusal {
         return None;
     }
     Some(
@@ -581,6 +637,53 @@ const fn cancelled_at(family: MetadataFamily) -> FamilyFailure {
         family,
         kind: ApplicationFailureKind::Cancelled,
         error: None,
+    }
+}
+
+enum BatchApplicationTarget<'a> {
+    Stage {
+        target: &'a dyn StagedDestination,
+        stage: &'a PreparedStage,
+    },
+    Directory {
+        target: &'a dyn Metadata,
+        path: &'a StoragePath,
+        expected: EntryIdentityKey,
+    },
+}
+
+impl BatchApplicationTarget<'_> {
+    async fn apply(
+        &self,
+        mutations: Vec<MetadataMutation>,
+        cancel: CancellationToken,
+    ) -> Result<(), MetadataBatchFailure> {
+        match self {
+            Self::Stage { target, stage } => {
+                target.apply_metadata_batch(stage, mutations, cancel).await
+            }
+            Self::Directory {
+                target,
+                path,
+                expected,
+            } => {
+                target
+                    .apply_bound_directory(path, *expected, mutations, cancel)
+                    .await
+            }
+        }
+    }
+
+    fn is_refusal(&self, error: &StorageRoleFailure) -> bool {
+        match self {
+            Self::Stage { .. } => is_refusal(error),
+            Self::Directory { .. } => matches!(error,
+                StorageRoleFailure::Entry(error)
+                    if error.transience() == Transience::Permanent
+                    && matches!(error.class(),
+                        FailureClass::PermissionDenied | FailureClass::Unsupported | FailureClass::InvalidInput)
+            ),
+        }
     }
 }
 

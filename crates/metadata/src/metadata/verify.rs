@@ -7,9 +7,9 @@ use tokio_util::sync::CancellationToken;
 use super::MetadataPlan;
 use crate::model::acl::{AclError, equivalent_native};
 use crate::model::{
-    EntryKind, IdentityStrength, MetadataFamily, MetadataObservationFailure, MetadataObservations,
-    ObservationMode, ObservationPlan, PermissionFacts, PrincipalIdentity, SourceVersion,
-    StoragePath, StorageTimestamp, TimestampMetadata,
+    EntryIdentityKey, EntryKind, IdentityStrength, MetadataFamily, MetadataObservationFailure,
+    MetadataObservations, ObservationMode, ObservationPlan, PermissionFacts, PrincipalIdentity,
+    SourceVersion, StoragePath, StorageTimestamp, TimestampMetadata,
 };
 use crate::storage::{
     CapabilityUnavailable, Metadata, MetadataMutation, SourceDescriptor, Storage,
@@ -70,14 +70,10 @@ impl MetadataPlan {
     /// 核验当前目标或指定历史版本的已捕获元数据计划，返回新描述供调用方核对类型和大小。
     /// Current 且无发布约束时保留 namespace 的目录语义；Id 精确读取历史版本。
     /// `expected_current_version` 独立约束当前发布版本，不会被历史版本读取替代。
-    /// `current_anchor` 只接受无当前版本约束的 Current 稳定目录描述；非法组合或身份／
-    /// 类型变化返回 `VersionChanged`。有锚点时所有额外属性读取后都实际 fresh stat 并核对
-    /// 稳定身份，不比较会因本轮属性写入变化的 `content_version`；这不是原子命名空间锁。
-    /// 旧描述仅是内联资格提示，不保证最少读取次数。OwnershipMode 缺少 authoritative
-    /// permissions 时保守完整回退，不从 inline ownership/mode 猜测或补齐权限。
-    /// 内联快路径信息不足时重新绑定回读并再次 fresh。回退时，权限和时间字段优先使用
-    /// 最终 fresh 描述中已有的权威值，缺失字段沿用此前读到的事实。fresh 失败不会降级为缓存读取。
-    /// None 保持原有当前／历史版本和权限读取语义。
+    /// `current_anchor` 只用于 Current 稳定目录，身份或类型变化返回 `VersionChanged`。
+    /// 常见的权限和时间从一次 fresh stat 核验。需额外回读时，在回读完成后 fresh stat
+    /// 并核对当前路径及稳定身份。最终描述中的权威权限和时间优先于中间读到的值。
+    /// 比对不包含会因本轮属性写入变化的 `content_version`。
     /// 取消会丢弃在途只读请求，不再等待其返回或启动后续读取。
     ///
     /// # Errors
@@ -88,7 +84,7 @@ impl MetadataPlan {
         path: &StoragePath,
         version: &SourceVersion,
         expected_current_version: Option<&str>,
-        current_anchor: Option<&SourceDescriptor>,
+        current_anchor: Option<EntryIdentityKey>,
         cancel: CancellationToken,
     ) -> Result<SourceDescriptor, MetadataVerificationError> {
         tokio::select! {
@@ -109,11 +105,13 @@ impl MetadataPlan {
         path: &StoragePath,
         version: &SourceVersion,
         expected_current_version: Option<&str>,
-        current_anchor: Option<&SourceDescriptor>,
+        current_anchor: Option<EntryIdentityKey>,
         cancel: CancellationToken,
     ) -> Result<SourceDescriptor, MetadataVerificationError> {
         if let Some(anchor) = current_anchor {
-            check_anchor_request(path, version, expected_current_version, anchor)?;
+            if version != &SourceVersion::Current || expected_current_version.is_some() {
+                return Err(MetadataVerificationError::VersionChanged { path: path.clone() });
+            }
             return self
                 .verify_anchored_directory(target, path, anchor, &cancel)
                 .await;
@@ -175,7 +173,7 @@ impl MetadataPlan {
         &self,
         target: &Storage,
         path: &StoragePath,
-        anchor: &SourceDescriptor,
+        anchor: EntryIdentityKey,
         cancel: &CancellationToken,
     ) -> Result<SourceDescriptor, MetadataVerificationError> {
         if self.mutations.is_empty() {
@@ -184,13 +182,16 @@ impl MetadataPlan {
         let metadata = target
             .metadata()
             .map_err(MetadataVerificationError::Capability)?;
-        // 旧描述只判断是否值得尝试纯内联；其值和错误都不是最终核验结果。
-        let inline = self
-            .inline_verification_facts(metadata.as_ref(), anchor)
-            .is_some_and(|facts| facts.is_ok());
-        let descriptor = read_anchored_directory(target, path, anchor, inline, cancel).await?;
-        if inline
-            && let Some(facts) = self.inline_verification_facts(metadata.as_ref(), &descriptor)
+        // 权限和时间通常由路径描述直接提供，先 fresh 一次即可核验。
+        // 其他属性通常独立读，先用描述绑定回读，末尾才需要 fresh。
+        let fresh = self.mutations.iter().all(|(family, _)| {
+            matches!(
+                family,
+                MetadataFamily::OwnershipMode | MetadataFamily::Timestamps
+            )
+        });
+        let descriptor = read_anchored_directory(target, path, anchor, fresh, cancel).await?;
+        if fresh && let Some(facts) = self.inline_verification_facts(metadata.as_ref(), &descriptor)
         {
             let (facts, permissions) = facts?;
             return self.verify_facts(descriptor, &facts, &permissions, None, cancel);
@@ -332,28 +333,10 @@ fn check_cancel(cancel: Option<&CancellationToken>) -> Result<(), MetadataVerifi
     }
 }
 
-fn check_anchor_request(
-    path: &StoragePath,
-    version: &SourceVersion,
-    expected_current_version: Option<&str>,
-    anchor: &SourceDescriptor,
-) -> Result<(), MetadataVerificationError> {
-    if version != &SourceVersion::Current
-        || expected_current_version.is_some()
-        || &anchor.path != path
-        || anchor.version != SourceVersion::Current
-        || anchor.kind != EntryKind::Directory
-        || anchor.source_identity.strength() != IdentityStrength::StableWithinBackend
-    {
-        return Err(MetadataVerificationError::VersionChanged { path: path.clone() });
-    }
-    Ok(())
-}
-
 async fn read_anchored_directory(
     target: &Storage,
     path: &StoragePath,
-    anchor: &SourceDescriptor,
+    anchor: EntryIdentityKey,
     fresh: bool,
     cancel: &CancellationToken,
 ) -> Result<SourceDescriptor, MetadataVerificationError> {
@@ -369,7 +352,7 @@ async fn read_anchored_directory(
         || descriptor.kind != EntryKind::Directory
         || descriptor.version != SourceVersion::Current
         || descriptor.source_identity.strength() != IdentityStrength::StableWithinBackend
-        || descriptor.source_identity.identity_key() != anchor.source_identity.identity_key()
+        || descriptor.source_identity.identity_key() != anchor
     {
         return Err(MetadataVerificationError::VersionChanged { path: path.clone() });
     }

@@ -46,6 +46,7 @@ mod role_create;
 mod role_delete;
 mod role_listing;
 mod role_metadata;
+mod role_metadata_bound;
 mod role_namespace;
 mod role_rename;
 mod role_symlink;

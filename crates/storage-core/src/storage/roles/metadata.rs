@@ -3,13 +3,14 @@
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use super::StorageRoleFailure;
 use super::version::version_unsupported;
+use super::{MetadataBatchFailure, StorageRoleFailure};
 use crate::model::{
-    AclMetadata, EntryOperationFailure, ExtendedAttribute, FailureClass, MappedOwnership,
-    MetadataCapabilities, MetadataFamily, MetadataObservation, MetadataObservations, ObjectTag,
-    ObservationMode, ObservationPlan, ObservationSupport, Operation, OwnershipMode, SourceIdentity,
-    SourceVersion, StoragePath, TimestampMetadata, Transience,
+    AclMetadata, EntryIdentityKey, EntryOperationFailure, ExtendedAttribute, FailureClass,
+    MappedOwnership, MetadataCapabilities, MetadataFamily, MetadataObservation,
+    MetadataObservations, ObjectTag, ObservationMode, ObservationPlan, ObservationSupport,
+    Operation, OwnershipMode, SourceIdentity, SourceVersion, StoragePath, TimestampMetadata,
+    Transience,
 };
 use crate::storage::{
     CopiedMetadataObservation, PermissionFacts, PrincipalIdentity, SourceDescriptor,
@@ -154,6 +155,47 @@ pub trait Metadata: Send + Sync {
         mutation: MetadataMutation,
         cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure>;
+
+    /// Whether the backend can verify stable directory identity and hold that object while writing.
+    /// This describes the identity guarantee; individual metadata families can still be refused.
+    fn supports_bound_directory_metadata(&self) -> bool {
+        false
+    }
+
+    /// Applies mutations in order to the current directory identified by `expected`.
+    ///
+    /// Resolve the current name, check stable identity, and apply every mutation through the
+    /// verified object reference. An empty batch still verifies identity. A mismatch is a
+    /// whole-batch Conflict before any writes. An unavailable guarantee is a whole-batch
+    /// Unsupported. A retry must preserve the binding and must not replay an uncertain write.
+    /// The caller verifies the current name separately after application.
+    async fn apply_bound_directory(
+        &self,
+        path: &StoragePath,
+        _expected: EntryIdentityKey,
+        mutations: Vec<MetadataMutation>,
+        cancel: CancellationToken,
+    ) -> Result<(), MetadataBatchFailure> {
+        let failure = if cancel.is_cancelled() {
+            None
+        } else {
+            Some(StorageRoleFailure::Entry(
+                EntryOperationFailure::new(
+                    path.clone(),
+                    Operation::Metadata,
+                    FailureClass::Unsupported,
+                    Transience::Permanent,
+                    "identity-bound directory metadata is unsupported",
+                )
+                .unwrap_or_else(|_| unreachable!("static metadata diagnostic")),
+            ))
+        };
+        Err(MetadataBatchFailure::whole_batch(
+            mutations.len(),
+            0,
+            failure,
+        ))
+    }
 
     /// 只修改指定的既有对象版本；不支持版本的适配器必须拒绝，不能退回当前对象。
     async fn apply_to_version(

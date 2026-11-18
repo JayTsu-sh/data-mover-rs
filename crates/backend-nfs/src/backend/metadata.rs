@@ -1,20 +1,23 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 
 use super::acl;
 use super::namespace::inline_ownership;
 use super::source::NfsProtocolFailure;
 use crate::model::acl::equivalent_native;
 use crate::model::{
-    AclEncoding, AclMetadata, EntryKind, ExtendedAttribute, FailureClass, MetadataCapabilities,
-    MetadataFamily as F, MetadataObservation, MetadataObservations, MetadataProvenance,
-    ObservationMode, ObservationPlan, ObservationSupport as S, Operation, OwnershipMode,
-    SourceVersion, StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata, Transience,
+    AclEncoding, AclMetadata, EntryIdentityKey, EntryKind, ExtendedAttribute, FailureClass,
+    IdentityStrength, MetadataCapabilities, MetadataFamily as F, MetadataObservation,
+    MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan,
+    ObservationSupport as S, Operation, OwnershipMode, SourceIdentity, SourceVersion, StoragePath,
+    StorageTimestamp, TimePrecision, TimestampMetadata, Transience,
 };
 use crate::storage::{
-    CopiedMetadataObservation, InlineOwnership, Metadata, MetadataMutation, PermissionFacts,
-    PrincipalIdentity, SourceDescriptor, StorageRoleFailure,
+    CopiedMetadataObservation, InlineOwnership, Metadata, MetadataBatchFailure, MetadataMutation,
+    PermissionFacts, PrincipalIdentity, SourceDescriptor, StorageRoleFailure,
 };
 
 pub(crate) struct NfsMetadataAdapter {
@@ -37,6 +40,28 @@ pub struct NfsMetadataInline {
 #[async_trait]
 pub trait NfsMetadataProtocol: Send + Sync {
     async fn stat(&self, path: &StoragePath) -> Result<NfsMetadataInline, NfsProtocolFailure>;
+
+    fn supports_bound_directory_metadata(&self) -> bool {
+        false
+    }
+
+    /// Resolves the current name through the configured root and returns only a directory FH.
+    async fn resolve_bound_directory(
+        &self,
+        _path: &StoragePath,
+    ) -> Result<Bytes, NfsProtocolFailure> {
+        Err(bound_directory_unsupported())
+    }
+
+    /// Applies one mutation to the resolved FH. A retry must not look it up by name.
+    async fn apply_to_bound_directory(
+        &self,
+        _file_handle: &Bytes,
+        _mutation: MetadataMutation,
+        _cancel: &CancellationToken,
+    ) -> Result<(), NfsProtocolFailure> {
+        Err(bound_directory_unsupported())
+    }
     fn supports_acl(&self) -> bool;
     fn acl_encoding(&self) -> Option<AclEncoding> {
         self.supports_acl().then_some(AclEncoding::NfsV4)
@@ -107,6 +132,36 @@ impl NfsMetadataAdapter {
         identity: crate::model::BackendIdentity,
     ) -> Self {
         Self { protocol, identity }
+    }
+
+    async fn resolve_expected_directory(
+        &self,
+        path: &StoragePath,
+        expected: EntryIdentityKey,
+        cancel: &CancellationToken,
+    ) -> Result<Bytes, StorageRoleFailure> {
+        let failure = |error| super::source::role_failure(path, Operation::Metadata, error);
+        let file_handle = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(NfsProtocolFailure::new(
+                FailureClass::Cancelled, Transience::Transient,
+            )),
+            result = self.protocol.resolve_bound_directory(path) => result,
+        }
+        .map_err(failure)?;
+        let identity = SourceIdentity::new(
+            self.identity.clone(),
+            IdentityStrength::StableWithinBackend,
+            &file_handle,
+        )
+        .map_err(|_| failure(NfsProtocolFailure::protocol()))?;
+        if identity.identity_key() != expected {
+            return Err(failure(NfsProtocolFailure::new(
+                FailureClass::Conflict,
+                Transience::Permanent,
+            )));
+        }
+        Ok(file_handle)
     }
 
     /// A successful SET is insufficient: servers may rewrite or drop ACL entries.
@@ -490,6 +545,52 @@ impl Metadata for NfsMetadataAdapter {
         self.observe_entry(path, plan, entry).await
     }
 
+    fn supports_bound_directory_metadata(&self) -> bool {
+        self.protocol.supports_bound_directory_metadata()
+    }
+
+    async fn apply_bound_directory(
+        &self,
+        path: &StoragePath,
+        expected: EntryIdentityKey,
+        mutations: Vec<MetadataMutation>,
+        cancel: CancellationToken,
+    ) -> Result<(), MetadataBatchFailure> {
+        let total = mutations.len();
+        let file_handle = self
+            .resolve_expected_directory(path, expected, &cancel)
+            .await
+            .map_err(|error| MetadataBatchFailure::whole_batch(total, 0, Some(error)))?;
+        for (index, mutation) in mutations.into_iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(MetadataBatchFailure {
+                    failed_index: index,
+                    completed: index,
+                    error: None,
+                });
+            }
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(NfsProtocolFailure::new(
+                    FailureClass::Cancelled, Transience::Unknown,
+                ).with_status("NFS directory metadata cancelled in flight; write result is unconfirmed")),
+                result = self.protocol.apply_to_bound_directory(&file_handle, mutation, &cancel) => result,
+            };
+            if let Err(error) = result {
+                return Err(MetadataBatchFailure {
+                    failed_index: index,
+                    completed: index,
+                    error: Some(super::source::role_failure(
+                        path,
+                        Operation::Metadata,
+                        error,
+                    )),
+                });
+            }
+        }
+        Ok(())
+    }
+
     async fn apply(
         &self,
         path: &StoragePath,
@@ -544,6 +645,10 @@ impl Metadata for NfsMetadataAdapter {
             } => result,
         }
     }
+}
+
+fn bound_directory_unsupported() -> NfsProtocolFailure {
+    NfsProtocolFailure::new(FailureClass::Unsupported, Transience::Permanent)
 }
 
 fn unsupported(path: &StoragePath) -> StorageRoleFailure {

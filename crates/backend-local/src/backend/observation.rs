@@ -10,8 +10,16 @@ use std::{collections::HashMap, time::Duration};
 use async_trait::async_trait;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Metadata};
+#[cfg(unix)]
+use tokio_util::sync::CancellationToken;
 
+#[cfg(unix)]
+use super::namespace::{RootAnchor, open_metadata_directory};
 use super::rename;
+#[cfg(unix)]
+use super::staged::apply_local_mutations;
+#[cfg(unix)]
+use crate::model::EntryIdentityKey;
 use crate::model::{
     AclMetadata, BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure,
     ExtendedAttribute, FailureClass, IdentityStrength, MetadataCapabilities, MetadataObservation,
@@ -19,6 +27,8 @@ use crate::model::{
     Operation, OwnershipMode, SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget,
     SymlinkTargetEncoding, TimePrecision, TimestampMetadata, Transience,
 };
+#[cfg(unix)]
+use crate::storage::MetadataBatchFailure;
 use crate::storage::{
     Metadata as MetadataRole, MetadataMutation, SourceDescriptor, StorageRoleFailure,
 };
@@ -36,6 +46,8 @@ pub(super) use facts::purge_content_version;
 
 pub struct LocalObservationAdapter {
     root: Arc<Dir>,
+    #[cfg(unix)]
+    root_anchor: Option<Arc<RootAnchor>>,
     root_device: Option<u64>,
     identity: BackendIdentity,
     #[cfg(any(test, feature = "test-support"))]
@@ -149,6 +161,8 @@ impl LocalObservationAdapter {
         Ok(Self {
             root_device: rename::root_device(&root),
             root: Arc::new(root),
+            #[cfg(unix)]
+            root_anchor: Some(Arc::new(RootAnchor::new(root_path))),
             identity,
             #[cfg(any(test, feature = "test-support"))]
             probe: Arc::new(ObservationProbe::default()),
@@ -160,10 +174,18 @@ impl LocalObservationAdapter {
         Self {
             root_device: rename::root_device(&root),
             root,
+            #[cfg(unix)]
+            root_anchor: None,
             identity,
             #[cfg(any(test, feature = "test-support"))]
             probe: Arc::new(ObservationProbe::default()),
         }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn with_root_anchor(mut self, root_anchor: Option<Arc<RootAnchor>>) -> Self {
+        self.root_anchor = root_anchor;
+        self
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -492,6 +514,79 @@ impl MetadataRole for LocalObservationAdapter {
             metadata_failure_with_transience(path, class, transience)
         })
     }
+
+    #[cfg(unix)]
+    fn supports_bound_directory_metadata(&self) -> bool {
+        true
+    }
+
+    #[cfg(unix)]
+    async fn apply_bound_directory(
+        &self,
+        path: &StoragePath,
+        expected: EntryIdentityKey,
+        mutations: Vec<MetadataMutation>,
+        cancel: CancellationToken,
+    ) -> Result<(), MetadataBatchFailure> {
+        let count = mutations.len();
+        let root = Arc::clone(&self.root);
+        let identity = self.identity.clone();
+        let destination = path.clone();
+        let root_anchor = self.root_anchor.clone();
+        // 调用方丢弃等待时，阻塞线程仍可能在队列中；阻止它随后开始新的写入。
+        let cancel = cancel.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        tokio::task::spawn_blocking(move || {
+            let whole = |error| MetadataBatchFailure::whole_batch(count, 0, error);
+            if cancel.is_cancelled() {
+                return Err(whole(None));
+            }
+            let directory =
+                open_metadata_directory(&root, &destination, root_anchor.as_deref(), &cancel)
+                    .map_err(|error| whole(Some(error)))?;
+            let observed = directory
+                .dir_metadata()
+                .map_err(|error| whole(Some(metadata_io_failure(&destination, &error, false))))?;
+            let identity = source_identity(&identity, &destination, &observed)
+                .map_err(|error| whole(Some(error)))?;
+            if identity.identity_key() != expected {
+                return Err(whole(Some(metadata_failure(
+                    &destination,
+                    FailureClass::Conflict,
+                ))));
+            }
+            apply_local_mutations(&directory.into_std_file(), mutations, &cancel).map_err(
+                |(index, error)| MetadataBatchFailure {
+                    failed_index: index,
+                    completed: index,
+                    error: error.map(|failure| {
+                        if failure.cancelled {
+                            let transience = if failure.changed {
+                                Transience::Unknown
+                            } else {
+                                Transience::Transient
+                            };
+                            metadata_failure_with_transience(
+                                &destination,
+                                FailureClass::Cancelled,
+                                transience,
+                            )
+                        } else {
+                            metadata_io_failure(&destination, &failure.error, failure.changed)
+                        }
+                    }),
+                },
+            )
+        })
+        .await
+        .map_err(|_| {
+            MetadataBatchFailure::whole_batch(
+                count,
+                0,
+                Some(metadata_failure(path, FailureClass::Internal)),
+            )
+        })?
+    }
 }
 
 fn additional_only<T>(mode: ObservationMode) -> MetadataObservation<T> {
@@ -798,6 +893,23 @@ fn metadata_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailu
     metadata_failure_with_transience(path, class, Transience::Permanent)
 }
 
+#[cfg(unix)]
+fn metadata_io_failure(path: &StoragePath, error: &io::Error, changed: bool) -> StorageRoleFailure {
+    let (class, transience) = classify_io(error.kind());
+    // 单项属性已经写入一部分时，其余属性不能按确定拒绝继续提交。
+    let transience = if changed {
+        Transience::Unknown
+    } else {
+        transience
+    };
+    match error.kind() {
+        io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe => {
+            local_session_failure(Operation::Metadata, class, transience)
+        }
+        _ => metadata_failure_with_transience(path, class, transience),
+    }
+}
+
 fn metadata_failure_with_transience(
     path: &StoragePath,
     class: FailureClass,
@@ -834,6 +946,14 @@ fn observation_io_failure(path: &StoragePath, error: &io::Error) -> StorageRoleF
 
 fn session_failure(operation: Operation, error: &io::Error) -> StorageRoleFailure {
     let (class, transience) = classify_io(error.kind());
+    local_session_failure(operation, class, transience)
+}
+
+fn local_session_failure(
+    operation: Operation,
+    class: FailureClass,
+    transience: Transience,
+) -> StorageRoleFailure {
     let failure = BackendSessionFailure::new(
         operation,
         class,

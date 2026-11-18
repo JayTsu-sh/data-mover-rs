@@ -72,12 +72,12 @@ pub enum StorageRoleFailure {
     Session(BackendSessionFailure),
 }
 
-/// Failure while applying an ordered batch of staged metadata mutations.
+/// Failure while applying an ordered batch of metadata mutations.
 ///
-/// The caller resends what was not applied after a refusal, so these fields are a
-/// contract, not diagnostics.
+/// After a definitive refusal the caller can resend unapplied mutations. Uncertain writes
+/// and failures of the batch as a whole stop application.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StagedMetadataApplicationFailure {
+pub struct MetadataBatchFailure {
     /// Index in the batch of the mutation that failed, or the batch length when no single
     /// mutation did and the batch failed as a whole (see [`Self::whole_batch`]).
     pub failed_index: usize,
@@ -89,10 +89,9 @@ pub struct StagedMetadataApplicationFailure {
     pub error: Option<StorageRoleFailure>,
 }
 
-impl StagedMetadataApplicationFailure {
-    /// A failure of a batch of `len` mutations as a whole — the stage could not be opened, or the
-    /// persistence barrier over the mutations it applied failed, whether the batch ran to the end
-    /// or stopped at a refusal — with the first `completed` applied but not made durable.
+impl MetadataBatchFailure {
+    /// A failure of a batch of `len` mutations as a whole, such as a missing identity binding
+    /// before any writes or a stage persistence barrier failure after `completed` mutations.
     ///
     /// It is never the destination declining one write, so application stops instead of going
     /// on to the families after it. Reporting it against the last mutation would make it read as
@@ -630,17 +629,17 @@ pub trait StagedDestination: Send + Sync {
         stage: &PreparedStage,
         mutations: Vec<MetadataMutation>,
         cancel: CancellationToken,
-    ) -> Result<(), StagedMetadataApplicationFailure> {
+    ) -> Result<(), MetadataBatchFailure> {
         for (completed, mutation) in mutations.into_iter().enumerate() {
             if cancel.is_cancelled() {
-                return Err(StagedMetadataApplicationFailure {
+                return Err(MetadataBatchFailure {
                     failed_index: completed,
                     completed,
                     error: None,
                 });
             }
             if let Err(error) = self.apply_metadata(stage, mutation, cancel.clone()).await {
-                return Err(StagedMetadataApplicationFailure {
+                return Err(MetadataBatchFailure {
                     failed_index: completed,
                     completed,
                     error: Some(error),

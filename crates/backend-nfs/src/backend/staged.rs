@@ -821,7 +821,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
         stage: &PreparedStage,
         mutations: Vec<MetadataMutation>,
         cancel: CancellationToken,
-    ) -> Result<(), crate::storage::StagedMetadataApplicationFailure> {
+    ) -> Result<(), crate::storage::MetadataBatchFailure> {
         self.apply_batch(stage, mutations, cancel).await
     }
 

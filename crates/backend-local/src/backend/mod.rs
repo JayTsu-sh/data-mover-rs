@@ -47,14 +47,15 @@ fn connect_roles(config: LocalBackendConfig) -> Result<Storage, Box<dyn std::err
     }
     let source = Arc::new(source);
     let sandbox = open_root(&root)?;
-    let metadata = Arc::new(observation::LocalObservationAdapter::from_root(
-        Arc::clone(&sandbox),
-        identity.clone(),
-    ));
+    let metadata =
+        observation::LocalObservationAdapter::from_root(Arc::clone(&sandbox), identity.clone());
     let namespace = namespace::LocalNamespace::from_root(sandbox, identity.clone())
         .with_rename_context(config.rename_context);
     #[cfg(unix)]
     let namespace = namespace.with_persistence_root(root.clone());
+    #[cfg(unix)]
+    let metadata = metadata.with_root_anchor(namespace.root_anchor());
+    let metadata = Arc::new(metadata);
     let namespace = Arc::new(namespace);
     let mut staged = staged::LocalStagedDestination::new(
         root,
