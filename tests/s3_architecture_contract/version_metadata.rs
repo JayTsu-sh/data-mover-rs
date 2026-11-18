@@ -129,14 +129,7 @@ async fn exact_version_metadata_with_real_requests() -> TestResult {
         let detail = failure.to_string();
         println!("version metadata fault={mode} detail={detail}");
         assert_eq!(failure.failures().len(), 1);
-        match mode.as_str() {
-            "deny" => assert!(detail.contains("PermissionDenied")),
-            "cancel" => {
-                assert!(detail.contains("cancel") || detail.contains("Cancel"));
-                assert!(elapsed < Duration::from_secs(1));
-            }
-            _ => assert!(detail.contains("Connectivity") || detail.contains("Timeout")),
-        }
+        assert_injected_metadata_failure(&mode, &detail, elapsed);
         // 精确版本 tags 写入幂等；结果不明后仍只重试同一版本，不重传数据。
         plan.apply(
             metadata.as_ref(),
@@ -196,4 +189,15 @@ async fn exact_version_metadata_with_real_requests() -> TestResult {
         Err(MetadataVerificationError::VersionChanged { .. })
     ));
     Ok(())
+}
+
+fn assert_injected_metadata_failure(mode: &str, detail: &str, elapsed: Duration) {
+    match mode {
+        "deny" => assert!(detail.contains("PermissionDenied")),
+        "cancel" => {
+            assert!(detail.contains("cancel") || detail.contains("Cancel"));
+            assert!(elapsed < Duration::from_secs(1));
+        }
+        _ => assert!(detail.contains("Connectivity") || detail.contains("Timeout")),
+    }
 }
