@@ -9,7 +9,7 @@ use crate::model::acl::{AclError, equivalent_native};
 use crate::model::{
     EntryKind, IdentityStrength, MetadataFamily, MetadataObservationFailure, MetadataObservations,
     ObservationMode, ObservationPlan, PermissionFacts, PrincipalIdentity, SourceVersion,
-    StoragePath, StorageTimestamp,
+    StoragePath, StorageTimestamp, TimestampMetadata,
 };
 use crate::storage::{
     CapabilityUnavailable, Metadata, MetadataMutation, SourceDescriptor, Storage,
@@ -75,7 +75,8 @@ impl MetadataPlan {
     /// 稳定身份，不比较会因本轮属性写入变化的 `content_version`；这不是原子命名空间锁。
     /// 旧描述仅是内联资格提示，不保证最少读取次数。OwnershipMode 缺少 authoritative
     /// permissions 时保守完整回退，不从 inline ownership/mode 猜测或补齐权限。
-    /// 最终 fresh 描述信息不足时重新绑定回读并再次 fresh；fresh 失败不会降级为缓存读取。
+    /// 内联快路径信息不足时重新绑定回读并再次 fresh。回退时，权限和时间字段优先使用
+    /// 最终 fresh 描述中已有的权威值，缺失字段沿用此前读到的事实。fresh 失败不会降级为缓存读取。
     /// None 保持原有当前／历史版本和权限读取语义。
     /// 取消会丢弃在途只读请求，不再等待其返回或启动后续读取。
     ///
@@ -167,7 +168,7 @@ impl MetadataPlan {
             return Ok(descriptor);
         }
         let (facts, permissions) = self.verification_facts(target, &descriptor, None).await?;
-        self.verify_facts(descriptor, &facts, &permissions, &cancel)
+        self.verify_facts(descriptor, &facts, &permissions, None, &cancel)
     }
 
     async fn verify_anchored_directory(
@@ -192,13 +193,25 @@ impl MetadataPlan {
             && let Some(facts) = self.inline_verification_facts(metadata.as_ref(), &descriptor)
         {
             let (facts, permissions) = facts?;
-            return self.verify_facts(descriptor, &facts, &permissions, cancel);
+            return self.verify_facts(descriptor, &facts, &permissions, None, cancel);
         }
-        let (facts, permissions) = self
+        let (facts, mut permissions) = self
             .verification_facts(target, &descriptor, Some(cancel))
             .await?;
         let actual = read_anchored_directory(target, path, anchor, true, cancel).await?;
-        self.verify_facts(actual, &facts, &permissions, cancel)
+        if let Some(fresh) = actual.permissions.as_deref() {
+            permissions.owner = fresh.owner.clone().or(permissions.owner);
+            permissions.group = fresh.group.clone().or(permissions.group);
+            permissions.mode = fresh.mode.or(permissions.mode);
+        }
+        let prior_times = facts.timestamps().value();
+        let mut fresh_times = actual.inline_timestamps();
+        if let (Some(fresh), Some(prior)) = (fresh_times.as_mut(), prior_times) {
+            fresh.accessed = fresh.accessed.or(prior.accessed);
+            fresh.modified = fresh.modified.or(prior.modified);
+            fresh.created = fresh.created.or(prior.created);
+        }
+        self.verify_facts(actual, &facts, &permissions, fresh_times.as_ref(), cancel)
     }
 
     fn inline_verification_facts(
@@ -238,14 +251,18 @@ impl MetadataPlan {
         descriptor: SourceDescriptor,
         facts: &MetadataObservations,
         permissions: &PermissionFacts,
+        fresh_times: Option<&TimestampMetadata>,
         cancel: &CancellationToken,
     ) -> Result<SourceDescriptor, MetadataVerificationError> {
+        let timestamps = fresh_times.or_else(|| facts.timestamps().value());
         let mut families = Vec::new();
         for (family, expected) in &self.mutations {
             if cancel.is_cancelled() {
                 return Err(MetadataVerificationError::Cancelled);
             }
-            if !matches_mutation(expected, facts, permissions)? && !families.contains(family) {
+            if !matches_mutation(expected, facts, permissions, timestamps)?
+                && !families.contains(family)
+            {
                 families.push(*family);
             }
         }
@@ -386,6 +403,7 @@ fn matches_mutation(
     expected: &MetadataMutation,
     facts: &MetadataObservations,
     permissions: &PermissionFacts,
+    timestamps: Option<&TimestampMetadata>,
 ) -> Result<bool, MetadataVerificationError> {
     Ok(match expected {
         MetadataMutation::Mode(mode) => permissions.mode == Some(*mode & 0o7777),
@@ -399,20 +417,18 @@ fn matches_mutation(
                 && permissions.group == Some(PrincipalIdentity::Named(owner.group().into()))
                 && permissions.mode == Some(owner.mode & 0o7777)
         }
-        MetadataMutation::Timestamps(expected) => {
-            facts.timestamps().value().is_some_and(|actual| {
-                [
-                    expected.accessed.zip(actual.accessed),
-                    expected.modified.zip(actual.modified),
-                    expected.created.zip(actual.created),
-                ]
-                .into_iter()
-                .zip([expected.accessed, expected.modified, expected.created])
-                .all(|(pair, expected)| {
-                    expected.is_none() || pair.is_some_and(|(a, b)| same_time(a, b))
-                })
+        MetadataMutation::Timestamps(expected) => timestamps.is_some_and(|actual| {
+            [
+                expected.accessed.zip(actual.accessed),
+                expected.modified.zip(actual.modified),
+                expected.created.zip(actual.created),
+            ]
+            .into_iter()
+            .zip([expected.accessed, expected.modified, expected.created])
+            .all(|(pair, expected)| {
+                expected.is_none() || pair.is_some_and(|(a, b)| same_time(a, b))
             })
-        }
+        }),
         MetadataMutation::Tags(expected) => facts.tags().value().is_some_and(|actual| {
             let mut expected: Vec<_> = expected
                 .iter()

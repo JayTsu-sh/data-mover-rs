@@ -25,7 +25,7 @@ use crate::model::{
     FailureClass, IdentityStrength, MetadataFamily, MetadataObservation, MetadataObservationParts,
     MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan, Operation,
     OwnershipMode, PermissionFacts, PrincipalIdentity, SourceIdentity, SourceVersion, StoragePath,
-    Transience,
+    StorageTimestamp, TimePrecision, TimestampMetadata, Transience,
 };
 use crate::storage::{
     BackendCapabilities, CapabilityAvailability, CopiedMetadataObservation, InlineOwnership,
@@ -88,6 +88,15 @@ impl DirectoryTarget {
         };
         MetadataObservationParts {
             ownership_mode,
+            timestamps: match descriptor.inline_timestamps() {
+                Some(value) if plan.timestamps() != ObservationMode::Omit => {
+                    MetadataObservation::Value {
+                        value,
+                        provenance: MetadataProvenance::Inline,
+                    }
+                }
+                _ => MetadataObservation::NotRequested,
+            },
             xattrs: if plan.xattrs() == ObservationMode::Omit {
                 MetadataObservation::NotRequested
             } else {
@@ -263,6 +272,11 @@ fn fixture(
         mode: 0o751,
     }));
     actual.content_version = Some(Bytes::from_static(b"fresh-after-metadata"));
+    actual.inline_timestamps = Some(TimestampMetadata {
+        accessed: Some(StorageTimestamp::new(100, TimePrecision::Nanoseconds)?),
+        modified: Some(StorageTimestamp::new(200, TimePrecision::Nanoseconds)?),
+        created: None,
+    });
     let mut ordinary = actual.clone();
     ordinary.content_version = Some(Bytes::from_static(b"ordinary-stat"));
     let role = Arc::new(DirectoryTarget {
@@ -421,6 +435,69 @@ async fn opaque_facts_are_bound_before_the_actual_last_fresh() -> TestResult {
         [Call::Stat(false), Call::Opaque, Call::Stat(true)]
     );
     assert_eq!(*role.bound.lock().unwrap(), [anchor.source_identity]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_read_uses_final_fresh_permission_and_timestamp_values() -> TestResult {
+    let (storage, role, mut anchor, mut plan) = fixture(BackendKind::Local, true)?;
+    anchor.permissions = Some(Box::new(numeric_permissions(0o700)));
+    role.ordinary.lock().unwrap().permissions = Some(Box::new(numeric_permissions(0o751)));
+    let expected_times = role.actual.inline_timestamps().unwrap();
+    plan.mutations.push((
+        MetadataFamily::OwnershipMode,
+        MetadataMutation::NumericOwnership(OwnershipMode {
+            uid: 1,
+            gid: 2,
+            mode: 0o751,
+        }),
+    ));
+    plan.mutations.push((
+        MetadataFamily::Timestamps,
+        MetadataMutation::Timestamps(expected_times),
+    ));
+    for (mode, modified, mismatch) in [
+        (
+            0o700,
+            expected_times.modified,
+            Some(MetadataFamily::OwnershipMode),
+        ),
+        (
+            0o751,
+            Some(StorageTimestamp::new(300, TimePrecision::Nanoseconds)?),
+            Some(MetadataFamily::Timestamps),
+        ),
+        (0o751, expected_times.modified, None),
+    ] {
+        let fresh = role
+            .actual
+            .clone()
+            .with_permissions(PermissionFacts {
+                mode: Some(mode),
+                ..PermissionFacts::default()
+            })
+            .with_inline_timestamps(TimestampMetadata {
+                accessed: None,
+                modified,
+                created: None,
+            });
+        *role.fresh.lock().unwrap() = VecDeque::from([fresh.clone()]);
+        role.calls.lock().unwrap().clear();
+
+        let result = anchored(&storage, &anchor, &plan).await;
+        assert_eq!(
+            role.trace(),
+            [Call::Stat(false), Call::Opaque, Call::Stat(true)]
+        );
+        if let Some(family) = mismatch {
+            assert!(
+                matches!(result, Err(MetadataVerificationError::Mismatch { ref families, .. }) if families == &[family]),
+                "{result:?}"
+            );
+        } else {
+            assert_eq!(result?, fresh);
+        }
+    }
     Ok(())
 }
 
