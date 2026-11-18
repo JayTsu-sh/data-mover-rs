@@ -695,10 +695,13 @@ impl NfsNamespaceProtocol for NFSStorage {
 struct NfsRoleStageFile {
     storage: NFSStorage,
     handle: NFSFileHandle,
-    deferred_gate: tokio::sync::RwLock<()>,
+    // 关闭也持有写锁，并在释放锁前保留首次关闭的结果，供并发和后续调用读取。
+    deferred_gate: Arc<tokio::sync::RwLock<Option<NfsStageCloseResult>>>,
     deferred_writes: tokio::sync::Mutex<Vec<NfsDeferredWrite>>,
     closed: std::sync::atomic::AtomicBool,
 }
+
+type NfsStageCloseResult = std::result::Result<(), NfsProtocolFailure>;
 
 struct NfsDeferredWrite {
     offset: u64,
@@ -746,7 +749,7 @@ impl NfsRoleStageFile {
         Self {
             storage,
             handle,
-            deferred_gate: tokio::sync::RwLock::new(()),
+            deferred_gate: Arc::default(),
             deferred_writes: tokio::sync::Mutex::new(Vec::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -754,6 +757,10 @@ impl NfsRoleStageFile {
 
     async fn checkpoint_deferred_writes(&self) -> nfs_rs::Result<()> {
         let _gate = self.deferred_gate.write().await;
+        self.commit_deferred_writes().await
+    }
+
+    async fn commit_deferred_writes(&self) -> nfs_rs::Result<()> {
         let mut writes = self.deferred_writes.lock().await;
         if writes.is_empty() {
             return Ok(());
@@ -826,6 +833,44 @@ impl NfsRoleStageFile {
             }
         }
         unreachable!("the final commit attempt always returns")
+    }
+
+    async fn close_stage(&self, commit_deferred: bool) -> NfsStageCloseResult {
+        let mut gate = Arc::clone(&self.deferred_gate).write_owned().await;
+        if self.closed.load(Ordering::SeqCst) {
+            return gate.clone().unwrap_or_else(Self::unknown_close);
+        }
+        // 预处理仍归调用方，取消时不能在后台继续提交或重放写入。
+        let checkpoint = if commit_deferred {
+            self.commit_deferred_writes().await.map_err(classify_error)
+        } else {
+            self.deferred_writes.lock().await.clear();
+            Ok(())
+        };
+        // 标记和交接之间没有挂起点。交接前取消由 Drop 收尾，交接后由唯一的关闭任务收尾。
+        self.closed.store(true, Ordering::SeqCst);
+        if self.storage.version() == NFSVersion::NFSv3 {
+            // NFSv3 无 OPEN 状态，SDK CLOSE 不会等待 RPC。
+            let result = checkpoint.and(self.storage.role_close(&self.handle).await);
+            *gate = Some(result.clone());
+            return result;
+        }
+        let storage = self.storage.clone();
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let result = checkpoint.and(storage.role_close(&handle).await);
+            *gate = Some(result.clone());
+            result
+        })
+        .await
+        .unwrap_or_else(|_| Self::unknown_close())
+    }
+
+    fn unknown_close() -> NfsStageCloseResult {
+        Err(
+            NfsProtocolFailure::new(FailureClass::Internal, Transience::Unknown)
+                .with_status("NFS stage close task ended without a result"),
+        )
     }
 
     async fn retain_unstable_write(
@@ -968,24 +1013,11 @@ impl NfsStageFile for NfsRoleStageFile {
     }
 
     async fn close(&self) -> std::result::Result<(), NfsProtocolFailure> {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
-        let checkpoint = self
-            .checkpoint_deferred_writes()
-            .await
-            .map_err(crate::storage::backends::nfs::protocol::classify_error);
-        let close = self.storage.role_close(&self.handle).await;
-        checkpoint.and(close)
+        self.close_stage(true).await
     }
 
     async fn close_uncommitted(&self) -> std::result::Result<(), NfsProtocolFailure> {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
-        let _gate = self.deferred_gate.write().await;
-        self.deferred_writes.lock().await.clear();
-        self.storage.role_close(&self.handle).await
+        self.close_stage(false).await
     }
 }
 
@@ -2499,3 +2531,7 @@ mod namespace_lookup_tests;
 #[cfg(test)]
 #[path = "client/root_refresh_tests.rs"]
 mod root_refresh_tests;
+
+#[cfg(test)]
+#[path = "client/stage_close_tests.rs"]
+mod stage_close_tests;
