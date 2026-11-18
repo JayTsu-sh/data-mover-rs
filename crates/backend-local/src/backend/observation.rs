@@ -14,10 +14,8 @@ use cap_std::fs::{Dir, Metadata};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
-use super::namespace::{RootAnchor, open_metadata_directory};
+use super::namespace::RootAnchor;
 use super::rename;
-#[cfg(unix)]
-use super::staged::apply_local_mutations;
 #[cfg(unix)]
 use crate::model::EntryIdentityKey;
 use crate::model::{
@@ -32,6 +30,9 @@ use crate::storage::MetadataBatchFailure;
 use crate::storage::{
     Metadata as MetadataRole, MetadataMutation, SourceDescriptor, StorageRoleFailure,
 };
+
+#[cfg(unix)]
+mod bound_directory;
 
 #[path = "observation_capabilities.rs"]
 mod capabilities;
@@ -528,64 +529,7 @@ impl MetadataRole for LocalObservationAdapter {
         mutations: Vec<MetadataMutation>,
         cancel: CancellationToken,
     ) -> Result<(), MetadataBatchFailure> {
-        let count = mutations.len();
-        let root = Arc::clone(&self.root);
-        let identity = self.identity.clone();
-        let destination = path.clone();
-        let root_anchor = self.root_anchor.clone();
-        // 调用方丢弃等待时，阻塞线程仍可能在队列中；阻止它随后开始新的写入。
-        let cancel = cancel.child_token();
-        let _cancel_on_drop = cancel.clone().drop_guard();
-        tokio::task::spawn_blocking(move || {
-            let whole = |error| MetadataBatchFailure::whole_batch(count, 0, error);
-            if cancel.is_cancelled() {
-                return Err(whole(None));
-            }
-            let directory =
-                open_metadata_directory(&root, &destination, root_anchor.as_deref(), &cancel)
-                    .map_err(|error| whole(Some(error)))?;
-            let observed = directory
-                .dir_metadata()
-                .map_err(|error| whole(Some(metadata_io_failure(&destination, &error, false))))?;
-            let identity = source_identity(&identity, &destination, &observed)
-                .map_err(|error| whole(Some(error)))?;
-            if identity.identity_key() != expected {
-                return Err(whole(Some(metadata_failure(
-                    &destination,
-                    FailureClass::Conflict,
-                ))));
-            }
-            apply_local_mutations(&directory.into_std_file(), mutations, &cancel).map_err(
-                |(index, error)| MetadataBatchFailure {
-                    failed_index: index,
-                    completed: index,
-                    error: error.map(|failure| {
-                        if failure.cancelled {
-                            let transience = if failure.changed {
-                                Transience::Unknown
-                            } else {
-                                Transience::Transient
-                            };
-                            metadata_failure_with_transience(
-                                &destination,
-                                FailureClass::Cancelled,
-                                transience,
-                            )
-                        } else {
-                            metadata_io_failure(&destination, &failure.error, failure.changed)
-                        }
-                    }),
-                },
-            )
-        })
-        .await
-        .map_err(|_| {
-            MetadataBatchFailure::whole_batch(
-                count,
-                0,
-                Some(metadata_failure(path, FailureClass::Internal)),
-            )
-        })?
+        bound_directory::apply(self, path, expected, mutations, cancel).await
     }
 }
 
@@ -891,23 +835,6 @@ fn entry_failure(
 
 fn metadata_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {
     metadata_failure_with_transience(path, class, Transience::Permanent)
-}
-
-#[cfg(unix)]
-fn metadata_io_failure(path: &StoragePath, error: &io::Error, changed: bool) -> StorageRoleFailure {
-    let (class, transience) = classify_io(error.kind());
-    // 单项属性已经写入一部分时，其余属性不能按确定拒绝继续提交。
-    let transience = if changed {
-        Transience::Unknown
-    } else {
-        transience
-    };
-    match error.kind() {
-        io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe => {
-            local_session_failure(Operation::Metadata, class, transience)
-        }
-        _ => metadata_failure_with_transience(path, class, transience),
-    }
 }
 
 fn metadata_failure_with_transience(
