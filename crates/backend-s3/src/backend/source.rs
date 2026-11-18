@@ -593,7 +593,7 @@ pub(super) fn entry(
             operation,
             FailureClass::Protocol,
             Transience::Unknown,
-            diagnostic,
+            diagnostic.into(),
         )
         .unwrap_or_else(|_| {
             crate::model::EntryOperationFailure::new(
@@ -620,7 +620,7 @@ pub(super) fn classified_entry(
         operation,
         class,
         transience,
-        diagnostic,
+        diagnostic.into(),
     ) {
         Ok(failure) => StorageRoleFailure::Entry(failure),
         Err(_) => entry(path, operation, "invalid adapter diagnostic"),

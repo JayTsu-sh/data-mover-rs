@@ -23,8 +23,8 @@ use nfs_rs::{
 use tracing::info;
 
 use super::{
-    FType3, NFSStorage, Result, attributes, attrs_timestamps, invalidate_path_cache, is_nfs_noent,
-    is_retryable_with_invalidation, owners_are_strings,
+    FType3, NFSStorage, attributes, attrs_timestamps, classify_role_error, invalidate_path_cache,
+    is_nfs_noent, is_retryable_with_invalidation, owners_are_strings,
 };
 use crate::model::{EntryKind, FailureClass, StoragePath, without_unowned_set_id};
 use crate::storage::artifacts::is_artifact_name;
@@ -165,10 +165,14 @@ impl NFSStorage {
 
     /// Forgets the cached handles of `path` and its ancestors, refreshing the root handle first
     /// when it is the one that went stale.
-    pub(super) async fn forget_role_directory(&self, path: &StoragePath) -> Result<()> {
+    pub(super) async fn forget_role_directory(
+        &self,
+        path: &StoragePath,
+    ) -> Result<(), NfsProtocolFailure> {
         let stale_generation = self.refresh_generation.load(Ordering::Acquire);
         self.maybe_refresh_root_fh(stale_generation).await?;
-        let components = Self::collect_components(Path::new(path.as_str()))?;
+        let components =
+            Self::collect_components(Path::new(path.as_str())).map_err(classify_role_error)?;
         invalidate_path_cache(&components, &self.get_root_fh());
         Ok(())
     }

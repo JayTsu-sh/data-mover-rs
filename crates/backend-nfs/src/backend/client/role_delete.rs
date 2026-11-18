@@ -1,7 +1,6 @@
 //! NFS 删除：私有产物清理与基于原观察的非递归源清理。
 use super::{
-    FType3, MAX_STALE_RETRIES, NFSStorage, classify_role_error, is_retryable_with_invalidation,
-    is_server_busy,
+    FType3, MAX_STALE_RETRIES, NFSStorage, is_retryable_with_invalidation, is_server_busy,
 };
 use crate::model::{EntryKind, FailureClass, ObservedEntry, StoragePath, Transience};
 use crate::storage::artifacts::is_artifact_path;
@@ -142,7 +141,7 @@ impl NFSStorage {
                     .map_err(classify_error)?,
             };
             if attrs.type_ != FType3::NF3DIR as u32 {
-                self.delete_file(&path).await.map_err(classify_role_error)?;
+                self.delete_file(&path).await?;
                 continue;
             }
             let mut cookie = DirectoryCookie::default();
@@ -185,9 +184,7 @@ impl NFSStorage {
                     if is_retryable_with_invalidation(&error) {
                         let relative = StoragePath::new(path.to_string_lossy())
                             .map_err(|_| NfsProtocolFailure::protocol())?;
-                        self.forget_role_directory(&relative)
-                            .await
-                            .map_err(classify_role_error)?;
+                        self.forget_role_directory(&relative).await?;
                         *handle = self.role_lookup_fh(path).await?.fh;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

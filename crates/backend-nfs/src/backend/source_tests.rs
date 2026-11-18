@@ -2,7 +2,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::namespace::{NfsUndescribedChild, undescribed};
-use super::super::protocol::classify_error;
+use super::super::protocol::{classify_error, classify_mutation_error};
 use super::*;
 use crate::model::{BackendKind, FailureClass, SourceVersion};
 
@@ -21,6 +21,10 @@ fn sdk_readlink_decode_reason_reaches_entry_failure() -> Result<(), Box<dyn std:
     };
     assert_eq!(error.class(), FailureClass::Protocol);
     assert_eq!(error.transience(), Transience::Unknown);
+    assert!(
+        matches!(error.source().and_then(|cause| cause.downcast_ref()),
+        Some(nfs_rs::NfsError::Xdr(reason)) if reason.contains("READLINK"))
+    );
     assert!(
         error.diagnostic().contains("READLINK target is not UTF-8"),
         "{}",
@@ -58,6 +62,10 @@ fn sdk_listing_decode_keeps_specific_cause_and_entry_scope()
     assert_eq!(failure.operation(), Operation::Traverse);
     assert_eq!(failure.class(), FailureClass::Protocol);
     assert_eq!(failure.transience(), Transience::Unknown);
+    assert!(
+        matches!(failure.source().and_then(|cause| cause.downcast_ref()),
+        Some(nfs_rs::NfsError::Xdr(reason)) if reason == detail)
+    );
     assert!(
         failure
             .diagnostic()
@@ -122,6 +130,59 @@ fn sdk_transport_reason_reaches_session_failure() -> Result<(), Box<dyn std::err
             .diagnostic()
             .contains("peer reset while reading response header")
     );
+    Ok(())
+}
+
+#[test]
+fn cloned_role_failure_keeps_uncertain_sdk_transmission_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nfs_rs::{
+        NFSVersion, NfsError, OperationClass, OperationOutcome, OperationOutcomeError,
+        RecoveryAction, RequestContext, RequestTransmission,
+    };
+
+    let cause = NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+        OperationOutcome::Uncertain,
+        OperationClass::ReplaySensitive,
+        RecoveryAction::VerifyThenResume,
+        RequestContext {
+            operation: "rename".into(),
+            protocol: NFSVersion::NFSv4p1,
+            request_id: None,
+        },
+        NfsError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "nfs://user:private-password@server/export",
+        )),
+    )));
+    let failure = role_failure(
+        &StoragePath::new("output")?,
+        Operation::Publish,
+        classify_mutation_error(cause),
+    );
+    let cloned = failure.clone();
+    let StorageRoleFailure::Session(session) = &cloned else {
+        panic!("timed-out mutation must be session scoped");
+    };
+    assert_eq!(cloned, failure);
+    let plain = BackendSessionFailure::new(
+        session.operation(),
+        session.class(),
+        session.transience(),
+        session.diagnostic(),
+    )?;
+    assert_eq!(*session, plain);
+    assert!(plain.source().is_none());
+    assert!(!format!("{cloned:?} {cloned} {}", session.diagnostic()).contains("private-password"));
+    let evidence = cloned
+        .source()
+        .and_then(Error::source)
+        .and_then(|source| source.downcast_ref::<NfsError>())
+        .and_then(NfsError::operation_outcome)
+        .unwrap_or_else(|| panic!("role error chain must keep the SDK outcome"));
+    assert_eq!(evidence.outcome, OperationOutcome::Uncertain);
+    assert_eq!(evidence.transmission, RequestTransmission::Sent);
+    assert_eq!(evidence.recovery, RecoveryAction::VerifyThenResume);
     Ok(())
 }
 

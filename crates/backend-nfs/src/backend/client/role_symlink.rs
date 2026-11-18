@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::{MAX_STALE_RETRIES, NFSStorage, classify_role_error, is_retryable_with_invalidation};
+use super::{MAX_STALE_RETRIES, NFSStorage, is_retryable_with_invalidation};
 use crate::model::{FailureClass, StorageTimestamp, SymlinkTargetEncoding, Transience};
 use crate::storage::CreateSymlinkRequest;
 use crate::storage::backends::nfs::protocol::classify_error;
@@ -71,9 +71,7 @@ impl NFSStorage {
                 Err(error)
                     if is_retryable_with_invalidation(&error) && attempt < MAX_STALE_RETRIES =>
                 {
-                    self.forget_role_directory(&request.path)
-                        .await
-                        .map_err(classify_role_error)?;
+                    self.forget_role_directory(&request.path).await?;
                 }
                 Err(error) => return Err(classify_error(error)),
             }

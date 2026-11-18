@@ -76,4 +76,5 @@ fn queued_observations_stay_within_the_compact_record_budget() {
     assert!(size_of::<ObservedEntry>() <= 384);
     assert!(size_of::<MetadataObservations>() <= 80);
     assert!(size_of::<StorageTimestamp>() <= 17);
+    assert!(size_of::<FailureDiagnostic>() <= size_of::<RedactedString>());
 }

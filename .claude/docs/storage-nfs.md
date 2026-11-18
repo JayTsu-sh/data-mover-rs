@@ -74,11 +74,14 @@ URL 协议版本本身不构成 ACL 能力证明。当前 ACL 自动复制、损
 
 ## 绑定前缀与目录缓存
 
-绑定子目录时，RPC 根文件句柄与既有目录缓存的根标识必须同时切换；缓存根由
-端点身份与实际已绑定根 FH 构成。否则同一 export 的不同前缀可能复用相对路径，
-将元数据修改发到另一个根。根刷新遵循同一规则，不通过清空全部缓存绕过隔离。
+连接时绑定配置根，目录缓存以端点身份和绑定的根 FH 隔离。句柄恢复从挂载根重新
+查找配置的子目录前缀，确认仍指向原 FH 后才重试。绑定的子目录消失或被替换时，
+清除该根作用域的缓存并返回 `Conflict`。fresh 查询使用同一绑定核验当前名字。
 Linux v3/v4.1 的旧错误复现及修复后独立核验见
 [实验室说明](../../tests/lab/README.md#nfs-bound-root-cache-isolation-2026-11-09)。
+
+NFS 操作的原始 SDK 原因可从 role 错误的 `Error::source` 链获取，其中包含 SDK
+已经确认的发送状态、操作结果及恢复动作。展示使用 role 错误的脱敏诊断。
 
 ## 元数据应用取消
 
@@ -344,7 +347,7 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   `NotFound`，断连 → `Connectivity`，保留状态名）后 MKDIR：
   - `EXIST` → LOOKUP 该名字（无属性则 GETATTR）：目录 → 成功；**非目录（文件 / 符号链接）→ 删掉再 MKDIR**
     —— legacy 的 rsync 式迁移语义，保留，`warn!` 记录；REMOVE 的 `NOENT` 当作兄弟任务已删，`ISDIR` / `NOTEMPTY` 当作兄弟任务已删并建好了目录（再 MKDIR → `EXIST` → 目录）。
-  - `STALE` / `BADHANDLE` / `NOENT`（并发改名 / 删除）→ 刷新根句柄、忘掉路径缓存、重试。
+  - `STALE` / `BADHANDLE` / `NOENT`（并发改名 / 删除）→ 核验原根绑定、忘掉路径缓存、重试。
   - 其余直接 `classify_error`（保留状态名）：`ACCES` / `PERM` / `ROFS` → 条目 `PermissionDenied` / Permanent。
   - 至多 `MAX_STALE_RETRIES`（3）次重试，用尽报最后的原因（一直被非目录挡住 → `Conflict` / Unknown，最后那个
     非目录不删 —— 没有重试可用来建目录时不做破坏性的一步）。

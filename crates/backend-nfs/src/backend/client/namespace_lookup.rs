@@ -52,13 +52,8 @@ pub(super) async fn lookup<C: Calls + ?Sized>(
     let mut object = calls
         .root(canonical_root)
         .await
-        .map_err(|error| failed_lookup(error, scope, PathBuf::new()))?;
-    if !reconcile_namespace_cache(PathBuf::new(), scope.clone(), bound, &object.fh, true) {
-        return Err(NfsProtocolFailure::new(
-            FailureClass::Conflict,
-            Transience::Permanent,
-        ));
-    }
+        .map_err(|error| failed_root_lookup(error, scope))?;
+    check_root(bound, scope, &object.fh)?;
     // Deliberately start from the original held root; the guard never rebinds it. Do not
     // shortcut through GLOBAL_CACHE: every ancestor must be confirmed by this observation.
     let mut parent = bound.clone();
@@ -97,9 +92,28 @@ pub(super) async fn lookup<C: Calls + ?Sized>(
         None => calls
             .attrs(object.fh.clone())
             .await
-            .map_err(|error| failed_lookup(error, scope, PathBuf::new()))?,
+            .map_err(|error| failed_root_lookup(error, scope))?,
     };
     Ok((object.fh, attrs))
+}
+
+pub(super) fn check_root(
+    bound: &Bytes,
+    scope: &Bytes,
+    observed: &Bytes,
+) -> Result<(), NfsProtocolFailure> {
+    if reconcile_namespace_cache(PathBuf::new(), scope.clone(), bound, observed, true) {
+        Ok(())
+    } else {
+        Err(NfsProtocolFailure::new(
+            FailureClass::Conflict,
+            Transience::Permanent,
+        ))
+    }
+}
+
+pub(super) fn failed_root_lookup(error: NfsError, scope: &Bytes) -> NfsProtocolFailure {
+    failed_lookup(error, scope, PathBuf::new())
 }
 
 fn failed_lookup(error: NfsError, scope: &Bytes, relative: PathBuf) -> NfsProtocolFailure {

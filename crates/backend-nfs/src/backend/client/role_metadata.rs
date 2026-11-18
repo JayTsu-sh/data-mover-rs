@@ -11,7 +11,7 @@ use super::{
 use crate::model::{AclEncoding, AclMetadata, FailureClass, StoragePath, Transience};
 use crate::storage::backends::nfs::acl;
 use crate::storage::backends::nfs::metadata::{NfsMetadataInline, NfsMetadataProtocol};
-use crate::storage::backends::nfs::protocol::classify_error;
+use crate::storage::backends::nfs::protocol::{classify_error, classify_mutation_error};
 use crate::storage::backends::nfs::source::NfsProtocolFailure;
 
 impl NFSStorage {
@@ -38,9 +38,7 @@ impl NFSStorage {
         path: &Path,
         observed_generation: u64,
     ) -> Result<(), NfsProtocolFailure> {
-        self.maybe_refresh_root_fh(observed_generation)
-            .await
-            .map_err(classify_role_error)?;
+        self.maybe_refresh_root_fh(observed_generation).await?;
         let cache_root = self.get_root_fh();
         let components = Self::collect_components(path).map_err(classify_role_error)?;
         invalidate_path_cache(&components, &cache_root);
@@ -60,12 +58,10 @@ impl NFSStorage {
         mode: Option<u32>,
     ) -> Result<(), NfsProtocolFailure> {
         let native = Path::new(path.as_str());
-        let object = self.lookup_fh(native).await.map_err(classify_role_error)?;
+        let object = self.role_lookup_fh(native).await?;
         let handle = NFSFileHandle::new(object.fh, PathBuf::from(native));
         self.setattr_retrying(&handle, atime, mtime, uid, gid, mode)
             .await
-            .map_err(classify_role_error)?
-            .map_err(classify_error)
     }
 }
 
@@ -117,7 +113,7 @@ impl NfsMetadataProtocol for NFSStorage {
         }
         let native = Path::new(path.as_str());
         for attempt in 0..=MAX_STALE_RETRIES {
-            let object = self.lookup_fh(native).await.map_err(classify_role_error)?;
+            let object = self.role_lookup_fh(native).await?;
             let generation = self.refresh_generation.load(Ordering::Acquire);
             match self.mount.get_posix_acl(object.fh.clone()).await {
                 Ok(mut value) => {
@@ -154,7 +150,7 @@ impl NfsMetadataProtocol for NFSStorage {
         let value = acl::decode_posix(value).map_err(|_| invalid_acl())?;
         let native = Path::new(path.as_str());
         for attempt in 0..=MAX_STALE_RETRIES {
-            let object = self.lookup_fh(native).await.map_err(classify_role_error)?;
+            let object = self.role_lookup_fh(native).await?;
             let generation = self.refresh_generation.load(Ordering::Acquire);
             match self.mount.set_posix_acl(object.fh, &value).await {
                 Ok(()) => return Ok(()),
@@ -163,7 +159,7 @@ impl NfsMetadataProtocol for NFSStorage {
                 {
                     self.invalidate_acl_lookup(native, generation).await?;
                 }
-                Err(error) => return Err(classify_error(error)),
+                Err(error) => return Err(classify_mutation_error(error)),
             }
         }
         unreachable!("bounded ACL retry loop always returns")
@@ -179,7 +175,7 @@ impl NfsMetadataProtocol for NFSStorage {
     ) -> Result<nfs_rs::Acl, NfsProtocolFailure> {
         let native = Path::new(path.as_str());
         for attempt in 0..=MAX_STALE_RETRIES {
-            let object = self.lookup_fh(native).await.map_err(classify_role_error)?;
+            let object = self.role_lookup_fh(native).await?;
             let generation = self.refresh_generation.load(Ordering::Acquire);
             match self.mount.getacl(object.fh).await {
                 Ok(acl) => return Ok(acl),
@@ -201,13 +197,20 @@ impl NfsMetadataProtocol for NFSStorage {
         path: &crate::model::StoragePath,
     ) -> Result<Vec<crate::model::ExtendedAttribute>, NfsProtocolFailure> {
         let native = Path::new(path.as_str());
-        let names = self.list_xattr(native).await.map_err(classify_role_error)?;
+        let object = self.role_lookup_fh(native).await?;
+        let names = self
+            .mount
+            .listxattr(object.fh)
+            .await
+            .map_err(classify_error)?;
         let mut values = Vec::with_capacity(names.len());
         for name in names {
+            let object = self.role_lookup_fh(native).await?;
             let value = self
-                .get_xattr(native, &name)
+                .mount
+                .getxattr(object.fh, &name)
                 .await
-                .map_err(classify_role_error)?;
+                .map_err(classify_error)?;
             values.push(
                 crate::model::ExtendedAttribute::new(name.into_bytes(), value.to_vec())
                     .map_err(|_| NfsProtocolFailure::protocol())?,
@@ -223,7 +226,7 @@ impl NfsMetadataProtocol for NFSStorage {
     ) -> Result<(), NfsProtocolFailure> {
         let native = Path::new(path.as_str());
         for attempt in 0..=MAX_STALE_RETRIES {
-            let object = self.lookup_fh(native).await.map_err(classify_role_error)?;
+            let object = self.role_lookup_fh(native).await?;
             let generation = self.refresh_generation.load(Ordering::Acquire);
             match self.mount.setacl(object.fh, acl).await {
                 Ok(()) => return Ok(()),
@@ -233,7 +236,7 @@ impl NfsMetadataProtocol for NFSStorage {
                     self.invalidate_acl_lookup(native, generation).await?;
                 }
                 Err(error) => {
-                    return Err(classify_error(error));
+                    return Err(classify_mutation_error(error));
                 }
             }
         }
@@ -246,14 +249,11 @@ impl NfsMetadataProtocol for NFSStorage {
         value: &crate::model::ExtendedAttribute,
     ) -> Result<(), NfsProtocolFailure> {
         let name = std::str::from_utf8(value.name()).map_err(|_| NfsProtocolFailure::protocol())?;
-        NFSStorage::set_xattr(
-            self,
-            Path::new(path.as_str()),
-            name,
-            Bytes::copy_from_slice(value.value()),
-        )
-        .await
-        .map_err(classify_role_error)
+        let object = self.role_lookup_fh(Path::new(path.as_str())).await?;
+        self.mount
+            .setxattr(object.fh, name, Bytes::copy_from_slice(value.value()))
+            .await
+            .map_err(classify_mutation_error)
     }
 
     async fn remove_xattr(
@@ -272,7 +272,7 @@ impl NfsMetadataProtocol for NFSStorage {
                 {
                     self.invalidate_acl_lookup(native, generation).await?;
                 }
-                Err(error) => return Err(classify_error(error)),
+                Err(error) => return Err(classify_mutation_error(error)),
             }
         }
         unreachable!("bounded xattr retry loop always returns")
