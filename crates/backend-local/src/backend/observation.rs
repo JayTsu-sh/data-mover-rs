@@ -10,8 +10,14 @@ use std::{collections::HashMap, time::Duration};
 use async_trait::async_trait;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Metadata};
+#[cfg(unix)]
+use tokio_util::sync::CancellationToken;
 
+#[cfg(unix)]
+use super::namespace::RootAnchor;
 use super::rename;
+#[cfg(unix)]
+use crate::model::EntryIdentityKey;
 use crate::model::{
     AclMetadata, BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure,
     ExtendedAttribute, FailureClass, IdentityStrength, MetadataCapabilities, MetadataObservation,
@@ -19,9 +25,14 @@ use crate::model::{
     Operation, OwnershipMode, SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget,
     SymlinkTargetEncoding, TimePrecision, TimestampMetadata, Transience,
 };
+#[cfg(unix)]
+use crate::storage::MetadataBatchFailure;
 use crate::storage::{
     Metadata as MetadataRole, MetadataMutation, SourceDescriptor, StorageRoleFailure,
 };
+
+#[cfg(unix)]
+mod bound_directory;
 
 #[path = "observation_capabilities.rs"]
 mod capabilities;
@@ -36,6 +47,8 @@ pub(super) use facts::purge_content_version;
 
 pub struct LocalObservationAdapter {
     root: Arc<Dir>,
+    #[cfg(unix)]
+    root_anchor: Option<Arc<RootAnchor>>,
     root_device: Option<u64>,
     identity: BackendIdentity,
     #[cfg(any(test, feature = "test-support"))]
@@ -149,6 +162,8 @@ impl LocalObservationAdapter {
         Ok(Self {
             root_device: rename::root_device(&root),
             root: Arc::new(root),
+            #[cfg(unix)]
+            root_anchor: Some(Arc::new(RootAnchor::new(root_path))),
             identity,
             #[cfg(any(test, feature = "test-support"))]
             probe: Arc::new(ObservationProbe::default()),
@@ -160,10 +175,18 @@ impl LocalObservationAdapter {
         Self {
             root_device: rename::root_device(&root),
             root,
+            #[cfg(unix)]
+            root_anchor: None,
             identity,
             #[cfg(any(test, feature = "test-support"))]
             probe: Arc::new(ObservationProbe::default()),
         }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn with_root_anchor(mut self, root_anchor: Option<Arc<RootAnchor>>) -> Self {
+        self.root_anchor = root_anchor;
+        self
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -491,6 +514,22 @@ impl MetadataRole for LocalObservationAdapter {
             let (class, transience) = classify_io(error.kind());
             metadata_failure_with_transience(path, class, transience)
         })
+    }
+
+    #[cfg(unix)]
+    fn supports_bound_directory_metadata(&self) -> bool {
+        true
+    }
+
+    #[cfg(unix)]
+    async fn apply_bound_directory(
+        &self,
+        path: &StoragePath,
+        expected: EntryIdentityKey,
+        mutations: Vec<MetadataMutation>,
+        cancel: CancellationToken,
+    ) -> Result<(), MetadataBatchFailure> {
+        bound_directory::apply(self, path, expected, mutations, cancel).await
     }
 }
 
@@ -834,6 +873,14 @@ fn observation_io_failure(path: &StoragePath, error: &io::Error) -> StorageRoleF
 
 fn session_failure(operation: Operation, error: &io::Error) -> StorageRoleFailure {
     let (class, transience) = classify_io(error.kind());
+    local_session_failure(operation, class, transience)
+}
+
+fn local_session_failure(
+    operation: Operation,
+    class: FailureClass,
+    transience: Transience,
+) -> StorageRoleFailure {
     let failure = BackendSessionFailure::new(
         operation,
         class,

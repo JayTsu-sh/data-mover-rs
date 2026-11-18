@@ -175,6 +175,22 @@ IDs are different. Missing mappings must not be repaired by silently publishing 
 data over the current object. Metadata writes remain fallible and can have an unknown
 result after timeout/cancellation; retry only the same explicit version and mutation.
 
+For an already published directory, capture its stable target identity and use
+`MetadataPlan::apply_bound_directory` to apply attributes to the same verified object.
+The backend resolves the current name once for a successful batch and applies the
+mutations through the checked object reference. Unix Local and NFS implement the
+binding. Other implementations report `Unsupported` before making changes. A
+definitive per-family refusal leaves later families eligible for application.
+A conflict, cancellation, or uncertain write stops the batch and preserves confirmed
+progress. Use `verify_published` with that identity key to verify the current directory
+name and the resulting attributes. For the configured Local root, both operations
+reopen its canonical path and check it against the original capability. A root
+constructed from only a directory handle cannot perform this check, so it refuses
+bound writes and fresh observations of the root. Local identity remains subject to inode reuse between
+separately acquired references. For cancellation, signal the token and await
+completion before starting a dependent operation. A syscall already submitted
+can still finish.
+
 ### Bounded current-source observations
 
 `storage::read_namespace_entry` accepts an optional `ObservationPlan`. With `None`,

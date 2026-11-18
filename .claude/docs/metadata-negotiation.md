@@ -179,7 +179,7 @@ set-id 也去掉，尽管 uid 实际留住了；内核还允许 chgrp 到文件*
    （Local 的预校验就是，`completed = 0` 而 `failed_index > 0`），那样前面的族会被静默跳过。
    也不是把被拒的族挪到队尾凑成一批 —— 那会让 ownership 跑到 ACL 后面，重新制造第 1 条要防的
    静默覆盖。
-   `StagedMetadataApplicationFailure` 的三条字段约定（`src/storage/roles.rs`）就是这条的前提。
+   `MetadataBatchFailure` 的三条字段约定（`src/storage/roles.rs`）就是这条的前提。
    由 `src/metadata/stage_tests.rs` 看守。
 
 **应用期失败的规则**（用户，2026-09-23）：**任何一族写失败都意味着该文件拷贝失败**，但一个文件的
@@ -188,12 +188,17 @@ set-id 也去掉，尽管 uid 实际留住了；内核还允许 chgrp 到文件*
 - **取消** —— token 已触发，或 backend 报 `Cancelled`（含服务端的 `STATUS_CANCELLED`）；被打断的请求
   可能报成别的类别，所以两者任一即算。该族保持规划期结果，不记 `Failed`。
 - **会话级失败**（`StorageRoleFailure::Session`）—— 会话断了，后面每一次写都会跟着失败。
-- **整批失败** —— backend 用 `StagedMetadataApplicationFailure::whole_batch(len, completed, error)`
+- **整批失败** —— backend 用 `MetadataBatchFailure::whole_batch(len, completed, error)`
   报告，即 `failed_index == len`：不归属任何一条 mutation。Local 的 stage 打不开、`spawn_blocking`
   丢失、以及 durable **屏障 `sync_all` 失败**走这里。记在**最后一条已应用但未落盘**的族上
   （`completed - 1`；一条都没应用时记第一条），该批次一个都不标 `Applied`。
 
 其余（Entry 级、非取消，`is_refusal`）都是「目的端拒绝这一次写入」：记下，续发剩下的族。
+
+**已发布目录的身份绑定写入**由 `MetadataPlan::apply_bound_directory` 调用后端。
+后端解析当前目录名，并使用通过身份检查的同一对象引用写入。Local Unix 使用文件描述符，
+NFS 使用文件句柄。绑定写入仅在属性明确被拒时继续，身份冲突、取消和结果不明会停止整项，
+保留已确认的写入前缀。调用方用 `verify_published` 再核对当前路径和结果。
 
 **Local 在拒绝处不跑屏障**（`apply_local_batch`）：任何拒绝都让文件失败、不会发布，续发的批次以屏障
 结束、覆盖整个文件；若在拒绝处跑屏障且它失败，整批失败会**盖掉拒绝本身** —— 调用方要处置的原因。

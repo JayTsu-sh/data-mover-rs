@@ -1243,6 +1243,72 @@ async fn positioned_sparse_completion_crosses_multiple_intervals_once() -> io::R
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_metadata_cancellation_stops_after_first_xattr() -> io::Result<()> {
+    use crate::model::ExtendedAttribute;
+
+    let root = TestRoot::new().await?;
+    let path = root.0.join("metadata");
+    let file = std::fs::File::create(&path)?;
+    let first = "user.cancellation_first";
+    let second = "user.cancellation_second";
+    let attrs = [first, second]
+        .into_iter()
+        .map(|name| ok(ExtendedAttribute::new(name.as_bytes().to_vec(), vec![1])))
+        .collect();
+
+    let cancel = CancellationToken::new();
+    let failure = apply_local_metadata_tracked(&file, MetadataMutation::Xattrs(attrs), |changed| {
+        // 在第一个实际写入之后发出取消，验证第二个属性从未写入。
+        if changed {
+            cancel.cancel();
+        }
+        check_local_metadata_cancel(&cancel, changed)
+    })
+    .err()
+    .ok_or_else(|| io::Error::other("expected partial metadata cancellation"))?;
+    assert!(failure.changed);
+    assert!(failure.cancelled);
+    assert_eq!(failure.error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(xattr::get(&path, first)?, Some(vec![1]));
+    assert_eq!(xattr::get(&path, second)?, None);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_metadata_cancellation_after_chown_skips_chmod() -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use crate::model::OwnershipMode;
+
+    let root = TestRoot::new().await?;
+    let path = root.0.join("metadata");
+    let file = std::fs::File::create(&path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+    let metadata = file.metadata()?;
+    let mutation = MetadataMutation::NumericOwnership(OwnershipMode {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: 0o750,
+    });
+
+    let cancel = CancellationToken::new();
+    let failure = apply_local_metadata_tracked(&file, mutation, |changed| {
+        if changed {
+            cancel.cancel();
+        }
+        check_local_metadata_cancel(&cancel, changed)
+    })
+    .err()
+    .ok_or_else(|| io::Error::other("expected cancellation after ownership write"))?;
+    assert!(failure.changed);
+    assert!(failure.cancelled);
+    assert_eq!(file.metadata()?.permissions().mode() & 0o7777, 0o640);
+    Ok(())
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn windows_acl_batch_reopens_stage_and_survives_publication() -> io::Result<()> {

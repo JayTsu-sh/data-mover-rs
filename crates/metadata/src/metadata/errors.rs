@@ -221,9 +221,11 @@ impl std::error::Error for MetadataPlanError {}
 pub enum ApplicationFailureKind {
     /// The destination declined this one write.
     Refused,
-    /// The batch failed as a whole — its stage could not be opened, or the barrier that makes it
-    /// durable failed — so nothing in it is durable.
+    /// The batch failed as a whole, for example because the target could not be bound or a
+    /// stage durability barrier did not complete.
     BatchFailed,
+    /// A bound directory mutation may have applied partially or could not be confirmed.
+    WriteUnconfirmed,
     /// The destination session was lost.
     SessionLost,
     /// The copy was cancelled.
@@ -256,10 +258,8 @@ impl fmt::Display for ApplicationFailureKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Refused => "the destination refused the write",
-            Self::BatchFailed => {
-                "the destination failed the batch as a whole (stage open or durability barrier); \
-                 nothing in it is durable"
-            }
+            Self::BatchFailed => "the destination failed the batch as a whole",
+            Self::WriteUnconfirmed => "the resulting attribute state is unconfirmed",
             Self::SessionLost => "the destination session was lost",
             Self::Cancelled => "the copy was cancelled",
         })
@@ -311,7 +311,7 @@ impl fmt::Display for FamilyFailure {
 
 /// Every family of one item that could not be applied. Application goes on past a family the
 /// destination refuses, so the item fails once with every reason rather than with the first; only
-/// a cancellation, a lost session, or a batch that failed as a whole stops it early, and that one
+/// a cancellation, lost session, whole-batch failure or unconfirmed write stops it early, and that one
 /// is always last.
 #[derive(Debug)]
 pub struct MetadataApplicationFailure {

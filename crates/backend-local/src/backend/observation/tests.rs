@@ -1,10 +1,12 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use super::*;
 use crate::model::observation::PrivateBackendEntryFacts;
 use crate::model::{
     BackendKind, MetadataObservation, MetadataProvenance, ObservationMode, ObservationPlan,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+mod bound_directory;
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
