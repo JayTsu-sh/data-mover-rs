@@ -41,6 +41,32 @@ pub(super) async fn lookup<C: Calls + ?Sized>(
     scope: &Bytes,
     path: &StoragePath,
 ) -> Result<(Bytes, Attr), NfsProtocolFailure> {
+    let object = lookup_object(calls, root, bound, scope, Path::new(path.as_str()), true).await?;
+    let attrs = object.attr.ok_or_else(NfsProtocolFailure::protocol)?;
+    Ok((object.fh, attrs))
+}
+
+/// Resolve a mutation parent by name without fetching optional attributes on its ancestors.
+pub(super) async fn lookup_handle<C: Calls + ?Sized>(
+    calls: &C,
+    root: &str,
+    bound: &Bytes,
+    scope: &Bytes,
+    path: &Path,
+) -> Result<Bytes, NfsProtocolFailure> {
+    Ok(lookup_object(calls, root, bound, scope, path, false)
+        .await?
+        .fh)
+}
+
+async fn lookup_object<C: Calls + ?Sized>(
+    calls: &C,
+    root: &str,
+    bound: &Bytes,
+    scope: &Bytes,
+    path: &Path,
+    observe_attrs: bool,
+) -> Result<ObjRes, NfsProtocolFailure> {
     let root_components = NFSStorage::collect_components(Path::new(root))
         .map_err(|_| NfsProtocolFailure::protocol())?;
     let canonical_root = root_components.join("/");
@@ -58,14 +84,18 @@ pub(super) async fn lookup<C: Calls + ?Sized>(
     // shortcut through GLOBAL_CACHE: every ancestor must be confirmed by this observation.
     let mut parent = bound.clone();
     let mut relative = PathBuf::new();
-    let components = NFSStorage::collect_components(Path::new(path.as_str()))
-        .map_err(|_| NfsProtocolFailure::protocol())?;
+    let components =
+        NFSStorage::collect_components(path).map_err(|_| NfsProtocolFailure::protocol())?;
     for name in components {
         relative.push(&name);
         object = calls
             .child(parent, &name)
             .await
             .map_err(|error| failed_lookup(error, scope, relative.clone()))?;
+        parent = object.fh.clone();
+        if !observe_attrs {
+            continue;
+        }
         if object.attr.is_none() {
             object.attr = Some(
                 calls
@@ -85,16 +115,16 @@ pub(super) async fn lookup<C: Calls + ?Sized>(
             &object.fh,
             directory,
         );
-        parent = object.fh.clone();
     }
-    let attrs = match object.attr {
-        Some(attrs) => attrs,
-        None => calls
-            .attrs(object.fh.clone())
-            .await
-            .map_err(|error| failed_root_lookup(error, scope))?,
-    };
-    Ok((object.fh, attrs))
+    if observe_attrs && object.attr.is_none() {
+        object.attr = Some(
+            calls
+                .attrs(object.fh.clone())
+                .await
+                .map_err(|error| failed_root_lookup(error, scope))?,
+        );
+    }
+    Ok(object)
 }
 
 pub(super) fn check_root(

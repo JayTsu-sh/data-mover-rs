@@ -16,8 +16,12 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use super::{GLOBAL_CACHE, NFSStorage, classify_role_error, create_nfs_role_storage};
-use crate::model::{FailureClass, SourceVersion, StoragePath, Transience};
-use crate::storage::{ReadRequest, StorageRoleFailure};
+use crate::model::{
+    EntryKind, FailureClass, IdentityStrength, MetadataObservation, MetadataObservations,
+    MetadataProvenance, ObservedEntry, SourceIdentity, SourceVersion, StoragePath,
+    StorageTimestamp, TimePrecision, TimestampMetadata, Transience,
+};
+use crate::storage::{PurgeOutcome, ReadRequest, StorageRoleFailure};
 
 const NFS_PROGRAM: u32 = 100_003;
 const MOUNT_PROGRAM: u32 = 100_005;
@@ -25,6 +29,8 @@ const ACL_PROGRAM: u32 = 100_227;
 const EXPORT: &[u8] = b"export";
 const ORIGINAL: &[u8] = b"original";
 const REPLACEMENT: &[u8] = b"replacement";
+const NESTED: &[u8] = b"nested-parent";
+const LINKED_FILE: &[u8] = b"linked-file";
 
 #[derive(Clone, Copy)]
 enum RootReply {
@@ -37,6 +43,7 @@ struct Server {
     next_root: RootReply,
     stale_leaf: AtomicBool,
     lookups: Mutex<Vec<(Bytes, Bytes)>>,
+    removals: Mutex<Vec<(Bytes, Bytes)>>,
 }
 
 async fn start_server(next_root: RootReply) -> (String, Arc<Server>, JoinHandle<io::Result<()>>) {
@@ -46,6 +53,7 @@ async fn start_server(next_root: RootReply) -> (String, Arc<Server>, JoinHandle<
         next_root,
         stale_leaf: AtomicBool::new(true),
         lookups: Mutex::new(Vec::new()),
+        removals: Mutex::new(Vec::new()),
     });
     let serving = Arc::clone(&server);
     let task = tokio::spawn(async move { serving.serve(listener).await });
@@ -101,6 +109,14 @@ impl Server {
             }
             (ORIGINAL, b"leaf") => lookup_ok(b"leaf", 1),
             (REPLACEMENT, b"leaf") => lookup_ok(b"unrelated-leaf", 1),
+            (ORIGINAL, b"nested") => {
+                let mut payload = 0u32.to_be_bytes().to_vec();
+                opaque(&mut payload, NESTED);
+                payload.extend_from_slice(&[0; 8]); // No object or parent attributes.
+                payload
+            }
+            (ORIGINAL | REPLACEMENT | NESTED, b"purge") => lookup_ok(LINKED_FILE, 1),
+            (ORIGINAL, b"absent") => lookup_error(2),
             (ORIGINAL, b"denied") => lookup_error(13), // NFS3ERR_ACCES.
             _ => panic!("unexpected LOOKUP {parent:?}/{name:?}"),
         }
@@ -144,6 +160,13 @@ impl Server {
                 }
                 (ACL_PROGRAM, 0) | (MOUNT_PROGRAM, 3) => Vec::new(), // NFSACL NULL, MOUNT UMNT.
                 (NFS_PROGRAM, 3) => self.lookup(request),
+                (NFS_PROGRAM, 12) => {
+                    let parent = take_opaque(&mut request);
+                    let name = take_opaque(&mut request);
+                    assert!(request.is_empty());
+                    self.removals.lock().unwrap().push((parent, name));
+                    vec![0; 12] // NFS3_OK, absent pre-op and post-op directory attributes.
+                }
                 _ => panic!("unexpected RPC program {program} procedure {procedure}"),
             };
             let mut reply = Vec::new();
@@ -236,6 +259,80 @@ async fn stale_lookup_keeps_the_configured_root_binding() {
         })
         .await
         .unwrap_or_else(|error| panic!("NFSv3 root refresh fixture timed out: {error}"));
+    }
+}
+
+#[tokio::test]
+async fn protected_purge_refuses_a_changed_root_before_removing_a_matching_handle() {
+    for (next_root, path) in [
+        (RootReply::Same, "purge"),
+        (RootReply::Same, "nested/purge"),
+        (RootReply::Same, "absent"),
+        (RootReply::Replaced, "purge"),
+        (RootReply::Missing, "purge"),
+    ] {
+        timeout(Duration::from_secs(5), async {
+            let (url, server, task) = start_server(next_root).await;
+            let storage = create_nfs_role_storage(&url, None, false, None)
+                .await
+                .unwrap();
+            let namespace = storage.namespace().unwrap();
+            let identity = SourceIdentity::new(
+                storage.identity().clone(),
+                IdentityStrength::StableWithinBackend,
+                LINKED_FILE,
+            )
+            .unwrap();
+            let time = Some(StorageTimestamp::new(0, TimePrecision::Nanoseconds).unwrap());
+            let mut metadata = MetadataObservations::default();
+            metadata.set_timestamps(MetadataObservation::Value {
+                value: TimestampMetadata {
+                    accessed: time,
+                    modified: time,
+                    created: time,
+                },
+                provenance: MetadataProvenance::Inline,
+            });
+            let entry = ObservedEntry::new(
+                StoragePath::new(path).unwrap(),
+                EntryKind::File,
+                Some(0),
+                time,
+                identity,
+            )
+            .unwrap()
+            .with_metadata(metadata);
+            let result = namespace.purge_observed(&entry, CancellationToken::new()).await;
+            drop(namespace);
+            drop(storage);
+            task.await.unwrap().unwrap();
+            let removals = server.removals.lock().unwrap();
+
+            match (next_root, path) {
+                (RootReply::Same, "purge" | "nested/purge") => {
+                    let parent = if path == "purge" { ORIGINAL } else { NESTED };
+                    assert!(matches!(result, Ok(PurgeOutcome::Deleted { records: 1 })));
+                    assert_eq!(
+                        removals.as_slice(),
+                        &[(Bytes::from_static(parent), Bytes::from_static(b"purge"))]
+                    );
+                }
+                (RootReply::Same, _) => {
+                    assert!(matches!(result, Ok(PurgeOutcome::AlreadyAbsent)));
+                    assert!(removals.is_empty());
+                }
+                (RootReply::Replaced | RootReply::Missing, _) => {
+                    assert!(
+                        matches!(result, Err(ref error) if matches!(error.source.as_ref(), StorageRoleFailure::Entry(failure)
+                            if failure.class() == FailureClass::Conflict && failure.transience() == Transience::Permanent)),
+                        "purge must refuse a changed root: {result:?}"
+                    );
+                    assert!(removals.is_empty());
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|error| panic!("NFSv3 purge fixture timed out: {error}"));
     }
 }
 

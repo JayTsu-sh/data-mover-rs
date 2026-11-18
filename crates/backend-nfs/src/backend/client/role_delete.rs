@@ -1,6 +1,7 @@
 //! NFS 删除：私有产物清理与基于原观察的非递归源清理。
 use super::{
     FType3, MAX_STALE_RETRIES, NFSStorage, is_retryable_with_invalidation, is_server_busy,
+    namespace_lookup,
 };
 use crate::model::{EntryKind, FailureClass, ObservedEntry, StoragePath, Transience};
 use crate::storage::artifacts::is_artifact_path;
@@ -33,7 +34,7 @@ impl NFSStorage {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(NfsProtocolFailure::protocol)?;
-        let (parent, current) = self.role_fresh_purge_child(path).await?;
+        let (parent, current) = self.role_fresh_purge_child(path, native, name).await?;
         verify_current(expected, &current)?;
         // RFC 1813 §§3.3.12–13 / RFC 8881 §18.25：只删除此名称或空目录。
         // 协议没有 compare-and-unlink；调用方仍须排除并发源修改。
@@ -56,23 +57,22 @@ impl NFSStorage {
     async fn role_fresh_purge_child(
         &self,
         path: &StoragePath,
+        native: &Path,
+        name: &str,
     ) -> Result<(Bytes, NfsNamespaceObservation)> {
-        let native = Path::new(path.as_str());
         let parent = native.parent().ok_or_else(NfsProtocolFailure::protocol)?;
-        let name = native
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(NfsProtocolFailure::protocol)?;
-        // 从端点前缀重新解析父目录；不能借用 rename 后仍有效的旧缓存句柄。
-        let relative = format!("{}/{}", self.root, parent.display());
-        let directory = self
-            .mount
-            .lookup_path(&relative)
-            .await
-            .map_err(classify_error)?;
+        // 从原绑定根按当前名字重新解析父目录，拒绝根被替换或移除。
+        let directory = namespace_lookup::lookup_handle(
+            self.mount.as_ref().as_ref(),
+            &self.root,
+            &self.root_fh,
+            &self.cache_root_fh,
+            parent,
+        )
+        .await?;
         let object = self
             .mount
-            .lookup(directory.fh.clone(), name)
+            .lookup(directory.clone(), name)
             .await
             .map_err(classify_error)?;
         let attrs = match object.attr {
@@ -90,7 +90,7 @@ impl NFSStorage {
             ));
         }
         let current = self.role_namespace_observation(path, object.fh, &attrs);
-        Ok((directory.fh, current))
+        Ok((directory, current))
     }
 
     pub(super) async fn role_cleanup_artifacts(
