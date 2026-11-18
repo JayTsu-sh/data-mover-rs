@@ -9,7 +9,7 @@ use super::super::histories::record;
 use super::super::listing::file_descriptor;
 use super::super::paging::Paging;
 use super::super::source::role_failure;
-use super::super::{S3Protocol, S3ProtocolFailure, S3Result};
+use super::super::{S3Protocol, S3ProtocolFailure, S3Result, is_real_version_id};
 use super::{S3Namespace, failure, refuse_artifact};
 use crate::model::{
     EntryKind, FailureClass, ObservedEntry, Operation, RecordKind, SourceVersion, StoragePath,
@@ -140,19 +140,26 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
         };
         let current = file_descriptor(&self.identity, key.clone(), &facts)
             .map_err(StorageRoleFailure::Entry)?;
+        let supports_exact_delete = self.protocol.bucket_capabilities().versions;
+        let modified_matches = match (facts.last_modified, entry.modified()) {
+            (None, None) => {
+                supports_exact_delete && facts.version_id.as_deref().is_some_and(is_real_version_id)
+            }
+            (actual, expected) => same_modified(actual, expected),
+        };
         if current.source_identity != *entry.source_identity()
             || current.size != entry.size()
-            || !same_modified(facts.last_modified, entry.modified())
+            || !modified_matches
         {
             return Err(failure(
                 key,
                 FailureClass::Conflict,
-                "source object changed after observation; retained",
+                "source object changed after observation or lacks modification evidence; retained",
             )
             .into());
         }
         check_cancel(key, cancel)?;
-        if self.protocol.bucket_capabilities().versions {
+        if supports_exact_delete {
             // 从未启用版本的对象也用精确 null 版本删除，避免期间启用版本后留下删除标记。
             self.purge_version(key, facts.version_id.as_deref().unwrap_or("null"), cancel)
                 .await?;
@@ -190,7 +197,7 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
                 return Err(failure(
                     key,
                     FailureClass::Conflict,
-                    "source history changed after observation; current record retained",
+                    "source history changed after observation or lacks modification evidence; current record retained",
                 )
                 .into());
             }
@@ -394,7 +401,7 @@ fn batch_result(
     })
 }
 
-/// LIST 的毫秒和 HEAD 的 HTTP 秒按实际较粗精度比较；缺失证据不能与已有时间相等。
+/// LIST 的毫秒和 HEAD 的 HTTP 秒按实际较粗精度比较，要求双方均有修改时间。
 pub(super) fn same_modified(
     actual: Option<StorageTimestamp>,
     expected: Option<StorageTimestamp>,
@@ -407,7 +414,6 @@ pub(super) fn same_modified(
                 .max(expected.precision().quantum_nanos());
             actual.unix_nanos().div_euclid(quantum) == expected.unix_nanos().div_euclid(quantum)
         }
-        (None, None) => true,
         _ => false,
     }
 }
@@ -429,7 +435,11 @@ fn same_anchor(actual: &VersionRecord, expected: &VersionRecord) -> bool {
         && actual.identity() == expected.identity()
         && same_payload
         // null 记录可以原地替换，不能只靠版本号或 marker 的路径身份保护。
-        && (actual.version_id().is_some() || actual.modified() == expected.modified())
+        && (actual.version_id().is_some()
+            || actual
+                .modified()
+                .zip(expected.modified())
+                .is_some_and(|(actual, expected)| actual == expected))
 }
 
 fn cancelled(key: &StoragePath, submitted: bool) -> StorageRoleFailure {

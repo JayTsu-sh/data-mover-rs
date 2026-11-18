@@ -121,6 +121,10 @@ async fn suspended_and_never_versioned_buckets_delete_exact_null_record() -> Tes
         }
         protocol.listing().same_instant = true;
         put(&protocol, "key", b"payload").await?;
+        *protocol.last_modified.lock().await = Some(StorageTimestamp::new(
+            1_000_000_000,
+            TimePrecision::Seconds,
+        )?);
         let namespace = namespace(&protocol)?;
         let entry = if suspended {
             observed(namespace.as_ref(), "key").await?
@@ -187,6 +191,101 @@ async fn current_purge_compares_list_and_head_times_at_observed_precision() -> T
 }
 
 #[tokio::test]
+async fn current_purge_refuses_a_mutable_object_without_modification_evidence() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    put(&protocol, "key", b"payload").await?;
+    let namespace = namespace(&protocol)?;
+    let entry = observed(namespace.as_ref(), "key").await?;
+    assert_eq!(entry.modified(), None);
+
+    let result = namespace
+        .purge_observed(&entry, CancellationToken::new())
+        .await;
+    assert!(
+        matches!(&result, Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::Conflict)),
+        "{result:?}"
+    );
+    assert!(protocol.version_deletes().is_empty());
+    assert!(protocol.plain_deletes_of_final_keys().is_empty());
+    assert!(protocol.objects.lock().await.contains_key("key"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_purge_accepts_an_immutable_version_without_timestamps() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    lists_histories(&protocol, false);
+    put(&protocol, "key", b"payload").await?;
+    let storage = connect(protocol.clone(), identity(), None)?;
+    let namespace = storage.namespace()?;
+    let entry = observe_descriptor(
+        &storage,
+        namespace.stat(&path("key"), false).await?,
+        ObservationPlan::default(),
+    )
+    .await?;
+    assert_eq!(entry.modified(), None);
+
+    assert_eq!(
+        namespace
+            .purge_observed(&entry, CancellationToken::new())
+            .await?,
+        PurgeOutcome::Deleted { records: 1 }
+    );
+    assert_eq!(protocol.version_deletes(), [("key".into(), "v0001".into())]);
+    assert!(protocol.plain_deletes_of_final_keys().is_empty());
+    Ok(())
+}
+
+async fn assert_missing_null_time_retains_history(marker: bool) -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    put(&protocol, "key", b"historical").await?;
+    protocol.set_versioning(Versioning::Suspended);
+    if marker {
+        protocol
+            .write_delete_marker("key")
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+    } else {
+        put(&protocol, "key", b"current").await?;
+    }
+    protocol.listing().omit_version_timestamps = true;
+    let namespace = namespace(&protocol)?;
+    let entry = observed(namespace.as_ref(), "key").await?;
+    let latest = entry
+        .history()
+        .and_then(|history| history.latest())
+        .ok_or("latest missing")?;
+    assert_eq!(latest.version_id(), None);
+    assert_eq!(latest.modified(), None);
+    assert_eq!(latest.is_delete_marker(), marker);
+
+    let result = namespace
+        .purge_observed(&entry, CancellationToken::new())
+        .await;
+    assert!(
+        matches!(&result, Err(purge) if matches!(purge.source.as_ref(), StorageRoleFailure::Entry(error) if error.class() == FailureClass::Conflict)),
+        "{result:?}"
+    );
+    assert!(protocol.version_deletes().is_empty());
+    assert!(protocol.plain_deletes_of_final_keys().is_empty());
+    assert!(protocol.keys_with_versions().contains(&"key".into()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_purge_refuses_a_null_object_without_modification_evidence() -> TestResult {
+    assert_missing_null_time_retains_history(false).await
+}
+
+#[tokio::test]
+async fn history_purge_refuses_a_null_marker_without_modification_evidence() -> TestResult {
+    assert_missing_null_time_retains_history(true).await
+}
+
+#[tokio::test]
 async fn deleted_key_purges_every_data_version_and_the_final_marker() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     protocol.set_versioning(Versioning::Enabled);
@@ -196,6 +295,7 @@ async fn deleted_key_purges_every_data_version_and_the_final_marker() -> TestRes
         .delete_object("gone")
         .await
         .map_err(|error| format!("{error:?}"))?;
+    protocol.listing().omit_version_timestamps = true;
     let namespace = namespace(&protocol)?;
     let entry = observed(namespace.as_ref(), "gone").await?;
     assert_eq!(
