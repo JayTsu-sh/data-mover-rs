@@ -8,6 +8,9 @@ use crate::traversal::{ListingOutcome, TraversalTerminalFailure};
 
 impl Runner {
     pub(super) async fn walk(&mut self) -> Result<(), TraversalTerminalFailure> {
+        if self.consumer.stopped.is_cancelled() {
+            return Ok(());
+        }
         self.root().await?;
         loop {
             if let Some(failure) = self.consumer.failure() {

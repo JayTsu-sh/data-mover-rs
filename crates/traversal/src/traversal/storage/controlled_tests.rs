@@ -49,6 +49,7 @@ async fn acknowledge(
 struct ReadOnlyNamespace {
     inner: Arc<dyn Namespace>,
     calls: Arc<Mutex<Vec<String>>>,
+    stat_called: CancellationToken,
     parked: Option<NonZeroUsize>,
     objects: bool,
     block: bool,
@@ -63,6 +64,7 @@ impl ReadOnlyNamespace {
         Self {
             inner,
             calls: Arc::default(),
+            stat_called: CancellationToken::new(),
             parked: None,
             objects: false,
             block: false,
@@ -90,6 +92,7 @@ impl Namespace for ReadOnlyNamespace {
         path: &StoragePath,
         fresh: bool,
     ) -> Result<SourceDescriptor, StorageRoleFailure> {
+        self.stat_called.cancel();
         self.inner.stat(path, fresh).await
     }
     async fn read_link(&self, path: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
@@ -382,6 +385,28 @@ async fn source_failure_is_delivered_with_ack_outstanding_and_survives_derived_c
         Err(TraversalTerminalFailure::ConsumerSource(Box::new(
             failure.failure
         )))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn already_cancelled_request_does_not_stat_root() {
+    let root = tempfile::tempdir().assert_value("controlled traversal fixture");
+    let (storage, namespace, metadata) =
+        test_traversal_storage(root.path(), "controlled-pre-cancel")
+            .assert_value("controlled traversal fixture");
+    let namespace = Arc::new(ReadOnlyNamespace::new(namespace));
+    let source = StorageTraversalSource::with_roles(namespace.clone(), metadata)
+        .identified(storage.identity().clone());
+    let request = configured();
+    request.cancel.cancel();
+
+    let (items, outcome) = acknowledge(source.traverse(request)).await;
+    assert!(items.is_empty());
+    assert_eq!(outcome, Ok(TraversalOutcome::Cancelled));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), namespace.stat_called.cancelled())
+            .await
+            .is_err()
     );
 }
 
