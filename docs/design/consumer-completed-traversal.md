@@ -23,8 +23,8 @@ events and the final snapshot; prepare success does not erase them. A failed con
 blocks ancestor finalization without fabricating errors for those ancestors.
 
 Ready subtrees advance through a private generation-indexed arena and deduplicated ready queue.
-Waiting for a file/prepare/finalize receipt does not block an unrelated sibling. Each turn does
-one bounded admission/publication/page unit, with receipt and completion processing first.
+Other active branches can advance while a file/prepare/finalize receipt is pending. Each turn
+does one bounded admission/publication/page unit, with receipt and completion processing first.
 Parent dependencies release only after child finalization is acknowledged; hidden directories
 release their internal dependency after their selected range completes. One child output bundle
 retains publication ownership until its facts and entries are sent: output backpressure can
@@ -74,6 +74,10 @@ Bounds are separate:
 
 - W (`consumer_max_inflight`) bounds issued phases across Native output, dispatch, workers,
   results and feedback. Directory state between prepare/finalize does not occupy a phase slot.
+- W also bounds the number of active directory branches across the entire tree. A directory's
+  first child extends the existing branch without using another slot, and further children can
+  advance as earlier branches complete. The bound includes hidden and policy-limited directories.
+  Each branch may retain a chain of ancestors subject to the separate logical byte budget.
 - The logical byte budget reserves every active node, including root/hidden/policy nodes:
   fixed Node and arena/queue storage reserves, visible work/listing/statistics paths and
   descent-hint bytes, and its original encoded snapshot. Therefore active nodes are at most
