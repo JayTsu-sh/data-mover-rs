@@ -4,9 +4,14 @@ use thiserror::Error;
 
 use super::{CapabilityUnavailable, SourceDescriptor, Storage, StorageRoleFailure};
 use crate::model::{
-    EntryKind, MetadataCapabilities, ModelValueError, ObservationPlan, ObservedEntry,
-    SourceVersion, StoragePath,
+    EntryKind, FailureClass, MetadataCapabilities, MetadataFamily, MetadataObservation,
+    MetadataObservationParts, MetadataObservations, ModelValueError, ObservationMode,
+    ObservationPlan, ObservedEntry, SourceVersion, StoragePath, Transience,
 };
+
+#[cfg(test)]
+#[path = "observation_tests.rs"]
+mod tests;
 
 #[derive(Debug, Error)]
 pub enum EntryObservationFailure {
@@ -49,9 +54,22 @@ pub async fn observe_descriptor(
         descriptor.inline_observations(plan, MetadataCapabilities::default())
     } else {
         let metadata_role = storage.metadata()?;
-        match metadata_role.observe_listed(&descriptor, plan) {
-            Some(result) => result?,
-            None => metadata_role.observe(&descriptor.path, plan).await?,
+        let result = match metadata_role.observe_listed(&descriptor, plan) {
+            Some(result) => result,
+            None => metadata_role.observe(&descriptor.path, plan).await,
+        };
+        match result {
+            Ok(facts) => facts,
+            Err(StorageRoleFailure::Entry(error)) if optional_failure(plan, error.class()) => {
+                failed_optional_observations(
+                    &descriptor,
+                    plan,
+                    metadata_role.observation_capabilities(),
+                    error.class(),
+                    error.transience(),
+                )?
+            }
+            Err(error) => return Err(error.into()),
         }
     };
     let modified = metadata
@@ -85,4 +103,57 @@ pub async fn observe_descriptor(
         entry = entry.with_backend_fact_bytes(facts)?;
     }
     Ok(entry)
+}
+
+fn optional_failure(plan: ObservationPlan, class: FailureClass) -> bool {
+    class != FailureClass::Cancelled
+        && !MetadataFamily::ALL
+            .into_iter()
+            .any(|family| plan.mode(family) == ObservationMode::Required)
+        && MetadataFamily::ALL
+            .into_iter()
+            .any(|family| plan.mode(family) == ObservationMode::BestEffort)
+}
+
+fn failed_optional_observations(
+    descriptor: &SourceDescriptor,
+    plan: ObservationPlan,
+    capabilities: MetadataCapabilities,
+    class: FailureClass,
+    transience: Transience,
+) -> Result<MetadataObservations, ModelValueError> {
+    let inline: MetadataObservationParts =
+        descriptor.inline_observations(plan, capabilities).into();
+    let failed = |mode| mode == ObservationMode::BestEffort;
+    // 保留 stat/listing 已证明的事实；只给需要额外读取的 family 记录失败，不伪造空值。
+    MetadataObservationParts {
+        acl: if failed(plan.acl()) {
+            MetadataObservation::Failed { class, transience }
+        } else {
+            inline.acl
+        },
+        xattrs: if failed(plan.xattrs()) {
+            MetadataObservation::Failed { class, transience }
+        } else {
+            inline.xattrs
+        },
+        tags: if failed(plan.tags()) {
+            MetadataObservation::Failed { class, transience }
+        } else {
+            inline.tags
+        },
+        ownership_mode: if failed(plan.ownership_mode()) && inline.ownership_mode.value().is_none()
+        {
+            MetadataObservation::Failed { class, transience }
+        } else {
+            inline.ownership_mode
+        },
+        timestamps: if failed(plan.timestamps()) && inline.timestamps.value().is_none() {
+            MetadataObservation::Failed { class, transience }
+        } else {
+            inline.timestamps
+        },
+        ..MetadataObservationParts::default()
+    }
+    .build()
 }

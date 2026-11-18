@@ -110,6 +110,7 @@ pub(super) fn transient_if_gone(
 fn lookup_failure(failure: LookupFailure) -> NfsProtocolFailure {
     match failure {
         LookupFailure::Storage(error) => classify_role_error(error),
+        LookupFailure::Refresh(error) => error,
         LookupFailure::Component { error, .. } => classify_error(error),
     }
 }
@@ -305,10 +306,7 @@ impl FileCalls for MountFile<'_> {
 
     async fn forget(&self) -> Result<(), NfsProtocolFailure> {
         let generation = self.storage.refresh_generation.load(Ordering::Acquire);
-        self.storage
-            .maybe_refresh_root_fh(generation)
-            .await
-            .map_err(classify_role_error)?;
+        self.storage.maybe_refresh_root_fh(generation).await?;
         invalidate_path_cache(self.components, &self.storage.get_root_fh());
         Ok(())
     }

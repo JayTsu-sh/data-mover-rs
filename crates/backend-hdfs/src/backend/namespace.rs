@@ -127,7 +127,12 @@ impl HdfsNamespace {
 
 #[async_trait]
 impl Namespace for HdfsNamespace {
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    // stat_entry 每次向 NameNode 查询当前路径；不维护按名字复用的目录句柄。
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         refuse_artifacts(&[path])?;
         self.stat_entry(path).await
     }
@@ -260,7 +265,9 @@ mod tests {
         let protocol = Arc::new(super::super::contract_tests::MemoryHdfs::default());
         let namespace = namespace(&protocol);
         assert!(refused(
-            &namespace.stat(&path("dir/.data-mover-0123.part")).await
+            &namespace
+                .stat(&path("dir/.data-mover-0123.part"), false)
+                .await
         ));
         let request = ListRequest::new(path(".data-mover-staging"), CancellationToken::new());
         assert!(refused(

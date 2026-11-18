@@ -47,6 +47,8 @@ pub struct TarRequest<E = ObservedEntry> {
     pub final_path: StoragePath,
     pub cancel: CancellationToken,
     pub source_qos: Option<SourceQosGroup>,
+    /// 归档由完整清单生成，支持 `Direct` 或 `AtomicReplace`；不支持文件内续传。
+    pub transfer_policy: TransferPolicy,
 }
 
 /// Checked archive size, including headers, padding and the two end blocks.
@@ -67,15 +69,21 @@ pub fn calculate_tar_size<E: Borrow<ObservedEntry>>(entries: &[E]) -> Result<u64
     })
 }
 
-/// Streams an archive and atomically replaces its destination using the shared transfer engine.
+/// 按调用方指定的 `Direct` 或 `AtomicReplace` 策略流式写入归档。
 ///
 /// # Errors
-/// Returns invalid input or the original transfer error after Atomic artifact cleanup.
-/// Every file is checked against its observation before and after reading; detected changes fail
-/// without publication. Cleanup never removes an already published final object.
+/// `Checkpointed` 在准备目标前明确拒绝，生成的归档流不提供文件内续传。
+/// 每个源文件读取前后复核观察身份；Direct 失败可能留下已写入的最终内容。
+/// 返回原始传输原因，按对应策略清理暂存；不回滚已发布的最终对象。
 pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
     request: TarRequest<E>,
 ) -> Result<TransferOutcome, TarFailure> {
+    let policy = request.transfer_policy;
+    if policy == TransferPolicy::Checkpointed {
+        return Err(invalid(
+            "generated archives do not support Checkpointed transfers",
+        ));
+    }
     let size = calculate_tar_size(&request.entries)?;
     let observed = archive_observation(&request, size)?;
     let identity_key = observed.identity_key();
@@ -84,18 +92,7 @@ pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
         .read_source()
         .map_err(|error| invalid(&error.to_string()))?;
     let maximum = source.maximum_read_chunk_bytes().max(512);
-    let prepared = ExpertDestinationSession::prepare(
-        ExpertDestinationRequest::new(
-            observed,
-            maximum,
-            request.destination,
-            request.final_path.clone(),
-            request.cancel.clone(),
-        )
-        .with_transfer_policy(TransferPolicy::AtomicReplace),
-    )
-    .await;
-    let destination = finish_archive_phase(prepared).await?;
+    let destination = prepare_archive(&request, observed, maximum).await?;
     let budget = request
         .source_qos
         .as_ref()
@@ -140,7 +137,7 @@ pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
         Some(cause) => written.map_err(|failure| failure.attribute_source_input(cause.as_ref())),
         None => written,
     };
-    let transferred = finish_archive_phase(written).await?;
+    let transferred = finish_archive_phase(written, policy).await?;
     let (digest, actual) = {
         let tally = evidence
             .lock()
@@ -166,7 +163,36 @@ pub async fn pack<E: Borrow<ObservedEntry> + Send + Sync + 'static>(
             ),
         })
         .await;
-    finish_archive_phase(completed).await
+    finish_archive_phase(completed, policy).await
+}
+
+async fn prepare_archive<E: Borrow<ObservedEntry> + Send + Sync>(
+    request: &TarRequest<E>,
+    observed: ObservedEntry,
+    maximum: usize,
+) -> Result<ExpertDestinationSession, TarFailure> {
+    let inputs = request.entries.iter().map(|entry| {
+        let entry = entry.borrow();
+        SourceDescriptor::new(
+            entry.path().clone(),
+            entry.kind(),
+            entry.size(),
+            entry.source_identity().clone(),
+        )
+    });
+    let prepared = ExpertDestinationSession::prepare_generated(
+        ExpertDestinationRequest::new(
+            observed,
+            maximum,
+            request.destination.clone(),
+            request.final_path.clone(),
+            request.cancel.clone(),
+        )
+        .with_transfer_policy(request.transfer_policy),
+        Some(Box::new(inputs)),
+    )
+    .await;
+    finish_archive_phase(prepared, request.transfer_policy).await
 }
 
 fn archive_observation<E: Borrow<ObservedEntry>>(
@@ -341,13 +367,14 @@ fn stream_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure
 fn invalid(message: &str) -> TarFailure {
     TarFailure::Invalid(message.to_owned())
 }
-async fn finish_archive_phase<T>(result: Result<T, TransferFailure>) -> Result<T, TarFailure> {
+async fn finish_archive_phase<T>(
+    result: Result<T, TransferFailure>,
+    policy: TransferPolicy,
+) -> Result<T, TarFailure> {
     match result {
         Ok(value) => Ok(value),
         Err(failure) => Err(TarFailure::Transfer(Box::new(
-            failure
-                .cleanup_for_policy(TransferPolicy::AtomicReplace)
-                .await,
+            failure.cleanup_for_policy(policy).await,
         ))),
     }
 }

@@ -27,14 +27,18 @@ struct Scan {
 }
 
 async fn scan(root: &Path, request: TraversalRequest) -> io::Result<Scan> {
+    let mut traversal_completed = Vec::new();
     let (storage, _, _) = test_traversal_storage(root, "local-filter-test")
         .map_err(|error| io::Error::other(error.to_string()))?;
     let source = StorageTraversalSource::new(&storage).map_err(io::Error::other)?;
     let mut session = source.traverse(request);
     let mut paths = Vec::new();
     let mut saved = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
+            TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+                panic!("ordinary scan emitted consumer work")
+            }
             TraversalItem::Entry(entry) => paths.push(entry.path().as_str().to_owned()),
             TraversalItem::Checkpoint(checkpoint) => saved.push((paths.clone(), *checkpoint)),
             TraversalItem::DirectoryListed(_)
@@ -197,6 +201,52 @@ async fn modified_conditions_are_applied_to_each_descendant() -> io::Result<()> 
         let scan = scan(root.path(), request).await?;
         assert_completed(&scan);
         assert_eq!(scan.paths, ["k", "k/old"], "{order:?}");
+    }
+    Ok(())
+}
+
+fn anchored_request(order: TraversalOrder, epoch: i64) -> TraversalRequest {
+    request(order, "modified < 7d", None)
+        .filter(Arc::new(
+            DslTraversalFilter::parse(Some("modified < 7d"), None)
+                .assert_value("filter")
+                .with_time_anchor(epoch),
+        ))
+        .observation_plan(ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly))
+        .resumable(Resumable::On {
+            every: Duration::ZERO,
+        })
+}
+
+#[tokio::test]
+async fn fixed_windows_select_real_files_and_refuse_checkpoints_from_another_window()
+-> io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("payload"), b"window-bound")?;
+    set_file_mtime(
+        root.path().join("payload"),
+        FileTime::from_unix_time(10 * 86_400, 0),
+    )?;
+    for order in [TraversalOrder::Blocks, TraversalOrder::Unordered] {
+        let first = scan(root.path(), anchored_request(order, 16 * 86_400)).await?;
+        assert_completed(&first);
+        assert_eq!(first.paths, ["payload"]);
+        assert!(!first.saved.is_empty());
+        let later = scan(root.path(), anchored_request(order, 18 * 86_400)).await?;
+        assert_completed(&later);
+        assert!(later.paths.is_empty());
+        for (_, checkpoint) in first.saved {
+            let resumed = scan(
+                root.path(),
+                anchored_request(order, 18 * 86_400).resume_from(checkpoint),
+            )
+            .await?;
+            assert!(resumed.paths.is_empty());
+            assert_eq!(
+                resumed.outcome,
+                Err(TraversalTerminalFailure::Resume(ResumeRefusal::Mismatch))
+            );
+        }
     }
     Ok(())
 }

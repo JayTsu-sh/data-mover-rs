@@ -3,14 +3,18 @@
 use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use super::StorageRoleFailure;
 use crate::model::{
-    EntryOperationFailure, FailureClass, Operation, RenameContext, StoragePath, SymlinkTarget,
-    Transience,
+    EntryOperationFailure, FailureClass, ObservedEntry, Operation, RenameContext, StoragePath,
+    SymlinkTarget, Transience,
 };
 use crate::storage::SourceDescriptor;
 use crate::storage::listing::{ListRequest, ListingStream};
+
+mod purge;
+pub use purge::{PurgeFailure, PurgeOutcome};
 
 /// Creates a link itself; the target is stored verbatim, never traversed during creation.
 /// Parents must exist. Ownership and times may be sent with creation in one protocol operation.
@@ -36,16 +40,50 @@ pub trait Namespace: Send + Sync {
     /// Performs a fresh connectivity operation. Object stores override this with a bucket
     /// request because their root descriptor is synthetic.
     async fn check_connectivity(&self) -> Result<(), StorageRoleFailure> {
-        self.stat(&StoragePath::root()).await.map(|_| ())
+        self.stat(&StoragePath::root(), false).await.map(|_| ())
     }
 
     /// Describes one entry itself, without following a symlink in its last segment (a link is
     /// described as the link). A missing entry is an `Entry` failure of class `NotFound`.
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    /// `fresh=false` permits this library's existing namespace/handle caches. `fresh=true`
+    /// resolves the current name from the namespace root instead of inspecting an old cached
+    /// handle, including when an ancestor name was replaced. A fresh failure must not fall
+    /// back to cached success. Backends without such caches already resolve the name normally.
+    /// This does not upgrade weak identities, change virtual-root semantics, bypass the
+    /// filesystem/server's consistency model, rebind a held root, or exclude a subsequent
+    /// rename. Callers still apply their cancellation and recovery budgets around this call.
+    /// An adapter that discovers its configured root name now resolves to another held-root
+    /// identity refuses with `Conflict`; it must not combine that new identity with metadata
+    /// or writes still using the original anchor.
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         Err(unsupported(
             path,
             Operation::Observe,
             "stat is unsupported by this namespace",
+        ))
+    }
+
+    /// Confirms persistence of the already verified entry and its namespace binding. The
+    /// descriptor must come from this destination after its last data/metadata mutation.
+    /// Implementations recheck identity and change evidence; this is neither content validation
+    /// nor an exclusion lock. Callers must exclude concurrent writers through source removal.
+    /// S3 对象桶也可确认 `describe_version` 返回的选中删除标记。Id 复核精确历史版本；
+    /// 将该描述的 version 设为 Current 会额外要求此标记仍为当前唯一记录，其原有身份
+    /// 和 history 事实必须保留。null 标记还要求可比较的修改时间证据。不读取内容或改写。
+    /// Unsupported backends refuse rather than treating readable page-cache data as durable.
+    async fn persist_observed(
+        &self,
+        expected: &SourceDescriptor,
+        _cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        Err(unsupported(
+            &expected.path,
+            Operation::Publish,
+            "published entry persistence is unsupported",
         ))
     }
 
@@ -126,6 +164,28 @@ pub trait Namespace: Send + Sync {
     /// nothing is deleted.
     async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
         Err(unsupported(path, Operation::Namespace, NO_MUTATIONS))
+    }
+
+    /// Permanently removes the observed entry after rechecking its source identity. Filesystem
+    /// directories must be empty; object stores override this to remove all versions and markers
+    /// of the exact key, retaining the latest record until the other records have been removed.
+    ///
+    /// The caller authorizes deletion only after publication, required metadata, selected
+    /// verification and required persistence succeed. External bookkeeping is caller policy,
+    /// not enforced by this role. It must exclude concurrent writers: protocols do not
+    /// universally offer atomic compare-and-unlink. A failure may follow partial historical
+    /// cleanup; re-observe before retrying. Missing entries are idempotent. This never recursively
+    /// deletes children. `PurgeFailure` preserves the first typed cause and each additional
+    /// failed version in the bounded batch. An error does not mean no historical record was
+    /// deleted, and cancellation after submission may leave unknown outcomes.
+    async fn purge_observed(
+        &self,
+        entry: &ObservedEntry,
+        cancel: CancellationToken,
+    ) -> Result<PurgeOutcome, PurgeFailure> {
+        purge::current(self, entry, &cancel)
+            .await
+            .map_err(PurgeFailure::from)
     }
 
     /// Deletes listed non-directory entries. Results correspond one-for-one, in input order;

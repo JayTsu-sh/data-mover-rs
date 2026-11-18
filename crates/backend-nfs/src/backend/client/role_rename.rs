@@ -134,10 +134,7 @@ impl RenameCalls for MountRename<'_> {
 
     async fn forget(&self) -> Result<(), NfsProtocolFailure> {
         let generation = self.storage.refresh_generation.load(Ordering::Acquire);
-        self.storage
-            .maybe_refresh_root_fh(generation)
-            .await
-            .map_err(classify_role_error)?;
+        self.storage.maybe_refresh_root_fh(generation).await?;
         let root = self.storage.get_root_fh();
         invalidate_path_cache(self.from_components, &root);
         invalidate_path_cache(self.to_components, &root);

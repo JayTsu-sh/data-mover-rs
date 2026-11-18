@@ -17,7 +17,7 @@ async fn nfs_probe_reads_root_without_using_unsupported_root_stat() -> Result<()
     }))
     .await?;
     assert!(matches!(
-        storage.namespace()?.stat(&StoragePath::root()).await,
+        storage.namespace()?.stat(&StoragePath::root(), false).await,
         Err(StorageRoleFailure::Entry(failure)) if failure.class() == FailureClass::InvalidInput
     ));
     check_connectivity(&storage).await?;

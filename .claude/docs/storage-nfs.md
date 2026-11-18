@@ -26,6 +26,42 @@ VerifyThenResume 的修改操作仍是 Protocol / Unknown，重放前需核验�
 data-mover 保留 Throttled 与原始状态，不再次启动列举退避预算。
 原生库增加 v4.2 不表示 data-mover 自动声明该版本；当前 dialect 仍明确映射 v3 / v4.0 / v4.1。
 
+## 普通文件 Direct
+
+普通传输支持既有 `TransferPolicy::Direct`：直接写最终文件，不创建 stage／pointer，
+不进行发布 rename。已有文件无截断打开，源数据完整结束后才调整最终长度；空文件同样处理。
+源／目标 FH 相同则在写入前拒绝。元数据仍独立复制及校验，失败保留数据。
+
+既有 `NfsStagedProtocol::create_empty_open`／`open_write` 扩展为返回实际句柄与 FH，
+适配器复用同一连接的 `NfsSourceProtocol::describe` 核验归属，不增加另一套观察接口。
+失败清理只针对本次拥有且受影响的最终文件，路径已替换、已进入元数据阶段或已发布均拒绝删除。
+失败／放弃写入后的 CLOSE 最多等待 3 秒；结果未知必须报告，不能宣称目标已清理。
+该期限不包括底层 WRITE 的故障检测；目前真实 v4.1 静默丢包检测约 45 秒、连同关闭约 48 秒，
+不能据此声称产品已经满足尽早退出目标。普通 Direct 成功也不替代删源前的独立持久化门槛。
+
+真实回归入口及严格验证范围见 [实验室说明](../../tests/lab/README.md#nfs-direct-contract)。
+
+## 已发布普通文件的持久化确认
+
+`Namespace::persist_observed` 使用已核验的目标描述符，只确认普通文件。
+身份、大小、mtime／ctime、mode 和 ownership 必须与确认前后重新解析的路径一致；
+包括端点前缀和祖先，不能把已被 rename 的缓存目录当作当前路径。
+它复用既有 `NfsNamespaceProtocol::stat` 的 fresh 参数，以及 `open_read` 返回的实际 FH；
+不创建文件，不修改权限，不读取内容，不创建传输状态。
+
+通过 `NfsStageFile::checkpoint(true)` 发出整文件 COMMIT，再确认 CLOSE 和路径观察。
+COMMIT(0,0) 的稳定存储语义见 [RFC 1813 §3.3.21](https://www.rfc-editor.org/rfc/rfc1813.html#section-3.3.21)
+及 [RFC 8881 §18.3](https://www.rfc-editor.org/rfc/rfc8881.html#section-18.3)。
+CLOSE 也是确认的一部分，nfs-rs 0.11.1 在此收束当前 mount 的 pNFS DS/LAYOUTCOMMIT；
+本次没有真实 pNFS DS 设备验收，不能把 Linux 功能用例表述为 pNFS 认证。
+原有 `checkpoint(false)` 的回执／verifier 和恢复语义不变。
+
+该操作响应在途取消，关闭最多另等 3 秒。COMMIT 与 CLOSE 均失败时同时保留两者诊断；
+确认丢失仍为 Unknown，同时准确保留 Connectivity／Timeout，不授权重放文件或删除源端。
+完整内容校验、源端新鲜性、执行身份及最终删除由原有角色与任务层继续负责。
+目录及软链接仍明确 Unsupported；OPEN／COMMIT 权限不足也必须失败并保留源端。
+该能力不解除产品当前的数据库收尾顺序，也不等于全任务共享故障预算已经接通。
+
 ## ACL 能力（2026-10-28）
 
 NFSv3 仅在实际探测到 NFSACL RPC 100227 v3 扩展时声明 `posix_acl`；后端以 typed POSIX
@@ -35,6 +71,27 @@ NFSv3 GET 可重放；SET 使用单次传输尝试，传输结果不确定时返
 URL 协议版本本身不构成 ACL 能力证明。当前 ACL 自动复制、损失报告与独立严格比对见
 [元数据协商](metadata-negotiation.md#acl-自动复制与错误报告)。四组合的历史实机结果见
 [验收报告](../../docs/reports/2026-10-28-nfs-acl-four-way-validation.md)，其旧复制开关不属于当前接口。
+
+## 绑定前缀与目录缓存
+
+连接时绑定配置根，目录缓存以端点身份和绑定的根 FH 隔离。句柄恢复从挂载根重新
+查找配置的子目录前缀，确认仍指向原 FH 后才重试。绑定的子目录消失或被替换时，
+清除该根作用域的缓存并返回 `Conflict`。fresh 查询使用同一绑定核验当前名字。
+Linux v3/v4.1 的旧错误复现及修复后独立核验见
+[实验室说明](../../tests/lab/README.md#nfs-bound-root-cache-isolation-2026-11-09)。
+
+NFS 操作的原始 SDK 原因可从 role 错误的 `Error::source` 链获取，其中包含 SDK
+已经确认的发送状态、操作结果及恢复动作。展示使用 role 错误的脱敏诊断。
+
+## 元数据应用取消
+
+既有 `Metadata::apply` 的令牌覆盖 NFS 元数据写入及 ACL 读回等待，而不只检查调用前状态。
+预先取消返回 Metadata / Cancelled / Transient，不发送修改请求；在途取消返回
+Metadata / Cancelled / Unknown，并明确元数据写入未确认。批量 xattr 取消后停止后续修改。
+已发送请求可能仍在服务端完成，不能以取消证明属性未变，也不能授权删源。
+协议原有安全重放、会话 slot fencing 和正常拒绝分类保持由 backend／nfs-rs 负责。
+Linux v3/v4.1 的真实故障范围、取消耗时和未覆盖项见
+[实验室说明](../../tests/lab/README.md#nfs-metadata-cancellation-2026-11-09)。
 
 ## 读写块大小
 
@@ -290,7 +347,7 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   `NotFound`，断连 → `Connectivity`，保留状态名）后 MKDIR：
   - `EXIST` → LOOKUP 该名字（无属性则 GETATTR）：目录 → 成功；**非目录（文件 / 符号链接）→ 删掉再 MKDIR**
     —— legacy 的 rsync 式迁移语义，保留，`warn!` 记录；REMOVE 的 `NOENT` 当作兄弟任务已删，`ISDIR` / `NOTEMPTY` 当作兄弟任务已删并建好了目录（再 MKDIR → `EXIST` → 目录）。
-  - `STALE` / `BADHANDLE` / `NOENT`（并发改名 / 删除）→ 刷新根句柄、忘掉路径缓存、重试。
+  - `STALE` / `BADHANDLE` / `NOENT`（并发改名 / 删除）→ 核验原根绑定、忘掉路径缓存、重试。
   - 其余直接 `classify_error`（保留状态名）：`ACCES` / `PERM` / `ROFS` → 条目 `PermissionDenied` / Permanent。
   - 至多 `MAX_STALE_RETRIES`（3）次重试，用尽报最后的原因（一直被非目录挡住 → `Conflict` / Unknown，最后那个
     非目录不删 —— 没有重试可用来建目录时不做破坏性的一步）。
@@ -353,3 +410,7 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 4. 改完跑 `make e2e-nfs` (需测试服务器)。
 
 目录列举的路径句柄解析使用 `role_lookup_fh`，保留原生 LOOKUP 的 Connectivity/Timeout 分类。旧 `lookup_fh` 会把原生错误转成字符串，不能用于扫描角色，否则恢复期间并发目录失败会被误报成 Protocol/Unknown。
+
+### 根目录观察与持久性
+
+现有 Namespace::stat 接受空 StoragePath 所表示的绑定根；persist_observed 仅对根目录放开路径准入，并保留当前身份、ctime／mtime、属性和前后 fresh 前缀复核。根文件、根删除和根创建仍被拒绝，不新增公开函数或类型。真实 v3／v4.1 根元数据回归覆盖 mode 的闪断、持续断连、静默超时、取消、丢确认，以及 owner／time 取消和 v4.1 ACL 写入／读回取消，共 16 例。显式恢复后由服务端独立核验子文件及请求属性，取消返回小于 1 秒；未据此声称整个迁移已有统一 3 秒预算。

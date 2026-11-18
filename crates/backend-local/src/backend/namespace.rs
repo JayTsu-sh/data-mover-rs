@@ -16,6 +16,7 @@
 //! seen through `List` — removes them with it.
 
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use blake3::Hasher;
 use cap_std::fs::{Dir, Metadata};
+use cap_std::io_lifetimes::AsFilelike as _;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK;
 
@@ -34,19 +36,19 @@ use super::observation::{
     timestamp_metadata,
 };
 use super::rename;
-#[cfg(unix)]
-use crate::model::OwnershipMode;
 use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
-    Operation, RenameContext, StoragePath, SymlinkTarget, Transience,
+    ObservedEntry, Operation, RenameContext, StoragePath, SymlinkTarget, Transience,
 };
+#[cfg(unix)]
+use crate::model::{OwnershipMode, PermissionFacts, PrincipalIdentity};
 #[cfg(unix)]
 use crate::storage::InlineOwnership;
 use crate::storage::artifacts::is_artifact_name;
 use crate::storage::durability::sync_directory;
 use crate::storage::{
     CaseSensitivity, ListRequest, ListingStream, NameNormalization, NameSemantics, Namespace,
-    NamespaceCapabilities, SourceDescriptor, StorageRoleFailure,
+    NamespaceCapabilities, PurgeFailure, PurgeOutcome, SourceDescriptor, StorageRoleFailure,
 };
 use hooks::Hooks;
 #[cfg(any(test, feature = "test-support"))]
@@ -60,6 +62,8 @@ pub struct LocalNamespace {
     root_device: Option<u64>,
     rename_context: Option<RenameContext>,
     listing_resume_key: [u8; 32],
+    #[cfg(unix)]
+    persistence: Option<Arc<persistence::RootAnchor>>,
     #[cfg(any(test, feature = "test-support"))]
     probe: Arc<ListProbe>,
 }
@@ -84,9 +88,19 @@ impl LocalNamespace {
             identity,
             rename_context: None,
             listing_resume_key: listing_key(None),
+            #[cfg(unix)]
+            persistence: None,
             #[cfg(any(test, feature = "test-support"))]
             probe: Arc::new(ListProbe::default()),
         }
+    }
+
+    /// 配置根目录的持久化锚点；首次确认时也同步根目录外的新建祖先目录项。
+    #[cfg(unix)]
+    #[must_use]
+    pub fn with_persistence_root(mut self, root: PathBuf) -> Self {
+        self.persistence = Some(Arc::new(persistence::RootAnchor::new(root)));
+        self
     }
 
     #[must_use]
@@ -206,7 +220,11 @@ impl LocalNamespace {
             .map_err(|_| entry_failure(path, operation, FailureClass::Internal))?
     }
 
-    async fn stat_entry(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat_entry(
+        &self,
+        path: &StoragePath,
+        fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         let native = checked(path, Operation::Observe, true)?;
         let target = path.clone();
         let root_device = self.root_device;
@@ -217,7 +235,27 @@ impl LocalNamespace {
                 in_parent(root, &native, |parent, leaf| parent.symlink_metadata(leaf))
             }
             .map_err(|error| io_failure(&target, Operation::Observe, &error))?;
-            describe(identity, target, &metadata, Operation::Observe, root_device)
+            let descriptor =
+                describe(identity, target, &metadata, Operation::Observe, root_device)?;
+            // 仅 Unix fresh 描述附带同一次 stat 已确认的真实权限，不额外访问路径。
+            #[cfg(unix)]
+            let descriptor = if fresh && descriptor.permissions.is_none() {
+                match descriptor.inline_ownership {
+                    Some(InlineOwnership::Known(owner)) => {
+                        descriptor.with_permissions(PermissionFacts {
+                            owner: Some(PrincipalIdentity::Numeric(owner.uid)),
+                            group: Some(PrincipalIdentity::Numeric(owner.gid)),
+                            mode: Some(owner.mode & 0o7777),
+                        })
+                    }
+                    _ => descriptor,
+                }
+            } else {
+                descriptor
+            };
+            #[cfg(not(unix))]
+            let _ = fresh;
+            Ok(descriptor)
         })
         .await
     }
@@ -293,8 +331,22 @@ impl Namespace for LocalNamespace {
         &self.listing_resume_key
     }
 
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
-        self.stat_entry(path).await
+    // 每次经目录能力句柄重新解析相对路径；没有本库目录 FH 缓存需要绕过。
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
+        self.stat_entry(path, fresh).await
+    }
+
+    #[cfg(unix)]
+    async fn persist_observed(
+        &self,
+        expected: &SourceDescriptor,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        self.persist_entry(expected, cancel).await
     }
 
     /// Streams the directory page by page, one blocking read per page ([`listing`], P7 C5).
@@ -362,6 +414,33 @@ impl Namespace for LocalNamespace {
 
     async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
         self.delete_one(path).await
+    }
+
+    async fn purge_observed(
+        &self,
+        entry: &ObservedEntry,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<PurgeOutcome, PurgeFailure> {
+        if cancel.is_cancelled() {
+            return Err(
+                entry_failure(entry.path(), Operation::Namespace, FailureClass::Cancelled).into(),
+            );
+        }
+        #[cfg(unix)]
+        {
+            self.purge_entry(entry, cancel)
+                .await
+                .map_err(PurgeFailure::from)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(entry_failure(
+                entry.path(),
+                Operation::Namespace,
+                FailureClass::Unsupported,
+            )
+            .into())
+        }
     }
 
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {
@@ -451,16 +530,22 @@ fn listing_key(context: Option<&RenameContext>) -> [u8; 32] {
 /// Opens the directory at `relative` below `root`, one component at a time, refusing a
 /// symlink at every step. An empty path is the root itself.
 fn open_directory(root: &Dir, relative: &Path) -> io::Result<Dir> {
-    let mut current = root.try_clone()?;
-    for component in relative.components() {
+    let mut components = relative.components();
+    let Some(first) = components.next() else {
+        return root.try_clone();
+    };
+    let Component::Normal(name) = first else {
+        return Err(io::ErrorKind::InvalidInput.into());
+    };
+    let parent = root.as_filelike_view::<File>();
+    let mut current = cap_primitives::fs::open_dir_nofollow(&parent, Path::new(name))?;
+    for component in components {
         let Component::Normal(name) = component else {
             return Err(io::ErrorKind::InvalidInput.into());
         };
-        let parent = current.into_std_file();
-        let child = cap_primitives::fs::open_dir_nofollow(&parent, Path::new(name))?;
-        current = Dir::from_std_file(child);
+        current = cap_primitives::fs::open_dir_nofollow(&current, Path::new(name))?;
     }
-    Ok(current)
+    Ok(Dir::from_std_file(current))
 }
 
 /// Runs `work` on the final component of `native` inside its parent, opened without
@@ -473,6 +558,9 @@ fn in_parent<T>(
     let (Some(parent), Some(leaf)) = (native.parent(), native.file_name()) else {
         return Err(io::ErrorKind::InvalidInput.into());
     };
+    if parent.as_os_str().is_empty() {
+        return work(root, leaf);
+    }
     work(&open_directory(root, parent)?, leaf)
 }
 
@@ -674,3 +762,9 @@ mod streaming_tests;
 mod symlink;
 #[cfg(test)]
 mod tests;
+
+#[cfg(unix)]
+mod persistence;
+
+#[cfg(unix)]
+mod purge;

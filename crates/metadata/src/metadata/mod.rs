@@ -5,8 +5,8 @@ use std::fmt;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    AclEncoding, FailureClass, MappedOwnership, MetadataObservations, OwnershipMode, StoragePath,
-    TimePrecision,
+    AclEncoding, FailureClass, MappedOwnership, MetadataObservations, OwnershipMode, SourceVersion,
+    StoragePath, TimePrecision,
 };
 use crate::storage::{
     Metadata, MetadataMutation, PreparedStage, StagedDestination, StagedMetadataApplicationFailure,
@@ -20,11 +20,19 @@ mod acl_policy_tests;
 mod checkpoint_binding;
 mod compile;
 mod errors;
+mod verify;
+#[cfg(test)]
+mod verify_anchor_tests;
+#[cfg(test)]
+mod verify_cancel_tests;
+#[cfg(test)]
+mod verify_tests;
+#[cfg(test)]
+mod version_tests;
+pub use verify::MetadataVerificationError;
 
 pub use compile::compile_metadata_plan;
-pub use compile::{
-    compile_copied_metadata_plan, compile_nothing_stored_plan, compile_unavailable_plan,
-};
+pub use compile::{compile_copied_metadata_plan, compile_unavailable_plan};
 use errors::family_name;
 pub use errors::role_failure_text;
 pub use errors::{
@@ -314,6 +322,8 @@ impl MetadataPlan {
     /// Applies the immutable plan in family order. A family the target refuses does not stop the
     /// others; the item fails afterwards with every refusal listed.
     ///
+    /// version 指定既有目标版本，Id 不会创建新版本或回退修改当前对象。
+    ///
     /// # Errors
     /// Returns every failed family and the partial application report on cancellation or target
     /// storage failure.
@@ -321,10 +331,18 @@ impl MetadataPlan {
         &self,
         target: &dyn Metadata,
         path: &StoragePath,
+        version: &SourceVersion,
         cancel: CancellationToken,
     ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
-        self.apply_to(ApplicationTarget::Published { target, path }, cancel)
-            .await
+        let destination = match version {
+            SourceVersion::Current => ApplicationTarget::Published { target, path },
+            SourceVersion::Id(version_id) => ApplicationTarget::Version {
+                target,
+                path,
+                version_id,
+            },
+        };
+        self.apply_to(destination, cancel).await
     }
 
     /// Checks that recovered staged metadata still satisfies this plan.
@@ -567,6 +585,11 @@ const fn cancelled_at(family: MetadataFamily) -> FamilyFailure {
 }
 
 enum ApplicationTarget<'a> {
+    Version {
+        target: &'a dyn Metadata,
+        path: &'a StoragePath,
+        version_id: &'a str,
+    },
     Published {
         target: &'a dyn Metadata,
         path: &'a StoragePath,
@@ -580,6 +603,15 @@ impl ApplicationTarget<'_> {
         cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
         match self {
+            Self::Version {
+                target,
+                path,
+                version_id,
+            } => {
+                target
+                    .apply_to_version(path, version_id, mutation, cancel)
+                    .await
+            }
             Self::Published { target, path } => target.apply(path, mutation, cancel).await,
         }
     }

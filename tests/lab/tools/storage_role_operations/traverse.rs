@@ -79,6 +79,7 @@ async fn consume(
     command: &Command,
     cancel: &CancellationToken,
 ) -> Result<Tally, Error> {
+    let mut traversal_completed = Vec::new();
     let Command::Traverse {
         quiet,
         snapshot_bytes,
@@ -90,7 +91,7 @@ async fn consume(
         unreachable!("dispatched by the caller")
     };
     let mut tally = Tally::default();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match &item {
             TraversalItem::Entry(entry) => {
                 tally.entries += 1;

@@ -3,7 +3,7 @@ use super::listing::directory_prefix;
 use super::paging::{ListingLimits, Paging};
 use super::source::role_failure;
 use super::{S3ObjectPage, S3Protocol, S3ProtocolFailure};
-use crate::model::{FailureClass, Operation, StoragePath, Transience};
+use crate::model::{FailureClass, Operation, SourceVersion, StoragePath, Transience};
 use crate::storage::StorageRoleFailure;
 use crate::storage::artifacts::is_artifact_path;
 use std::collections::{HashSet, VecDeque};
@@ -64,7 +64,7 @@ pub(super) async fn cleanup<P: S3Protocol + ?Sized>(
                 .into_iter()
                 .filter_map(|object| {
                     (is_artifact_path(&object.key) || (require_empty && object.key == prefix))
-                        .then_some(object.key)
+                        .then_some((object.key, SourceVersion::Current))
                 })
                 .collect();
             for results in protocol.delete_objects(&keys).await {

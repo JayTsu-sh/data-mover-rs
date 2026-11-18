@@ -453,6 +453,10 @@ fn the_fingerprint_binds_what_decides_the_listing_and_nothing_else() {
         ),
         ("depth", print(&local, &base.clone().max_depth(depth))),
         (
+            "directory object metadata",
+            print(&local, &base.clone().directory_object_metadata(false)),
+        ),
+        (
             "listing semantics",
             fingerprint(&local, &base, b"another-listing-mode")
                 .unwrap_or_else(|error| panic!("{error}")),

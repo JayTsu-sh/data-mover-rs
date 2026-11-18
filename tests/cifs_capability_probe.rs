@@ -346,7 +346,7 @@ async fn probe_symlink_named(share: &smb_domain::Share, target: &Endpoint, name:
     }))
     .await?;
     let namespace = storage.namespace()?;
-    let stat = namespace.stat(&StoragePath::new(&name)?).await;
+    let stat = namespace.stat(&StoragePath::new(&name)?, false).await;
     println!("[probe] symlink {name}: role stat -> {}", describe(&stat));
     Ok(())
 }

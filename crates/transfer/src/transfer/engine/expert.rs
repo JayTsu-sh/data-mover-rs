@@ -1,5 +1,6 @@
 //! Transport-neutral source and destination halves of the unified transfer lifecycle.
 
+use crate::transfer::PublicationDurability;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -331,6 +332,7 @@ pub struct ExpertDestinationRequest {
     final_path: StoragePath,
     cancel: tokio_util::sync::CancellationToken,
     transfer_policy: TransferPolicy,
+    publication_durability: PublicationDurability,
     metadata_plan: Option<MetadataPlan>,
     write_observer: Option<WriteProgressObserver>,
 }
@@ -363,6 +365,7 @@ impl ExpertDestinationRequest {
             final_path,
             cancel,
             transfer_policy: TransferPolicy::default(),
+            publication_durability: PublicationDurability::default(),
             metadata_plan: None,
             write_observer: None,
         }
@@ -371,6 +374,13 @@ impl ExpertDestinationRequest {
     #[must_use]
     pub const fn with_transfer_policy(mut self, policy: TransferPolicy) -> Self {
         self.transfer_policy = policy;
+        self
+    }
+
+    /// 发布持久性独立于是否续传。
+    #[must_use]
+    pub const fn with_publication_durability(mut self, durability: PublicationDurability) -> Self {
+        self.publication_durability = durability;
         self
     }
 
@@ -420,13 +430,20 @@ impl ExpertDestinationSession {
     /// # Errors
     /// Returns a phase-attributed preflight or destination failure.
     pub async fn prepare(request: ExpertDestinationRequest) -> Result<Self, TransferFailure> {
+        Self::prepare_generated(request, None).await
+    }
+
+    pub(crate) async fn prepare_generated(
+        request: ExpertDestinationRequest,
+        inputs: Option<Box<dyn Iterator<Item = SourceDescriptor> + Send + '_>>,
+    ) -> Result<Self, TransferFailure> {
         if request.source_maximum_chunk_bytes == 0 {
             return Err(TransferFailure::orchestration(
                 TransferPhase::Preflight,
                 "expert source chunk ceiling must be non-zero",
             ));
         }
-        if request.transfer_policy == TransferPolicy::Direct {
+        if request.transfer_policy == TransferPolicy::Direct && inputs.is_none() {
             return Err(TransferFailure::capability(
                 TransferSide::Destination,
                 "Direct requires the ordinary transfer entry with source identity validation",
@@ -466,6 +483,17 @@ impl ExpertDestinationSession {
         }
         let mut stage =
             prepare_destination_stage(&request, &destination, &source, recovery_enabled).await?;
+        if request.transfer_policy == TransferPolicy::Direct
+            && let Some(inputs) = inputs
+            && let Err(error) = destination.validate_direct_inputs(&stage, inputs).await
+        {
+            return Err(TransferFailure::role(
+                TransferPhase::Preflight,
+                TransferSide::Destination,
+                error,
+            )
+            .with_stage(destination, stage));
+        }
         // The destination may decline recovery for this stage (a single S3 PUT).
         let recovery_enabled = recovery_enabled && stage.recovery_enabled();
         let effective_recovery = match effective_recovery {
@@ -474,7 +502,11 @@ impl ExpertDestinationSession {
             }
             effective_recovery => effective_recovery,
         };
-        stage.set_durable_publication(request.transfer_policy == TransferPolicy::Checkpointed);
+        stage.set_durable_publication(
+            request
+                .publication_durability
+                .required(request.transfer_policy),
+        );
         stage.set_write_observer(request.write_observer);
         if stage.write_offset() > 0 && stage.recovery_enabled() {
             stage.checkpoint_recorded(stage.write_offset());

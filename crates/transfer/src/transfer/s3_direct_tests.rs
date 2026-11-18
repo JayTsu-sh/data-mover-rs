@@ -9,10 +9,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, StoragePath, Transience};
 use crate::storage::PrepareFact;
-use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, source_storage};
+use crate::storage::backends::s3::tests::{MemoryS3, Versioning, endpoint_of, source_storage};
 use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect};
 use crate::transfer::{
-    EffectiveRecovery, TransferPolicy, TransferRequest, TransferRoute, transfer,
+    EffectiveRecovery, FailedDataCleanup, MetadataTransferMode, TransferPhase, TransferPolicy,
+    TransferRequest, TransferRoute, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -70,6 +71,84 @@ async fn a_small_direct_transfer_is_one_put() -> TestResult {
     assert_eq!(*protocol.multipart_begins.lock().await, 0);
     assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
     assert!(leaves_nothing_behind(&protocol).await?);
+    Ok(())
+}
+
+/// 已确认发布后的数据校验失败也必须保留清理授权；只移除本次版本，旧版本和源保留。
+#[tokio::test]
+async fn opted_in_postpublication_verification_failure_removes_only_our_s3_output() -> TestResult {
+    for versioned in [false, true] {
+        for size in [1024, 20 * MIB] {
+            let (protocol, payload) = seeded(size).await;
+            if versioned {
+                protocol.set_versioning(Versioning::Enabled);
+                protocol
+                    .put_version("final", "old", Bytes::from_static(b"valid old version"))
+                    .await;
+            }
+            *protocol.head_failure.lock().await = Some((
+                "final".into(),
+                S3ProtocolFailure::entry(
+                    FailureClass::PermissionDenied,
+                    Transience::Permanent,
+                    "read-back refused",
+                ),
+            ));
+            let failure = transfer(
+                direct_request(&protocol)?
+                    .with_metadata_mode(MetadataTransferMode::CallerManaged)
+                    .with_failed_data_cleanup(FailedDataCleanup::RemoveOwned),
+            )
+            .await
+            .err()
+            .ok_or("read-back failure must stop the transfer")?;
+            assert_eq!(failure.phase(), TransferPhase::Verify);
+            assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
+            assert!(failure.has_failed_data_cleanup(), "{failure}");
+            *protocol.head_failure.lock().await = None;
+            let failure = failure.cleanup_for_policy(TransferPolicy::Direct).await;
+            assert!(failure.cleanup_failure().is_none(), "{failure}");
+            assert_eq!(
+                protocol.objects.lock().await.get("src/final"),
+                Some(&payload)
+            );
+            if versioned {
+                assert_eq!(
+                    protocol.objects.lock().await.get("final"),
+                    Some(&Bytes::from_static(b"valid old version"))
+                );
+                assert_eq!(protocol.version_deletes().len(), 1);
+                assert_ne!(protocol.version_deletes()[0].1, "old");
+            } else {
+                assert!(!protocol.objects.lock().await.contains_key("final"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_direct_policy_keeps_published_output_on_failed_read_back() -> TestResult {
+    let (protocol, payload) = seeded(1024).await;
+    *protocol.head_failure.lock().await = Some((
+        "final".into(),
+        S3ProtocolFailure::entry(
+            FailureClass::PermissionDenied,
+            Transience::Permanent,
+            "read-back refused",
+        ),
+    ));
+    let failure = transfer(
+        direct_request(&protocol)?.with_metadata_mode(MetadataTransferMode::CallerManaged),
+    )
+    .await
+    .err()
+    .ok_or("read-back must fail")?;
+    assert_eq!(failure.phase(), TransferPhase::Verify);
+    assert!(!failure.has_failed_data_cleanup());
+    let failure = failure.cleanup_for_policy(TransferPolicy::Direct).await;
+    assert!(failure.cleanup_failure().is_none());
+    assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
     Ok(())
 }
 

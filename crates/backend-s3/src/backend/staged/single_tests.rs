@@ -3,6 +3,7 @@
 
 use tokio_util::sync::CancellationToken;
 
+use super::single::{self, SingleStage};
 use super::*;
 use crate::model::{EntryKind, IdentityStrength, SourceIdentity, StoragePath};
 use crate::storage::artifacts::ARTIFACT_PREFIX;
@@ -271,8 +272,13 @@ async fn a_lost_put_reply_is_settled_by_head() -> TestResult {
         .await
         .map_err(|failure| failure.error)?;
     let current = protocol.version.lock().await.clone();
-    assert!(published.version.is_some());
-    assert_eq!(published.version, current);
+    assert!(published.version.is_none());
+    let read_pin = single::of(&stage)
+        .and_then(SingleStage::published)
+        .ok_or("published read pin")?;
+    assert_eq!(read_pin.version_id, current);
+    assert!(read_pin.reported_version.is_none());
+    assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
     destination
         .verify(&stage, verify_request(&payload, &published))
         .await?;

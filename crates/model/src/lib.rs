@@ -1,5 +1,6 @@
 //! Protocol-neutral values shared by the storage and transfer modules.
 
+use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -90,6 +91,50 @@ fn required(
         Ok(RedactedString(value))
     }
 }
+
+/// A comparable diagnostic with optional process-local evidence.
+#[derive(Clone)]
+struct FailureDiagnostic {
+    text: Arc<str>,
+    source: Option<Arc<FailureReport>>,
+}
+
+struct FailureReport(Box<dyn Error + Send + Sync>);
+
+impl FailureDiagnostic {
+    fn new(report: impl Into<Box<dyn Error + Send + Sync>>) -> Result<Self, ModelValueError> {
+        let report = report.into();
+        let text = Arc::from(required(report.to_string(), "diagnostic")?.0);
+        // A plain text report has no source. Keep only reports carrying structured evidence.
+        let source = report
+            .source()
+            .is_some()
+            .then(|| Arc::new(FailureReport(report)));
+        Ok(Self { text, source })
+    }
+
+    fn text(&self) -> &str {
+        &self.text
+    }
+
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_ref().and_then(|report| report.0.source())
+    }
+}
+
+impl fmt::Debug for FailureDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl PartialEq for FailureDiagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for FailureDiagnostic {}
 
 /// The closed set of storage implementations.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -620,7 +665,7 @@ macro_rules! failure_accessors {
         /// Returns the adapter-provided, already-redacted diagnostic.
         #[must_use]
         pub fn diagnostic(&self) -> &str {
-            &self.diagnostic.0
+            self.diagnostic.text()
         }
     };
 }
@@ -633,11 +678,13 @@ pub struct EntryOperationFailure {
     operation: Operation,
     class: FailureClass,
     transience: Transience,
-    diagnostic: RedactedString,
+    diagnostic: FailureDiagnostic,
 }
 
 impl EntryOperationFailure {
-    /// Creates an entry-scoped failure from an already-redacted diagnostic.
+    /// Creates an entry-scoped failure from an already-redacted message or report.
+    /// The report's display text must be redacted. Its optional error source is exposed
+    /// through [`Error::source`] and is excluded from value comparison and formatting.
     ///
     /// # Errors
     /// Returns an error when the diagnostic is blank, contains NUL, or exceeds the model field limit.
@@ -646,7 +693,7 @@ impl EntryOperationFailure {
         operation: Operation,
         class: FailureClass,
         transience: Transience,
-        diagnostic: impl Into<String>,
+        diagnostic: impl Into<Box<dyn Error + Send + Sync>>,
     ) -> Result<Self, ModelValueError> {
         Ok(Self {
             path,
@@ -654,7 +701,7 @@ impl EntryOperationFailure {
             operation,
             class,
             transience,
-            diagnostic: required(diagnostic, "diagnostic")?,
+            diagnostic: FailureDiagnostic::new(diagnostic)?,
         })
     }
 
@@ -690,7 +737,11 @@ impl fmt::Display for EntryOperationFailure {
     }
 }
 
-impl std::error::Error for EntryOperationFailure {}
+impl Error for EntryOperationFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.diagnostic.source()
+    }
+}
 
 /// Opaque comparison identity for an entry that could not be fully observed.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -732,11 +783,13 @@ pub struct BackendSessionFailure {
     operation: Operation,
     class: FailureClass,
     transience: Transience,
-    diagnostic: RedactedString,
+    diagnostic: FailureDiagnostic,
 }
 
 impl BackendSessionFailure {
-    /// Creates a session-scoped failure from an already-redacted diagnostic.
+    /// Creates a session-scoped failure from an already-redacted message or report.
+    /// The report's display text must be redacted. Its optional error source is exposed
+    /// through [`Error::source`] and is excluded from value comparison and formatting.
     ///
     /// # Errors
     /// Returns an error when the diagnostic is blank, contains NUL, or exceeds the model field limit.
@@ -744,13 +797,13 @@ impl BackendSessionFailure {
         operation: Operation,
         class: FailureClass,
         transience: Transience,
-        diagnostic: impl Into<String>,
+        diagnostic: impl Into<Box<dyn Error + Send + Sync>>,
     ) -> Result<Self, ModelValueError> {
         Ok(Self {
             operation,
             class,
             transience,
-            diagnostic: required(diagnostic, "diagnostic")?,
+            diagnostic: FailureDiagnostic::new(diagnostic)?,
         })
     }
 
@@ -767,7 +820,11 @@ impl fmt::Display for BackendSessionFailure {
     }
 }
 
-impl std::error::Error for BackendSessionFailure {}
+impl Error for BackendSessionFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.diagnostic.source()
+    }
+}
 
 #[cfg(test)]
 mod compact_tests;

@@ -42,6 +42,7 @@ async fn listed_nfs_file_can_be_copied_to_local() -> Result<(), Box<dyn Error>> 
     let request = TransferRequest::from_observation(
         source.clone(),
         observed,
+        None,
         destination.clone(),
         CancellationToken::new(),
     )?;
@@ -57,6 +58,7 @@ async fn listed_file(
     source: &Storage,
     path: &StoragePath,
 ) -> Result<ObservedEntry, Box<dyn Error>> {
+    let mut traversal_completed = Vec::new();
     let parent = path
         .as_str()
         .rsplit_once('/')
@@ -66,7 +68,7 @@ async fn listed_file(
     let traversal = StorageTraversalSource::new(source)?;
     let mut session = traversal.traverse(request);
     let mut observed = None;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) if entry.path() == path => observed = Some(entry),
             TraversalItem::Failure(failure) => {

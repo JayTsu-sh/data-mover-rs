@@ -160,7 +160,7 @@ async fn create_level(
     if !needs_proof {
         return Ok(());
     }
-    match namespace.stat(&level).await {
+    match namespace.stat(&level, false).await {
         Ok(entry) if entry.kind == EntryKind::Directory => Ok(()),
         // A cancelled, session-wide or throttled probe says nothing about the entry, and turning
         // it into the entry's refusal would make an upstream signal (R10), a lost session or a

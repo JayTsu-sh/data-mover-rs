@@ -278,10 +278,7 @@ impl LevelCalls for MountLevel<'_> {
 
     async fn forget(&self) -> Result<(), NfsProtocolFailure> {
         let generation = self.storage.refresh_generation.load(Ordering::Acquire);
-        self.storage
-            .maybe_refresh_root_fh(generation)
-            .await
-            .map_err(classify_role_error)?;
+        self.storage.maybe_refresh_root_fh(generation).await?;
         invalidate_path_cache(self.components, &self.storage.get_root_fh());
         Ok(())
     }

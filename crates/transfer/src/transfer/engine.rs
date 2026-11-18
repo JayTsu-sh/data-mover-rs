@@ -167,6 +167,8 @@ pub struct TransferOutcome {
     pub route: TransferRoute,
     pub recovery: EffectiveRecovery,
     /// The version the publication created, for a destination that versions its objects.
+    /// S3 reports one only from this attempt's acknowledged write receipt, including recovery
+    /// of a saved receipt; a read pin inferred from matching content is not creation evidence.
     pub destination_version: Option<String>,
     /// How the copy was checked (P7 §14.2 N4): the read-back method used (`NotPerformed` when
     /// read-back is disabled; `EtagBracketed` with its reason where reads cannot be pinned) and
@@ -218,11 +220,18 @@ impl TransferVerification {
 /// verification, which is cleaned up in place.
 pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, TransferFailure> {
     let read_back = request.read_back;
+    let metadata_failure_policy = request.metadata_failure_policy;
     let cancel = request.cancel.clone();
     let transferred = run_until_transferred(request).await?;
     let source_qos = transferred_source_qos(&transferred);
-    let (evidence, transferred, metadata) =
-        publication::complete_transfer(transferred, read_back, cancel, source_qos).await?;
+    let (evidence, transferred, metadata, metadata_failure) = publication::complete_transfer(
+        transferred,
+        read_back,
+        cancel,
+        source_qos,
+        metadata_failure_policy,
+    )
+    .await?;
     let expected_size = transferred.checkpoint.durable_prefix;
     let source_digest = transferred.source_blake3;
     let prepare = transferred.stage.prepare_fact();
@@ -242,7 +251,7 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         version: destination_version,
         ..
     } = evidence;
-    Ok(TransferOutcome {
+    let outcome = TransferOutcome {
         identity: transferred.identity,
         final_destination,
         prepare,
@@ -257,7 +266,11 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         recovery: transferred.effective_recovery,
         destination_version,
         verification,
-    })
+    };
+    match metadata_failure {
+        Some(failure) => Err(TransferFailure::metadata_published(failure, outcome)),
+        None => Ok(outcome),
+    }
 }
 
 const fn transfer_route(data_path: TransferDataPath) -> TransferRoute {
@@ -345,6 +358,7 @@ mod plan_tests {
     use crate::storage::backends::local::{
         test_destination_storage_with_role, test_source_storage,
     };
+    use crate::transfer::MetadataFailurePolicy;
 
     fn descriptor(size: u64) -> Result<SourceDescriptor, Box<dyn std::error::Error>> {
         let backend = BackendIdentity::new("local".parse()?, "source-chunk-plan")?;
@@ -423,6 +437,7 @@ mod plan_tests {
             ReadBackVerification::Enabled,
             tokio_util::sync::CancellationToken::new(),
             source_qos,
+            MetadataFailurePolicy::StopBeforePublication,
         )
         .await
         .err()

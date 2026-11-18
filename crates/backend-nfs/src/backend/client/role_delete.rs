@@ -1,20 +1,98 @@
-//! Private artifact cleanup below a namespace directory. Visible children are never followed.
+//! NFS 删除：私有产物清理与基于原观察的非递归源清理。
 use super::{
-    FType3, MAX_STALE_RETRIES, NFSStorage, classify_role_error, is_retryable_with_invalidation,
-    is_server_busy,
+    FType3, MAX_STALE_RETRIES, NFSStorage, is_retryable_with_invalidation, is_server_busy,
+    namespace_lookup,
 };
-use crate::model::{FailureClass, StoragePath, Transience};
+use crate::model::{EntryKind, FailureClass, ObservedEntry, StoragePath, Transience};
 use crate::storage::artifacts::is_artifact_path;
-use crate::storage::backends::nfs::protocol::classify_error;
+use crate::storage::backends::nfs::namespace::NfsNamespaceObservation;
+use crate::storage::backends::nfs::namespace::purge::{refused, verify_current};
+use crate::storage::backends::nfs::protocol::{classify_error, classify_mutation_error};
 use crate::storage::backends::nfs::source::NfsProtocolFailure;
 use bytes::Bytes;
-use nfs_rs::{DirectoryCookie, ReaddirplusPage};
+use nfs_rs::{DirectoryCookie, NfsError, ReaddirplusPage};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, NfsProtocolFailure>;
 
 impl NFSStorage {
+    pub(super) async fn role_purge_observed(
+        &self,
+        path: &StoragePath,
+        kind: EntryKind,
+        expected: &ObservedEntry,
+    ) -> Result<()> {
+        if expected.path() != path || expected.kind() != kind {
+            return Err(refused(
+                FailureClass::InvalidInput,
+                "NFS source purge path/kind do not match its observation",
+            ));
+        }
+        let native = Path::new(path.as_str());
+        let name = native
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(NfsProtocolFailure::protocol)?;
+        let (parent, current) = self.role_fresh_purge_child(path, native, name).await?;
+        verify_current(expected, &current)?;
+        // RFC 1813 §§3.3.12–13 / RFC 8881 §18.25：只删除此名称或空目录。
+        // 协议没有 compare-and-unlink；调用方仍须排除并发源修改。
+        let result = if kind == EntryKind::Directory {
+            self.mount.rmdir(parent, name).await
+        } else {
+            self.mount.remove(parent, name).await
+        };
+        // 不复用旧 delete_file 的 stale/name 重试，也不清理目录中的隐藏产物。
+        // 删除确认与 COMMIT 一样，须同时保留网络原因与未知结果。
+        match result {
+            Ok(()) => {
+                self.forget_subtree(native);
+                Ok(())
+            }
+            Err(error) => Err(classify_mutation_error(error)),
+        }
+    }
+
+    async fn role_fresh_purge_child(
+        &self,
+        path: &StoragePath,
+        native: &Path,
+        name: &str,
+    ) -> Result<(Bytes, NfsNamespaceObservation)> {
+        let parent = native.parent().ok_or_else(NfsProtocolFailure::protocol)?;
+        // 从原绑定根按当前名字重新解析父目录，拒绝根被替换或移除。
+        let directory = namespace_lookup::lookup_handle(
+            self.mount.as_ref().as_ref(),
+            &self.root,
+            &self.root_fh,
+            &self.cache_root_fh,
+            parent,
+        )
+        .await?;
+        let object = self
+            .mount
+            .lookup(directory.clone(), name)
+            .await
+            .map_err(classify_error)?;
+        let attrs = match object.attr {
+            Some(attrs) => attrs,
+            None => self
+                .mount
+                .getattr(object.fh.clone())
+                .await
+                .map_err(attributes_failure)?,
+        };
+        if !super::attributes::present(&attrs, 1) {
+            return Err(refused(
+                FailureClass::Protocol,
+                "NFS source recheck omitted file type",
+            ));
+        }
+        let current = self.role_namespace_observation(path, object.fh, &attrs);
+        Ok((directory, current))
+    }
+
     pub(super) async fn role_cleanup_artifacts(
         &self,
         directory: &Path,
@@ -63,7 +141,7 @@ impl NFSStorage {
                     .map_err(classify_error)?,
             };
             if attrs.type_ != FType3::NF3DIR as u32 {
-                self.delete_file(&path).await.map_err(classify_role_error)?;
+                self.delete_file(&path).await?;
                 continue;
             }
             let mut cookie = DirectoryCookie::default();
@@ -106,9 +184,7 @@ impl NFSStorage {
                     if is_retryable_with_invalidation(&error) {
                         let relative = StoragePath::new(path.to_string_lossy())
                             .map_err(|_| NfsProtocolFailure::protocol())?;
-                        self.forget_role_directory(&relative)
-                            .await
-                            .map_err(classify_role_error)?;
+                        self.forget_role_directory(&relative).await?;
                         *handle = self.role_lookup_fh(path).await?.fh;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -118,6 +194,19 @@ impl NFSStorage {
         }
         unreachable!("bounded NFS cleanup retry loop always returns")
     }
+}
+
+fn attributes_failure(error: NfsError) -> NfsProtocolFailure {
+    let mut failure = classify_error(error);
+    if failure.class == FailureClass::NotFound {
+        let reason = format!(
+            "NFS source attribute read failed after successful lookup; path absence is unconfirmed: {}",
+            failure.status.as_deref().unwrap_or("NotFound"),
+        );
+        failure.class = FailureClass::Protocol;
+        failure = failure.with_status(reason);
+    }
+    failure
 }
 
 fn child(parent: &Path, name: &str) -> Result<PathBuf> {
@@ -132,7 +221,27 @@ fn child(parent: &Path, name: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::child;
+    use super::{attributes_failure, child};
+    use crate::model::FailureClass;
+    use nfs_rs::{Nfs3ErrorCode, Nfs4ErrorCode, NfsError};
+
+    #[test]
+    fn missing_attributes_after_lookup_do_not_confirm_path_absence() {
+        for error in [
+            NfsError::Nfs3(Nfs3ErrorCode::NFS3ERR_NOENT),
+            NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_NOENT),
+        ] {
+            let failure = attributes_failure(error);
+            assert_eq!(failure.class, FailureClass::Protocol);
+            assert!(
+                failure
+                    .status
+                    .as_deref()
+                    .is_some_and(|message| message.contains("after successful lookup")
+                        && message.contains("NOENT"))
+            );
+        }
+    }
     use std::path::Path;
 
     #[test]

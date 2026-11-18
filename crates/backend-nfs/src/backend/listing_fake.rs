@@ -201,7 +201,11 @@ impl FakeNfs {
     pub fn namespace_named(self: &Arc<Self>, name: &str) -> NfsNamespaceAdapter {
         let identity =
             BackendIdentity::new(BackendKind::Nfs, name).unwrap_or_else(|error| panic!("{error}"));
-        NfsNamespaceAdapter::new(Arc::clone(self) as Arc<dyn NfsNamespaceProtocol>, identity)
+        NfsNamespaceAdapter::new(
+            Arc::clone(self) as Arc<dyn NfsNamespaceProtocol>,
+            identity,
+            None,
+        )
     }
 
     fn named_by(&self, handle: &Bytes) -> Option<String> {
@@ -300,6 +304,7 @@ impl NfsNamespaceProtocol for FakeNfs {
     async fn stat(
         &self,
         _path: &StoragePath,
+        _fresh: bool,
     ) -> Result<NfsNamespaceObservation, NfsProtocolFailure> {
         Err(NfsProtocolFailure::protocol())
     }
@@ -428,7 +433,15 @@ impl NfsNamespaceProtocol for FakeNfs {
         &self,
         _path: &StoragePath,
         _kind: EntryKind,
+        expected: Option<&crate::model::ObservedEntry>,
     ) -> Result<(), NfsProtocolFailure> {
+        if expected.is_some() {
+            return Err(NfsProtocolFailure::new(
+                crate::model::FailureClass::Unsupported,
+                crate::model::Transience::Permanent,
+            ));
+        }
+
         Err(NfsProtocolFailure::protocol())
     }
 

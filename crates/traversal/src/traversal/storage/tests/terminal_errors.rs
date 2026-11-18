@@ -112,8 +112,9 @@ fn session(order: TraversalOrder, inline: bool, resumable: bool) -> TraversalSes
 }
 
 async fn drain(mut session: TraversalSession) -> super::resume::Run {
+    let mut traversal_completed = Vec::new();
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     (items, session.finish().await)

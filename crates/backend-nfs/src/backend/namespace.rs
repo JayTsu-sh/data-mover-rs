@@ -4,24 +4,28 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use nfs_rs::DirectoryCookie;
+use tokio_util::sync::CancellationToken;
 
-use super::source::{NfsProtocolFailure, role_failure};
+use super::staged::NfsStagedProtocol;
+
+use super::source::{NfsProtocolFailure, diagnostic, role_failure};
 use crate::model::{
-    BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength, Operation,
-    OwnershipMode, SourceIdentity, SourceVersion, StoragePath, SymlinkTarget,
-    SymlinkTargetEncoding, Transience,
+    BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
+    ObservedEntry, Operation, OwnershipMode, SourceIdentity, SourceVersion, StoragePath,
+    SymlinkTarget, SymlinkTargetEncoding, Transience,
 };
 use crate::storage::artifacts::{is_artifact_native, is_artifact_path};
 use crate::storage::{InlineOwnership, ListingFacts};
 use crate::storage::{
-    ListRequest, ListingStream, Namespace, NamespaceCapabilities, SourceDescriptor,
-    StorageRoleFailure,
+    ListRequest, ListingStream, Namespace, NamespaceCapabilities, PurgeFailure, PurgeOutcome,
+    SourceDescriptor, StorageRoleFailure,
 };
 
 #[derive(Clone)]
 pub struct NfsNamespaceAdapter {
     pub(super) protocol: Arc<dyn NfsNamespaceProtocol>,
     pub(super) identity: BackendIdentity,
+    persistence: Option<Arc<dyn NfsStagedProtocol>>,
     /// Leads every descent hint this namespace makes, so it reads only its own
     /// (`listing::hinted_handle`): 8 bytes of the endpoint identity's digest. It keeps a hint from
     /// another endpoint from being read by mistake; it is no proof — hints are plain bytes a
@@ -192,6 +196,7 @@ pub trait NfsListingPages: Send {
     fn reached(&mut self, next: DirectoryCookie) -> bool;
 }
 
+/// namespace 修改必须按 NFS 协议在稳定存储完成后才返回成功；目录／链接确认依赖此契约。
 #[async_trait]
 pub trait NfsNamespaceProtocol: Send + Sync {
     async fn create_symlink(
@@ -203,8 +208,13 @@ pub trait NfsNamespaceProtocol: Send + Sync {
             Transience::Permanent,
         ))
     }
-    async fn stat(&self, path: &StoragePath)
-    -> Result<NfsNamespaceObservation, NfsProtocolFailure>;
+    /// fresh=true 先按配置根名字复核原绑定，再从原根 FH 逐级 LOOKUP，不复用祖先缓存。
+    /// 根替换或缺失是 Conflict，不重新绑定；成本为一次根查询加每级 LOOKUP（缺属性再 GETATTR）。
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        fresh: bool,
+    ) -> Result<NfsNamespaceObservation, NfsProtocolFailure>;
     /// The handle of the directory `path` names, resolved from the root through the directory
     /// handle cache (a LOOKUP for each component it does not hold). A listing asks for it only
     /// when it has no descent hint, or its hint no longer names the directory.
@@ -238,27 +248,43 @@ pub trait NfsNamespaceProtocol: Send + Sync {
     ) -> Result<(), NfsProtocolFailure> {
         Ok(())
     }
-    async fn delete(&self, path: &StoragePath, kind: EntryKind) -> Result<(), NfsProtocolFailure>;
+    /// expected 非空时仅删除重新核验的原源项；不得清理目录内的任何产物。
+    async fn delete(
+        &self,
+        path: &StoragePath,
+        kind: EntryKind,
+        expected: Option<&ObservedEntry>,
+    ) -> Result<(), NfsProtocolFailure>;
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), NfsProtocolFailure>;
 }
 
 impl NfsNamespaceAdapter {
-    pub fn new(protocol: Arc<dyn NfsNamespaceProtocol>, identity: BackendIdentity) -> Self {
+    /// persistence 如提供，必须复用同一已连接端点的文件协议。
+    pub fn new(
+        protocol: Arc<dyn NfsNamespaceProtocol>,
+        identity: BackendIdentity,
+        persistence: Option<Arc<dyn NfsStagedProtocol>>,
+    ) -> Self {
         let digest = blake3::hash(identity.stable_id().as_bytes());
         let mut hint_tag = [0_u8; HINT_TAG_LEN];
         hint_tag.copy_from_slice(&digest.as_bytes()[..HINT_TAG_LEN]);
         Self {
             protocol,
             identity,
+            persistence,
             hint_tag,
         }
     }
 
-    async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
-        checked(path)?;
+    async fn describe(
+        &self,
+        path: &StoragePath,
+        fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
+        checked_allow_root(path)?;
         let entry = self
             .protocol
-            .stat(path)
+            .stat(path, fresh)
             .await
             .map_err(|error| role_failure(path, Operation::Namespace, error))?;
         descriptor(&self.identity, path.clone(), &entry).map_err(StorageRoleFailure::Entry)
@@ -274,10 +300,10 @@ pub(super) fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
         reason,
         ..
     } = child;
-    let diagnostic = match failure.status.as_deref() {
-        Some(status) => format!("NFS listing could not describe the entry: {reason}: {status}"),
-        None => format!("NFS listing could not describe the entry: {reason}"),
-    };
+    let diagnostic = diagnostic(
+        format_args!("NFS listing could not describe the entry: {reason}"),
+        &failure,
+    );
     EntryOperationFailure::new(
         path,
         Operation::Traverse,
@@ -285,7 +311,7 @@ pub(super) fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
         failure.transience,
         diagnostic,
     )
-    .unwrap_or_else(|_| unreachable!("the NFS listing diagnostic is non-blank"))
+    .unwrap_or_else(|_| unreachable!("the bounded NFS listing diagnostic is nonblank and NUL-free"))
 }
 
 #[async_trait]
@@ -304,8 +330,20 @@ impl Namespace for NfsNamespaceAdapter {
             .await
             .map_err(|error| role_failure(&request.path, Operation::Namespace, error))
     }
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
-        self.describe(path).await
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
+        self.describe(path, fresh).await
+    }
+
+    async fn persist_observed(
+        &self,
+        expected: &SourceDescriptor,
+        cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        self.persist_entry(expected, cancel).await
     }
 
     /// Streams the directory page by page with READDIRPLUS, starting from the request's descent
@@ -349,11 +387,21 @@ impl Namespace for NfsNamespaceAdapter {
 
     async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
         checked(path)?;
-        let observed = self.describe(path).await?;
+        let observed = self.describe(path, false).await?;
         self.protocol
-            .delete(path, observed.kind)
+            .delete(path, observed.kind, None)
             .await
             .map_err(|error| role_failure(path, Operation::Namespace, error))
+    }
+
+    async fn purge_observed(
+        &self,
+        entry: &ObservedEntry,
+        cancel: CancellationToken,
+    ) -> Result<PurgeOutcome, PurgeFailure> {
+        self.purge_entry(entry, cancel)
+            .await
+            .map_err(PurgeFailure::from)
     }
 
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {
@@ -540,6 +588,7 @@ mod tests {
         async fn stat(
             &self,
             _path: &StoragePath,
+            _fresh: bool,
         ) -> Result<NfsNamespaceObservation, NfsProtocolFailure> {
             Err(NfsProtocolFailure::protocol())
         }
@@ -578,7 +627,15 @@ mod tests {
             &self,
             _path: &StoragePath,
             _kind: EntryKind,
+            expected: Option<&crate::model::ObservedEntry>,
         ) -> Result<(), NfsProtocolFailure> {
+            if expected.is_some() {
+                return Err(NfsProtocolFailure::new(
+                    crate::model::FailureClass::Unsupported,
+                    crate::model::Transience::Permanent,
+                ));
+            }
+
             Err(NfsProtocolFailure::protocol())
         }
         /// A destination whose missing parent `d/missing` is refused.
@@ -617,6 +674,7 @@ mod tests {
         async fn stat(
             &self,
             _path: &StoragePath,
+            _fresh: bool,
         ) -> Result<NfsNamespaceObservation, NfsProtocolFailure> {
             Err(NfsProtocolFailure::protocol())
         }
@@ -645,7 +703,15 @@ mod tests {
             &self,
             _path: &StoragePath,
             _kind: EntryKind,
+            expected: Option<&crate::model::ObservedEntry>,
         ) -> Result<(), NfsProtocolFailure> {
+            if expected.is_some() {
+                return Err(NfsProtocolFailure::new(
+                    crate::model::FailureClass::Unsupported,
+                    crate::model::Transience::Permanent,
+                ));
+            }
+
             Err(NfsProtocolFailure::protocol())
         }
         async fn rename(
@@ -668,7 +734,7 @@ mod tests {
     fn adapter(listing: Listing) -> NfsNamespaceAdapter {
         let identity = BackendIdentity::new(crate::model::BackendKind::Nfs, "nfs-listing-test")
             .unwrap_or_else(|error| panic!("{error}"));
-        NfsNamespaceAdapter::new(Arc::new(listing), identity)
+        NfsNamespaceAdapter::new(Arc::new(listing), identity, None)
     }
 
     fn symlink_adapter(
@@ -681,7 +747,7 @@ mod tests {
         let identity = BackendIdentity::new(crate::model::BackendKind::Nfs, "nfs-symlink-test")
             .unwrap_or_else(|error| panic!("{error}"));
         (
-            NfsNamespaceAdapter::new(protocol.clone(), identity),
+            NfsNamespaceAdapter::new(protocol.clone(), identity, None),
             protocol,
         )
     }
@@ -886,3 +952,21 @@ mod tests {
         assert!(checked_allow_root(&StoragePath::root()).is_ok());
     }
 }
+
+#[path = "namespace_persistence.rs"]
+mod persistence;
+
+#[cfg(test)]
+#[path = "namespace_persistence_tests.rs"]
+mod persistence_tests;
+
+#[path = "namespace_purge.rs"]
+pub(in crate::backend) mod purge;
+
+#[cfg(test)]
+#[path = "namespace_purge_tests.rs"]
+mod purge_tests;
+
+#[cfg(test)]
+#[path = "namespace_freshness_tests.rs"]
+mod freshness_tests;

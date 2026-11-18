@@ -14,6 +14,304 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
+
+`python3 tests/lab/run-archive-policy-local.py` checks Direct tar output in an owned
+RustFS network namespace. It uses cached Docker/Rust dependencies, `nsenter` and
+`boto3`; `ARCHIVE_S3_IMAGE` can override the cached image. It independently opens
+single-PUT and multipart archives, checks all payload bytes and exactly four final
+versions, no staging keys/delete markers/uploads, and rejects a cross-prefix source
+alias before writing. A local proxy injects write permission refusal, disconnect and
+silent timeout without modifying firewall rules. The source remains intact and
+subsequent normal writes succeed. The functional timeout profile is 1-second read /
+2-second operation, not a production network recovery budget. Local tests additionally
+check actual inode behavior, cross-root hardlink protection, and Checkpointed refusal
+before target access. This does not certify NFS/CIFS generated Direct, cancellation,
+unknown-write reconciliation, final-data cleanup or whole-job performance. The owned
+container and volumes are removed on exit.
+
+`python3 tests/lab/run-direct-native-local.py` checks small Direct S3-to-S3 native
+copies against an owned versioned RustFS service. It verifies quick/full data paths,
+failed target tags retaining data, permission refusal, persistent disconnect, silent
+timeout, in-flight cancellation, recovered disconnect, and lost successful-copy
+response. The proxy records CopyObject versus payload PUT/GET; independent boto3
+reads require one target version per completed attempt, the complete source and no
+uploads, staging keys or delete markers. Functional request timeouts are 1/2 seconds;
+this does not establish a product-wide fault budget or whole-job performance.
+Large-object native Direct and slash-ended source native copies are not enabled.
+The container/network namespace is isolated and removed on exit; no firewall edits.
+
+`python3 tests/lab/run-version-metadata-local.py` checks exact historical metadata
+updates against an owned versioned RustFS service: two different data versions per
+case, only the old version's tags updated/cleared, the current body/tags unchanged, and zero
+payload GET/PUT, new versions, markers or uploads. Controlled permission refusal,
+disconnect, timeout, cancellation, flash recovery and lost-response retry preserve
+the same version selection. The runner independently reads both versions and tags.
+It verifies the metadata API; task-level catalogue mapping and aggregate callback
+semantics require separate terrasync tests. The owned container is removed on exit.
+
+The same runner also stalls read-only verification at historical HEAD, current-version
+HEAD, tags GET and the stat used by an empty metadata plan. Cancellation after 250 ms
+returned typed `MetadataVerificationError::Cancelled` in 252–254 ms in the 2026-11-08
+run. Independent inspection found both original bodies/tags and their two versions
+unchanged; proxy records contained no payload GET or mutation. Deterministic tests
+also cover an independent permission read and confirm the pending futures are dropped.
+These checks establish cancellation of verification, not network detection/recovery
+budgets, other protocols' handle cleanup, or whole-migration throughput/RSS targets.
+
+`python3 tests/lab/run-source-purge-local.py` runs the exact-version source-purge contract in
+an isolated local RustFS container, using a cached image (override `SOURCE_PURGE_S3_IMAGE`),
+`docker`, `nsenter`, `boto3`, and cached Rust dependencies. It creates only its own bucket and
+container, injects failures through a process-local proxy without changing firewall rules,
+independently inspects remaining versions, and removes its container and volumes on exit.
+Cases cover normal permanent deletion, read-only refusal, disconnect, silent timeout, in-flight
+cancellation, a recovered disconnect and a lost deletion response followed by an exact-ID retry.
+This is a storage-role contract; task-level ClickHouse/callback and other backends use their
+separate integration gates.
+
+The versioned purge route now also rejects contradictory `IsLatest` evidence: the same
+version ID cannot occur as both current and historical. Both encounter orders are checked,
+for data versions and delete markers; deterministic checks also cover the mutable null ID.
+The private batch accumulator rejects the listing before returning any deletion candidates.
+It adds no public interface, SDK change, storage request, or collection tied to total history.
+
+The two new deterministic tests first failed because the contradictory flags were accepted.
+After the fix, the S3 backend suite passed 416 tests (two ignored). The isolated versioned
+runner adds four real response-rewrite cases: data/marker, current-first/history-first.
+The original seven fault cases and all four new cases passed; the proxy observed zero DELETE
+requests in the contradictory cases, and independent reads retained all three data versions
+or all four records including the current marker, plus the unrelated sentinel. The response
+rewrite preserves the real version ID and fields, changing only a duplicate record's
+`IsLatest`; it is a controlled malformed-response test, not evidence of a real server defect.
+
+The complete CI scope was run in parts: architecture/harness/minimal-feature gates passed;
+strict all-target Clippy passed after extracting the new fixture assertion from a function
+that exceeded its line limit. All workspace library, integration, example-test and doc-test
+steps passed. Building all example binaries initially exhausted the shared task cache disk;
+only completed Main-project cache libraries/tests were released, then the full example
+build passed. This cache cleanup kept source, SDK libraries, fixed benchmark binaries and
+unrelated work. Local E2E and the seven current-only fault cases passed, completing the same validation
+scope. No application-level callback, source-key fencing, other vendor, or full-migration
+performance certification is implied by these malformed-listing checks.
+
+`python3 tests/lab/run-source-purge-local.py --version-batch` exercises the SDK implementation
+of the existing S3Protocol::delete_objects after extending its input with SourceVersion.
+This does not add a public entrypoint or type. Current namespace/artifact callers explicitly
+select Current. At this primitive-only step source-history purge still used its serial,
+current-last route; the later dedicated PurgeFailure integration is documented below. No nfs-rs change is required.
+
+Each isolated case seeds an old null slot, an immutable data version, a delete marker and a
+current data version. Only the three older IDs are submitted; independent reads require the
+current payload and sentinel unchanged, no new markers or uploads. Twelve exact-version cases cover normal
+success, partial denial, absent/wrong/duplicated version receipts, whole-request refusal,
+disconnect, silent timeout, cancellation by dropping the caller's wait, flash recovery and lost
+response recovery. The partial case performs a real upstream DeleteObjects for two siblings
+and synthesizes AccessDenied for the retained third; malformed receipt cases rewrite a real
+successful response. These are controlled proxy faults, not server defects. Flash/lost-response
+recovery is an explicit exact-ID test retry; it does not certify application automatic retry
+or a unified fault budget. Caller-wait cancellation is not a new typed protocol cancellation API.
+
+Seven more Current cases exercise the existing quiet SDK path: normal, refusal, disconnect,
+timeout, dropped caller wait, flash retry and lost response. Successful Current deletion adds
+one current delete marker while preserving all four original records and the independent
+sentinel. Lost Current responses are not blindly retried; the fixture confirms exactly one
+marker. A transient transport classification says nothing about mutation replay safety.
+
+The deterministic contract keeps all individual PermissionDenied results, matches shuffled
+same-key versions including null, refuses ambiguous selectors and NAS version requests before
+mutation, verifies 100+1 request boundaries and stops the second batch on partial failure.
+A malformed batch cannot replace an already recognized denial's typed class or original code;
+missing receipts remain Protocol/Unknown. Unsubmitted results identify that no later request
+was sent. The old current-only 101-key regression remains covered. Oversized receipt lists cannot
+amplify the additional classification state or diagnostics beyond the request batch; the SDK
+response parsing allocation itself is outside this check. Remote codes use existing bounded
+sanitization and never append unsafe raw code text back to diagnostics.
+
+The final S3 backend suite passed 429 tests (three ignored); the new ignored SDK contract
+was then run explicitly for all 19 cases. The original 11 exact-version source-purge cases
+also passed. Under explicit 1-second read / 2-second operation settings, silent loss returned
+in about 1.003 seconds; the dropped caller wait returned in about 301–302 ms including its
+50 ms observation delay. A lost exact-ID response was retried against the same IDs, while
+lost Current responses were not replayed. Independent checks confirmed the expected actual
+remaining versions in each case, not just the Rust result. These are functional profiles,
+not production-wide recovery budgets, typed cancellation or power-cut guarantees.
+
+The full CI scope passed in 53 sequential steps covering fmt, architecture/harness gates,
+minimal features, strict Clippy, workspace library/integration/example/doc tests, all example
+binaries and Local E2E (Rust 1.98.1, existing binrw future-compatibility note retained).
+The first pass stopped at the new real fixture's 107-line Clippy limit; extracting its result
+assertion fixed that. After final receipt-bound/sanitization and mixed-selector refinements,
+workspace library tests, the final 429-test backend suite and all-target strict Clippy passed.
+The final 19-case run used one fixed test binary; no runtime changes followed those checks.
+
+`--version-batch-perf` requires the same existing LAB_S3_PURGE_TEST_BINARY override pointing
+to an already built private backend test binary. It times serial delete_version versus the
+extended delete_objects in the same binary, with serial/bulk/bulk/serial/serial/bulk ordering.
+Each case seeds a new 128-record key including a null slot and marker, submits exactly 127
+older IDs, and retains the latest version and sentinel. The proxy confirms 127 serial requests
+versus two bulk requests of 100 and 27 selectors, with no current-version deletion or upload.
+The owned RustFS container uses one CPU / 768 MiB; both branches use Rust 1.98.1 dev debug=0,
+incremental=0. Seeding and initial connection/listing are outside phase timing; whole-process
+wall/RSS additionally include test/runtime/connection setup. Own builds and functional fixtures
+were finished before timing.
+
+| Pair | Serial delete phase / ms | Bulk delete phase / ms | Serial process peak / KiB | Bulk process peak / KiB |
+| --- | --- | --- | --- | --- |
+| 1 | 10538.232 | 250.980 | 29184 | 30912 |
+| 2 | 10617.775 | 224.598 | 29376 | 30336 |
+| 3 | 10682.400 | 230.613 | 29568 | 30720 |
+
+Median phase time was 10617.775→230.613 ms; whole-process time 10.68→0.30 s, peak RSS
+28.6875→30.00 MiB. This is a small same-key SDK experiment, not the guarded purge lifecycle,
+ClickHouse/callback, whole-migration throughput/RSS, release, other vendors or 1000+ pagination
+certification. At that measurement step the application was pinned to its prior Native revision and source
+purge was still serial; this SDK measurement does not imply product-level adoption.
+Raw logs/results and the fixed binary are in `/tmp/native-exact-bulk-perf/` and
+`/tmp/native-exact-bulk-perf6.log`; SHA-256 is
+`6e5897f390101828714e7cdf802674481b85593d735c9b04a1b47e1d53a6b4ed`.
+All owned containers/volumes were removed. No SDK or new public function/type was needed;
+protocol selection/receipt handling stays in the S3 adapter, source readiness/order in purge,
+and job/error-count/callback policy in the application.
+
+### Dedicated permanent-cleanup failures and protected version batches
+
+The existing Namespace::purge_observed now returns the user-authorized PurgeFailure type.
+It retains an optional exact first selector, a boxed original StorageRoleFailure as the
+standard error source, and each additional (SourceVersion, StorageRoleFailure) in the bounded
+batch. Listing/anchor failures do not invent a version. General entry/session role errors,
+scanning, directory creation and recursive target deletion keep their existing contracts;
+Local/NFS and the default filesystem route only wrap the same original error. No SDK or new
+operation entrypoint is added. The explicit error-source implementation is checked by a
+downcast test, not inferred from the displayed message.
+
+S3 purge keeps at most 100 old records per batch, submits old data versions through the
+existing delete_objects and deletes historical markers separately by exact version ID.
+It re-lists/rechecks the current anchor between batches, never reuses a deletion-shifted page
+cursor, stops after any failed batch and separately deletes the current ID last. All returned
+version failures survive; a malformed result count refuses success and identifies unconfirmed
+requested versions. Cancellation before submission sends no request; in-flight cancellation
+returns the requested version causes with unknown outcomes. Successful sibling deletions are
+not rolled back. Existing exclusivity requirements remain; this is not atomic source fencing
+or an authorization to purge before the caller confirms all required target results.
+
+The normal real fixture contains two historical markers of the same key. Before this marker
+separation, the five-record fixture returned Deleted { records: 6 }: RustFS acknowledged
+both marker IDs in one bulk request but retained one. An independent boto3 probe reproduced
+the same result without data-mover or the fault proxy; the marker remained after two seconds
+and an exact single-version delete removed it. The protected purge now sends same-key marker
+mutations sequentially and rejects any reappearance of the preceding batch's confirmed IDs,
+retaining the current anchor instead of inflating the deletion count. This is a backend
+mechanism change, with no additional public entrypoint. The older SDK timing fixture below
+contains only one marker and cannot certify this multiple-marker path.
+
+The S3 suite passed 433 tests (three ignored); core passed 224 tests and its two adapter
+contracts. Four new S3 checks cover 100 mixed typed causes, partial success, missing batch
+results and cancellation timing; core checks the original error source and absence of an
+invented version. Existing Local/NFS/S3 call sites and tests were migrated to the dedicated
+error contract. The complete CI scope passed in 53 sequential steps on Rust 1.98.1, including
+strict Clippy, features, workspace tests, all examples and Local E2E. The first front gate
+stopped on two new doc-markdown backticks; they were corrected and the full scope rerun.
+Existing ignored tests/future-compatibility notes are not counted as runtime passes.
+
+The versioned owned runner now has 13 real cases: the original 11 plus a real bulk response
+with two refused versions/two actually deleted siblings, and a rewritten successful response
+missing one version ID. Independent reads confirm respectively three/final-current-only
+records left, all failed version causes preserved, and the current record/sentinel intact.
+Permission, disconnect, silent timeout, token cancellation, flash/lost-response retry and
+contradictory lists also passed. The seven current-only source cases passed unchanged,
+including exactly one normal HEAD and zero data GETs. Recovery in these fixtures is an
+explicit test retry, not an application retry or unified-budget claim. Application adoption,
+callback pagination, history-target readiness and whole-migration performance require their
+separate product evidence; source/target concurrent-write exclusion still applies.
+
+`--current-source` uses the same contract against a bucket that was never versioned.
+Its observation comes from LIST (milliseconds), whereas the purge guard reads HEAD
+(whole HTTP seconds). The guard compares at the coarser observed precision while
+retaining identity, ETag, size and missing-time checks. Six deterministic combinations
+cover matching precisions, changed seconds/milliseconds, missing time and changed
+equal-size content. The original implementation fails the matching LIST/HEAD case.
+All seven real fault cases passed for both current-only and versioned fixtures;
+the current-only normal path issues exactly one payload HEAD and no data GET.
+Recovery in this fixture is an explicit test retry, not an application retry claim.
+Concurrency exclusion is still required; same-ETag changes inside a HEAD time tick
+cannot be detected from that header. No new public functions or SDK changes are needed.
+The final full `make ci` passed on Rust 1.98.1, including strict Clippy, architecture
+and minimal-feature checks, workspace tests, examples and Local E2E. These results
+are limited to the tested RustFS protocol path; they do not certify NAS buckets,
+other vendors, application-level retry budgets or whole-migration throughput/RSS.
+
+`python3 tests/lab/run-source-purge-local.py --namespace-read` reuses the isolated fixture for
+`read_namespace_entry`, a bounded read-only stat with caller-selected detection/recovery
+deadlines and cancellation. It covers a present path, typed absence, permission refusal,
+disconnect, silent timeout, cancellation, recovered disconnect and recovered timeout.
+Independent S3 inspection requires all three versions and the sentinel to remain in every
+case. It proves current-path stat semantics only, not absence of historical versions or an
+atomic absence-and-delete transaction. Local/NFS/CIFS/HDFS and task-level target mutation
+protection require their own evidence.
+
+`python3 tests/lab/run-source-purge-local.py --namespace-persistence` reuses that fixture for
+the S3 target's existing `Namespace::persist_observed`. It captures a current descriptor and
+an exact-version descriptor, then exercises normal HEAD, permission refusal, persistent loss,
+silent timeout, cancellation, recovered disconnect and recovered timeout. Independent reads
+require all three original versions and the sentinel in every case; proxy counters require
+zero payload GETs and mutations. This is a read-only storage-role contract. It does not prove
+whole-job source-removal sequencing, ClickHouse/callback behavior, other S3 vendors, NAS bucket
+durability, power-cut recovery or migration throughput/RSS targets.
+The fixture can run an already built external integration test with
+`LAB_S3_PURGE_TEST_BINARY` and its exact `LAB_S3_PURGE_TEST_NAME`, without changing the fixture's
+independent version/mutation checks. The test binary uses the existing `LAB_S3_PURGE_*`
+environment to address the owned prefix and arm faults.
+`python3 tests/lab/run-source-purge-local.py --marker-persistence` covers selected deletion
+markers through the same public `describe_version` and `persist_observed` operations. The owned
+fixture has four data versions, two markers and an unrelated sentinel per case. The original fifteen modes
+cover normal exact-marker HEAD and current-binding LIST, denied reads, disconnect/stall/cancel
+at both HEAD and LIST, explicit recovery after flash/stall, missing/wrong version headers,
+invalid marker type, actual current replacement and actual permanent marker removal. The
+2026-11-09 run passed all fifteen; observed disconnects returned in 2–5 ms, stalls in 1003–1006 ms
+and cancellation in 253 ms under the 1-second read / 2-second operation test profile. Independent
+version inspection and proxy counters confirmed no payload GET or mutation by the Rust
+operations; only the named replacement/removal was performed by fixture control. The plain
+marker descriptor cannot be read as empty data. This verifies the storage contract on RustFS,
+not task source purge, other vendors or a unified network-jitter recovery budget.
+
+The marker fixture now includes seventeen modes: `paged_normal` and `paged_disconnect`
+exercise one-record real RustFS pages through the SDK, with an explicit `zz-` storage
+prefix and a MinIO-shaped opaque continuation decoration. The read-only proxy obtains
+actual `MaxKeys=1` pages with boto3 and round-trips decorated tokens; no new data or
+version facts are invented. A later-page fault first reproduced the old wrong `Ok(())`
+result in both the deterministic MemoryS3 seam and the real SDK. Confirmation now
+consumes continuations unchanged until actual EOF, never comparing a token to a
+relative key. The normal case confirmed six pages/five returned opaque tokens; the
+faulted case surfaced typed Connectivity on page two, retained all six records and
+sent no mutation. Full seventeen-mode evidence is
+`/tmp/native-marker-pagination-{red,green}-real.log`; unit red/green logs have the
+same prefix. This confirms marker persistence pagination, not more-than-1000-version
+source enumeration or every vendor's actual pagination behavior.
+
+`python3 tests/lab/run-source-purge-local.py --null-source` and `--null-marker`
+check the mutable null slot on a real suspended RustFS bucket. Each runs an unchanged
+record and a replacement after its original observation. The data replacement keeps
+its bytes/ETag; the marker replacement writes data and recreates the null marker
+(repeated Delete alone may be idempotently merged). The 2026-11-09 run deleted the
+unchanged slots and refused both replacements before any source DELETE, with one
+record and the sentinel retained and no payload GET. Comparison uses the model's
+normalized absent version ID, not the literal string `"null"`. A deterministic
+regression first failed with the old condition and passes for data and markers,
+while immutable IDs retain their prior behavior. The fixture waits for modification
+time to advance before issuing the tested request; this is no product retry/delay.
+The marker-persistence suite also verifies actual ordinary transfer refusal at
+Describe before destination mutation in all fifteen modes.
+
+`python3 tests/lab/run-source-purge-local.py --source-observation` tests the composed
+current-source observation against real S3. Nine modes cover success, denied tag
+reads, metadata NotFound while HEAD still succeeds, disconnect, silent timeout,
+cancellation, recovered disconnect/timeout, and failures alternating between stat
+and observation. One-second detection and a three-second recovery window return
+continuous loss in about three seconds, silent loss in about four seconds, and
+cancellation in about 254 ms. Proxy counters require zero data GETs/writes and
+independent inspection retains three source versions plus the sentinel per case.
+This does not establish NFS/CIFS/HDFS fault behavior, atomic source metadata
+snapshots or task-level source purge readiness.
+
 The runner must resolve the canonical Kerberos HDFS hostnames to their lab
 management/data addresses. `health-check.sh` verifies the NameNode and both
 DataNode mappings (plus the second NameNode when HA is configured) before any
@@ -681,3 +979,355 @@ fixtures; an empty run cannot qualify. Isolated cleanup rejects parent path
 components (including URL-encoded forms) and unsupported URL schemes. For Local,
 it resolves the actual root and refuses symlinks at or below the run directory;
 cleanup only starts after that validation succeeds.
+
+## NFS Direct contract
+
+`python3 tests/lab/run-nfs-direct-contract.py --binary <nfs_mkdir_contract> --url
+<nfs-v4.1-url>` runs an already built ignored contract against a separately prepared
+owned `nightly-nfs-direct-*` prefix. Build with `backend-local,backend-nfs,transfer,
+integrity`. Pass `--functional` to include normal Direct transfers. Preparation,
+independent server-side inspection and exact-prefix cleanup belong to the lab
+lifecycle; the runner never changes exports, firewall rules or shared services.
+`LAB_NFS_DIRECT_ONLY` selects one of `flash`, `disconnect`, `stall`, `cancel`,
+`lost_ack` for diagnosis. The functional ignored test may also run directly with
+`LAB_NFS_DIRECT_URL`, on either v3 or v4.1.
+
+The private loopback proxy injects faults only after a real confirmed WRITE. It
+checks actual fault packet counters, explicit retry and retained Local source bytes.
+Cancellation here drops the role write future after 250 ms; it does not certify
+whole-request or CLI cancellation. CLOSE uncertainty is reported and the harness
+may reset a fixture only after independently comparing its original FH. Such a reset
+is not automatic backend cleanup success. Functional coverage includes quick/full,
+long-to-short overwrite, empty files, partial data failure cleanup, replacement FH
+protection, writable files in read-only parents and real owner-setting refusal with
+published data retained. Independent server-side reads must check payloads, owners,
+permissions and absence of stage/pointer artifacts.
+
+On Linux NFSv3/v4.1, the functional paths passed. The real v4.1 proxy run recovered
+flash/lost-response cases, returned persistent disconnect in about 0.96 s, and
+returned silent-loss Timeout/Unknown in about 48 s (roughly 45 s WRITE detection plus
+3 s failed CLOSE). Role cancellation returned in about 252 ms. Neither these results
+nor the deterministic close-budget regression certify a shared task recovery
+budget, source purge, post-metadata namespace persistence, ONTAP behavior or the
+whole-migration throughput/RSS target.
+
+### Published NFS file persistence
+
+The same owned-prefix runner accepts `--contract persistence`. Keep its adjacent
+`nfs_fault_rpc.py` available when deploying the runner. It assembles bounded RPC
+records, recognizes the real NFSv4 COMPOUND tag and XID, and arms failures on the
+COMMIT request. Lost responses match that COMMIT's reply XID. Independent counters
+must confirm all requested COMMIT triggers and the dropped reply; TCP segmentation
+and multi-fragment RPC parsing have standalone tests in `test_nfs_fault_rpc.py`.
+
+`direct::persistence::real_nfs_published_file_persistence_contract` checks regular
+and empty files, mode 0444, replaced files and replaced cached ancestors, with
+independent server-side payload/mode checks. Linux v3 and v4.1 passed. The v4.1
+COMMIT fault run recovered flash/lost-reply cases, returned persistent disconnect
+in about 0.63 s as Connectivity/Unknown, silent timeout in about 18 s as
+Timeout/Unknown (including a three-second CLOSE limit), and cancelled in-flight
+COMMIT about 252 ms after injection with less than 1 ms after the cancellation
+signal. Sources remained intact; explicit persistence-only retries succeeded,
+and all five destination payloads were independently checked. These role-level
+results do not certify CLI source purge, directory/symlink persistence, pNFS DS,
+shared recovery budgets, or whole-migration throughput/RSS.
+
+### Published NFS directories and symlinks
+
+`--contract nonfile` selects
+`direct::nonfile::real_nfs_nonfile_persistence_fault_contract` and arms actual
+`lookup_path` requests. The runner asserts zero file COMMITs and matches the lost
+reply by XID. The functional
+`direct::nonfile::real_nfs_directory_and_symlink_persistence_contract` checks
+empty/readonly directories, exact restored nanosecond mtime after child creation,
+broken symlinks and replacement protection on Linux v3/v4.1. Independent server
+inspection checks mode, mtime, child bytes and literal link targets.
+
+Directory/link mutations rely on NFS's synchronous namespace/SETATTR completion
+contract; persistence confirmation freshly resolves and checks the full path twice.
+No regular-file OPEN or COMMIT is issued for these entries. Linux v4.1 flash and
+lost-reply cases recovered; disconnect returned Connectivity in about 0.32 s,
+silent loss returned Timeout in about 15 s and cancellation returned in about
+252 ms. A lost uncached read reply is recovered inside nfs-rs using one fresh
+sequence under the same operation deadline, with no backend requery loop.
+These results do not certify whole-task source purge, physical pNFS DS, NFSv4.2,
+shared task recovery budgets or whole-migration performance/RSS.
+
+### Protected NFS source removal
+
+`--contract purge` selects `direct::purge::real_nfs_source_purge_fault_contract`
+and arms the actual REMOVE. The adjacent RPC helper also recognizes NFSv3
+REMOVE/RMDIR procedures. For v3, provide the server's `mountport` in the URL;
+the runner creates a second private relay for that service without changing
+rpcbind, exports or firewall rules. `LAB_NFS_PURGE_BACKUP_DIR` must name the
+owned persistent Local backup directory. Prepare and independently inspect the
+source and backup before exact-prefix cleanup.
+
+`direct::purge::real_nfs_protected_source_purge_contract` passed Linux v3/v4.1:
+ordinary files and repeated absence, equal-length rewrite with restored mtime,
+leaf and cached-parent replacement (using a separate UID cache namespace),
+child-then-empty-directory removal, hidden nonempty children, broken symlinks,
+readonly-parent refusal and endpoint-root refusal. Independent reads verified
+six backup payloads and the literal link target, confirmed deletions, and every
+refused source/replacement.
+
+Both dialects passed flash, disconnect, silent loss, cancellation and a dropped
+successful REMOVE reply. V4.1 flash/lost-reply replay completed; disconnect
+returned Connectivity/Unknown in 322 ms, silent loss Timeout/Unknown in 15.0 s,
+and cancellation Cancelled/Unknown in 252 ms. A sixth v4.1-only synthetic
+BADSESSION reply returned uncertainty with zero new EXCHANGE_ID requests.
+V3 conservatively returned Connectivity/Unknown for flash/disconnect (about
+1 ms) and lost reply (142 ms), Timeout/Unknown in 5.0 s and cancellation in
+253 ms. In the v3 lost-reply case the source was independently confirmed absent;
+the original backup remained intact. In every uncertain case a later same-name
+replacement was retained when purging the old observation. The relay confirms
+actual operation triggers and matches the lost reply's XID.
+
+These are storage-role checks, not whole-CLI/database/callback, server restart,
+power-cut, v4.0/v4.2/pNFS or throughput/RSS acceptance. Unknown is not proof of
+source retention; destination readiness must precede the first delete request.
+The role's deadlines above do not establish the application's shared recovery
+budget. NFS has no atomic compare-and-unlink here; concurrent source and ancestor
+mutation must be excluded by the caller.
+
+### Metadata-plan ACL request audit
+
+`--contract metadata-plan --test-name <prebuilt-ignored-test>` reuses the same
+owned-prefix relay for an external application's source-observation contract.
+It audits the actual GETATTR/LOOKUP/READDIR attribute masks, verifies zero ACL
+queries before the `acl_denied` phase, and rewrites two real successful GETACL
+replies into ACCESS while preserving RPC identity, the real SEQUENCE response
+and PUTFH result. The bounded RPC helper's optional payload and mask/reply codecs
+have nine deterministic tests. This adds no storage role or SDK API.
+
+With SDK fdc541c, the real Linux NFSv4.1 application contract audited 118 attribute
+requests: zero implicit ACL requests, three explicit ACL requests, two denied
+replies. Its object-target plan uses S3 capability projection; the real data target
+is NFS. Source metadata failure still delivered the complete target payload and
+returned PublishedDataMetadata with the typed ACL/PermissionDenied cause, retained
+the source and refused source purge. A successful selected ACL survived snapshot
+roundtrip and copying. Independent server reads verified all three source/target
+payloads, completed permission modes and no transfer artifacts.
+
+The same SDK also passed the five v3/six v4.1 source-purge fault regressions,
+including the session-loss guard; original backups and later same-name entries
+were protected, and the metadata-plan fixtures remained intact. Silent detection
+remains about 5/15 seconds, cancellation about 252 ms. These results do not certify
+an actual S3 destination, complete CLI/ClickHouse/callback, server restart,
+v4.0/v4.2/pNFS, power-cut durability or whole-migration throughput/RSS.
+
+## S3 Direct failed-data cleanup
+
+`python3 tests/lab/run-direct-data-cleanup-local.py` verifies the existing
+`FailedDataCleanup::RemoveOwned` policy against isolated RustFS. Sixty cases cover
+never-versioned and versioned destinations, small native copies, 12 MiB multipart
+writes, and nonempty slash-ended keys using streamed PUT. The parent independently
+reads source bodies/versions, old destination versions and a sentinel. RustFS uses
+one mutable null version for slash-ended keys even in the version-enabled fixture;
+this is checked as observed, not reported as immutable version coverage.
+
+Confirmed write receipts authorize cleanup after data verification fails. Immutable
+versions are deleted by their exact reported ID; mutable slots require fresh size
+and ETag checks. No-write refusals leave preexisting output intact. Lost write
+responses and inferred matching content do not grant deletion authority. Default
+Keep and metadata failures retain data. Uncertified NAS output remains unsupported.
+The caller still excludes concurrent writers; mutable HEAD plus DELETE is not an
+atomic conditional mutation.
+
+Permission refusal, corrupt readback, persistent disconnect, silent timeout, lost
+DELETE acknowledgment and cancellation preserve typed original/cleanup causes.
+Unknown DELETE outcomes remain Unknown even when independent inspection proves the
+object was removed. Cancellation waits for an actual target GET before signalling
+and returns Cancelled while cleanup removes only confirmed owned output. No blind
+retry is added. Request timeouts are explicitly 1/2 seconds; these tests do not
+establish production-wide budgets, other vendors, power-loss guarantees, application
+ClickHouse/callback behavior, or whole-migration performance. All six owned containers
+and namespaces are removed on exit.
+
+Architecture review: policy and failure cleanup authorization remain in the generic
+transfer engine, while receipt ownership, version checks and protocol deletion live
+in the S3 staged destination. Existing role methods and VerifyRequest cancellation
+are extended; no public function/type or SDK dependency is added.
+
+On Rust 1.98.1 the full CI scope passed. The initial `make ci` passed guards,
+feature isolation and strict Clippy, then exhausted local disk during batched test
+linking. The remaining workspace libraries, all 46 integration targets, test-enabled
+example, doctests, examples, Local E2E and final fmt were rerun as 52 sequential
+steps and passed. This is completed equivalent CI scope, not an uninterrupted
+`make ci` run; ignored external fixtures remain ignored except the sixty cases
+explicitly executed above.
+
+## Direct publication version receipts
+
+The existing `run-direct-native-local.py` matrix now runs thirteen real scenarios.
+A version-enabled target preseeded with an identical old body is tested with a copy
+request disconnected before forwarding, a committed copy with a lost reply, and a
+successful copy whose version header the private proxy removes. Independent version
+and body reads require the original target version and source to remain, exactly one
+target version for the uncommitted request, and two for the committed cases. Direct
+returns no created-version ID in all three cases. The original ten success/metadata/
+network/cancellation/recovery cases remain; a lost acknowledged response also returns
+no created-version ID even when independent inspection proves the new version exists.
+Normal acknowledged writes still report their version, and no client payload GET is
+introduced on quick paths. The explicit recovery attempts remain test retries.
+
+A deterministic preexisting-body regression first returned preexisting-target as this
+attempt's new version and failed; the corrected Direct contract passes all thirteen
+Direct unit tests. The existing ambiguous multipart test now separately checks that
+Direct keeps the completed body without inventing a receipt, while retaining the
+unchanged Checkpointed expectation until that separate path is addressed. Complete
+CI scope passes via guards, feature matrix, strict Clippy and 52 sequential workspace/
+example/Local steps; final transfer-target strict Clippy checks the revised assertion.
+These results certify the tested Direct RustFS path, not AtomicReplace/Checkpointed
+publication identity, application history purge or other vendors. No SDK or public API
+is added, and all owned containers are removed. Application ClickHouse/callback and
+normal-path resource measurements are separate acceptance gates.
+
+## S3 publication version evidence across policies
+
+`run-direct-native-local.py --all-policies` reuses the existing private fixture for
+Direct, AtomicReplace and Checkpointed. Thirty-three real cases passed: the original
+thirteen Direct cases and ten each for the other policies. Non-Direct metadata
+refusal and in-flight cancellation are not included in this version-proof gate;
+their existing stage/error/budget semantics are separate work. Normal acknowledgments
+report a version. A failed request against an identical old object, a committed copy
+with a lost reply, and a successful reply with its version header removed report no
+created-version ID across all policies. Independent reads verify source and old
+versions, data/tags, exact version counts and no extra quick-path payload reads.
+Reconciled network failures are captured in actual warning output with their original
+Connectivity cause; test retries after faults remain explicit. Retrying the non-Direct
+fixture requires its existing cleanup_for_policy and releasing the failure's stage
+lease first, which the fixture now does.
+
+`python3 tests/lab/run-checkpoint-version-local.py` uses five separate isolated
+RustFS containers, generated 9 MiB payloads, the existing public checkpoint roles,
+and independent boto3 inspection. Each initial transfer creates exactly one upload,
+two parts and one completion; reconnecting creates no new upload or data part.
+
+| Case | Recovered created-version evidence | Independent target / root result |
+| --- | --- | --- |
+| Saved successful write receipt | Original version retained | One body; source roots released after verification |
+| Complete forwarded, successful response lost | None; observed pin retained | One body; source roots released after verification |
+| Published pointer PUT denied after data completed | None from the saved Ready state | One body; source roots released after verification |
+| Reconciled completion then identical-body replacement | Conflict | Both versions and original source root retained |
+| Acknowledged completion then identical-body replacement | Conflict | Both versions and original source root retained |
+
+All original/final body bytes and the sentinel are independently read; no deletion
+markers or open uploads remain. Replaced cases deliberately retain the checkpoint
+root as unresolved state. The fixture destroys only its own container after those
+checks. It verifies target storage-role behavior with generated source bytes, not
+an application migration, external source backend, ClickHouse/callback, vendor
+certification, power-cut behavior or a whole-job network budget.
+
+The private current checkpoint record is DMS3CP02, bounded to 4 KiB and preserving
+both observed version and raw write receipt. Previous/future layouts and conflicting
+receipt/pin values are rejected; no compatibility reader is added. Codec regression
+first reproduced losing the observed pin, and the cross-policy regression first
+reproduced returning a preexisting version as newly created. Backend library tests
+passed 414 with two ignored; transfer library tests passed 329 with one ignored.
+Saved-ack versus Ready-only recovery tests use a versioned fixture and verify the
+original receipt or its absence as well as the independent read pin and no reupload.
+These results do not authorize application historical source purge by themselves.
+
+The complete CI scope passed on Rust 1.98.1: architecture/harness/feature guards,
+workspace all-targets strict Clippy, and the 52 sequential workspace-library,
+integration, test-enabled-example, doctest, example-build and Local E2E steps.
+Strict checks first caught new rustdoc markup and a fixture function-size limit;
+the final checks passed after correcting those test/documentation issues. Ignored
+external environments remain ignored outside the explicitly executed matrices.
+The existing sixty Direct failed-data cleanup cases were rerun and passed after
+this change. Architecture review confirms that read pins, raw write receipts and
+checkpoint serialization stay in the S3 backend; application readiness and callback
+policy remain outside it. No public functions/types or SDK revisions were added.
+
+### NFS metadata cancellation (2026-11-09)
+
+The existing `run-nfs-direct-contract.py` relay accepts `--contract metadata-cancel`.
+Use a prebuilt `nfs_mkdir_contract` test binary and an exclusively prepared
+`/srv/nfs/v3:/ci/nightly-nfs-direct-*` or `/srv/nfs/v4:/ci/nightly-nfs-direct-*`
+URL; v3 also needs its actual `mountport`. Preparation, independent inspection
+and cleanup must remain inside that exact owned prefix. No export, server or
+firewall changes are required. The contract uses `Metadata::apply`'s existing
+cancellation token; it adds no public library function or type.
+
+The default family is mode and the default operation tag is `setattr`. It runs
+flash disconnect, persistent disconnect, silent loss, caller cancellation after
+an observed real request, and lost-response recovery. Set
+`LAB_NFS_DIRECT_ONLY=cancel` for a single cancellation case and
+`LAB_NFS_METADATA_FAMILY=owner|time|acl` to select another family. NFSv4.1 ACL
+uses `--operation-tag setacl` or `getacl` to interrupt its write or readback.
+Each case copies a real nested payload first, keeps its Local source, and retries
+only the requested metadata explicitly through a fresh direct connection.
+
+The Linux VM 104 v3/v4.1 exports passed 16 cases: five mode faults per dialect,
+one owner and one timestamp cancellation per dialect, plus v4.1 ACL SET and
+readback cancellation. Every cancellation returned in less than one second
+(0 ms at the fixture's timer resolution). Independent guest reads confirmed
+all 16 nested payloads survived and mode/owner/nanosecond mtime matched after
+explicit recovery. The interrupted ACL payload was the server's existing ACL;
+this does not prove a changed ACL or arbitrary xattr survived a lost response.
+Deterministic tests cover cancellation during all five writable mutation
+families, no follow-up xattr, correct Metadata operation, and Unknown in-flight
+outcome; the pre-cancel case performs no protocol operation.
+
+These cases exercise the backend token, not a whole product job, callback,
+ClickHouse cancellation, or cross-generation execution fencing. Cancellation
+cannot retract a request already accepted by a server. The v4.1 session slot
+uses the pinned SDK's existing fence-on-drop behavior; no SDK change is made.
+Uncancelled silent loss still took about 15 seconds on v4.1 and about 5 seconds
+on v3; it is not evidence of a universal three-second network-detection bound.
+Raw logs and independent checks for this run are in
+`/tmp/native-nfs-metadata-cancel-real/` on the development host.
+
+Validation for this change covered the complete `make ci` scope in sequential
+steps: architecture and harness guards, minimal-feature matrix, strict all-target
+Clippy, workspace library/integration/example/doc tests, compilation of every
+example, and the two Local E2E test targets. The first all-example link and the
+Local runner's duplicate all-example build hit the shared cache disk limit.
+Compilation then passed while releasing only each completed compile-only example
+executable; the unchanged Local E2E tests passed separately. This is not a claim
+that one unmodified `make ci` invocation completed. Existing `binrw` future
+compatibility notes remain. The final architecture review kept cancellation and
+NFS outcome classification together in the metadata adapter, reused its existing
+token and failure mapping, and added neither product policy nor public API.
+Normal whole-migration throughput/RSS is not certified by these backend tests.
+
+### NFS bound-root cache isolation (2026-11-09)
+
+`direct::root_cache::real_nfs_bound_roots_isolate_directory_cache_and_metadata`
+in the prebuilt `nfs_mkdir_contract` binary requires an exclusively prepared
+`LAB_NFS_DIRECT_URL` prefix. It creates only `cache-a/item/body` and
+`cache-b/item/body` below that prefix, connects separate storage instances rooted
+at each child, and writes different modes to the same relative directory `item`.
+The parent-root lookup and independent VM reads must see mode 0711 for A, 0722
+for B, and the distinct original payloads `prefix A` / `prefix B`.
+
+Before the fix, both Linux NFSv3 and v4.1 changed A to 0722 while leaving B at
+0755: the test fails and independent guest stat confirms the wrong-root mutation.
+`attach_root` had changed the RPC root handle without updating the existing cache
+root identifier, so relative paths from different bound prefixes could collide.
+The fix updates both handles during binding through the existing cache-key helper,
+as root refresh already does. It adds no public function/type, per-operation RPC,
+cache-wide clearing, timer, retry, or application policy. Both real protocols now
+pass with independent mode and payload checks. The exact-prefix runner cleans its
+own roots; no export/service/firewall is changed. Red/green raw evidence is at
+`/tmp/native-nfs-prefix-cache-real/` on the development host.
+
+The final architecture review keeps RPC and cache namespace binding together in
+`NFSStorage::attach_root`, preserving shared directory handles only for instances
+with the same actual bound root and endpoint identity. No nfs-rs change is needed.
+The prior application migration recovery failures under ordinary timestamps and
+then fixed atime are retained as separate diagnostic evidence, not counted as
+passing cancellation/recovery runs; complete application revalidation follows
+with this exact dependency revision. This root-isolation check alone does not
+certify whole-migration performance or all storage vendors.
+
+This isolated fix passed the complete CI scope in 53 sequential steps, including
+strict all-target Clippy, architecture/harness/minimal-feature guards, workspace
+and doc tests, every example build, and the four Local E2E assertions. Examples
+were released only after compiler completion to bound the shared build-cache
+footprint; the Local tests reused that already-passed compilation scope. All 16
+real metadata network/cancellation/recovery cases were rerun on the fixed root
+binding and passed with independent payload/attribute checks. The two root
+isolation cases use unmodified current filesystem timestamps and distinct data;
+no atime relaxation or safety-check bypass is part of the production fix.

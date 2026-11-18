@@ -114,16 +114,16 @@ async fn a_named_version_is_described_and_read_as_it_is() -> TestResult {
     Ok(())
 }
 
-/// A delete marker, or a version the bucket does not have, fails that entry — never the session.
+/// 缺失版本仍是条目 NotFound；选中删除标记只有描述事实，不能读取数据。
 #[tokio::test]
-async fn a_deleted_or_missing_version_is_an_entry_not_found() -> TestResult {
+async fn a_marker_is_describable_but_unreadable_and_a_missing_version_is_not_found() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     protocol
         .put_version(KEY, "v1", Bytes::from_static(b"first"))
         .await;
     protocol.put_delete_marker(KEY, "marker").await;
     let source = source(&protocol)?;
-    for version in ["marker", "no-such-version"] {
+    for version in ["no-such-version"] {
         let result = source
             .describe_version(&StoragePath::new(KEY)?, &SourceVersion::Id(version.into()))
             .await;
@@ -132,6 +132,12 @@ async fn a_deleted_or_missing_version_is_an_entry_not_found() -> TestResult {
             "{version}: {result:?}"
         );
     }
+    let marker = source
+        .describe_version(&StoragePath::new(KEY)?, &SourceVersion::Id("marker".into()))
+        .await?;
+    assert!(marker.listing.listing_only);
+    assert_eq!(marker.size, None);
+    assert!(read_all(source.as_ref(), &marker).await.is_err());
     // The version before the marker is still there to copy.
     let kept = source
         .describe_version(&StoragePath::new(KEY)?, &SourceVersion::Id("v1".into()))

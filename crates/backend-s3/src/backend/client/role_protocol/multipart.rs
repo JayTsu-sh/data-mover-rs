@@ -159,10 +159,14 @@ mod tests {
             ("InvalidPartOrder", FailureClass::Conflict),
             ("EntityTooSmall", FailureClass::Corruption),
         ] {
-            for status in [Some(400), None] {
+            for (status, status_text) in [(Some(400), "400"), (None, "unknown")] {
                 assert_eq!(
                     s3_role_remote_failure(status, Some(code), "complete"),
-                    S3ProtocolFailure::entry(class, Transience::Permanent, "complete"),
+                    S3ProtocolFailure::entry(
+                        class,
+                        Transience::Permanent,
+                        format!("complete (HTTP={status_text}, code={code})")
+                    ),
                     "{code} {status:?}"
                 );
             }

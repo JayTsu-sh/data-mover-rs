@@ -5,7 +5,7 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::metadata::{ApplicationOutcome, MetadataFamily, RefusalCause};
+use crate::metadata::{ApplicationFailureKind, ApplicationOutcome, MetadataFamily, RefusalCause};
 use crate::model::{FailureClass, ObjectTag, StoragePath, Transience};
 use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, identity, source_storage};
 use crate::storage::backends::s3::{
@@ -54,7 +54,7 @@ fn tag_outcome(report: &crate::metadata::MetadataApplicationReport) -> Option<Ap
         .map(|outcome| outcome.outcome)
 }
 
-const PAYLOAD_AND_WRITE_PATHS: [(usize, TransferPolicy, bool, TransferRoute); 6] = [
+const PAYLOAD_AND_WRITE_PATHS: [(usize, TransferPolicy, bool, TransferRoute); 8] = [
     (
         1024,
         TransferPolicy::Checkpointed,
@@ -77,6 +77,13 @@ const PAYLOAD_AND_WRITE_PATHS: [(usize, TransferPolicy, bool, TransferRoute); 6]
         9 * MIB,
         TransferPolicy::Direct,
         false,
+        TransferRoute::Streaming,
+    ),
+    (1024, TransferPolicy::Direct, true, TransferRoute::Native),
+    (
+        9 * MIB,
+        TransferPolicy::Direct,
+        true,
         TransferRoute::Streaming,
     ),
     (
@@ -109,7 +116,7 @@ async fn tags_follow_the_selected_version_on_every_payload_and_write_path() -> R
             .await
             .insert(("src/file".into(), "v1".into()), old_tags.clone());
         protocol
-            .put_tags("src/file", &[ObjectTag::new("generation", "new")?])
+            .put_tags("src/file", None, &[ObjectTag::new("generation", "new")?])
             .await
             .map_err(|e| format!("{e:?}"))?;
         let outcome = transfer(
@@ -304,6 +311,82 @@ async fn tag_write_failures_are_not_silently_skipped() -> Result {
 }
 
 #[tokio::test]
+async fn data_only_s3_completion_still_verifies_after_a_tag_write_refusal() -> Result {
+    for size in [1024, 9 * MIB] {
+        let protocol = Arc::new(MemoryS3::default());
+        let payload = Bytes::from(vec![0x6a; size]);
+        protocol
+            .objects
+            .lock()
+            .await
+            .insert("src/file".into(), payload.clone());
+        *protocol.tag_write_failure.lock().await = Some(denied());
+        let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 64 * 1024, None)?);
+        let failure = transfer(
+            request(&protocol, TransferPolicy::Direct, false)?
+                .with_source_qos(qos)
+                .with_metadata_failure_policy(MetadataFailurePolicy::PublishData),
+        )
+        .await
+        .err()
+        .ok_or("failed tags became a successful transfer")?;
+        assert_eq!(failure.phase(), TransferPhase::Metadata);
+        let data = failure
+            .published_data()
+            .ok_or("published data evidence missing")?;
+        assert_eq!(data.transferred_bytes, size as u64);
+        assert_eq!(data.blake3, Some(*blake3::hash(&payload).as_bytes()));
+        assert!(
+            protocol.range_dispatches.lock().await.len() as u64
+                > data.source_qos.source_read_operations,
+            "源读取之外必须发生目标回读，不能因元数据失败跳过 full 校验"
+        );
+        assert_eq!(protocol.objects.lock().await.get("file"), Some(&payload));
+        assert_eq!(
+            protocol.objects.lock().await.get("src/file"),
+            Some(&payload)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_backend_metadata_cancellation_is_not_converted_to_data_publication() -> Result {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol
+        .objects
+        .lock()
+        .await
+        .insert("src/file".into(), Bytes::from_static(b"payload"));
+    *protocol.tag_write_failure.lock().await = Some(S3ProtocolFailure::entry(
+        FailureClass::Cancelled,
+        Transience::Transient,
+        "backend metadata cancelled",
+    ));
+    let failure = transfer(
+        request(&protocol, TransferPolicy::Direct, false)?
+            .with_metadata_failure_policy(MetadataFailurePolicy::PublishData),
+    )
+    .await
+    .err()
+    .ok_or("cancelled metadata became success")?;
+    assert_eq!(failure.phase(), TransferPhase::Metadata);
+    assert_eq!(
+        failure
+            .metadata_failure()
+            .ok_or("typed cancellation missing")?
+            .kind(),
+        ApplicationFailureKind::Cancelled
+    );
+    assert!(failure.published_data().is_none());
+    assert_eq!(
+        protocol.objects.lock().await.get("src/file"),
+        Some(&Bytes::from_static(b"payload"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn an_empty_source_tag_set_clears_old_destination_tags() -> Result {
     let protocol = Arc::new(MemoryS3::default());
     protocol
@@ -312,7 +395,7 @@ async fn an_empty_source_tag_set_clears_old_destination_tags() -> Result {
         .await
         .insert("src/file".into(), Bytes::from_static(b"payload"));
     protocol
-        .put_tags("file", &[ObjectTag::new("stale", "value")?])
+        .put_tags("file", None, &[ObjectTag::new("stale", "value")?])
         .await
         .map_err(|e| format!("{e:?}"))?;
     transfer(request(&protocol, TransferPolicy::Checkpointed, false)?).await?;

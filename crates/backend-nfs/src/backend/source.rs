@@ -1,4 +1,5 @@
-use std::fmt;
+use std::error::Error;
+use std::fmt::{self, Write};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ use crate::storage::{
     ByteStream, PositionedByteStream, PositionedChunk, ReadRequest, ReadSource, SourceDescriptor,
     StorageRoleFailure,
 };
+use crate::url_redact::redact_storage_url;
 
 const MAX_ROLE_READ: usize = 1024 * 1024;
 
@@ -24,7 +26,7 @@ pub struct NfsSourceObservation {
     pub kind: EntryKind,
     pub size: Option<u64>,
     pub file_handle: Bytes,
-    pub content_version: Bytes,
+    pub content_version: Option<Bytes>,
     pub timestamps: Option<crate::model::TimestampMetadata>,
     pub ownership: Option<crate::storage::InlineOwnership>,
     pub mode: Option<u32>,
@@ -37,6 +39,8 @@ pub struct NfsSourceObservation {
 pub struct NfsProtocolFailure {
     pub class: FailureClass,
     pub transience: Transience,
+    /// 原始 SDK 原因通过 role 错误的 source 链交付，诊断单独脱敏。
+    pub(super) cause: Option<Arc<nfs_rs::NfsError>>,
     /// The status the server answered with, when the failure came from one — `NFS4ERR_PERM
     /// (permission denied)`: the diagnostic names it, so a refused owner can be told from a
     /// refused permission without a packet capture.
@@ -45,7 +49,7 @@ pub struct NfsProtocolFailure {
     /// parent the write, rename or directory creation had to create first
     /// (`NFSStorage::role_create_all`). The failure is reported at that level, and the
     /// diagnostic names the operation's own entry.
-    pub level: Option<StoragePath>,
+    pub level: Option<Box<StoragePath>>,
 }
 
 impl NfsProtocolFailure {
@@ -55,6 +59,7 @@ impl NfsProtocolFailure {
         Self {
             class,
             transience,
+            cause: None,
             status: None,
             level: None,
         }
@@ -64,7 +69,7 @@ impl NfsProtocolFailure {
     /// already named the level that failed.
     #[must_use]
     pub fn at_level(mut self, level: StoragePath) -> Self {
-        self.level.get_or_insert(level);
+        self.level.get_or_insert_with(|| Box::new(level));
         self
     }
 
@@ -138,7 +143,7 @@ impl NfsReadSourceAdapter {
             size: observed.size,
             source_identity,
             backend_fact: None,
-            content_version: Some(observed.content_version),
+            content_version: observed.content_version,
             inline_timestamps: observed.timestamps,
             inline_mode: observed.mode,
             permissions: super::namespace::permission_facts(
@@ -480,7 +485,7 @@ pub(super) fn role_failure(
         error.class,
         FailureClass::Connectivity | FailureClass::Timeout
     ) {
-        let diagnostic = diagnostic("session", error.status.as_deref());
+        let diagnostic = diagnostic(format_args!("NFS session failed"), &error);
         return StorageRoleFailure::Session(
             BackendSessionFailure::new(operation, error.class, error.transience, diagnostic)
                 .unwrap_or_else(|_| unreachable!("{DIAGNOSTIC_IS_VALID}")),
@@ -496,44 +501,140 @@ pub(super) fn entry_scoped(
     operation: Operation,
     error: NfsProtocolFailure,
 ) -> StorageRoleFailure {
-    let NfsProtocolFailure {
-        class,
-        transience,
-        status,
-        level,
-    } = error;
-    let plain = diagnostic("role", status.as_deref());
-    let (at, diagnostic) = match level {
-        Some(level) if level != *path => {
-            let context = parent_context(path, operation, status.as_deref());
-            (level, context)
-        }
-        _ => (path.clone(), plain.clone()),
+    let diagnostic = if error.level.as_deref().is_some_and(|level| level != path) {
+        parent_context(path, operation, &error)
+    } else {
+        diagnostic(format_args!("NFS role failed"), &error)
     };
-    let failure = EntryOperationFailure::new(at.clone(), operation, class, transience, diagnostic)
-        .or_else(|_| EntryOperationFailure::new(at, operation, class, transience, plain));
+    let at = error.level.map_or_else(|| path.clone(), |level| *level);
+    let failure =
+        EntryOperationFailure::new(at, operation, error.class, error.transience, diagnostic);
     StorageRoleFailure::Entry(failure.unwrap_or_else(|_| unreachable!("{DIAGNOSTIC_IS_VALID}")))
 }
 
-/// The diagnostic of a failure at a missing parent level: which entry's operation needed it.
-fn parent_context(path: &StoragePath, operation: Operation, status: Option<&str>) -> String {
-    let context = format!(
-        "NFS role failed creating a missing parent directory of `{}` ({operation:?})",
-        path.as_str()
+/// 父级失败仍报告真实失败层级，诊断保留需要它的原操作及 SDK 原因。
+fn parent_context(
+    path: &StoragePath,
+    operation: Operation,
+    error: &NfsProtocolFailure,
+) -> RoleDiagnostic {
+    if path.as_str().len() <= 1024 {
+        return diagnostic(
+            format_args!(
+                "NFS role failed creating a missing parent directory of `{}` ({operation:?})",
+                path.as_str()
+            ),
+            error,
+        );
+    }
+    // 超长上下文不能占满预算而挤掉实际失败原因。
+    let mut output = Diagnostic::default();
+    let _ = write!(
+        output,
+        "NFS role failed creating a missing parent directory ({operation:?})"
     );
-    match status {
-        Some(status) => format!("{context}: {status}"),
-        None => context,
+    append_cause(&mut output, error);
+    let _ = write!(output, "; requested entry `{}`", path.as_str());
+    output.finish(error)
+}
+
+const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+const DIAGNOSTIC_IS_VALID: &str =
+    "diagnostics have a fixed nonblank prefix, no NUL and at most 4096 bytes";
+
+pub(super) fn diagnostic(
+    context: fmt::Arguments<'_>,
+    error: &NfsProtocolFailure,
+) -> RoleDiagnostic {
+    let mut output = Diagnostic::default();
+    let _ = output.write_fmt(context);
+    append_cause(&mut output, error);
+    output.finish(error)
+}
+
+fn append_cause(output: &mut Diagnostic, error: &NfsProtocolFailure) {
+    // 服务端状态保持原有文本；客户端解码、传输等失败不伪装成 server status。
+    if let Some(status) = &error.status {
+        let _ = write!(output, ": {status}");
+        return;
+    }
+    let mut cause = error.cause.as_deref().map(|error| error as &dyn Error);
+    for _ in 0..8 {
+        let Some(error) = cause else { break };
+        if write!(output, ": {error}").is_err() {
+            break;
+        }
+        cause = error.source();
     }
 }
 
-const DIAGNOSTIC_IS_VALID: &str =
-    "the prefix is non-blank and nfs-rs status text is fixed, NUL-free and short";
+#[derive(Default)]
+struct Diagnostic {
+    text: String,
+    truncated: bool,
+}
 
-fn diagnostic(scope: &str, status: Option<&str>) -> String {
-    match status {
-        Some(status) => format!("NFS {scope} failed: {status}"),
-        None => format!("NFS {scope} failed"),
+impl Write for Diagnostic {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let available = (MAX_DIAGNOSTIC_BYTES - 16).saturating_sub(self.text.len());
+        let mut take = available.min(value.len());
+        while !value.is_char_boundary(take) {
+            take -= 1;
+        }
+        self.text.push_str(&value[..take]);
+        if take < value.len() {
+            self.truncated = true;
+            return Err(fmt::Error);
+        }
+        Ok(())
+    }
+}
+
+impl Diagnostic {
+    fn finish(mut self, error: &NfsProtocolFailure) -> RoleDiagnostic {
+        if self.truncated {
+            // 凭据的 @ 可能尚未进入截断片段，不能把不完整 URL 当作无凭据文本。
+            if let Some(scheme) = self.text.find("://") {
+                self.text.truncate(scheme + 3);
+                self.text.push_str("<truncated>");
+            }
+            self.text.push_str(" …");
+        }
+        let mut safe = redact_storage_url(&self.text).replace('\0', "?");
+        if safe.len() > MAX_DIAGNOSTIC_BYTES {
+            let mut end = MAX_DIAGNOSTIC_BYTES;
+            while !safe.is_char_boundary(end) {
+                end -= 1;
+            }
+            safe.truncate(end);
+        }
+        RoleDiagnostic {
+            text: safe,
+            cause: error.cause.clone(),
+        }
+    }
+}
+
+pub(super) struct RoleDiagnostic {
+    text: String,
+    cause: Option<Arc<nfs_rs::NfsError>>,
+}
+
+impl fmt::Display for RoleDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.text)
+    }
+}
+
+impl fmt::Debug for RoleDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RoleDiagnostic(<redacted>)")
+    }
+}
+
+impl Error for RoleDiagnostic {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.cause.as_deref().map(|error| error as &dyn Error)
     }
 }
 

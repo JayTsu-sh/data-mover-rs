@@ -69,6 +69,7 @@ async fn traverse_in(
     concurrency: usize,
     order: TraversalOrder,
 ) -> Result<Vec<TraversalItem>> {
+    let mut traversal_completed = Vec::new();
     let source = StorageTraversalSource::with_roles(fake.role(), Arc::new(NoMetadata));
     let slots = NonZeroUsize::new(concurrency).ok_or("concurrency is not zero")?;
     let mut session = source.traverse(
@@ -78,7 +79,7 @@ async fn traverse_in(
             .cancel(CancellationToken::new()),
     );
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if items.len() < 50 {
             // A slow consumer at first: prefetch runs as far ahead as it may.
             tokio::time::sleep(Duration::from_millis(2)).await;

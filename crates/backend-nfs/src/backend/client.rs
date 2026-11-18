@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use std::{error::Error, fmt, io};
 
 // 外部crate
 use async_trait::async_trait;
@@ -20,15 +21,15 @@ use tracing::{debug, error, info, trace, warn};
 use url::form_urlencoded;
 
 use crate::error::StorageError;
-use crate::model::AclEncoding;
+use crate::model::{AclEncoding, FailureClass, Transience};
 use crate::storage::backends::nfs::common::{
     NfsFactsError, NfsFactsProvider, NfsFailureCode, NfsInstanceFacts, NfsRetryAction,
     NfsRetryPolicy,
 };
 use crate::storage::backends::nfs::namespace::{
     NfsListingPages, NfsNamespaceObservation, NfsNamespaceProtocol, NfsReadEnd, NfsReadFailure,
-    inline_ownership,
 };
+use crate::storage::backends::nfs::protocol::{classify_error, classify_mutation_error};
 use crate::storage::backends::nfs::source::{
     NfsProtocolFailure, NfsReadCursor, NfsSourceObservation, NfsSourceProtocol,
 };
@@ -38,6 +39,8 @@ use crate::transfer_concurrency::{
 };
 use crate::{MB, Result};
 
+mod attributes;
+mod namespace_lookup;
 mod owner;
 mod role_create;
 mod role_delete;
@@ -151,6 +154,36 @@ fn invalidate_subtree_cache(prefix: PathBuf, root_fh: Bytes) {
         // always safe, just slower.
         GLOBAL_CACHE.invalidate_all();
     }
+}
+
+/// 只整理这次按名确认的目录；同一 FH 不失效、不重复写缓存，也不增加 LOOKUP。
+fn reconcile_namespace_cache(
+    path: PathBuf,
+    root: Bytes,
+    bound_root: &Bytes,
+    handle: &Bytes,
+    directory: bool,
+) -> bool {
+    if path.as_os_str().is_empty() {
+        // 根仍是原绑定锚点；不通过缓存偷偷切换后续写入根。
+        if handle != bound_root {
+            invalidate_subtree_cache(path, root);
+        }
+        return handle == bound_root;
+    }
+    let key = (path.clone(), root.clone());
+    let previous = GLOBAL_CACHE.get(&key);
+    if directory && previous.as_ref() == Some(handle) {
+        return true;
+    }
+    if directory || previous.is_some() {
+        // 父目录被替换时，后代 FH 也可能仍然存活，不能继续优先命中它们。
+        invalidate_subtree_cache(path, root);
+    }
+    if directory {
+        NFSStorage::cache_directory(key, handle);
+    }
+    true
 }
 
 /// `nfs_url` → `server_id` 映射表。
@@ -283,6 +316,7 @@ fn reject_readdir_buffer(query: &str) -> Result<()> {
 /// stale / busy retries were spent.
 enum LookupFailure {
     Storage(StorageError),
+    Refresh(NfsProtocolFailure),
     Component { dirname: String, error: NfsError },
 }
 
@@ -290,6 +324,35 @@ impl From<StorageError> for LookupFailure {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
+}
+
+/// Carries the root-check failure through legacy client methods returning `StorageError`.
+struct RootRefreshFailure(NfsProtocolFailure);
+
+impl fmt::Debug for RootRefreshFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for RootRefreshFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "NFS root binding check failed ({:?}, {:?})",
+            self.0.class, self.0.transience
+        )
+    }
+}
+
+impl Error for RootRefreshFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.0.cause.as_deref().map(|cause| cause as &dyn Error)
+    }
+}
+
+fn legacy_root_refresh_failure(error: NfsProtocolFailure) -> StorageError {
+    io::Error::other(RootRefreshFailure(error)).into()
 }
 
 /// 检测调用方可通过"清除路径缓存 + 刷新 `root_fh` + 重试"恢复的错误。
@@ -412,30 +475,30 @@ impl NfsSourceProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<NfsSourceObservation, NfsProtocolFailure> {
-        let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
+        let (file_handle, attrs) = self.role_lookup_with_attrs(path, false).await?;
         let kind = role_kind(&attrs);
         Ok(NfsSourceObservation {
-            uid: owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-            gid: owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
+            uid: attributes::uid(&attrs, self.owners_are_strings()),
+            gid: attributes::gid(&attrs, self.owners_are_strings()),
             kind,
             timestamps: Some(attrs_timestamps(&attrs)),
-            ownership: Some(inline_ownership(
-                owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-                owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
-                attrs.file_mode,
-            )),
-            mode: Some(attrs.file_mode),
-            size: (kind == crate::model::EntryKind::File).then_some(attrs.filesize),
-            content_version: [
-                attrs.mtime.seconds,
-                attrs.mtime.nseconds,
-                attrs.ctime.seconds,
-                attrs.ctime.nseconds,
-            ]
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect::<Vec<_>>()
-            .into(),
+            ownership: attributes::ownership(&attrs, self.owners_are_strings()),
+            mode: attributes::present(&attrs, 33).then_some(attrs.file_mode),
+            size: (kind == crate::model::EntryKind::File && attributes::present(&attrs, 4))
+                .then_some(attrs.filesize),
+            content_version: (attributes::present(&attrs, 52) && attributes::present(&attrs, 53))
+                .then(|| {
+                    [
+                        attrs.mtime.seconds,
+                        attrs.mtime.nseconds,
+                        attrs.ctime.seconds,
+                        attrs.ctime.nseconds,
+                    ]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>()
+                    .into()
+                }),
             file_handle,
         })
     }
@@ -444,10 +507,7 @@ impl NfsSourceProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<(Box<dyn NfsReadCursor>, Bytes), NfsProtocolFailure> {
-        let handle = self
-            .open(&PathBuf::from(path.as_str()), nfs_rs::OPEN_READ)
-            .await
-            .map_err(classify_role_error)?;
+        let handle = self.open(Path::new(path.as_str()), OPEN_READ).await?;
         let identity = handle.inner.fh.clone();
         Ok((
             Box::new(NfsRoleReadCursor {
@@ -461,6 +521,13 @@ impl NfsSourceProtocol for NFSStorage {
 
 #[allow(clippy::needless_pass_by_value)]
 fn classify_role_error(error: StorageError) -> NfsProtocolFailure {
+    if let StorageError::IoError(ref error) = error
+        && let Some(refresh) = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<RootRefreshFailure>())
+    {
+        return refresh.0.clone();
+    }
     let (class, transience) = match error {
         StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_) => (
             crate::model::FailureClass::NotFound,
@@ -508,9 +575,15 @@ use crate::storage::backends::nfs::metadata::timestamp as nfs_timestamp;
 /// the NFS metadata role already uses, so both roles report the same three values.
 fn attrs_timestamps(attrs: &Attr) -> crate::model::TimestampMetadata {
     crate::model::TimestampMetadata {
-        accessed: nfs_timestamp(time_to_i64(attrs.atime)),
-        modified: nfs_timestamp(time_to_i64(attrs.mtime)),
-        created: nfs_timestamp(time_to_i64(attrs.ctime)),
+        accessed: attributes::present(attrs, 47)
+            .then(|| nfs_timestamp(time_to_i64(attrs.atime)))
+            .flatten(),
+        modified: attributes::present(attrs, 53)
+            .then(|| nfs_timestamp(time_to_i64(attrs.mtime)))
+            .flatten(),
+        created: attributes::present(attrs, 52)
+            .then(|| nfs_timestamp(time_to_i64(attrs.ctime)))
+            .flatten(),
     }
 }
 
@@ -525,24 +598,10 @@ impl NfsNamespaceProtocol for NFSStorage {
     async fn stat(
         &self,
         path: &crate::model::StoragePath,
+        fresh: bool,
     ) -> std::result::Result<NfsNamespaceObservation, NfsProtocolFailure> {
-        let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
-        let kind = role_kind(&attrs);
-        Ok(NfsNamespaceObservation {
-            uid: owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-            gid: owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
-            path: path.clone(),
-            kind,
-            size: (kind == crate::model::EntryKind::File).then_some(attrs.filesize),
-            file_handle,
-            timestamps: Some(attrs_timestamps(&attrs)),
-            mode: Some(attrs.file_mode),
-            ownership: Some(inline_ownership(
-                owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-                owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
-                attrs.file_mode,
-            )),
-        })
+        let (file_handle, attrs) = self.role_lookup_with_attrs(path, fresh).await?;
+        Ok(self.role_namespace_observation(path, file_handle, &attrs))
     }
 
     async fn directory_handle(
@@ -566,9 +625,7 @@ impl NfsNamespaceProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<(), NfsProtocolFailure> {
-        self.forget_role_directory(path)
-            .await
-            .map_err(classify_role_error)
+        self.forget_role_directory(path).await
     }
 
     async fn read_link(
@@ -604,13 +661,25 @@ impl NfsNamespaceProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
         kind: crate::model::EntryKind,
+        expected: Option<&crate::model::ObservedEntry>,
     ) -> std::result::Result<(), NfsProtocolFailure> {
+        if let Some(expected) = expected {
+            if !matches!(self.version(), NFSVersion::NFSv3 | NFSVersion::NFSv4p1) {
+                return Err(NfsProtocolFailure::new(
+                    crate::model::FailureClass::Unsupported,
+                    crate::model::Transience::Permanent,
+                )
+                .with_status("protected NFS source purge is validated only for v3 and v4.1"));
+            }
+            return self.role_purge_observed(path, kind, expected).await;
+        }
+
         let native = PathBuf::from(path.as_str());
         if kind == crate::model::EntryKind::Directory {
             self.role_cleanup_artifacts(&native, true).await?;
             self.role_delete_directory(&native).await
         } else {
-            self.delete_file(&native).await.map_err(classify_role_error)
+            self.delete_file(&native).await
         }
     }
 
@@ -626,10 +695,13 @@ impl NfsNamespaceProtocol for NFSStorage {
 struct NfsRoleStageFile {
     storage: NFSStorage,
     handle: NFSFileHandle,
-    deferred_gate: tokio::sync::RwLock<()>,
+    // 关闭也持有写锁，并在释放锁前保留首次关闭的结果，供并发和后续调用读取。
+    deferred_gate: Arc<tokio::sync::RwLock<Option<NfsStageCloseResult>>>,
     deferred_writes: tokio::sync::Mutex<Vec<NfsDeferredWrite>>,
     closed: std::sync::atomic::AtomicBool,
 }
+
+type NfsStageCloseResult = std::result::Result<(), NfsProtocolFailure>;
 
 struct NfsDeferredWrite {
     offset: u64,
@@ -677,7 +749,7 @@ impl NfsRoleStageFile {
         Self {
             storage,
             handle,
-            deferred_gate: tokio::sync::RwLock::new(()),
+            deferred_gate: Arc::default(),
             deferred_writes: tokio::sync::Mutex::new(Vec::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -685,6 +757,10 @@ impl NfsRoleStageFile {
 
     async fn checkpoint_deferred_writes(&self) -> nfs_rs::Result<()> {
         let _gate = self.deferred_gate.write().await;
+        self.commit_deferred_writes().await
+    }
+
+    async fn commit_deferred_writes(&self) -> nfs_rs::Result<()> {
         let mut writes = self.deferred_writes.lock().await;
         if writes.is_empty() {
             return Ok(());
@@ -757,6 +833,44 @@ impl NfsRoleStageFile {
             }
         }
         unreachable!("the final commit attempt always returns")
+    }
+
+    async fn close_stage(&self, commit_deferred: bool) -> NfsStageCloseResult {
+        let mut gate = Arc::clone(&self.deferred_gate).write_owned().await;
+        if self.closed.load(Ordering::SeqCst) {
+            return gate.clone().unwrap_or_else(Self::unknown_close);
+        }
+        // 预处理仍归调用方，取消时不能在后台继续提交或重放写入。
+        let checkpoint = if commit_deferred {
+            self.commit_deferred_writes().await.map_err(classify_error)
+        } else {
+            self.deferred_writes.lock().await.clear();
+            Ok(())
+        };
+        // 标记和交接之间没有挂起点。交接前取消由 Drop 收尾，交接后由唯一的关闭任务收尾。
+        self.closed.store(true, Ordering::SeqCst);
+        if self.storage.version() == NFSVersion::NFSv3 {
+            // NFSv3 无 OPEN 状态，SDK CLOSE 不会等待 RPC。
+            let result = checkpoint.and(self.storage.role_close(&self.handle).await);
+            *gate = Some(result.clone());
+            return result;
+        }
+        let storage = self.storage.clone();
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let result = checkpoint.and(storage.role_close(&handle).await);
+            *gate = Some(result.clone());
+            result
+        })
+        .await
+        .unwrap_or_else(|_| Self::unknown_close())
+    }
+
+    fn unknown_close() -> NfsStageCloseResult {
+        Err(
+            NfsProtocolFailure::new(FailureClass::Internal, Transience::Unknown)
+                .with_status("NFS stage close task ended without a result"),
+        )
     }
 
     async fn retain_unstable_write(
@@ -867,10 +981,18 @@ impl NfsStageFile for NfsRoleStageFile {
             .map(|(written, _)| written)
     }
 
-    async fn checkpoint(&self) -> std::result::Result<(), NfsProtocolFailure> {
+    async fn checkpoint(&self, whole_file: bool) -> std::result::Result<(), NfsProtocolFailure> {
         self.checkpoint_deferred_writes()
             .await
-            .map_err(crate::storage::backends::nfs::protocol::classify_error)
+            .map_err(crate::storage::backends::nfs::protocol::classify_error)?;
+        if whole_file {
+            self.storage
+                .mount
+                .commit(self.handle.inner.fh.clone(), 0, 0)
+                .await
+                .map_err(classify_mutation_error)?;
+        }
+        Ok(())
     }
 
     async fn set_len(&self, size: u64) -> std::result::Result<(), NfsProtocolFailure> {
@@ -891,24 +1013,11 @@ impl NfsStageFile for NfsRoleStageFile {
     }
 
     async fn close(&self) -> std::result::Result<(), NfsProtocolFailure> {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
-        let checkpoint = self
-            .checkpoint_deferred_writes()
-            .await
-            .map_err(crate::storage::backends::nfs::protocol::classify_error);
-        let close = self.storage.role_close(&self.handle).await;
-        checkpoint.and(close)
+        self.close_stage(true).await
     }
 
     async fn close_uncommitted(&self) -> std::result::Result<(), NfsProtocolFailure> {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
-        let _gate = self.deferred_gate.write().await;
-        self.deferred_writes.lock().await.clear();
-        self.storage.role_close(&self.handle).await
+        self.close_stage(false).await
     }
 }
 
@@ -942,29 +1051,11 @@ impl NfsStagedProtocol for NFSStorage {
         usize::try_from(self.config.write_chunk_bytes).unwrap_or(usize::MAX)
     }
 
-    async fn create_empty(
-        &self,
-        path: &crate::model::StoragePath,
-        mode: u32,
-    ) -> std::result::Result<(), NfsProtocolFailure> {
-        let native = Path::new(path.as_str());
-        let handle = self.create_empty_open(path, mode).await?;
-        if let Err(primary) = handle.close().await {
-            let cleanup_failure = self
-                .delete_file(native)
-                .await
-                .err()
-                .map(classify_role_error);
-            return Err(cleanup_failure.unwrap_or(primary));
-        }
-        Ok(())
-    }
-
     async fn create_empty_open(
         &self,
         path: &crate::model::StoragePath,
         mode: u32,
-    ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
+    ) -> std::result::Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure> {
         let native = Path::new(path.as_str());
         // Data and checkpoint creation select their own mode before writing any bytes.
         let Some(handle) = self.role_create_file_exclusive(native, Some(mode)).await? else {
@@ -973,36 +1064,42 @@ impl NfsStagedProtocol for NFSStorage {
                 crate::model::Transience::Permanent,
             ));
         };
-        Ok(Box::new(NfsRoleStageFile::new(self.clone(), handle)))
+        let identity = handle.inner.fh.clone();
+        Ok((
+            Box::new(NfsRoleStageFile::new(self.clone(), handle)),
+            identity,
+        ))
     }
 
     async fn open_read(
         &self,
         path: &crate::model::StoragePath,
-    ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
-        let handle = self
-            .open(Path::new(path.as_str()), OPEN_READ)
-            .await
-            .map_err(classify_role_error)?;
-        Ok(Box::new(NfsRoleStageFile::new(self.clone(), handle)))
+    ) -> std::result::Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure> {
+        let handle = self.open(Path::new(path.as_str()), OPEN_READ).await?;
+        let identity = handle.inner.fh.clone();
+        Ok((
+            Box::new(NfsRoleStageFile::new(self.clone(), handle)),
+            identity,
+        ))
     }
 
     async fn open_write(
         &self,
         path: &crate::model::StoragePath,
-    ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
-        let handle = self
-            .open(Path::new(path.as_str()), OPEN_WRITE)
-            .await
-            .map_err(classify_role_error)?;
-        Ok(Box::new(NfsRoleStageFile::new(self.clone(), handle)))
+    ) -> std::result::Result<(Box<dyn NfsStageFile>, Bytes), NfsProtocolFailure> {
+        let handle = self.open(Path::new(path.as_str()), OPEN_WRITE).await?;
+        let identity = handle.inner.fh.clone();
+        Ok((
+            Box::new(NfsRoleStageFile::new(self.clone(), handle)),
+            identity,
+        ))
     }
 
     async fn size(
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<u64, NfsProtocolFailure> {
-        self.role_lookup_with_attrs(path)
+        self.role_lookup_with_attrs(path, false)
             .await
             .map(|(_, attrs)| attrs.filesize)
     }
@@ -1012,7 +1109,7 @@ impl NfsStagedProtocol for NFSStorage {
         path: &crate::model::StoragePath,
     ) -> std::result::Result<(bool, u64), NfsProtocolFailure> {
         // nfs-rs reports both versions' types in the v3 numbering (NF4REG is also 1).
-        self.role_lookup_with_attrs(path)
+        self.role_lookup_with_attrs(path, false)
             .await
             .map(|(_, attrs)| (attrs.type_ == FType3::NF3REG as u32, attrs.filesize))
     }
@@ -1029,9 +1126,7 @@ impl NfsStagedProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<(), NfsProtocolFailure> {
-        self.delete_file(Path::new(path.as_str()))
-            .await
-            .map_err(classify_role_error)
+        self.delete_file(Path::new(path.as_str())).await
     }
 }
 
@@ -1076,13 +1171,13 @@ pub struct StorageConfig {
 pub struct NFSStorage {
     /// NFS 挂载实例
     mount: Arc<Box<dyn Mount>>,
-    /// 根目录文件句柄（共享可变，支持 stale 后刷新）
-    root_fh: Arc<std::sync::RwLock<Bytes>>,
+    /// 此实例绑定的根句柄，仅在初次挂载并选定前缀时设定。
+    root_fh: Bytes,
     /// 根路径（NFS 路径始终用 '/' 分隔，不依赖平台 `PathBuf`）
     root: Arc<String>,
     /// 存储配置
     pub config: StorageConfig,
-    /// `root_fh` 刷新代数，每次成功刷新 +1，用于合并并发刷新
+    /// 每次成功复核根绑定后递增，用于合并并发刷新。
     refresh_generation: Arc<AtomicU64>,
     /// 序列化 refresh 操作，确保同一时刻只有一个 worker 执行实际刷新 RPC
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
@@ -1090,15 +1185,8 @@ pub struct NFSStorage {
     /// 用于构造 `GLOBAL_CACHE` key 前缀，确保不同服务器的条目互不冲突，
     /// 同时允许同一端点的 worker 复用彼此缓存，消除重复 LOOKUP RPC。
     server_id: u64,
-    /// 预计算的 cache key 前缀：`server_id(8B)` + `root_fh`。
-    /// 仅在构造和 `refresh_root_fh` 时更新，避免热路径每次分配 `BytesMut`。
-    cache_root_fh: Arc<std::sync::RwLock<Bytes>>,
-}
-
-/// `RwLock` poison 错误统一入口（写路径均用 ? 传播，不会 panic，此路径理论上不触发）
-#[inline]
-fn root_fh_lock_err() -> StorageError {
-    StorageError::OperationError("root_fh lock poisoned".to_string())
+    /// 预计算的 cache key 前缀，固定为 `server_id(8B)` + `root_fh`。
+    cache_root_fh: Bytes,
 }
 
 /// 构建 cache key 前缀：`server_id(8B)` + `raw_fh`
@@ -1110,13 +1198,47 @@ fn build_cache_root_fh(server_id: u64, raw_fh: &Bytes) -> Bytes {
 }
 
 impl NFSStorage {
-    /// Optimized role-only lookup. nfs-rs already folds GETATTR into LOOKUP on every supported
-    /// dialect, so reuse those attributes instead of paying a second metadata RPC. Directory-cache
-    /// hits can lack attributes and deliberately fall back to one GETATTR.
+    fn role_namespace_observation(
+        &self,
+        path: &crate::model::StoragePath,
+        file_handle: Bytes,
+        attrs: &Attr,
+    ) -> NfsNamespaceObservation {
+        let kind = role_kind(attrs);
+        NfsNamespaceObservation {
+            uid: attributes::uid(attrs, self.owners_are_strings()),
+            gid: attributes::gid(attrs, self.owners_are_strings()),
+            path: path.clone(),
+            kind,
+            size: (kind == crate::model::EntryKind::File && attributes::present(attrs, 4))
+                .then_some(attrs.filesize),
+            file_handle,
+            timestamps: Some(attrs_timestamps(attrs)),
+            mode: attributes::present(attrs, 33).then_some(attrs.file_mode),
+            ownership: attributes::ownership(attrs, self.owners_are_strings()),
+        }
+    }
+
+    /// Normal role reads keep the existing cache-backed lookup and its GETATTR fallback.
+    /// Strong namespace reads guard the configured root and resolve every relative component
+    /// from the held root FH, reconciling the observed ancestor chain for later metadata reads.
+    /// The latter costs one root query plus one LOOKUP per component, within the caller's
+    /// existing operation budget; it never rebinds the root or fences concurrent external writes.
     async fn role_lookup_with_attrs(
         &self,
         path: &crate::model::StoragePath,
+        fresh: bool,
     ) -> std::result::Result<(Bytes, Attr), NfsProtocolFailure> {
+        if fresh {
+            return namespace_lookup::lookup(
+                self.mount.as_ref().as_ref(),
+                &self.root,
+                &self.root_fh,
+                &self.cache_root_fh,
+                path,
+            )
+            .await;
+        }
         let object = self.role_lookup_fh(Path::new(path.as_str())).await?;
         let file_handle = object.fh;
         let attrs = if let Some(attrs) = object.attr {
@@ -1404,7 +1526,7 @@ impl NFSStorage {
         let sid = get_or_assign_server_id(&nfs_url);
         let cache_fh = build_cache_root_fh(sid, &mount_fh);
         let storage = NFSStorage {
-            root_fh: Arc::new(std::sync::RwLock::new(mount_fh)),
+            root_fh: mount_fh,
             mount: Arc::new(mount),
             root: Arc::new(String::new()),
             config: StorageConfig {
@@ -1419,7 +1541,7 @@ impl NFSStorage {
             refresh_generation: Arc::new(AtomicU64::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             server_id: sid,
-            cache_root_fh: Arc::new(std::sync::RwLock::new(cache_fh)),
+            cache_root_fh: cache_fh,
         };
 
         Ok((storage, root_dir))
@@ -1484,7 +1606,9 @@ impl NFSStorage {
                 return Err(e);
             }
         };
-        *self.root_fh.write().map_err(|_| root_fh_lock_err())? = fh;
+        // RPC 根与缓存命名空间必须同时绑定前缀，避免同一 export 的不同根复用相对路径。
+        self.cache_root_fh = build_cache_root_fh(self.server_id, &fh);
+        self.root_fh = fh;
         self.root = Arc::new(root_dir);
         Ok(self)
     }
@@ -1492,62 +1616,41 @@ impl NFSStorage {
     /// 返回用于 `GLOBAL_CACHE` key 的标识符：`server_id`(8B) + `root_fh`。
     /// 预计算值，clone 仅增加引用计数。
     fn get_root_fh(&self) -> Bytes {
-        self.cache_root_fh
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.cache_root_fh.clone()
     }
 
     /// 返回真实的 NFS root file handle（用于 RPC 操作，不含 `server_id` 前缀）
     fn rpc_root_fh(&self) -> Bytes {
-        self.root_fh
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.root_fh.clone()
     }
 
-    /// 从 NFS mount 协议层重新获取 `root_fh`（绕开缓存，直接 RPC）。
-    /// `mount.getfh()` 不依赖 `self.root_fh`，即使 `root_fh` 已 stale 也能成功。
-    async fn do_refresh_root_fh(&self) -> Result<()> {
+    /// 绕开缓存，从挂载根逐级确认已绑定的前缀。拒绝在不同根句柄上重试。
+    async fn do_refresh_root_fh(&self) -> std::result::Result<(), NfsProtocolFailure> {
         let mut current_fh = self.mount.getfh().await;
-
-        // 如果有 prefix（self.root 非空），逐级 lookup 得到真正的 root_fh
-        if !self.root.is_empty() {
-            for component in self.root.split('/').filter(|s| !s.is_empty()) {
-                let obj = self
-                    .mount
-                    .lookup(current_fh, component)
-                    .await
-                    .map_err(|e| {
-                        StorageError::NfsError(format!(
-                            "Failed to refresh root fh at '{component}': {e}"
-                        ))
-                    })?;
-                current_fh = obj.fh;
-            }
+        for component in self.root.split('/').filter(|s| !s.is_empty()) {
+            let object = self
+                .mount
+                .lookup(current_fh, component)
+                .await
+                .map_err(|error| {
+                    namespace_lookup::failed_root_lookup(error, &self.cache_root_fh)
+                })?;
+            current_fh = object.fh;
         }
-
-        // 注意：刷新 root_fh 后本实例的 cache_root_fh 前缀随之变化。
-        // 与同 server_id 的其他 worker 暂时失去缓存共享，直到它们也完成 FH 刷新。
-        // 这是预期行为：root_fh 变化意味着服务器视角已改变，旧缓存条目需重建。
-        // 旧条目不会造成错误，仅在 TTI 到期前占用少量内存。
-        let cache_fh = build_cache_root_fh(self.server_id, &current_fh);
-        *self.root_fh.write().map_err(|_| root_fh_lock_err())? = current_fh;
-        *self.cache_root_fh.write().map_err(|_| root_fh_lock_err())? = cache_fh;
-        info!("root_fh refreshed successfully");
-        Ok(())
+        namespace_lookup::check_root(&self.root_fh, &self.cache_root_fh, &current_fh)
     }
 
-    /// 尝试刷新 `root_fh`。如果自 `stale_generation` 以来已有其他 worker 完成刷新，则跳过。
-    /// 通过 generation + async mutex 确保同一时刻只有一个 worker 做实际 RPC 刷新，
-    /// 其余 worker 等锁后发现 generation 已变，直接复用新 `root_fh`。
-    async fn maybe_refresh_root_fh(&self, stale_generation: u64) -> Result<()> {
+    /// 合并并发的根绑定复核。复核成功后可使用原根重新查询已失效的子路径。
+    async fn maybe_refresh_root_fh(
+        &self,
+        stale_generation: u64,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
         let _guard = self.refresh_lock.lock().await;
 
         let current_gen = self.refresh_generation.load(Ordering::Acquire);
         if current_gen != stale_generation {
             debug!(
-                "root_fh already refreshed by another worker (gen {} → {})",
+                "root binding already confirmed by another worker (gen {} → {})",
                 stale_generation, current_gen
             );
             return Ok(());
@@ -1585,6 +1688,7 @@ impl NFSStorage {
             .await
             .map_err(|failure| match failure {
                 LookupFailure::Storage(error) => error,
+                LookupFailure::Refresh(error) => legacy_root_refresh_failure(error),
                 // NOENT once the retries are spent: the component really is absent.
                 // Delete callers may treat it as idempotent success.
                 LookupFailure::Component { dirname, error } if is_nfs_noent(&error) => {
@@ -1686,7 +1790,9 @@ impl NFSStorage {
                             relative_path
                         );
                         let stale_gen = self.refresh_generation.load(Ordering::Acquire);
-                        self.maybe_refresh_root_fh(stale_gen).await?;
+                        self.maybe_refresh_root_fh(stale_gen)
+                            .await
+                            .map_err(LookupFailure::Refresh)?;
                         let root_fh = self.get_root_fh();
                         invalidate_path_cache(&components, &root_fh);
                         return Box::pin(self.lookup_fh_inner(relative_path, retries + 1)).await;
@@ -1715,24 +1821,26 @@ impl NFSStorage {
     /// 对 NFSv4.1：发送 OPEN RPC，建立 stateid，支持 share reservation。
     ///
     /// 使用完毕后必须调用 [`close`] 释放资源（v3 为 no-op，v4.1 释放 stateid）。
-    pub async fn open(&self, path: &Path, access: u32) -> Result<NFSFileHandle> {
-        let components = Self::collect_components(path)?;
-        if components.is_empty() {
-            return Err(StorageError::InvalidPath(
-                "Cannot open root as file".to_string(),
+    async fn open(
+        &self,
+        path: &Path,
+        access: u32,
+    ) -> std::result::Result<NFSFileHandle, NfsProtocolFailure> {
+        let components = Self::collect_components(path).map_err(classify_role_error)?;
+        let Some((filename, parents)) = components.split_last() else {
+            return Err(NfsProtocolFailure::new(
+                FailureClass::InvalidInput,
+                Transience::Permanent,
             ));
-        }
-
-        // components 非空已由上方 is_empty() 保证
-        let filename = &components[components.len() - 1];
+        };
 
         for attempt in 0..=MAX_STALE_RETRIES {
             // 获取父目录 fh（利用缓存；重试时缓存已被清除，会重新 lookup）
-            let parent_fh = if components.len() == 1 {
+            let parent_fh = if parents.is_empty() {
                 self.rpc_root_fh()
             } else {
-                let parent_path: PathBuf = components[..components.len() - 1].iter().collect();
-                self.lookup_fh(&parent_path).await?.fh
+                let parent_path: PathBuf = parents.iter().collect();
+                self.role_lookup_fh(&parent_path).await?.fh
             };
 
             // 调用 mount.open()：v3 内部走 lookup，v4.1 建立 stateid
@@ -1750,10 +1858,11 @@ impl NFSStorage {
                         invalidate_path_cache(&components, &root_fh);
                         continue;
                     }
-                    return Err(StorageError::NfsError(format!(
-                        "Failed to open {}: {e}",
-                        path.display()
-                    )));
+                    return Err(if access == OPEN_READ {
+                        classify_error(e)
+                    } else {
+                        classify_mutation_error(e)
+                    });
                 }
             }
         }
@@ -1774,13 +1883,18 @@ impl NFSStorage {
     /// # Errors
     ///
     /// Returns an error when the requested storage operation cannot be completed.
-    pub async fn delete_file(&self, relative_path: &Path) -> Result<()> {
+    async fn delete_file(
+        &self,
+        relative_path: &Path,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
         trace!("Removing file {:?}", relative_path);
 
         // 提取文件名
         let filename = relative_path
             .file_name()
-            .ok_or_else(|| StorageError::InvalidPath("Invalid file path".to_string()))?
+            .ok_or_else(|| {
+                NfsProtocolFailure::new(FailureClass::InvalidInput, Transience::Permanent)
+            })?
             .to_string_lossy()
             .to_string();
 
@@ -1791,28 +1905,20 @@ impl NFSStorage {
                     "Looking up parent path for remove file {:?}: {:?}",
                     relative_path, parent
                 );
-                self.lookup_fh(parent).await?
+                self.role_lookup_fh(parent).await?
             } else {
                 trace!("Parent directory of {:?} is root directory", relative_path);
-                self.mount.lookup_path("/").await.map_err(|e| {
-                    StorageError::NfsError(format!("Failed to lookup root directory: {e}"))
-                })?
+                self.mount.lookup_path("/").await.map_err(classify_error)?
             };
 
             // 删除文件 - 使用父目录的file handle
             match self.mount.remove(parent_obj.fh.clone(), &filename).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    // 目标已不存在：保留可观察的 FileNotFound 分类。
-                    // 需要幂等删除的调用方应显式将 FileNotFound 视为成功。
+                    // 目标已不存在时交付 NotFound；幂等由调用方决定。
                     if e.is_not_found() {
-                        trace!(
-                            "File {:?} already gone, returning FileNotFound",
-                            relative_path
-                        );
-                        return Err(StorageError::FileNotFound(
-                            relative_path.display().to_string(),
-                        ));
+                        trace!("File {:?} already gone, returning NotFound", relative_path);
+                        return Err(classify_mutation_error(e));
                     }
                     if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
@@ -1822,13 +1928,12 @@ impl NFSStorage {
                         let stale_gen = self.refresh_generation.load(Ordering::Acquire);
                         self.maybe_refresh_root_fh(stale_gen).await?;
                         let root_fh = self.get_root_fh();
-                        let components = Self::collect_components(relative_path)?;
+                        let components =
+                            Self::collect_components(relative_path).map_err(classify_role_error)?;
                         invalidate_path_cache(&components, &root_fh);
                         continue;
                     }
-                    return Err(StorageError::NfsError(format!(
-                        "Failed to remove file: {e}"
-                    )));
+                    return Err(classify_mutation_error(e));
                 }
             }
         }
@@ -1885,10 +1990,8 @@ impl NFSStorage {
         GLOBAL_CACHE.insert(cache_key, Bytes::copy_from_slice(file_handle));
     }
 
-    /// SETATTR with the stale-handle retry. The outer error is our own step failing (re-lookup,
-    /// time conversion); the inner one is the server's answer to the SETATTR itself, kept as
-    /// nfs-rs gave it so a caller can classify it and name its status.
-    pub async fn setattr_retrying(
+    /// SETATTR with the stale-handle retry, preserving the server's refusal or uncertain result.
+    async fn setattr_retrying(
         &self,
         file: &NFSFileHandle,
         atime: Option<i64>,
@@ -1896,12 +1999,18 @@ impl NFSStorage {
         uid: Option<u32>,
         gid: Option<u32>,
         mode: Option<u32>,
-    ) -> Result<std::result::Result<(), NfsError>> {
+    ) -> std::result::Result<(), NfsProtocolFailure> {
         debug!("Setting metadata for {:?}", file.path);
 
         // 转换纳秒时间戳到Time类型
-        let access_time_value = atime.map(i64_to_time).transpose()?;
-        let modification_time_value = mtime.map(i64_to_time).transpose()?;
+        let access_time_value = atime
+            .map(i64_to_time)
+            .transpose()
+            .map_err(classify_role_error)?;
+        let modification_time_value = mtime
+            .map(i64_to_time)
+            .transpose()
+            .map_err(classify_role_error)?;
 
         // set_metadata 在 stale 重试时需要 re-lookup 获取新 fh，用 current_fh 跟踪
         let mut current_fh = file.inner.fh.clone();
@@ -1921,7 +2030,7 @@ impl NFSStorage {
                 )
                 .await
             {
-                Ok(()) => return Ok(Ok(())),
+                Ok(()) => return Ok(()),
                 Err(e) => {
                     if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
@@ -1931,14 +2040,15 @@ impl NFSStorage {
                         let stale_gen = self.refresh_generation.load(Ordering::Acquire);
                         self.maybe_refresh_root_fh(stale_gen).await?;
                         let root_fh = self.get_root_fh();
-                        let components = Self::collect_components(&file.path)?;
+                        let components =
+                            Self::collect_components(&file.path).map_err(classify_role_error)?;
                         invalidate_path_cache(&components, &root_fh);
                         // 重新 lookup 获取新的文件句柄
-                        let fresh_obj = self.lookup_fh(&file.path).await?;
+                        let fresh_obj = self.role_lookup_fh(&file.path).await?;
                         current_fh = fresh_obj.fh;
                         continue;
                     }
-                    return Ok(Err(e));
+                    return Err(classify_mutation_error(e));
                 }
             }
         }
@@ -1965,55 +2075,6 @@ impl NFSStorage {
     #[must_use]
     pub fn supports_xattr(&self) -> bool {
         self.mount.capabilities().named_attributes
-    }
-
-    // ============================================================
-    // NFSv4 Extended Attributes (xattr)
-    // ============================================================
-
-    /// 获取指定 xattr 的值
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the requested storage operation cannot be completed.
-    pub async fn get_xattr(&self, relative_path: &Path, name: &str) -> Result<Bytes> {
-        let obj = self.lookup_fh(relative_path).await?;
-        self.mount.getxattr(obj.fh, name).await.map_err(|e| {
-            StorageError::NfsError(format!(
-                "Failed to get xattr '{name}' for {}: {e}",
-                relative_path.display()
-            ))
-        })
-    }
-
-    /// 设置 xattr 值
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the requested storage operation cannot be completed.
-    pub async fn set_xattr(&self, relative_path: &Path, name: &str, value: Bytes) -> Result<()> {
-        let obj = self.lookup_fh(relative_path).await?;
-        self.mount.setxattr(obj.fh, name, value).await.map_err(|e| {
-            StorageError::NfsError(format!(
-                "Failed to set xattr '{name}' for {}: {e}",
-                relative_path.display()
-            ))
-        })
-    }
-
-    /// 列出所有 xattr 名称
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the requested storage operation cannot be completed.
-    pub async fn list_xattr(&self, relative_path: &Path) -> Result<Vec<String>> {
-        let obj = self.lookup_fh(relative_path).await?;
-        self.mount.listxattr(obj.fh).await.map_err(|e| {
-            StorageError::NfsError(format!(
-                "Failed to list xattr for {}: {e}",
-                relative_path.display()
-            ))
-        })
     }
 }
 
@@ -2115,9 +2176,7 @@ impl NFSStorage {
                             relative_path
                         );
                         let stale_gen = self.refresh_generation.load(Ordering::Acquire);
-                        self.maybe_refresh_root_fh(stale_gen)
-                            .await
-                            .map_err(classify_role_error)?;
+                        self.maybe_refresh_root_fh(stale_gen).await?;
                         let root_fh = self.get_root_fh();
                         let components =
                             Self::collect_components(relative_path).map_err(classify_role_error)?;
@@ -2460,3 +2519,19 @@ mod tests {
         assert!(!is_retryable_with_invalidation(&err));
     }
 }
+
+#[cfg(test)]
+#[path = "client/namespace_freshness_tests.rs"]
+mod namespace_freshness_tests;
+
+#[cfg(test)]
+#[path = "client/namespace_lookup_tests.rs"]
+mod namespace_lookup_tests;
+
+#[cfg(test)]
+#[path = "client/root_refresh_tests.rs"]
+mod root_refresh_tests;
+
+#[cfg(test)]
+#[path = "client/stage_close_tests.rs"]
+mod stage_close_tests;

@@ -59,7 +59,7 @@ The removals intentionally break scan consumers; the crate does not keep forward
 |---|---|
 | `StorageEnum::{walkdir,walkdir_2}` and backend-specific methods, `HDFSStorage::scan_recursive` | Connect a role `Storage`, then `StorageTraversalSource::new(&storage)?.traverse(request)` |
 | `WalkOptions` (crate root, `storage_options`, `storage_enum`) | `TraversalRequest`: filter adapter, depth, observation plan, concurrency and ordering |
-| `WalkDirAsyncIterator`, `WalkDirAsyncIterator2`, `StorageEntryMessage`, `ErrorEvent`, `HdfsScanEvent` | `TraversalSession::next_item()` and `finish()`; inspect `TraversalItem::Failure` and completion totals |
+| `WalkDirAsyncIterator`, `WalkDirAsyncIterator2`, `StorageEntryMessage`, `ErrorEvent`, `HdfsScanEvent` | `TraversalSession::next_item(&mut completed)` and `finish()`; inspect `TraversalItem::Failure` and completion totals |
 | `dir_matches_date_filter`, `FilterExpression::has_matching_dir_date` | Use generic `DirDate` DSL matching through `DslTraversalFilter`; scanner packaging is retired |
 | Public modules `ndx_walk`, `dir_tree`, `async_receiver`; `AsyncReceiver<T>` | `TraversalOrder::Blocks` for directory boundaries; session identifiers/numbering belong to consumers |
 | Scan examples and `ndx-walk` CLI command | `storage_role_operations --backend <backend> traverse [--order blocks]` |

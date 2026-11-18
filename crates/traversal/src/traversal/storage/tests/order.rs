@@ -255,11 +255,12 @@ impl Namespace for FailingListNamespace {
 /// unreadable, whatever the order.
 #[tokio::test]
 async fn a_directory_that_could_not_be_listed_is_unreadable() {
+    let mut traversal_completed = Vec::new();
     let source =
         StorageTraversalSource::with_roles(Arc::new(FailingListNamespace), Arc::new(FakeMetadata));
     let mut session = source.traverse(ordered_request());
     let mut seen = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if let TraversalItem::DirectoryListed(listed) = item {
             seen.push((listed.path.as_str().to_owned(), listed.outcome));
         }

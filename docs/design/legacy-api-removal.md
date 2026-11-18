@@ -12,7 +12,7 @@ Removing exports alone does not satisfy this work.
 | `StorageEnum`, `create_storage`, backend dispatch | `storage::connect_backend`, `Storage` and typed roles | Migrate examples, test fixtures and CLI configuration; preserve credential redaction and explicit HDFS configuration |
 | `walkdir`, `walkdir_2`, NDX, HDFS recursive scanner | `StorageTraversalSource` | Already removed by P7; retain historical evidence |
 | `copy_file`, per-backend read/write pipelines | `transfer::transfer` | Verify policy, cancellation, size guards, bounded positional I/O, metadata and native route coverage |
-| Copy-and-delete source (`is_source_reserved = false`) | `transfer::move_file` | Verify and publish destination, recheck source binding, then delete; preserve published outcome on cleanup failure |
+| Copy-and-delete source | Caller-owned `transfer` followed by `Namespace::purge_observed` | Caller verifies publication and metadata and confirms its external commits before authorizing source removal; purge rechecks identity and removes exact historical version IDs |
 | `copy_file_resumable`, HDFS compatibility orchestration | Destination-resident recovery in `transfer::transfer` | Preserve source binding, durable checkpoints, cancellation and restart behavior; no caller-managed legacy stream handle |
 | `resume_prepare`, `read_chunk_stream`, `write_chunk_stream`, `commit_chunk_stream` | `ExpertSourceSession`, `ExpertDestinationSession`, `WriteProgressObserver` | Split transport retains acknowledged range notifications; destination-recorded checkpoints remain recovery authority |
 | S3 native copy / multipart wrappers | S3 role native endpoint and staged destination | Retain server-side copy, limits, checksums, profile behavior and directory-object refusal tests |
@@ -100,12 +100,13 @@ contiguous recovery prefix. A new attempt still rediscovers destination state;
 notifications cannot authorize resume. Single-PUT buffering emits no confirmed-write
 event until the service accepts the PUT.
 
-`transfer::move_file` retains all transfer policies and QoS and forces read-back
-verification. It deletes the source only after successful metadata application and
-publication, with a fresh source identity/content check. If cleanup fails,
-`MoveFailure::published` retains the completed transfer outcome. Callers must keep
-the source quiescent and exclude destination aliases: backend namespaces do not
-provide a universal atomic compare-and-unlink operation.
+The transfer engine never deletes its source. The caller retains the published outcome,
+verifies its required data and metadata, confirms external commits, and explicitly authorizes
+`Namespace::purge_observed`. Filesystem deletion rechecks identity, size and modification time;
+directories must be empty. S3 history purge removes exact version IDs in bounded batches,
+retaining the observed latest version or marker until last. A changed current record or failed
+historical deletion stops cleanup. Callers must keep the source quiescent and exclude destination
+aliases: backend namespaces do not provide a universal atomic compare-and-unlink operation.
 
 `tests/hdfs_architecture_contract.rs` retains traversal/overwrite, durable-prefix
 reconnect and cancellation/resume cases. The old `DataChunk` writer reorder test is
@@ -137,7 +138,8 @@ spellings, so confinement is asserted on actual namespace operations; deletion c
 and directories separately. Exact deletion events, sentinel preservation and hidden-artifact
 cleanup remain asserted. The S3 contract now expects exactly two native part-copy requests
 for its payload, matching the existing 64 MiB copy-part size. These fixes did not change
-production semantics. Both copy examples now use `move_file` for `--delete-source`.
+production semantics. Those runs used the previous copy-and-delete helper. The current examples
+authorize `purge_observed` only after transfer and independent verification succeed.
 
 HDFS cleanup passed after both runs, with independent `FileNotFound` checks on both confined
 roots. S3 cleanup independently confirmed no current objects, historical versions, delete

@@ -10,6 +10,12 @@ use super::TraversalRequest;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TraversalConfigurationError {
+    /// Consumer-completed traversal is not implemented by this source.
+    ConsumerCompletionUnsupported,
+    /// Consumer-completed subtrees do not use scan block ordering.
+    ConsumerOrderUnsupported,
+    /// Released consumer subtrees cannot be replayed from scan checkpoints.
+    ConsumerResumeUnsupported,
     /// The filter reads a family omitted by the caller's observation plan.
     OmittedFilterMetadata(MetadataFamily),
     /// The caller requires a family this connected backend cannot observe.
@@ -19,6 +25,14 @@ pub enum TraversalConfigurationError {
 impl fmt::Display for TraversalConfigurationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ConsumerCompletionUnsupported => {
+                formatter.write_str("consumer completion is unsupported by this traversal source")
+            }
+            Self::ConsumerOrderUnsupported => {
+                formatter.write_str("consumer completion requires unordered traversal")
+            }
+            Self::ConsumerResumeUnsupported => formatter
+                .write_str("consumer completion cannot use scan checkpoints or automatic replay"),
             Self::OmittedFilterMetadata(family) => {
                 write!(
                     formatter,

@@ -94,7 +94,9 @@ pub(super) async fn prepare(
         source: descriptor.clone(),
         recovery_binding,
     };
-    prepare_with(destination, prepare, &spec, lease).await
+    let mut stage = prepare_with(destination, prepare, &spec, lease).await?;
+    stage.set_failed_data_cleanup(request.failed_data_cleanup);
+    Ok(stage)
 }
 
 /// [`prepare`] from plain inputs, shared with the expert destination half.
@@ -166,9 +168,11 @@ pub(super) async fn run_until_transferred(
         recovery_binding,
         plan,
         lease,
-        copied_metadata_plan
-            .as_ref()
-            .is_some_and(CopiedMetadataPlan::carries_mode),
+        request.private_creation(
+            copied_metadata_plan
+                .as_ref()
+                .is_some_and(CopiedMetadataPlan::carries_mode),
+        ),
     )
     .await?;
     if super::checkpointed::eligible(request, destination.as_ref(), &stage, plan) {
@@ -177,7 +181,11 @@ pub(super) async fn run_until_transferred(
         stage =
             super::publication::bind_prepared_checkpoint_metadata(stage, &destination, binding)?;
     }
-    stage.set_durable_publication(request.transfer_policy == TransferPolicy::Checkpointed);
+    stage.set_durable_publication(
+        request
+            .publication_durability
+            .required(request.transfer_policy),
+    );
     if let Some(interval_bytes) = plan.automatic_interval {
         // The destination writes its own pointer at the deferred checkpoint.
         stage.set_deferred_checkpoint(Some(crate::storage::DeferredCheckpoint {

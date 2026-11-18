@@ -58,10 +58,11 @@ async fn local(root: &Path) -> TestResult<Storage> {
 }
 
 async fn scan(storage: &Storage, order: TraversalOrder) -> TestResult<Vec<ObservedEntry>> {
+    let mut traversal_completed = Vec::new();
     let request = TraversalRequest::new(StoragePath::root()).order(order);
     let mut session = StorageTraversalSource::new(storage)?.traverse(request);
     let mut entries = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => entries.push(*entry),
             TraversalItem::Failure(failure) => return Err(format!("{failure:?}").into()),
@@ -160,6 +161,7 @@ async fn mixed_history_copies_its_empty_current_object_to_unversioned_s3() -> Te
         transfer(TransferRequest::from_observation(
             source.clone(),
             entry,
+            None,
             destination.clone(),
             CancellationToken::new(),
         )?)
@@ -213,6 +215,7 @@ async fn a_child_copy_creates_its_parent_after_the_content_object_is_skipped() -
         transfer(TransferRequest::from_observation(
             source.clone(),
             child,
+            None,
             destination,
             CancellationToken::new(),
         )?)
@@ -262,6 +265,7 @@ async fn unversioned_marker_survives_snapshot_and_copies_its_exact_s3_key() -> T
         let copy = TransferRequest::from_observation(
             source.clone(),
             restored,
+            None,
             destination,
             CancellationToken::new(),
         )?;
@@ -297,8 +301,9 @@ async fn virtual_directory_is_not_synthesized_into_an_s3_marker() -> TestResult 
             TransferRequest::from_observation(
                 source.clone(),
                 restored,
+                None,
                 destination.clone(),
-                CancellationToken::new(),
+                CancellationToken::new()
             )
             .is_err()
         );
@@ -310,6 +315,7 @@ async fn virtual_directory_is_not_synthesized_into_an_s3_marker() -> TestResult 
         transfer(TransferRequest::from_observation(
             source.clone(),
             child,
+            None,
             destination,
             CancellationToken::new(),
         )?)

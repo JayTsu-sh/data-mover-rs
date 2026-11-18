@@ -343,15 +343,18 @@ async fn an_all_zero_history_is_listed_whole() -> TestResult {
 async fn stat_of_a_gone_directory_object_is_not_found() -> TestResult {
     let protocol = bucket(&[("d/", b"own"), ("d/x", b"1")]).await?;
     let namespace = namespace(&protocol)?;
-    let found = namespace.stat(&path("d/")).await?;
+    let found = namespace.stat(&path("d/"), false).await?;
     assert_eq!((found.kind, found.size), (EntryKind::File, Some(3)));
     delete(&protocol, "d/").await?;
-    let gone = namespace.stat(&path("d/")).await;
+    let gone = namespace.stat(&path("d/"), false).await;
     assert!(
         matches!(gone, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::NotFound),
         "{gone:?}"
     );
-    assert_eq!(namespace.stat(&path("d")).await?.kind, EntryKind::Directory);
+    assert_eq!(
+        namespace.stat(&path("d"), false).await?.kind,
+        EntryKind::Directory
+    );
     Ok(())
 }
 

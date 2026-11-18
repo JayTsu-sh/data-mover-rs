@@ -56,6 +56,7 @@ impl Recovery {
         source: StorageTraversalSource,
         signal: &ScanFailureSignal,
     ) -> Outcome {
+        let mut traversal_completed = Vec::new();
         let request = self.request_for_attempt();
         let cancel = AttemptCancellation(request.cancel.clone());
         let mut inner = source.traverse(request);
@@ -68,7 +69,10 @@ impl Recovery {
             if self.expired() {
                 return self.exhausted();
             }
-            let Some(item) = self.next_item(&mut inner, signal).await? else {
+            let Some(item) = self
+                .next_item(&mut inner, signal, &mut traversal_completed)
+                .await?
+            else {
                 break;
             };
             if !history.accept(&item) {
@@ -109,6 +113,7 @@ impl Recovery {
         &mut self,
         inner: &mut TraversalSession,
         signal: &ScanFailureSignal,
+        completed: &mut Vec<([u8; 32], bool)>,
     ) -> Result<Option<TraversalItem>, TraversalTerminalFailure> {
         loop {
             self.start_window(signal);
@@ -121,7 +126,7 @@ impl Recovery {
                 () = signal.failed(), if signal.failure().is_none() => {
                     self.start_window(signal);
                 }
-                item = inner.next_item() => return Ok(item),
+                item = inner.next_item(completed) => return Ok(item),
                 () = sleep(Duration::from_millis(10)) => {}
             }
         }

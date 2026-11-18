@@ -84,12 +84,13 @@ async fn real_readonly_share_traverses_reads_and_refuses_writes() -> Result {
 
 /// Traverses the whole share and requires exactly the fixture tree with no failure.
 async fn assert_fixture_tree(storage: &Storage) -> Result {
+    let mut traversal_completed = Vec::new();
     let request = TraversalRequest::new(StoragePath::root())
         .max_inflight_operations(NonZeroUsize::new(4).ok_or("zero slots")?);
     let mut session = StorageTraversalSource::new(storage)?.traverse(request);
     let mut seen = BTreeMap::new();
     let mut failures = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => {
                 // A directory's size is whatever the server says; only a file's is fixed.
@@ -263,7 +264,7 @@ async fn refuse_upload(
     assert!(!failure.final_destination_changed(), "final path touched");
     assert!(!failure.has_unpublished_stage(), "a stage was left behind");
     expect_class(
-        namespace.stat(&path(&target)?).await,
+        namespace.stat(&path(&target)?, false).await,
         FailureClass::NotFound,
         "stat of the refused upload",
     )

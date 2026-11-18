@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let path = StoragePath::new("dir1/dir2/dir3")?;
     create_directory_all(&storage, &path).await?;
-    println!("{:?}", storage.namespace()?.stat(&path).await?);
+    println!("{:?}", storage.namespace()?.stat(&path, false).await?);
     let mut session = delete_tree(
         &storage,
         DeleteTreeRequest {

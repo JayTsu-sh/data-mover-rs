@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Run exact-version source purge and controlled faults against an isolated RustFS container.
+
+Requires cached rustfs/rustfs image, docker, nsenter, boto3 and the Rust dependencies.
+Uses the container network namespace so host firewall/NAT rules need no changes.
+"""
+
+import http.client
+import http.server
+import copy
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import urllib.parse
+import uuid
+import xml.etree.ElementTree as ET
+
+import boto3
+from botocore.config import Config
+
+
+def docker(*args):
+    return subprocess.check_output(["docker", *args], text=True).strip()
+
+
+def isolated_run():
+    name = f"dm-nightly-source-purge-{uuid.uuid4().hex[:12]}"
+    image = os.environ.get("SOURCE_PURGE_S3_IMAGE", "rustfs/rustfs:latest")
+    container = docker(
+        "run", "-d", "--name", name, "--network", "none", "--memory=768m", "--cpus=1",
+        "--tmpfs", "/data:rw,size=128m,mode=1777", "--label", "codex.task=source-purge-test",
+        "-e", "RUSTFS_ADDRESS=0.0.0.0:9000", "-e", "RUSTFS_ACCESS_KEY=purge-test",
+        "-e", "RUSTFS_SECRET_KEY=purge-test-isolated-only", image, "/data",
+    )
+    try:
+        print(f"isolated source-purge image={docker('inspect', container, '--format', '{{.Image}}')}", flush=True)
+        pid = docker("inspect", container, "--format", "{{.State.Pid}}")
+        arguments = [flag for flag in ("--namespace-read", "--source-observation", "--namespace-persistence", "--marker-persistence", "--current-source", "--null-source", "--null-marker", "--version-batch", "--version-batch-perf") if flag in sys.argv]
+        subprocess.run(["nsenter", "-t", pid, "-n", sys.executable, __file__, "--inside", *arguments], check=True)
+    finally:
+        docker("rm", "-f", "-v", container)
+
+
+
+def marker_version_page(client, bucket, query):
+    """Use real RustFS pagination; the proxy only decorates the opaque continuation."""
+    suffix = "[minio_cache:v2,return:]"
+    request = dict(Bucket=bucket, Prefix=query["prefix"][0], Delimiter="/", MaxKeys=1)
+    if marker := query.get("key-marker", [None])[0]:
+        assert marker.endswith(suffix), marker
+        request["KeyMarker"] = marker.removesuffix(suffix)
+    if version := query.get("version-id-marker", [None])[0]:
+        request["VersionIdMarker"] = version
+    response = client.list_object_versions(**request)
+    root = ET.Element("ListVersionsResult", xmlns="http://s3.amazonaws.com/doc/2006-03-01/")
+    for key, value in {"Name": bucket, "Prefix": request["Prefix"], "IsTruncated": str(response["IsTruncated"]).lower(),
+                       "MaxKeys": "1", "Delimiter": "/"}.items():
+        ET.SubElement(root, key).text = value
+    if response["IsTruncated"]:
+        ET.SubElement(root, "NextKeyMarker").text = response["NextKeyMarker"] + suffix
+        if value := response.get("NextVersionIdMarker"):
+            ET.SubElement(root, "NextVersionIdMarker").text = value
+    for field, tag in [("Versions", "Version"), ("DeleteMarkers", "DeleteMarker")]:
+        for record in response.get(field, []):
+            child = ET.SubElement(root, tag)
+            values = {"Key": record["Key"], "VersionId": record["VersionId"], "IsLatest": str(record["IsLatest"]).lower(),
+                      "LastModified": record["LastModified"].isoformat(timespec="milliseconds").replace("+00:00", "Z")}
+            if field == "Versions": values.update(ETag=record["ETag"], Size=str(record["Size"]))
+            for key, value in values.items(): ET.SubElement(child, key).text = value
+    for prefix in response.get("CommonPrefixes", []):
+        ET.SubElement(ET.SubElement(root, "CommonPrefixes"), "Prefix").text = prefix["Prefix"]
+    return ET.tostring(root)
+
+
+def inside_run():
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for attempt in range(60):
+        try:
+            with opener.open("http://127.0.0.1:9000/health/ready", timeout=1) as response:
+                if response.status == 200:
+                    break
+        except OSError:
+            pass
+        time.sleep(0.25)
+    else:
+        raise RuntimeError("isolated RustFS readiness timed out")
+    client = boto3.client(
+        "s3", endpoint_url="http://127.0.0.1:9000", aws_access_key_id="purge-test",
+        aws_secret_access_key="purge-test-isolated-only", region_name="us-east-1",
+        config=Config(s3={"addressing_style": "path"}, proxies={}, connect_timeout=2, read_timeout=3),
+    )
+    bucket = f"source-purge-{uuid.uuid4().hex[:12]}"
+    client.create_bucket(Bucket=bucket)
+    if "--version-batch" in sys.argv or "--version-batch-perf" in sys.argv:
+        from source_version_batch import run
+        return run(client, bucket, performance="--version-batch-perf" in sys.argv)
+    current_source = "--current-source" in sys.argv
+    null_marker = "--null-marker" in sys.argv
+    null_source = "--null-source" in sys.argv or null_marker
+    if not current_source:
+        client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Suspended" if null_source else "Enabled"})
+    stopped = threading.Event()
+    observing = "--source-observation" in sys.argv
+    marker_persist = "--marker-persistence" in sys.argv
+    persisting = "--namespace-persistence" in sys.argv or marker_persist
+    reading = "--namespace-read" in sys.argv or observing or persisting
+    if current_source and reading:
+        raise ValueError("--current-source is only for source purge")
+    alternating = [0]
+    requests = {"data_get": 0, "writes": 0}
+    marker_pages = {"calls": 0, "opaque_seen": 0}
+    if not reading and not current_source:
+        requests["version_deletes"] = 0
+    if current_source:
+        requests["payload_heads"] = 0
+    with tempfile.TemporaryDirectory(prefix="source-purge-") as directory:
+        control = Path(directory) / "fault"
+        control.write_text("normal")
+
+        class Proxy(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def handle_request(self):
+                mode = control.read_text().strip()
+                bulk = self.command == "POST" and "delete" in self.path.partition("?")[2]
+                deleting = (self.command == "DELETE" and "versionId=" in self.path) or bulk
+                if deleting and "version_deletes" in requests:
+                    requests["version_deletes"] += 1
+                payload = self.path.partition("?")[0].endswith("/payload")
+                tagging = self.command == "GET" and "tagging" in self.path
+                probing = reading and payload and (tagging if observing else self.command == "HEAD")
+                listing_marker = marker_persist and self.command == "GET" and "versions" in self.path.partition("?")[2]
+                if mode.startswith("list_"):
+                    probing = listing_marker
+                    mode = mode.removeprefix("list_")
+                paged = listing_marker and mode.startswith("paged_")
+                if paged:
+                    marker_pages["calls"] += 1
+                    query = urllib.parse.parse_qs(self.path.partition("?")[2], keep_blank_values=True)
+                    if query.get("key-marker"):
+                        assert query["key-marker"][0].endswith("[minio_cache:v2,return:]")
+                        marker_pages["opaque_seen"] += 1
+                        if mode == "paged_disconnect":
+                            mode = "disconnect"
+                            probing = True
+                affected = deleting or probing
+                if marker_persist and probing and mode in ("replaced", "missing"):
+                    if mode == "replaced":
+                        client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"replacement")
+                    else:
+                        client.delete_object(Bucket=bucket, Key=f"{prefix}/payload", VersionId=current_marker)
+                    control.write_text("normal")
+                if observing or persisting or current_source or null_source:
+                    if self.command == "GET" and payload and not tagging:
+                        requests["data_get"] += 1
+                    if self.command in ("PUT", "POST", "DELETE"):
+                        requests["writes"] += 1
+                    if current_source and self.command == "HEAD" and payload:
+                        requests["payload_heads"] += 1
+                if null_source and mode == "nullchanged" and self.command == "GET" and "versions" in self.path.partition("?")[2]:
+                    # 同一个可变 null 槽，内容／opaque identity 不变，但修改事实必须改变。
+                    if null_marker:
+                        # 重复 Delete 可由服务幂等合并；先写数据，再重建同一个 null 标记槽。
+                        client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
+                        client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
+                    else:
+                        client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
+                    control.write_text("normal")
+                if observing and payload and mode == "alternate":
+                    if self.command == "HEAD":
+                        alternating[0] += 1
+                    if tagging or (self.command == "HEAD" and alternating[0] % 2):
+                        self.close_connection = True
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        return
+                if affected and mode == "missing_metadata":
+                    body = b"<Error><Code>NoSuchKey</Code><Message>injected attribute read missing</Message></Error>"
+                    self.send_response(404)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if affected and mode == "readonly":
+                    body = b"<Error><Code>AccessDenied</Code><Message>injected read-only source</Message></Error>"
+                    self.send_response(403)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if affected and mode in ("disconnect", "stall", "cancel", "flash", "recover_stall"):
+                    if mode in ("flash", "recover_stall"):
+                        control.write_text("normal")
+                    if mode != "disconnect":
+                        if mode != "flash":
+                            stopped.wait(30)
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    return
+                if paged:
+                    body = marker_version_page(client, bucket, query)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/xml")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                upstream = http.client.HTTPConnection("127.0.0.1", 9000, timeout=5)
+                try:
+                    body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                    if bulk and mode == "partial_denial":
+                        selected = [{"Key": node.find("{*}Key").text, "VersionId": node.find("{*}VersionId").text}
+                                    for node in ET.fromstring(body) if node.tag.rsplit("}", 1)[-1] == "Object"]
+                        assert len(selected) == 4, selected
+                        actual = client.delete_objects(Bucket=bucket, Delete={"Objects": selected[2:], "Quiet": False})
+                        reply = ET.Element("DeleteResult")
+                        for item in actual["Deleted"]:
+                            node = ET.SubElement(reply, "Deleted")
+                            ET.SubElement(node, "Key").text = item["Key"]
+                            ET.SubElement(node, "VersionId").text = item["VersionId"]
+                        for item in selected[:2]:
+                            node = ET.SubElement(reply, "Error")
+                            ET.SubElement(node, "Key").text = item["Key"]
+                            ET.SubElement(node, "VersionId").text = item["VersionId"]
+                            ET.SubElement(node, "Code").text = "AccessDenied"
+                        payload = ET.tostring(reply)
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
+                    upstream.request(self.command, self.path, body=body, headers=dict(self.headers))
+                    response = upstream.getresponse()
+                    payload = response.read()
+                    rewritten = mode.startswith("contradictory_") and self.command == "GET" and "versions" in self.path and response.status == 200
+                    if rewritten:
+                        document = ET.fromstring(payload)
+                        if document.tag.startswith("{"):
+                            ET.register_namespace("", document.tag[1:].partition("}")[0])
+                        kind = "DeleteMarker" if mode.startswith("contradictory_marker_") else "Version"
+                        latest = next(node for node in document if node.tag.rsplit("}", 1)[-1] == kind and
+                                      node.find("{*}IsLatest").text == "true")
+                        duplicate = copy.deepcopy(latest)
+                        duplicate.find("{*}IsLatest").text = "false"
+                        position = list(document).index(latest) + int(mode.endswith("_current_first"))
+                        document.insert(position, duplicate)
+                        payload = ET.tostring(document, encoding="utf-8")
+                    if bulk and mode == "malformed_batch" and response.status == 200:
+                        reply = ET.fromstring(payload)
+                        first = next(node for node in reply if node.tag.rsplit("}", 1)[-1] == "Deleted")
+                        first.remove(first.find("{*}VersionId"))
+                        payload = ET.tostring(reply)
+                        rewritten = True
+                    if deleting and mode == "lost_ack":
+                        control.write_text("normal")
+                        self.close_connection = True
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        return
+                    self.send_response(response.status)
+                    for key, value in response.getheaders():
+                        if marker_persist and probing:
+                            if key.lower() == "x-amz-version-id" and mode == "missing_id":
+                                continue
+                            if key.lower() == "x-amz-version-id" and mode == "wrong_id":
+                                value = "wrong-marker-version"
+                            if key.lower() == "x-amz-delete-marker" and mode == "invalid_type":
+                                value = "unknown"
+                        if key.lower() not in ("connection", "transfer-encoding", "content-length") and not (rewritten and key.lower().startswith("x-amz-checksum")):
+                            self.send_header(key, value)
+                    self.send_header("Content-Length", response.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                finally:
+                    upstream.close()
+
+            do_GET = do_HEAD = do_DELETE = do_PUT = do_POST = handle_request
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            modes = ("normal", "readonly", "missing_metadata", "disconnect", "stall", "cancel", "flash", "recover_stall", "alternate") if observing else (("normal", "readonly", "disconnect", "stall", "cancel", "flash", "recover_stall") if reading else ("normal", "readonly", "disconnect", "stall", "cancel", "flash", "lost_ack"))
+            if not reading and not current_source:
+                modes += ("partial_denial", "malformed_batch", "contradictory_data_current_first", "contradictory_data_history_first",
+                          "contradictory_marker_current_first", "contradictory_marker_history_first")
+            if marker_persist:
+                modes += ("list_disconnect", "list_stall", "list_cancel", "missing_id", "wrong_id", "invalid_type", "replaced", "missing", "paged_disconnect", "paged_normal")
+            if null_source:
+                modes = ("normal", "nullchanged")
+            for mode in modes:
+                prefix = ("zz-" if mode.startswith("paged_") else "") + f"nightly-local-{mode}"
+                marker_pages.update(calls=0, opaque_seen=0)
+                for index in range(1 if current_source or null_source else 5 if mode == "partial_denial" else 3):
+                    client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"verified payload")
+                    # Two historical markers of the same key catch acknowledged-but-retained
+                    # bulk marker deletes; a single marker does not reproduce the failure.
+                    if not reading and not current_source and mode == "normal" and index < 2:
+                        client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
+                if null_marker:
+                    client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
+                if marker_persist:
+                    historical_marker = client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")["VersionId"]
+                    client.put_object(Bucket=bucket, Key=f"{prefix}/payload", Body=b"before current marker")
+                    current_marker = client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")["VersionId"]
+                if mode.startswith("contradictory_marker_"):
+                    client.delete_object(Bucket=bucket, Key=f"{prefix}/payload")
+                client.put_object(Bucket=bucket, Key=f"{prefix}/sentinel", Body=b"retain")
+                environment = dict(os.environ, S3_CONNECT_TIMEOUT="1", S3_OPERATION_TIMEOUT="2", S3_READ_TIMEOUT="1")
+                environment.update(
+                    LAB_S3_PURGE_URL=f"s3://purge-test:purge-test-isolated-only@{bucket}.127.0.0.1:{server.server_port}/{prefix}",
+                    LAB_S3_PURGE_KEY="payload", LAB_S3_PURGE_FAULT=mode, LAB_S3_PURGE_CONTROL=str(control),
+                )
+                if null_source:
+                    test_name = "source_purge::mutable_null_source_purge_with_real_requests"
+                elif marker_persist:
+                    environment.update(LAB_S3_HISTORICAL_MARKER=historical_marker, LAB_S3_CURRENT_MARKER=current_marker)
+                    test_name = "marker_persistence::published_marker_persistence_with_real_requests"
+                elif persisting:
+                    test_name = "namespace_persistence::published_object_persistence_with_real_requests"
+                elif observing:
+                    test_name = "source_observation::bounded_source_observation_with_real_requests"
+                elif reading:
+                    test_name = "namespace_read::bounded_namespace_read_with_real_requests"
+                else:
+                    test_name = "source_purge::permanent_source_purge_with_real_requests"
+                command = [
+                    "cargo", "test", "--offline", "--locked", "--test", "s3_architecture_contract",
+                    test_name, "--", "--ignored", "--exact", "--nocapture",
+                ]
+                if binary := os.environ.get("LAB_S3_PURGE_TEST_BINARY"):
+                    command = [binary, os.environ["LAB_S3_PURGE_TEST_NAME"], "--ignored", "--exact", "--nocapture"]
+                before_heads = requests.get("payload_heads", 0)
+                before_deletes = requests.get("version_deletes", 0)
+                subprocess.run(command, env=environment, check=True)
+                if mode.startswith("paged_"):
+                    assert marker_pages == ({"calls": 6, "opaque_seen": 5} if mode == "paged_normal" else {"calls": 2, "opaque_seen": 1}), (mode, marker_pages)
+                    print(f"marker pagination fault={mode} actual_pages={marker_pages} opaque_token_forwarded=true", flush=True)
+                if mode.startswith("contradictory_"):
+                    assert requests["version_deletes"] == before_deletes, (mode, requests)
+                if current_source and mode == "normal":
+                    assert requests["payload_heads"] - before_heads == 1, requests
+                if not reading and not current_source and mode == "normal":
+                    assert requests["version_deletes"] - before_deletes == (1 if null_source else 4), requests
+                if mode == "nullchanged":
+                    assert requests["version_deletes"] == before_deletes, requests
+                remaining = client.list_object_versions(Bucket=bucket, Prefix=f"{prefix}/")
+                records = remaining.get("Versions", []) + remaining.get("DeleteMarkers", [])
+                payload_records = [record for record in records if record["Key"] == f"{prefix}/payload"]
+                expected = 0 if not reading and mode in ("normal", "flash", "lost_ack") else 3 if mode == "partial_denial" else 1 if mode == "malformed_batch" or current_source else 4 if mode.startswith("contradictory_marker_") else 3
+                if null_source:
+                    expected = 0 if mode == "normal" else 1
+                if marker_persist:
+                    expected = 7 if mode == "replaced" else 5 if mode == "missing" else 6
+                assert len(payload_records) == expected, (mode, payload_records)
+                assert any(record["Key"] == f"{prefix}/sentinel" for record in records)
+                print(f"independent S3 inspection fault={mode} source_records={len(payload_records)} sentinel=retained", flush=True)
+            if observing or persisting:
+                assert requests == {"data_get": 0, "writes": 0}, requests
+                print("target-persistence data_GET=0 writes=0" if persisting else "source-observation data_GET=0 writes=0 missing_metadata_is_error=true shared_budget=true", flush=True)
+            if null_source:
+                assert requests["data_get"] == 0, requests
+                print(f"null-source marker={null_marker} normal_deleted=true changed_retained=true data_GET=0", flush=True)
+            if current_source:
+                assert requests["data_get"] == 0, requests
+                print(f"current-source purge data_GET=0 normal_payload_HEAD=1 requests={requests}", flush=True)
+        finally:
+            control.write_text("normal")
+            stopped.set()
+            server.shutdown()
+            server.server_close()
+
+
+if __name__ == "__main__":
+    if "--inside" in sys.argv:
+        inside_run()
+    else:
+        isolated_run()

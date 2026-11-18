@@ -40,7 +40,7 @@ mod tests {
 
     #[test]
     fn client_failover_defaults_visit_each_configured_node_once() -> Result<(), StorageError> {
-        let direct = HdfsLocation::parse("hdfs://user@127.0.0.1:9000/root")?;
+        let direct = HdfsLocation::parse("hdfs://user@127.0.0.1:9000/root", &HdfsConfig::default())?;
         let settings = super::hdfs_client_overrides(&direct, &HdfsConfig::default())?;
         assert_eq!(settings.get("dfs.client.failover.max.attempts").map(String::as_str), Some("0"));
         for count in [1, 2, 3] {
@@ -50,7 +50,7 @@ mod tests {
             for member in &members {
                 config.overrides.insert(format!("dfs.namenode.rpc-address.cluster.{member}"), format!("{member}:9000"));
             }
-            let location = HdfsLocation::parse_configured("hdfs://user@cluster/root", &config)?;
+            let location = HdfsLocation::parse("hdfs://user@cluster/root", &config)?;
             let settings = super::hdfs_client_overrides(&location, &config)?;
             assert_eq!(settings.get("dfs.client.failover.max.attempts"), Some(&(count - 1).to_string()));
             config.overrides.insert("dfs.client.failover.max.attempts".into(), "7".into());
@@ -255,7 +255,7 @@ mod tests {
         ];
 
         for (input, endpoint, user, root) in cases {
-            let Ok(parsed) = HdfsLocation::parse(input) else {
+            let Ok(parsed) = HdfsLocation::parse(input, &HdfsConfig::default()) else {
                 panic!("valid direct HDFS URL was rejected: {input}");
             };
             assert_eq!(parsed.endpoint(), endpoint);
@@ -281,14 +281,14 @@ mod tests {
         ];
 
         for input in invalid {
-            assert!(HdfsLocation::parse(input).is_err(), "accepted {input}");
+            assert!(HdfsLocation::parse(input, &HdfsConfig::default()).is_err(), "accepted {input}");
         }
     }
 
     #[test]
     fn errors_do_not_echo_rejected_userinfo() {
         let input = "hdfs://alice:do-not-log@namenode:9000/root";
-        let Err(error) = HdfsLocation::parse(input) else {
+        let Err(error) = HdfsLocation::parse(input, &HdfsConfig::default()) else {
             panic!("password was accepted");
         };
         assert!(!error.to_string().contains("do-not-log"));
@@ -500,7 +500,7 @@ mod tests {
             ..Default::default()
         };
         let Ok(location) =
-            HdfsLocation::parse_configured("hdfs://migration@analytics/warehouse", &config)
+            HdfsLocation::parse("hdfs://migration@analytics/warehouse", &config)
         else {
             panic!("complete explicit NameService configuration was rejected");
         };
@@ -520,7 +520,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        assert!(HdfsLocation::parse_configured("hdfs://user@analytics/", &incomplete).is_err());
+        assert!(HdfsLocation::parse("hdfs://user@analytics/", &incomplete).is_err());
 
         let kerberos = HdfsConfig {
             config_dir: None,
@@ -530,7 +530,7 @@ mod tests {
             )]),
             ..Default::default()
         };
-        assert!(HdfsLocation::parse_configured("hdfs://user@namenode:9000/", &kerberos).is_err());
+        assert!(HdfsLocation::parse("hdfs://user@namenode:9000/", &kerberos).is_err());
     }
 
     #[test]
@@ -561,7 +561,7 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let location = HdfsLocation::parse_configured("hdfs://user@analytics/", &config)
+        let location = HdfsLocation::parse("hdfs://user@analytics/", &config)
             .unwrap_or_else(|error| panic!("{error}"));
         let settings = super::hdfs_client_overrides(&location, &config)
             .unwrap_or_else(|error| panic!("{error}"));
@@ -625,7 +625,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            HdfsLocation::parse_configured("hdfs://source@namenode:9000/root", &config).is_err()
+            HdfsLocation::parse("hdfs://source@namenode:9000/root", &config).is_err()
         );
         assert!(!format!("{config:?}").contains("/run/krb5/source.ccache"));
     }

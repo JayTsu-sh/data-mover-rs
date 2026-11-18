@@ -80,7 +80,11 @@ impl Namespace for Fixture {
         }
     }
 
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         Ok(descriptor(path.clone(), EntryKind::Directory))
     }
 
@@ -239,6 +243,7 @@ fn policy() -> TraversalRecoveryPolicy {
 
 #[tokio::test]
 async fn restart_root_marks_the_new_attempt_before_repeated_entries() {
+    let mut traversal_completed = Vec::new();
     let selected = TraversalRecoveryPolicy {
         resume: TraversalRecoveryResume::RestartRoot,
         ..policy()
@@ -252,7 +257,7 @@ async fn restart_root_marks_the_new_attempt_before_repeated_entries() {
     .unwrap();
     let mut events = Vec::new();
     let mut count = 0;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => {
                 count += 1;
@@ -284,6 +289,7 @@ async fn restart_root_marks_the_new_attempt_before_repeated_entries() {
 /// `RestartRoot` 的有效请求关闭续扫；调用方原先的 On 不能让取消进入排空模式。
 #[tokio::test]
 async fn root_restart_overrides_resumable_cancellation_draining() {
+    let mut traversal_completed = Vec::new();
     let cancel = CancellationToken::new();
     let connect: TraversalReconnect = Arc::new(|| pending().boxed());
     let request = TraversalRequest::new(StoragePath::root())
@@ -297,7 +303,7 @@ async fn root_restart_overrides_resumable_cancellation_draining() {
         recoverable_traversal(&storage(true, false), request, selected, connect).unwrap();
     let mut state = status.subscribe();
     let draining = tokio::spawn(async move {
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             assert!(!matches!(item, TraversalItem::Checkpoint(_)));
         }
         session.finish().await
@@ -318,6 +324,7 @@ async fn root_restart_overrides_resumable_cancellation_draining() {
 
 #[tokio::test]
 async fn checkpoint_recovery_marks_the_actual_last_cursor_before_the_new_suffix() {
+    let mut traversal_completed = Vec::new();
     let request = TraversalRequest::new(StoragePath::root()).resumable(Resumable::On {
         every: Duration::ZERO,
     });
@@ -329,7 +336,7 @@ async fn checkpoint_recovery_marks_the_actual_last_cursor_before_the_new_suffix(
     )
     .unwrap();
     let (mut last, mut resumed, mut suffix) = (None, false, false);
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Checkpoint(checkpoint) => last = Some(*checkpoint),
             TraversalItem::Resumed(event) => {
@@ -357,8 +364,9 @@ fn reconnect(fails: bool, calls: Arc<AtomicUsize>) -> TraversalReconnect {
 }
 
 async fn drain(mut session: TraversalSession) -> (Vec<String>, Outcome) {
+    let mut traversal_completed = Vec::new();
     let mut paths = vec![];
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if let TraversalItem::Entry(entry) = item {
             paths.push(entry.path().as_str().to_owned());
         }
@@ -506,6 +514,7 @@ async fn native_faults_recover_even_without_an_operation_timeout() {
 
 #[tokio::test]
 async fn resumable_cancellation_drains_its_checkpoint_before_completion() {
+    let mut traversal_completed = Vec::new();
     let cancel = CancellationToken::new();
     let connect: TraversalReconnect = Arc::new(|| pending().boxed());
     let request = TraversalRequest::new(StoragePath::root())
@@ -516,7 +525,7 @@ async fn resumable_cancellation_drains_its_checkpoint_before_completion() {
     let mut state = status.subscribe();
     let draining = tokio::spawn(async move {
         let mut checkpoint = false;
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             checkpoint |= matches!(item, TraversalItem::Checkpoint(_));
         }
         (checkpoint, session.finish().await)

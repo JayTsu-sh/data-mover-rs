@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use md5::{Digest as _, Md5};
 use tokio::sync::mpsc;
 
 use super::S3BucketCapabilities;
-use crate::model::{FailureClass, ObjectTag, StorageTimestamp, Transience};
+use crate::model::{FailureClass, ObjectTag, SourceVersion, StorageTimestamp, Transience};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum S3ProtocolFailure {
@@ -58,8 +59,64 @@ impl S3ProtocolFailure {
 
 pub type S3Result<T> = Result<T, S3ProtocolFailure>;
 
+// 在任何修改前检查完整输入；同 key 混用选择器会使缺少版本 ID 的错误无法可靠归属。
+pub(super) fn validate_delete_objects(
+    capabilities: S3BucketCapabilities,
+    objects: &[(String, SourceVersion)],
+) -> S3Result<()> {
+    let mut kinds = HashMap::new();
+    let mut selected = HashSet::new();
+    for (key, version) in objects {
+        let id = match version {
+            SourceVersion::Current => None,
+            SourceVersion::Id(id) if id.is_empty() => {
+                return Err(S3ProtocolFailure::entry(
+                    FailureClass::InvalidInput,
+                    Transience::Permanent,
+                    "S3 bulk-delete version ID must not be empty",
+                ));
+            }
+            SourceVersion::Id(_) if !capabilities.versions => {
+                return Err(S3ProtocolFailure::entry(
+                    FailureClass::Unsupported,
+                    Transience::Permanent,
+                    "S3 bucket does not support exact-version bulk deletion",
+                ));
+            }
+            SourceVersion::Id(id) => Some(id.as_str()),
+        };
+        if kinds
+            .insert(key.as_str(), id.is_some())
+            .is_some_and(|old| old != id.is_some())
+            || !selected.insert((key.as_str(), id))
+        {
+            return Err(S3ProtocolFailure::entry(
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+                "S3 bulk-delete contains duplicate or ambiguous selectors",
+            ));
+        }
+    }
+    Ok(())
+}
+
+// 后续请求未提交；保留触发停止的分类，同时避免将它伪报为已执行删除。
+pub(super) fn unsubmitted_delete(cause: &S3ProtocolFailure) -> S3ProtocolFailure {
+    let mut failure = cause.clone();
+    match &mut failure {
+        S3ProtocolFailure::Entry { diagnostic, .. }
+        | S3ProtocolFailure::Session { diagnostic, .. } => {
+            *diagnostic =
+                format!("not submitted after preceding bulk-delete failure: {diagnostic}");
+        }
+    }
+    failure
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct S3ObjectFacts {
+    /// 指定版本 HEAD 确认的是删除标记；此时 size／etag 不表示可读数据。
+    pub delete_marker: bool,
     pub size: u64,
     pub etag: String,
     pub version_id: Option<String>,
@@ -75,11 +132,12 @@ pub fn is_real_version_id(version: &str) -> bool {
     !version.is_empty() && version != "null"
 }
 
-/// What a write that created an object reported about it.
+/// 最终对象的读取锚点与本次写响应分别记录，观察到版本不等于有创建回执。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct S3WriteFacts {
     pub etag: String,
-    /// The version the write created; `None` when the response named no real version.
+    /// A real version used to pin reads, reported by the write or observed during reconciliation.
+    /// An inferred read pin alone does not prove this attempt created the version.
     pub version_id: Option<String>,
     /// The version id exactly as the response spelled it — `"null"` included, which a bucket with
     /// versioning suspended reports — or `None` when it named none (an unversioned bucket). In a
@@ -447,11 +505,32 @@ pub trait S3Protocol: Send + Sync {
     /// version. Transfer recovery uses it only for pointers; namespace deletion also uses it for
     /// final keys explicitly selected by the caller.
     async fn delete_object(&self, key: &str) -> S3Result<()>;
-    /// Deletes at most 100 current keys; result order matches input. History remains intact.
-    async fn delete_objects(&self, keys: &[String]) -> Vec<S3Result<()>> {
-        let mut results = Vec::with_capacity(keys.len());
-        for key in keys {
-            results.push(self.delete_object(key).await);
+    /// 有界批量删除，结果与输入逐项对应；Current 保留历史，Id 永久删除指定版本／标记。
+    /// Id("null") 精确删除 null 槽；空 ID、重复选择及同 key 混用 Current／Id 在修改前拒绝。
+    /// 版本删除必须核对逐版本回执；任一版本批次失败后，不再提交后续批次。
+    /// 请求已发出但回执缺失仍是 Unknown；调用方负责取消、恢复预算及当前版本最后删除。
+    async fn delete_objects(&self, objects: &[(String, SourceVersion)]) -> Vec<S3Result<()>> {
+        if let Err(failure) = validate_delete_objects(self.bucket_capabilities(), objects) {
+            return objects.iter().map(|_| Err(failure.clone())).collect();
+        }
+        let exact = objects
+            .iter()
+            .any(|(_, version)| matches!(version, SourceVersion::Id(_)));
+        let mut results = Vec::with_capacity(objects.len());
+        let mut stopped: Option<S3ProtocolFailure> = None;
+        for (key, version) in objects {
+            let result = if let Some(failure) = &stopped {
+                Err(unsubmitted_delete(failure))
+            } else {
+                match version {
+                    SourceVersion::Current => self.delete_object(key).await,
+                    SourceVersion::Id(id) => self.delete_version(key, id).await,
+                }
+            };
+            if exact && stopped.is_none() {
+                stopped = result.as_ref().err().cloned();
+            }
+            results.push(result);
         }
         results
     }
@@ -495,5 +574,10 @@ pub trait S3Protocol: Send + Sync {
     ) -> S3Result<S3VersionPage>;
     /// Tags of the current object, or of one stored version.
     async fn get_tags(&self, key: &str, version_id: Option<&str>) -> S3Result<Vec<ObjectTag>>;
-    async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()>;
+    async fn put_tags(
+        &self,
+        key: &str,
+        version_id: Option<&str>,
+        tags: &[ObjectTag],
+    ) -> S3Result<()>;
 }

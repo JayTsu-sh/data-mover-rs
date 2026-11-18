@@ -2,10 +2,11 @@ use std::{fmt, sync::Arc};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::metadata::MetadataPlan;
 use crate::model::{
     EntryKind, ObservedEntry, SourceIdentity, SourceVersion, StoragePath, StorageTimestamp,
 };
-use crate::storage::{SourceQosGroup, Storage};
+use crate::storage::{FailedDataCleanup, SourceQosGroup, Storage};
 
 use super::TransferIdentity;
 
@@ -40,9 +41,25 @@ pub enum TransferPolicy {
     /// Other destinations may retain persistence required by their protocol.
     AtomicReplace,
     /// Write the final path directly, without staging, rename, or checkpoints.
-    /// Failure may leave partial content. Supported by Unix Local and HDFS destinations.
+    /// Failure may leave partial content. Requires destination `supports_direct()` capability.
     /// HDFS recreates the target and completes its writer; Local writes the existing inode.
     Direct,
+}
+
+/// 发布持久性独立于写入可见性及续传；调用方删除源端前可显式要求持久化。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PublicationDurability {
+    /// 保持所选传输策略的默认保证，不增加同步调用。
+    #[default]
+    PolicyDefault,
+    /// 成功前完成数据、已应用元数据及发布目录项所需的持久化屏障。
+    Required,
+}
+
+impl PublicationDurability {
+    pub(crate) fn required(self, policy: TransferPolicy) -> bool {
+        self == Self::Required || policy == TransferPolicy::Checkpointed
+    }
 }
 
 /// Whether copied content is independently read back before publication.
@@ -51,6 +68,33 @@ pub enum ReadBackVerification {
     #[default]
     Enabled,
     Disabled,
+}
+
+/// Which layer applies copied metadata. Caller-managed transfers publish data only; the caller
+/// must apply and verify its captured metadata before treating the entry as ready or deleting it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MetadataTransferMode {
+    #[default]
+    Automatic,
+    /// 调用方另行应用元数据；新建文件使用私有权限，直到调用方确认最终权限。
+    CallerManaged,
+}
+
+/// 已复制数据遇到元数据应用错误时的发布策略；两种策略都返回失败并保留错误。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MetadataFailurePolicy {
+    /// 保持严格顺序，元数据失败时不继续发布暂存内容。
+    #[default]
+    StopBeforePublication,
+    /// 非取消错误时继续校验和发布数据，返回失败及单独的数据完成事实。
+    /// 这不能证明元数据成功，也不能授权删除源端。
+    PublishData,
+}
+
+impl MetadataTransferMode {
+    pub(crate) const fn private_creation(self, carries_mode: bool) -> bool {
+        matches!(self, Self::CallerManaged) || carries_mode
+    }
 }
 
 /// Immutable inputs for one transfer attempt.
@@ -62,9 +106,14 @@ pub struct TransferRequest {
     pub(crate) destination: Storage,
     pub(crate) cancel: CancellationToken,
     pub(crate) transfer_policy: TransferPolicy,
+    pub(crate) publication_durability: PublicationDurability,
     pub(crate) source_qos: Option<SourceQosGroup>,
     pub(crate) read_back: ReadBackVerification,
     pub(crate) copied_metadata: CopiedMetadataRequest,
+    pub(crate) metadata_mode: MetadataTransferMode,
+    pub(crate) metadata_plan: Option<Arc<MetadataPlan>>,
+    pub(crate) metadata_failure_policy: MetadataFailurePolicy,
+    pub(crate) failed_data_cleanup: FailedDataCleanup,
 }
 
 /// One source selection, optionally constrained by an observation. An observed selection
@@ -293,9 +342,14 @@ impl TransferRequest {
             destination,
             cancel,
             transfer_policy: TransferPolicy::default(),
+            publication_durability: PublicationDurability::default(),
             source_qos: None,
             read_back: ReadBackVerification::default(),
             copied_metadata: CopiedMetadataRequest::default(),
+            metadata_mode: MetadataTransferMode::Automatic,
+            metadata_plan: None,
+            metadata_failure_policy: MetadataFailurePolicy::default(),
+            failed_data_cleanup: FailedDataCleanup::default(),
         }
     }
 
@@ -309,35 +363,22 @@ impl TransferRequest {
     /// A real unversioned directory marker is unwrapped to its original File observation when
     /// the destination holds directory objects. Virtual directories are never synthesized into
     /// objects; versioned marker directories use history replay at `history_source_path()`.
+    /// 观察值可以按值传入或通过 Arc 共享；历史记录索引为 None 时选择观察到的当前对象。
+    /// 克隆请求只共享观察数据，不复制整份版本历史。
     ///
     /// # Errors
-    /// Rejects an observation from another storage, a non-file entry, a deleted key, or a
-    /// history segment that does not identify the current object.
+    /// 拒绝其他 backend 的观察、不合法索引、所选删除标记和不可读条目。
+    /// 未指定记录索引时，历史必须标识观察到的当前对象；显式索引可以选择历史对象。
     pub fn from_observation(
         source: Storage,
-        observation: ObservedEntry,
-        destination: Storage,
-        cancel: CancellationToken,
-    ) -> Result<Self, TransferValueError> {
-        Self::from_shared_observation(source, Arc::new(observation), None, destination, cancel)
-    }
-
-    /// Borrows one immutable observation through an Arc, optionally selecting one history record.
-    /// Request cloning shares the original observation, including large histories. A directory's
-    /// real current marker is selected without cloning it when the destination holds objects.
-    ///
-    /// # Errors
-    /// Rejects a foreign backend, invalid index, delete marker or non-readable entry before I/O.
-    pub fn from_shared_observation(
-        source: Storage,
-        observation: Arc<ObservedEntry>,
+        observation: impl Into<Arc<ObservedEntry>>,
         version_index: Option<usize>,
         destination: Storage,
         cancel: CancellationToken,
     ) -> Result<Self, TransferValueError> {
         let observed = ObservedSource::new(
             &source,
-            observation,
+            observation.into(),
             version_index,
             destination.holds_directory_objects(),
         )?;
@@ -453,10 +494,56 @@ impl TransferRequest {
         self
     }
 
+    /// Selects independent data publication and caller-owned metadata application. In
+    /// `CallerManaged` mode no source metadata is fetched and `outcome.metadata` is `None`.
+    /// Any explicitly selected mode clears a previously captured metadata plan.
+    #[must_use]
+    pub fn with_metadata_mode(mut self, mode: MetadataTransferMode) -> Self {
+        self.metadata_mode = mode;
+        self.metadata_plan = None;
+        self
+    }
+
+    /// 使用扫描时已捕获并编译的计划，发布前执行，不再次查询源元数据。
+    /// 后续显式选择元数据模式会清除此计划；计划通过 Arc 共享，不复制原值。
+    /// 新建目标从私有权限开始，没有 mode 的计划也不会扩大访问权限。
+    #[must_use]
+    pub fn with_metadata_plan(mut self, plan: impl Into<Arc<MetadataPlan>>) -> Self {
+        self.metadata_mode = MetadataTransferMode::Automatic;
+        self.metadata_plan = Some(plan.into());
+        self
+    }
+
+    pub(crate) fn private_creation(&self, carries_mode: bool) -> bool {
+        self.metadata_plan.is_some() || self.metadata_mode.private_creation(carries_mode)
+    }
+
+    /// 显式允许元数据应用失败后发布已复制数据；失败仍通过 Err 返回。
+    #[must_use]
+    pub const fn with_metadata_failure_policy(mut self, policy: MetadataFailurePolicy) -> Self {
+        self.metadata_failure_policy = policy;
+        self
+    }
+
+    /// 选择 Direct 数据失败时的显式清理权限；清理由 `failure.cleanup_for_policy` 执行。
+    /// 元数据错误与未知发布失败保留目标，不受此选项影响。
+    #[must_use]
+    pub const fn with_failed_data_cleanup(mut self, cleanup: FailedDataCleanup) -> Self {
+        self.failed_data_cleanup = cleanup;
+        self
+    }
+
     /// Selects the job-level transfer policy. Route-specific details remain inside data-mover.
     #[must_use]
     pub const fn with_transfer_policy(mut self, policy: TransferPolicy) -> Self {
         self.transfer_policy = policy;
+        self
+    }
+
+    /// 显式要求最终发布持久化，不启用续传或改变目标写入方式。
+    #[must_use]
+    pub const fn with_publication_durability(mut self, durability: PublicationDurability) -> Self {
+        self.publication_durability = durability;
         self
     }
 

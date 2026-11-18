@@ -29,9 +29,9 @@ async fn main() -> Result<()> {
     let namespace = storage.namespace()?;
     let from = StoragePath::new(args.from.clone())?;
     let to = StoragePath::new(args.to.clone())?;
-    let source = namespace.stat(&from).await?;
+    let source = namespace.stat(&from, false).await?;
     namespace.rename(&from, &to).await?;
-    let destination = namespace.stat(&to).await?;
+    let destination = namespace.stat(&to, false).await?;
     if destination.size != source.size {
         return Err(format!(
             "destination size mismatch: expected {:?}, got {:?}",

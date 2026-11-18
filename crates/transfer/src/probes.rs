@@ -106,7 +106,7 @@ pub async fn probe_server_time(
     // reached through the public namespace role.
     let path =
         StoragePath::new(format!(".~clock-{}", Uuid::new_v4())).map_err(ProbeError::Model)?;
-    match namespace.stat(&path).await {
+    match namespace.stat(&path, false).await {
         Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {}
         Err(error) => return Err(ProbeError::Role(error).into()),
         Ok(_) => return Err(ProbeError::PathAlreadyExists.into()),

@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use super::current::produce_current;
 use super::histories::produce_histories;
@@ -16,14 +17,17 @@ use super::source::role_failure;
 use super::traversal_listing::produce as produce_traversal;
 use super::{S3Protocol, S3ProtocolFailure};
 use crate::model::{
-    BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath, SymlinkTarget,
-    Transience,
+    BackendIdentity, EntryOperationFailure, FailureClass, ObservedEntry, Operation, SourceVersion,
+    StoragePath, SymlinkTarget, Transience,
 };
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::{
-    ListRequest, ListingStream, NameSemantics, Namespace, NamespaceCapabilities, SourceDescriptor,
-    StorageRoleFailure,
+    ListRequest, ListingStream, NameSemantics, Namespace, NamespaceCapabilities, PurgeFailure,
+    PurgeOutcome, SourceDescriptor, StorageRoleFailure,
 };
+
+mod persistence;
+mod purge;
 
 const NO_DIRECTORIES: &str = "S3 prefixes are virtual; creating a directory is unsupported";
 
@@ -122,9 +126,22 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
             .map_err(|e| role_failure(&StoragePath::root(), Operation::Observe, e))
     }
 
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    // 非根路径每次执行 HEAD／前缀查询；虚拟根及 PathScoped 身份语义不因 fresh 改变。
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         refuse_artifact(path)?;
         self.stat_entry(path).await
+    }
+
+    async fn persist_observed(
+        &self,
+        expected: &SourceDescriptor,
+        cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        self.persist_entry(expected, &cancel).await
     }
 
     /// The subdirectories of the prefix, and its objects: on a bucket that keeps histories
@@ -206,6 +223,14 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
         }
     }
 
+    async fn purge_observed(
+        &self,
+        entry: &ObservedEntry,
+        cancel: CancellationToken,
+    ) -> Result<PurgeOutcome, PurgeFailure> {
+        self.purge_entry(entry, &cancel).await
+    }
+
     async fn cleanup_transfer_artifacts(
         &self,
         path: &StoragePath,
@@ -230,7 +255,10 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
             }
             return results;
         }
-        let keys: Vec<_> = paths.iter().map(|path| path.as_str().to_owned()).collect();
+        let keys: Vec<_> = paths
+            .iter()
+            .map(|path| (path.as_str().to_owned(), SourceVersion::Current))
+            .collect();
         self.protocol
             .delete_objects(&keys)
             .await

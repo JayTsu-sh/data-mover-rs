@@ -19,12 +19,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result {
+    let mut traversal_completed = Vec::new();
     let args = Args::parse();
     let storage = endpoint_support::connect_with_options(&args.storage, false, None).await?;
     let source = StorageTraversalSource::new(&storage)?;
     let mut session = source.traverse(TraversalRequest::new(StoragePath::root()));
     let mut failures = 0;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => {
                 println!("{:?}\t{}", entry.kind(), entry.path().as_str());

@@ -2,6 +2,9 @@
 //! directory blocks and the generic traversal all run against a real filesystem, with no external
 //! dependency.
 
+#[path = "local_namespace_contract/purge.rs"]
+mod purge;
+
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -73,6 +76,7 @@ async fn create_directory_all_builds_every_missing_level_idempotently() -> Resul
 
 #[tokio::test]
 async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
+    let mut traversal_completed = Vec::new();
     let temp = tempfile::tempdir()?;
     seed(temp.path())?;
     let storage = connect(temp.path()).await?;
@@ -84,7 +88,7 @@ async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
             .cancel(CancellationToken::new()),
     );
     let mut paths = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => paths.push(entry.path().as_str().to_owned()),
             // Directory events are ordering evidence, not entries.
@@ -116,6 +120,7 @@ async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
 
 #[tokio::test]
 async fn traversal_retains_local_modification_times() -> Result {
+    let mut traversal_completed = Vec::new();
     let temp = tempfile::tempdir()?;
     seed(temp.path())?;
     let storage = connect(temp.path()).await?;
@@ -127,7 +132,7 @@ async fn traversal_retains_local_modification_times() -> Result {
             ),
     );
     let mut entries = 0;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => {
                 assert!(entry.modified().is_some());
@@ -214,6 +219,7 @@ async fn delete_tree_whose_root_is_a_symlink_never_touches_the_target() -> Resul
 
 #[tokio::test]
 async fn directories_are_listed_as_directories_not_files() -> Result {
+    let mut traversal_completed = Vec::new();
     let temp = tempfile::tempdir()?;
     std::fs::create_dir(temp.path().join("only"))?;
     let storage = connect(temp.path()).await?;
@@ -224,7 +230,8 @@ async fn directories_are_listed_as_directories_not_files() -> Result {
             .max_inflight_operations(nonzero(1)?)
             .cancel(CancellationToken::new()),
     );
-    let Some(TraversalItem::Entry(entry)) = session.next_item().await else {
+    let Some(TraversalItem::Entry(entry)) = session.next_item(&mut traversal_completed).await
+    else {
         return Err("expected one entry".into());
     };
     assert_eq!(entry.path().as_str(), "only");
@@ -245,6 +252,7 @@ async fn directories_are_listed_as_directories_not_files() -> Result {
 /// * The same tree read twice visits its directories in the same order.
 #[tokio::test]
 async fn blocks_are_contiguous_and_descended_by_name_for_a_caller_outside_the_crate() -> Result {
+    let mut traversal_completed = Vec::new();
     let temp = tempfile::tempdir()?;
     seed_for_ordering(temp.path())?;
     let storage = connect(temp.path()).await?;
@@ -259,7 +267,7 @@ async fn blocks_are_contiguous_and_descended_by_name_for_a_caller_outside_the_cr
         );
         let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
         let mut block = Vec::new();
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             match item {
                 TraversalItem::Entry(entry) => block.push(entry.path().as_str().to_owned()),
                 TraversalItem::DirectoryListed(directory) => {

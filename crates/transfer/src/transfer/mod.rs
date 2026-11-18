@@ -5,13 +5,11 @@ mod engine;
 pub(crate) use engine::validate_observation;
 mod identity;
 mod model;
-mod move_file;
-pub use move_file::{MoveError, MoveFailure, move_file};
 
 pub use crate::model::SourceVersion;
 pub use crate::storage::{
-    DeleteMarkerOutcome, PrepareFact, ReadBackMethod, RestartReason, UnpinnedReadReason,
-    UploadDigest, UploadDigestGap,
+    DeleteMarkerOutcome, FailedDataCleanup, PrepareFact, ReadBackMethod, RestartReason,
+    UnpinnedReadReason, UploadDigest, UploadDigestGap,
 };
 pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
 pub use engine::{
@@ -26,8 +24,8 @@ pub use engine::{
 };
 pub use identity::TransferIdentity;
 pub use model::{
-    CopiedMetadataRequest, ReadBackVerification, TransferPolicy, TransferRequest,
-    TransferValueError,
+    CopiedMetadataRequest, MetadataFailurePolicy, MetadataTransferMode, PublicationDurability,
+    ReadBackVerification, TransferPolicy, TransferRequest, TransferValueError,
 };
 
 #[cfg(test)]
@@ -48,6 +46,8 @@ mod observation_tests;
 mod s3_at_destination_tests;
 #[cfg(test)]
 mod s3_copied_tags_tests;
+#[cfg(test)]
+mod s3_direct_native_tests;
 #[cfg(test)]
 mod s3_direct_tests;
 #[cfg(test)]
@@ -70,3 +70,13 @@ mod source_version_tests;
 mod tests;
 #[cfg(test)]
 mod write_progress_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod caller_metadata_tests;
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used)]
+mod metadata_failure_tests;
+
+#[cfg(all(test, unix))]
+mod direct_failure_cleanup_tests;

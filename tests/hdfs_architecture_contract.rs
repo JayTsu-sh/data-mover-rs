@@ -40,7 +40,7 @@ fn lab_config() -> HdfsConfig {
 }
 
 fn lab_location(case: &str) -> TestResult<String> {
-    let root = HdfsLocation::parse_configured(&env::var("LAB_HDFS_RUN_ROOT")?, &lab_config())?;
+    let root = HdfsLocation::parse(&env::var("LAB_HDFS_RUN_ROOT")?, &lab_config())?;
     let endpoint = root
         .endpoint()
         .strip_prefix("hdfs://")
@@ -95,6 +95,7 @@ async fn cleanup(storage: &Storage) -> TestResult {
 }
 
 async fn observes_nested_source(storage: &Storage) -> TestResult<bool> {
+    let mut traversal_completed = Vec::new();
     let traversal = StorageTraversalSource::new(storage)?;
     let slots = NonZeroUsize::new(2).ok_or("invalid inflight")?;
     let mut session = traversal.traverse(
@@ -103,7 +104,7 @@ async fn observes_nested_source(storage: &Storage) -> TestResult<bool> {
             .cancel(CancellationToken::new()),
     );
     let mut observed = false;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if let TraversalItem::Entry(entry) = item {
             observed |= entry.path().as_str() == "nested/source.bin";
         }
@@ -293,10 +294,11 @@ async fn interrupt_stage(backend: &Storage, payload: &Bytes) -> TestResult<Sourc
 }
 
 async fn assert_no_artifacts(storage: &Storage) -> TestResult {
+    let mut traversal_completed = Vec::new();
     let traversal = StorageTraversalSource::new(storage)?;
     let mut session = traversal
         .traverse(TraversalRequest::new(StoragePath::root()).cancel(CancellationToken::new()));
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if let TraversalItem::Entry(entry) = item {
             assert!(
                 !entry.path().as_str().starts_with(".data-mover-"),
@@ -365,10 +367,11 @@ async fn traverse_resumable(
     request: TraversalRequest,
     cancel_after: Option<usize>,
 ) -> TestResult<Traversed> {
+    let mut traversal_completed = Vec::new();
     let cancel = request.cancel.clone();
     let mut session = source.traverse(request);
     let (mut entries, mut checkpoints) = (Vec::new(), Vec::new());
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => entries.push(entry.path().as_str().to_owned()),
             TraversalItem::Checkpoint(checkpoint) => checkpoints.push((entries.len(), *checkpoint)),

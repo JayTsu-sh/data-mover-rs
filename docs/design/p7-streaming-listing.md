@@ -844,7 +844,7 @@ struct VersionRecord {
 - **并行度来自多个目录同时列举**：
   - Unordered：K 个 worker 各自列举、各自组装，天然 K 路并行，没有单点。
   - Blocks：在飞的预取列举（≤ P 个）各自组装，驱动只负责排序号、发出。
-- **条目通道也按页**：内部通道传 `Vec<TraversalItem>`，`TraversalSession::next_item()` 从缓冲的页里逐条取，对外接口不变，通道操作从每条一次降到每页一次。
+- **条目通道也按页**：内部通道传 `Vec<TraversalItem>`，`TraversalSession::next_item(&mut completed)` 从缓冲的页里逐条取，普通扫描复用空反馈 Vec，通道操作从每条一次降到每页一次。
 - **需要额外 I/O 的条目**（`should_scan` 里的 ACL / tags 等）：本来就是 I/O 等待，按条并发是对的，但不必每条 spawn。改为每页一个任务，里面用 `FuturesUnordered` 并发发这一页的请求，
   受 `max_inflight_operations` 约束。
 

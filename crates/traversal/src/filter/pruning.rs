@@ -41,6 +41,7 @@ mod tests {
                 size: Some(0),
                 extension: Some(""),
             },
+            None,
         )
     }
 

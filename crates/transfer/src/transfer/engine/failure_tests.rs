@@ -1,3 +1,4 @@
+use super::{FailedCleanup, StageCleanup};
 use std::error::Error;
 use std::path::Path;
 
@@ -7,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::TransferFailure;
 use crate::model::{
-    EntryKind, EntryOperationFailure, FailureClass, IdentityStrength, ObservedEntry, Operation,
-    SourceIdentity, StoragePath, Transience,
+    BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
+    ObservedEntry, Operation, SourceIdentity, StoragePath, Transience,
 };
 use crate::storage::StorageRoleFailure;
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
@@ -119,7 +120,51 @@ fn non_metadata_display_keeps_the_underlying_failure_class() -> TestResult {
     let message = failure.to_string();
     assert!(message.contains("PermissionDenied"), "{message}");
     assert!(message.contains("Permanent"), "{message}");
+    assert!(message.contains("scoped publish refusal"), "{message}");
     assert!(failure.source().is_some());
+    Ok(())
+}
+
+#[test]
+fn transfer_display_keeps_session_and_cleanup_diagnostics_with_typed_causes() -> TestResult {
+    let source = StorageRoleFailure::Session(BackendSessionFailure::new(
+        Operation::Read,
+        FailureClass::Connectivity,
+        Transience::Transient,
+        "source connection closed while reading version v7",
+    )?);
+    let cleanup = StorageRoleFailure::Entry(EntryOperationFailure::new(
+        StoragePath::new("file")?,
+        Operation::Namespace,
+        FailureClass::PermissionDenied,
+        Transience::Permanent,
+        "AccessDenied removing owned failed upload",
+    )?);
+    let mut failure = TransferFailure::role(
+        TransferPhase::Transfer,
+        TransferSide::Source,
+        source.clone(),
+    );
+    failure.cleanup_failure = Some(Box::new(FailedCleanup {
+        error: cleanup.clone(),
+        disposition: StageCleanup::Unpublished,
+    }));
+    let message = failure.to_string();
+    for detail in [
+        "Connectivity",
+        "source connection closed while reading version v7",
+        "artifact cleanup failed",
+        "AccessDenied removing owned failed upload",
+    ] {
+        assert!(message.contains(detail), "{message}");
+    }
+    assert_eq!(
+        failure
+            .source()
+            .and_then(|cause| cause.downcast_ref::<StorageRoleFailure>()),
+        Some(&source)
+    );
+    assert_eq!(failure.cleanup_failure(), Some(&cleanup));
     Ok(())
 }
 

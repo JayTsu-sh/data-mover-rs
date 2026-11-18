@@ -5,7 +5,7 @@ use super::{FilterASTNode, FilterCondition, FilterExpression, ModifiedValue};
 impl FilterExpression {
     /// Whether this expression contains a relative-time condition.
     ///
-    /// A relative `modified` condition uses the time of each evaluation. Absolute
+    /// A relative `modified` condition uses the supplied evaluation time (live or anchored). Absolute
     /// `modified` dates and dates extracted from directory names do not. This
     /// conservatively checks every branch, including conditions that may be
     /// short-circuited for a particular entry. A `true` result does not guarantee

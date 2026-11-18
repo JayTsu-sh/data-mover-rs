@@ -1,8 +1,10 @@
 //! Shared checks that a transfer source still matches the advertised observation.
 
 use super::{TransferFailure, TransferPhase, TransferSide};
-use crate::model::{EntryKind, ObservedEntry};
-use crate::storage::{ReadSource, SourceDescriptor};
+use crate::model::{
+    EntryKind, EntryOperationFailure, FailureClass, ObservedEntry, Operation, Transience,
+};
+use crate::storage::{ReadSource, SourceDescriptor, StorageRoleFailure};
 use crate::transfer::model::ObservationConstraint;
 
 /// Describes the observed path and checks it is the advertised object.
@@ -89,4 +91,29 @@ pub(super) fn validate_constraint(
         ));
     }
     Ok(())
+}
+
+/// 可观察的删除标记／虚拟前缀没有数据，必须在元数据与目标访问之前拒绝普通传输。
+pub(super) fn refuse_unreadable(descriptor: &SourceDescriptor) -> Result<(), TransferFailure> {
+    if !descriptor.listing.listing_only {
+        return Ok(());
+    }
+    let error = EntryOperationFailure::new(
+        descriptor.path.clone(),
+        Operation::Observe,
+        FailureClass::NotFound,
+        Transience::Permanent,
+        "selected source has no readable object content",
+    )
+    .map_err(|_| {
+        TransferFailure::orchestration(
+            TransferPhase::Describe,
+            "invalid non-data source diagnostic",
+        )
+    })?;
+    Err(TransferFailure::role(
+        TransferPhase::Describe,
+        TransferSide::Source,
+        StorageRoleFailure::Entry(error),
+    ))
 }

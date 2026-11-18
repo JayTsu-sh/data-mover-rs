@@ -26,7 +26,11 @@ impl Namespace for ErrorNamespace {
         );
         ListingStream::from_pages(request.path, [Ok(page)])
     }
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         Err(StorageRoleFailure::Entry(entry_failure(
             path,
             FailureClass::NotFound,
@@ -60,6 +64,7 @@ impl Metadata for ErrorMetadata {
 
 #[tokio::test]
 async fn directory_statistics_separate_known_failures_unknown_failures_and_vanished() {
+    let mut traversal_completed = Vec::new();
     for order in [TraversalOrder::Blocks, TraversalOrder::Unordered] {
         let source =
             StorageTraversalSource::with_roles(Arc::new(ErrorNamespace), Arc::new(ErrorMetadata));
@@ -69,7 +74,7 @@ async fn directory_statistics_separate_known_failures_unknown_failures_and_vanis
                 .directory_statistics(true),
         );
         let mut completed = None;
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             if let TraversalItem::DirectoryStatistics(stats) = item
                 && stats.outcome.is_some()
             {
@@ -123,6 +128,7 @@ impl Namespace for TerminalNamespace {
 
 #[tokio::test]
 async fn directory_statistics_never_publish_complete_after_a_terminal_listing_fault() {
+    let mut traversal_completed = Vec::new();
     for order in [TraversalOrder::Blocks, TraversalOrder::Unordered] {
         let gate = Arc::new(Semaphore::new(0));
         let source = StorageTraversalSource::with_roles(
@@ -135,7 +141,7 @@ async fn directory_statistics_never_publish_complete_after_a_terminal_listing_fa
                 .directory_statistics(true),
         );
         let mut snapshots: Vec<Box<DirectoryStatistics>> = Vec::new();
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             if let TraversalItem::DirectoryStatistics(stats) = item {
                 assert!(stats.outcome.is_none());
                 gate.add_permits(1);
@@ -172,6 +178,7 @@ impl Namespace for SpecialNamespace {
 
 #[tokio::test]
 async fn directory_statistics_keep_special_kinds_unknown_size_and_json_losslessly() {
+    let mut traversal_completed = Vec::new();
     for order in [TraversalOrder::Blocks, TraversalOrder::Unordered] {
         let source =
             StorageTraversalSource::with_roles(Arc::new(SpecialNamespace), Arc::new(FakeMetadata));
@@ -181,7 +188,7 @@ async fn directory_statistics_keep_special_kinds_unknown_size_and_json_losslessl
                 .directory_statistics(true),
         );
         let mut completed = None;
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             if let TraversalItem::DirectoryStatistics(stats) = item
                 && stats.outcome.is_some()
             {

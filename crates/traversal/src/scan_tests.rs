@@ -65,7 +65,11 @@ struct Fixture {
 }
 #[async_trait]
 impl Namespace for Fixture {
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat(
+        &self,
+        path: &StoragePath,
+        _fresh: bool,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
         Ok(SourceDescriptor::new(
             path.clone(),
             EntryKind::Directory,
@@ -170,6 +174,7 @@ fn fixture_roles(backend: BackendKind, denied: bool, conflict: bool) -> Storage 
 }
 #[tokio::test]
 async fn all_remote_backends_report_operation_timeout_without_waiting_for_native_retries() {
+    let mut traversal_completed = Vec::new();
     for backend in [
         BackendKind::Nfs,
         BackendKind::S3,
@@ -181,7 +186,7 @@ async fn all_remote_backends_report_operation_timeout_without_waiting_for_native
                 .unwrap();
         let mut session = source.traverse(TraversalRequest::new(StoragePath::root()));
         let result = timeout(Duration::from_millis(250), async {
-            while session.next_item().await.is_some() {}
+            while session.next_item(&mut traversal_completed).await.is_some() {}
             session.finish().await
         })
         .await
@@ -196,6 +201,7 @@ async fn all_remote_backends_report_operation_timeout_without_waiting_for_native
 }
 #[tokio::test]
 async fn permission_denied_never_becomes_a_network_failure() {
+    let mut traversal_completed = Vec::new();
     let (source, signal) = ScanFailureSignal::source(
         &roles(BackendKind::Cifs, true),
         Some(Duration::from_millis(20)),
@@ -203,7 +209,7 @@ async fn permission_denied_never_becomes_a_network_failure() {
     .unwrap();
     let mut session = source.traverse(TraversalRequest::new(StoragePath::root()));
     let mut denied = false;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if let TraversalItem::Failure(failure) = item {
             denied |= failure.failure.class() == FailureClass::PermissionDenied;
         }
@@ -360,7 +366,12 @@ async fn changed_inline_descriptor_recovers_without_reusing_stale_facts() {
     let storage = roles(BackendKind::Cifs, false);
     let (_, signal) = ScanFailureSignal::source(&storage, None).unwrap();
     let path = StoragePath::root();
-    let mut original = storage.namespace().unwrap().stat(&path).await.unwrap();
+    let mut original = storage
+        .namespace()
+        .unwrap()
+        .stat(&path, false)
+        .await
+        .unwrap();
     original.kind = EntryKind::File;
     let target = RecoveryTarget {
         read: ScanRead::InlineMetadata(ObservationPlan::default()),
@@ -415,7 +426,7 @@ async fn an_unchanged_identity_conflict_does_not_prove_network_recovery() {
     let identity = storage
         .namespace()
         .unwrap()
-        .stat(&path)
+        .stat(&path, false)
         .await
         .unwrap()
         .source_identity;
@@ -444,7 +455,7 @@ async fn current_descriptor_does_not_prove_a_historical_version_changed() {
     let identity = storage
         .namespace()
         .unwrap()
-        .stat(&path)
+        .stat(&path, false)
         .await
         .unwrap()
         .source_identity;

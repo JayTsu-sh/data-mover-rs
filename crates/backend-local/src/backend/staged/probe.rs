@@ -43,6 +43,10 @@ pub(super) struct WriteProbe {
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fail_metadata_sync: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
+    pub(super) fail_direct_data_sync: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fail_direct_directory_sync: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) replace_final_during_skip: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     pub(super) slow_existing_verify: std::sync::atomic::AtomicBool,
@@ -211,6 +215,18 @@ impl super::LocalStagedDestination {
     pub fn fail_metadata_sync(&self) {
         self.write_probe
             .fail_metadata_sync
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub fn fail_direct_data_sync(&self) {
+        self.write_probe
+            .fail_direct_data_sync
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub fn fail_direct_directory_sync(&self) {
+        self.write_probe
+            .fail_direct_directory_sync
             .store(true, Ordering::SeqCst);
     }
 

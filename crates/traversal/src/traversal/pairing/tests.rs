@@ -357,8 +357,9 @@ fn local_session(root: &Path) -> TraversalSession {
 }
 
 async fn next_block(session: &mut TraversalSession) -> Vec<TraversalItem> {
+    let mut traversal_completed = Vec::new();
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         let closed = matches!(item, TraversalItem::DirectoryListed(_));
         items.push(item);
         if closed {
@@ -370,6 +371,7 @@ async fn next_block(session: &mut TraversalSession) -> Vec<TraversalItem> {
 
 #[tokio::test]
 async fn pairs_real_local_blocks_then_checks_both_session_completions() {
+    let mut traversal_completed = Vec::new();
     let left_dir = tempfile::tempdir().unwrap();
     let right_dir = tempfile::tempdir().unwrap();
     for root in [left_dir.path(), right_dir.path()] {
@@ -400,7 +402,10 @@ async fn pairs_real_local_blocks_then_checks_both_session_completions() {
             assert_eq!(child.status, expected);
         }
     }
-    assert!(left.next_item().await.is_none() && right.next_item().await.is_none());
+    assert!(
+        left.next_item(&mut traversal_completed).await.is_none()
+            && right.next_item(&mut traversal_completed).await.is_none()
+    );
     for outcome in [left.finish().await.unwrap(), right.finish().await.unwrap()] {
         let TraversalOutcome::Completed(completion) = outcome else {
             panic!("unexpected cancellation")

@@ -529,11 +529,22 @@ async fn snapshot_rebuild_preserves_private_local_facts_without_requery() -> io:
     let PrivateBackendEntryFacts::Local(facts) = rebuilt.backend_facts() else {
         panic!("expected local backend facts");
     };
-    assert_eq!(facts.first(), Some(&1));
-    let (encoded, _) = facts[1..].as_chunks::<8>();
+    assert_eq!(facts.first(), Some(&2));
+    assert_eq!(facts.len(), 89);
+    let (encoded, _) = facts[1..57].as_chunks::<8>();
     for (encoded, expected) in encoded.iter().zip(expected) {
         assert_eq!(*encoded, expected.to_le_bytes());
     }
+    let mut version = Vec::new();
+    for value in [
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ] {
+        version.extend_from_slice(&value.to_le_bytes());
+    }
+    assert_eq!(purge_content_version(facts), Some(version.as_slice()));
     Ok(())
 }
 
@@ -613,5 +624,98 @@ async fn windows_acl_role_handles_files_directories_and_refuses_escape() -> io::
         matches!(failure, StorageRoleFailure::Entry(error) if error.class() == FailureClass::InvalidInput)
     );
     assert_eq!(std::fs::read(root.0.join("file"))?, b"unchanged");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_metadata_uses_the_existing_capability_and_preserves_children() -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio_util::sync::CancellationToken;
+
+    let root = TestRoot::new()?;
+    std::fs::write(root.0.join("child"), b"root payload")?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    let path = StoragePath::root();
+    let plan = capabilities::copied_metadata_observation_plan()
+        .with_acl(ObservationMode::Required)
+        .with_xattrs(ObservationMode::Required);
+    let before = MetadataRole::observe(&adapter, &path, plan)
+        .await
+        .map_err(io::Error::other)?;
+    assert!(before.failures().next().is_none());
+    let modified = UNIX_EPOCH + std::time::Duration::from_nanos(1_700_000_000_123_456_789);
+    let stamp = system_time_to_timestamp(modified).ok_or_else(|| io::Error::other("timestamp"))?;
+    MetadataRole::apply(
+        &adapter,
+        &path,
+        MetadataMutation::Timestamps(TimestampMetadata {
+            accessed: None,
+            modified: Some(stamp),
+            created: None,
+        }),
+        CancellationToken::new(),
+    )
+    .await
+    .map_err(io::Error::other)?;
+    let acl = before
+        .acl()
+        .value()
+        .ok_or_else(|| io::Error::other("root ACL missing"))?
+        .clone();
+    MetadataRole::apply(
+        &adapter,
+        &path,
+        MetadataMutation::Acl(acl),
+        CancellationToken::new(),
+    )
+    .await
+    .map_err(io::Error::other)?;
+    let attribute = ExtendedAttribute::new(
+        b"user.root-metadata-test".to_vec(),
+        b"root raw value".to_vec(),
+    )
+    .map_err(io::Error::other)?;
+    MetadataRole::apply(
+        &adapter,
+        &path,
+        MetadataMutation::Xattrs(vec![attribute.clone()]),
+        CancellationToken::new(),
+    )
+    .await
+    .map_err(io::Error::other)?;
+    let after = MetadataRole::observe(&adapter, &path, plan)
+        .await
+        .map_err(io::Error::other)?;
+    assert!(
+        after
+            .xattrs()
+            .value()
+            .is_some_and(|values| values.contains(&attribute))
+    );
+    MetadataRole::apply(
+        &adapter,
+        &path,
+        MetadataMutation::Mode(0o750),
+        CancellationToken::new(),
+    )
+    .await
+    .map_err(io::Error::other)?;
+    assert_eq!(
+        std::fs::metadata(&root.0)?.permissions().mode() & 0o7777,
+        0o750
+    );
+    assert_eq!(std::fs::metadata(&root.0)?.modified()?, modified);
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert!(
+        matches!(MetadataRole::apply(&adapter, &path, MetadataMutation::Mode(0o777), cancelled).await,
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled)
+    );
+    assert_eq!(
+        std::fs::metadata(&root.0)?.permissions().mode() & 0o7777,
+        0o750
+    );
+    assert_eq!(std::fs::read(root.0.join("child"))?, b"root payload");
     Ok(())
 }

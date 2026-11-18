@@ -4,7 +4,8 @@ use clap::Parser;
 use data_mover::model::StoragePath;
 use data_mover::qos::parse_bandwidth_string;
 use data_mover::transfer::{
-    SourceQosGroup, SourceQosPolicy, SourceQosStats, TransferRequest, move_file, transfer,
+    ReadBackVerification, SourceQosGroup, SourceQosPolicy, SourceQosStats, TransferRequest,
+    transfer,
 };
 use num_traits::ToPrimitive as _;
 use tokio_util::sync::CancellationToken;
@@ -116,6 +117,14 @@ async fn main() -> Result<()> {
     let source = connect_with_options(&args.source, false, Some(args.chunk_bytes)).await?;
     let destination = connect_with_options(&args.destination, true, Some(args.chunk_bytes)).await?;
     let path = StoragePath::new(&args.path)?;
+    if args.delete_source && source.identity() == destination.identity() {
+        return Err("source deletion requires distinct storage roots".into());
+    }
+    let source_to_remove = if args.delete_source {
+        Some(copy_support::observe(&source, &path).await?)
+    } else {
+        None
+    };
     copy_support::create_parent(&destination, &path).await?;
     let qos = qos_from_args(&args)?;
     let report_qos = qos.is_some();
@@ -130,19 +139,19 @@ async fn main() -> Result<()> {
     }
     let started = Instant::now();
     report_phase(args.report_phases, "transfer")?;
-    let outcome = if args.delete_source {
-        move_file(request).await?
-    } else {
-        transfer(request).await?
-    };
+    if args.delete_source {
+        request = request.with_read_back_verification(ReadBackVerification::Enabled);
+    }
+    let outcome = transfer(request).await?;
     let elapsed = started.elapsed().as_secs_f64();
     report_phase(args.report_phases, "verification")?;
-    let bytes = if args.delete_source {
-        // move_file read back the copy and applied metadata before guarded source removal.
-        outcome.transferred_bytes
-    } else {
-        copy_support::verify(&source, &destination, &path).await?
-    };
+    let bytes = copy_support::verify(&source, &destination, &path).await?;
+    if let Some(entry) = source_to_remove {
+        source
+            .namespace()?
+            .purge_observed(&entry, CancellationToken::new())
+            .await?;
+    }
     println!(
         "copied and verified {bytes} bytes and applicable metadata: {}",
         args.path

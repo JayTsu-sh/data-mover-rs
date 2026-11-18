@@ -68,7 +68,9 @@ async fn observe_timestamps(
 async fn local_namespace_classifies_missing_path() -> Result<(), Box<dyn std::error::Error>> {
     let root = TempDir::new("missing-metadata")?;
     let path = StoragePath::new("missing-file")?;
-    let result = namespace(&local(root.path()).await?)?.stat(&path).await;
+    let result = namespace(&local(root.path()).await?)?
+        .stat(&path, false)
+        .await;
 
     assert!(matches!(
         result,
@@ -85,7 +87,9 @@ async fn local_namespace_describes_existing_file() -> Result<(), Box<dyn std::er
     let root = TempDir::new("existing-metadata")?;
     std::fs::write(root.path().join("file.txt"), b"content")?;
     let path = StoragePath::new("file.txt")?;
-    let descriptor = namespace(&local(root.path()).await?)?.stat(&path).await?;
+    let descriptor = namespace(&local(root.path()).await?)?
+        .stat(&path, false)
+        .await?;
 
     assert_eq!(descriptor.path, path);
     assert_eq!(descriptor.kind, data_mover::model::EntryKind::File);
@@ -168,7 +172,7 @@ async fn local_namespace_describes_and_reads_dangling_symlink()
     let path = StoragePath::new("link")?;
     let namespace = namespace(&local(root.path()).await?)?;
 
-    let descriptor = namespace.stat(&path).await?;
+    let descriptor = namespace.stat(&path, false).await?;
     assert_eq!(descriptor.kind, data_mover::model::EntryKind::Symlink);
     assert_eq!(descriptor.size, None);
     assert_eq!(

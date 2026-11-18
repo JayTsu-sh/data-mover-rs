@@ -2,6 +2,11 @@
 //! that keeps histories, of one child per key with its history (P7 §10), `stat`, and the verbs S3
 //! cannot serve.
 
+#[path = "namespace_persistence_tests.rs"]
+mod persistence_tests;
+#[path = "namespace_purge_tests.rs"]
+mod purge_tests;
+
 use crate::storage::observe_descriptor;
 use std::num::NonZeroUsize;
 
@@ -224,7 +229,7 @@ async fn stat_tells_objects_prefixes_and_absence_apart() -> TestResult {
     let namespace = namespace(&protocol)?;
     let stat = |value: &'static str| {
         let namespace = &namespace;
-        async move { namespace.stat(&path(value)).await }
+        async move { namespace.stat(&path(value), false).await }
     };
     let kind =
         |result: Result<SourceDescriptor, StorageRoleFailure>| result.map(|entry| Some(entry.kind));
@@ -523,7 +528,7 @@ async fn stat_pages_past_empty_pages() -> TestResult {
     let protocol = bucket(&[("d/e", b"1")]).await?;
     protocol.listing().endless_empty = true;
     let namespace = limited(&protocol, 1000);
-    let stat = timeout(Duration::from_secs(5), namespace.stat(&path("d"))).await?;
+    let stat = timeout(Duration::from_secs(5), namespace.stat(&path("d"), false)).await?;
     assert!(
         matches!(stat, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::Protocol),
         "{stat:?}"
@@ -725,7 +730,7 @@ async fn current_virtual_directory_needs_no_object_metadata_rpc() -> TestResult 
         None,
         S3TagSupport::Unsupported,
     )?;
-    let descriptor = storage.namespace()?.stat(&path("virtual")).await?;
+    let descriptor = storage.namespace()?.stat(&path("virtual"), false).await?;
     assert_eq!(descriptor.kind, EntryKind::Directory);
     assert!(descriptor.listing.listing_only);
     let observed = observe_descriptor(

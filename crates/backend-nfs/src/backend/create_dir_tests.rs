@@ -65,6 +65,7 @@ impl NfsNamespaceProtocol for AccessFirst {
     async fn stat(
         &self,
         path: &StoragePath,
+        _fresh: bool,
     ) -> Result<NfsNamespaceObservation, NfsProtocolFailure> {
         self.record(format!("stat {}", path.as_str()));
         let directories = self
@@ -129,7 +130,15 @@ impl NfsNamespaceProtocol for AccessFirst {
         &self,
         _path: &StoragePath,
         _kind: EntryKind,
+        expected: Option<&crate::model::ObservedEntry>,
     ) -> Result<(), NfsProtocolFailure> {
+        if expected.is_some() {
+            return Err(NfsProtocolFailure::new(
+                crate::model::FailureClass::Unsupported,
+                crate::model::Transience::Permanent,
+            ));
+        }
+
         Err(unused())
     }
 
@@ -145,7 +154,7 @@ impl NfsNamespaceProtocol for AccessFirst {
 fn adapter(protocol: Arc<AccessFirst>) -> NfsNamespaceAdapter {
     let identity = BackendIdentity::new(BackendKind::Nfs, "nfs-create-dir-test")
         .unwrap_or_else(|error| panic!("{error}"));
-    NfsNamespaceAdapter::new(protocol, identity)
+    NfsNamespaceAdapter::new(protocol, identity, None)
 }
 
 fn path(value: &str) -> StoragePath {

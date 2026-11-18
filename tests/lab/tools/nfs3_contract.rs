@@ -317,6 +317,7 @@ fn validate_fixture_metadata(
 }
 
 async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> ContractResult {
+    let mut traversal_completed = Vec::new();
     let traversal = StorageTraversalSource::new(source)?;
     let acl_mode = match dialect {
         ContractDialect::Nfs3 => ObservationMode::Required,
@@ -336,7 +337,7 @@ async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> Contr
     );
     let mut saw_fixture = false;
     let mut saw_link = false;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         // Directory events are ordering evidence, not entries.
         if matches!(item, TraversalItem::DirectoryListed(_)) {
             continue;

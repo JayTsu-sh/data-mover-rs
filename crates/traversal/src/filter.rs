@@ -7,11 +7,13 @@ use num_traits::ToPrimitive;
 use tracing::trace;
 
 // 内部模块
+use crate::time_util::now_secs;
 use crate::{Result, error::StorageError};
 
 mod equivalence;
 mod pruning;
 mod relative_time;
+mod selection;
 
 /// glob 匹配选项：`require_literal_separator = true` 确保 `*` 不匹配路径分隔符 `/`，
 /// 只有 `**` 才能跨越目录边界。
@@ -77,12 +79,8 @@ fn included_entry_decision(result: &MatchResult, is_dir: bool) -> Option<(bool, 
 /// # 参数说明
 /// - `match_expressions`: 匹配表达式，用于白名单过滤
 /// - `exclude_expressions`: 排除表达式，用于黑名单过滤
-/// - `file_name`: 文件名（可选）
-/// - `file_path`: 文件路径（可选）
-/// - `file_type`: 文件类型（"file"或"dir"，可选）
-/// - `modified_epoch`: 文件修改时间的 epoch seconds（可选）
-/// - `size`: 文件大小（可选）
-/// - `extension`: 文件扩展名（可选）
+/// - `input`: 当前条目的名称、路径、类型、修改时间、大小和扩展名等过滤事实
+/// - `now_epoch`: 固定的 Unix 秒时间；None 时读取一次当前时间，所有过滤共用该基准
 ///
 /// # 返回值
 /// 返回一个三元组 (`should_skip`, `continue_scan`, `check_children`)，其中：
@@ -94,78 +92,20 @@ fn included_entry_decision(result: &MatchResult, is_dir: bool) -> Option<(bool, 
 /// 1. 优先检查排除表达式（黑名单），匹配则跳过
 /// 2. 再检查匹配表达式（白名单），根据匹配结果决定是否跳过
 /// 3. 最后处理无匹配表达式的情况
+#[must_use]
 pub fn should_skip(
     match_expressions: Option<&FilterExpression>,
     exclude_expressions: Option<&FilterExpression>,
     input: FilterInput<'_>,
+    now_epoch: Option<i64>,
 ) -> (bool, bool, bool) {
-    let FilterInput {
-        file_name,
-        file_path,
-        file_type,
-        modified_epoch,
-        size,
-        extension,
-    } = input;
-    trace!(
-        "[filter::should_skip:FILTER-ENTRY] 开始检查: 匹配表达式= {:?}, 排除表达式={:?}, name={:?}, path={:?}, type={:?}, modified_epoch={:?}, size={:?}, extension={:?}",
+    selection::trace_input(match_expressions, exclude_expressions, input);
+    selection::decide(
         match_expressions,
         exclude_expressions,
-        file_name,
-        file_path,
-        file_type,
-        modified_epoch,
-        size,
-        extension
-    );
-
-    // 预计算 now_epoch，避免在 evaluate 中重复调用 SystemTime::now()
-    let now_epoch = crate::time_util::now_secs();
-
-    let is_dir = file_type == Some("dir");
-
-    // 排除条件检查：黑名单过滤
-    if let Some(expr) = exclude_expressions {
-        let match_result = evaluate_filter(expr, &input, now_epoch);
-
-        trace!(
-            "[filter::should_skip:FILTER-EXCLUDE] 黑名单匹配结果: expr={:?}, result={:?}",
-            expr, match_result
-        );
-
-        if let Some(decision) = excluded_entry_decision(&match_result, is_dir) {
-            return decision;
-        }
-    }
-
-    // 匹配条件检查：白名单过滤
-    if let Some(expr) = match_expressions {
-        let match_result = evaluate_filter(expr, &input, now_epoch);
-
-        trace!(
-            "[filter::should_skip:FILTER-MATCH] 白名单匹配结果: expr={:?}, result={:?}, is_dir={}",
-            expr, match_result, is_dir
-        );
-
-        if let Some((skip_entry, continue_scan, check_children)) =
-            included_entry_decision(&match_result, is_dir)
-        {
-            // LISA-3849: admitting a directory must not bypass excludes or per-child conditions.
-            let check_children = check_children
-                || (is_dir
-                    && !skip_entry
-                    && (exclude_expressions.is_some()
-                        || !pruning::allows_unfiltered_descendants(&expr.root)));
-            return (skip_entry, continue_scan, check_children);
-        }
-    }
-
-    // 无匹配表达式，默认不跳过，目录继续扫描
-    trace!(
-        "[filter::should_skip:FILTER-DEFAULT] 无匹配表达式，默认处理: name={:?}, path={:?}, is_dir={}, 保留条目，继续递归",
-        file_name, file_path, is_dir
-    );
-    (false, is_dir, true)
+        input,
+        now_epoch.unwrap_or_else(now_secs),
+    )
 }
 
 /// 解析过滤表达式的辅助函数
@@ -346,14 +286,13 @@ enum Token {
     RParen,
 }
 
-pub struct Lexer<'a> {
+struct Lexer<'a> {
     input: &'a str,
     position: usize,
 }
 
 impl<'a> Lexer<'a> {
-    #[must_use]
-    pub fn new(input: &'a str) -> Self {
+    fn new(input: &'a str) -> Self {
         Lexer { input, position: 0 }
     }
 
@@ -1314,7 +1253,8 @@ impl FilterExpression {
                 } else {
                     f64::MIN
                 };
-                let file_days = (now_epoch - file_epoch).to_f64().unwrap_or(fallback) / 86_400.0;
+                let elapsed = i128::from(now_epoch) - i128::from(file_epoch);
+                let file_days = elapsed.to_f64().unwrap_or(fallback) / 86_400.0;
                 MatchResult::from_bool(match operator {
                     CompareOp::Lt => file_days < *days,
                     CompareOp::Gt => file_days > *days,
@@ -1756,6 +1696,7 @@ mod tests {
                     size: $size,
                     extension: $extension,
                 },
+                None,
             )
         }};
     }

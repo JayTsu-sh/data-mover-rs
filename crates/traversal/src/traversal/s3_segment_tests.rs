@@ -38,12 +38,13 @@ async fn run(
     request: TraversalRequest,
     cancel_after: Option<usize>,
 ) -> TestResult<(Vec<TraversalItem>, Outcome)> {
+    let mut traversal_completed = Vec::new();
     let cancel = request.cancel.clone();
     let mut session = source.traverse(request);
     let ran = tokio::time::timeout(Duration::from_mins(1), async {
         let mut items = Vec::new();
         let mut entries = 0;
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             entries += usize::from(matches!(item, TraversalItem::Entry(_)));
             items.push(item);
             if cancel_after == Some(entries) {

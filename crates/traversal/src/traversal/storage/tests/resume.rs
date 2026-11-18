@@ -288,12 +288,13 @@ pub(super) async fn run(
     request: TraversalRequest,
     cancel_after: Option<usize>,
 ) -> Run {
+    let mut traversal_completed = Vec::new();
     let cancel = request.cancel.clone();
     let mut session = source.traverse(request);
     let drained = tokio::time::timeout(Duration::from_secs(30), async {
         let mut items = Vec::new();
         let mut entries = 0;
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             entries += usize::from(matches!(item, TraversalItem::Entry(_)));
             items.push(item);
             if cancel_after.is_some_and(|after| entries == after) {
@@ -437,6 +438,7 @@ async fn a_filter_decides_alike_after_resuming() {
 /// either. Each period that passes yields one.
 #[tokio::test]
 async fn checkpoints_come_once_per_period_and_never_when_off() {
+    let mut traversal_completed = Vec::new();
     for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
         let mut setup = setup(Tree::generate(3, 3, 2, 2), false);
         setup.source = setup.source.output_capacity(NonZeroUsize::MIN);
@@ -454,7 +456,7 @@ async fn checkpoints_come_once_per_period_and_never_when_off() {
         // Two periods pass while the consumer takes its 5th and its 40th entry.
         let mut session = setup.source.traverse(on());
         let mut items = Vec::new();
-        while let Some(item) = session.next_item().await {
+        while let Some(item) = session.next_item(&mut traversal_completed).await {
             let entries = entry_paths(&items).len();
             if matches!(item, TraversalItem::Entry(_)) && (entries == 4 || entries == 39) {
                 setup.clock.advance(every);
@@ -479,7 +481,9 @@ async fn cancelling_pauses_and_a_chain_of_resumes_completes_the_tree() {
         // at least one whole directory across that window; cancelling after only two
         // directories' worth with four workers can replay partial blocks forever (§9.2).
         for (inflight, buffered, cancel_after) in [(1, 1, 15), (4, 1, 60), (8, 16, 100)] {
-            let mut setup = setup(Tree::generate(3, 3, 4, 3), false);
+            // 三层树只有 199 项，高并发下两轮即可合法完成，无法保证多次取消。
+            // 增大到四层，确保取消后排空在途工作仍留有足够条目供连续恢复。
+            let mut setup = setup(Tree::generate(3, 4, 4, 3), false);
             setup.source = setup
                 .source
                 .output_capacity(NonZeroUsize::new(buffered).unwrap_or(NonZeroUsize::MIN));

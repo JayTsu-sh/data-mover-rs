@@ -13,6 +13,25 @@ use data_mover::transfer::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "s3_architecture_contract/checkpoint_version.rs"]
+mod checkpoint_version;
+#[path = "s3_architecture_contract/direct_cleanup.rs"]
+mod direct_cleanup;
+#[path = "s3_architecture_contract/direct_native.rs"]
+mod direct_native;
+#[path = "s3_architecture_contract/marker_persistence.rs"]
+mod marker_persistence;
+#[path = "s3_architecture_contract/namespace_persistence.rs"]
+mod namespace_persistence;
+#[path = "s3_architecture_contract/namespace_read.rs"]
+mod namespace_read;
+#[path = "s3_architecture_contract/source_observation.rs"]
+mod source_observation;
+#[path = "s3_architecture_contract/source_purge.rs"]
+mod source_purge;
+#[path = "s3_architecture_contract/version_metadata.rs"]
+mod version_metadata;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const PART_SIZE: usize = 8 * 1024 * 1024;
 /// Over the 64 MiB automatic interval: only such a checkpointed object keeps a resume pointer

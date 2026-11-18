@@ -162,9 +162,19 @@ enum ModifiedValue {
 - `RelativeDays(-7.0)` = "7 天内修改的"。
 - `AbsoluteEpoch(1704067200)` = "2024-01-01 UTC 之后修改的"。
 
-解析后，相对条件保留为 `RelativeDays`，在每次求值时使用当前时间；绝对日期
-解析为固定的 `AbsoluteEpoch`。因此，同一表达式与同一份条目元数据在不同时间
+解析后，相对条件保留为 `RelativeDays`；`should_skip` 及未设时间基准的
+`DslTraversalFilter` 在每次求值时使用当前时间。调用方可用
+`DslTraversalFilter::with_time_anchor(unix_seconds)` 或 `should_skip_at` 固定本轮评估时间，
+包含、排除与全部子表达式共用该值，重试同一轮时复用。绝对日期
+解析为固定的 `AbsoluteEpoch`。因此，未固定基准时，同一表达式与同一份条目元数据在不同时间
 求值，相对条件的结果仍可能变化。
+
+`DslTraversalFilter::selection_key()` 返回不含时间基准的有序解析树指纹，可由调用方
+持久化用于比较过滤选择。它不合并交换过顺序的布尔表达式，也不能单独证明任务绑定、
+元数据计划或 checkpoint 兼容。固定时钟模式的 `TraversalFilter::resume_key()`
+另包含时间基准，换窗口会明确拒绝旧 checkpoint；默认实时模式保持原有行为。
+真实 Local 测试分别覆盖 unordered／blocks 的窗口命中及换窗口后的拒绝，迁移任务
+是否重新枚举和是否清理目标仍由调用方决定。
 
 `FilterExpression::has_relative_time_condition()` 遍历已解析的 AST：任一分支含
 `ModifiedValue::RelativeDays` 即返回 `true`，包括当前条目求值时可能短路的分支。

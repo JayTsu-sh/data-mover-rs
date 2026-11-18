@@ -18,12 +18,14 @@ use tokio_util::sync::CancellationToken;
 use super::super::source::{cancelled, classified_entry, entry, role_failure};
 use super::super::{S3Protocol, S3ProtocolFailure, S3WriteFacts, composite_etag};
 use super::completion::completed_object;
+use super::direct_cleanup::DirectCleanup;
 use super::parts::{PartTarget, UploadedParts};
 use super::{S3StagedDestination, cleanup_result, limits, planned_part_size, single, streaming};
-use crate::model::{FailureClass, Operation, StoragePath, Transience};
+use crate::model::{BackendKind, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
     ByteStream, PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
-    PublicationFailure, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    PublicationFailure, SourceDescriptor, StorageRoleFailure, VerificationEvidence, VerifyRequest,
+    WriteEvidence,
 };
 
 /// The upload-id half of a multipart `Direct` stage's token; a real upload id is printable.
@@ -36,6 +38,7 @@ pub(super) struct DirectUpload {
     /// `Direct` completion replaces the final object irreversibly.
     expected_size: Option<u64>,
     state: Mutex<DirectState>,
+    cleanup: DirectCleanup,
 }
 
 #[derive(Default)]
@@ -59,6 +62,16 @@ fn upload_of(stage: &PreparedStage) -> Option<&DirectUpload> {
         .downcast_ref::<DirectUpload>()
 }
 
+pub(super) fn cleanup_authority(stage: &PreparedStage) -> Option<&DirectCleanup> {
+    if let Some(single) = single::of(stage) {
+        return Some(&single.cleanup);
+    }
+    if let Some(streamed) = streaming::of(stage) {
+        return Some(&streamed.cleanup);
+    }
+    upload_of(stage).map(|upload| &upload.cleanup)
+}
+
 /// What the write that made the object reported, once it is written.
 fn written_facts(stage: &PreparedStage) -> Option<S3WriteFacts> {
     if let Some(streamed) = streaming::of(stage) {
@@ -79,6 +92,30 @@ fn not_written(path: &StoragePath, operation: Operation) -> StorageRoleFailure {
 }
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
+    pub(super) fn check_direct_inputs(
+        &self,
+        stage: &PreparedStage,
+        inputs: Box<dyn Iterator<Item = SourceDescriptor> + Send + '_>,
+    ) -> Result<(), StorageRoleFailure> {
+        self.validate(stage)?;
+        let path = stage.final_destination().path();
+        let target = format!("{}/{path}", self.identity.stable_id());
+        for source in inputs {
+            let backend = source.source_identity.backend();
+            if backend.kind() == BackendKind::S3
+                && format!("{}/{}", backend.stable_id(), source.path) == target
+            {
+                return Err(classified_entry(
+                    path,
+                    Operation::Prepare,
+                    FailureClass::Conflict,
+                    Transience::Permanent,
+                    "Direct archive would replace one of its source objects",
+                ));
+            }
+        }
+        Ok(())
+    }
     /// A `Direct` stage: a single stage for a known size up to T, and for a directory object one
     /// request carries (P7 D13); on a bucket without multipart uploads, one streamed `PutObject`
     /// committing inside `write` (P7 §14.2); otherwise a multipart one whose upload `write`
@@ -143,6 +180,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             part_size,
             expected_size,
             state: Mutex::new(DirectState::default()),
+            cleanup: DirectCleanup::default(),
         })));
         Ok(stage)
     }
@@ -244,7 +282,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 "the S3 Direct input differs from the source's size",
             ));
         }
-        let facts = self.complete_direct(path, upload_id, &sent, size).await?;
+        let facts = self
+            .complete_direct(path, upload, upload_id, &sent, size)
+            .await?;
         let mut state = upload.lock();
         state.open = None;
         state.written = Some((size, facts));
@@ -262,19 +302,29 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     async fn complete_direct(
         &self,
         path: &StoragePath,
+        upload: &DirectUpload,
         upload_id: &str,
         sent: &UploadedParts,
         size: u64,
     ) -> Result<S3WriteFacts, StorageRoleFailure> {
         let etags: Vec<String> = sent.parts.iter().map(|part| part.1.clone()).collect();
         let expected = composite_etag(&etags);
+        upload.cleanup.attempted();
         let facts = match self
             .protocol
             .complete_multipart(path.as_str(), upload_id, &sent.parts)
             .await
         {
-            Ok(facts) => facts,
+            Ok(facts) => {
+                upload
+                    .cleanup
+                    .confirmed(size, &facts, self.protocol.versioning_enabled());
+                facts
+            }
             Err(failure) => {
+                if single::definite_refusal(&failure) {
+                    upload.cleanup.refused();
+                }
                 self.settle_direct_completion(path, upload_id, size, expected.as_deref(), failure)
                     .await?
             }
@@ -297,11 +347,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         }
     }
 
-    /// Settles a failed completion by aborting the upload first. One already gone (`NoSuchUpload`)
-    /// completed: the object is ours when it is the key's latest version with our size and
-    /// composite `ETag`, and that version is claimed (ADR-0006 C17). One that could still be
-    /// aborted — or whose abort failed — may never have completed, and an identical earlier object
-    /// would match as well: it counts as written, but no version is claimed.
+    /// 先终止仍在的 upload，再按期望内容核对最终对象。
+    /// `NoSuchUpload` 允许观察最新版本作读取锚点，但也可能来自先前中止；不产生创建回执。
     async fn settle_direct_completion(
         &self,
         path: &StoragePath,
@@ -328,6 +375,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             Some(expected) => completed_object(&*self.protocol, path, size, expected, gone).await,
             None => None,
         };
+        if found.is_some() {
+            tracing::warn!(path = %path.as_str(), ?failure, "S3 Direct completion response unconfirmed; matching data reconciled without a created-version receipt");
+        }
         found.ok_or_else(|| role_failure(path, Operation::Write, failure))
     }
 
@@ -405,12 +455,12 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             final_destination_changed: false,
         };
         self.validate(stage).map_err(unchanged)?;
-        let facts =
-            written_facts(stage).ok_or_else(|| unchanged(not_written(path, Operation::Publish)))?;
+        written_facts(stage).ok_or_else(|| unchanged(not_written(path, Operation::Publish)))?;
+        let version = cleanup_authority(stage).and_then(DirectCleanup::publication_version);
         Ok(PublicationEvidence::new(
             path.clone(),
             PublicationDisposition::Published,
-            facts.version_id,
+            version,
         ))
     }
 

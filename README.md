@@ -127,6 +127,199 @@ backend settings shared by transfers, while each transfer retains its own bounde
 Default tuning and its workload limitations are documented in
 [the backend defaults research](docs/research/backend-transfer-defaults.md).
 
+### Captured metadata plans
+
+Ordinary `TransferRequest::with_metadata_plan` accepts a compiled `MetadataPlan`
+or its shared `Arc`. The transfer applies those captured values before publication
+without observing source metadata again. A cloned request shares the plan's raw
+values; the transfer releases its reference on success and failure. Checkpoint
+recovery remains bound to the plan's values. Selecting `with_metadata_mode` later
+clears the supplied plan and restores the selected mode's behavior.
+New captured-plan files start with private permissions even when the plan carries
+only xattrs or tags; an existing Direct file keeps its current permissions unless
+the plan explicitly changes them. Backend-default automatic metadata selection is
+unchanged.
+
+This preserves the library's existing strict metadata-failure behavior: a failed
+staged metadata operation does not publish that stage, while a Direct target may
+already contain copied data. Supplying a plan alone does not authorize source
+deletion. Real-file tests cover all three transfer policies, source-metadata refusal,
+shared-plan release and a failed metadata persistence barrier.
+
+An ordinary request can explicitly select
+`with_metadata_failure_policy(MetadataFailurePolicy::PublishData)` to retain
+successfully copied data at the final path after a metadata application failure.
+The result remains `Err`: `metadata_failure()` retains every failed family, and
+`published_data()` exposes only the completed data publication and selected data
+verification, with no successful metadata report. It cannot authorize source
+deletion. Cancellation stops publication; data verification/publication/cleanup
+failures remain primary and retain the metadata failure alongside them.
+
+Data-only checkpoint publication clears the complete metadata-plan binding before
+arming publication. A crash cannot make that final recover as a fully successful
+copy: it is rejected until the owned incomplete recovery artifacts are released
+and the caller retries. A surviving unpublished stage can still reapply the current
+plan. Completed data-only publication releases its checkpoints normally. This
+policy handles metadata application failures; a backend failure reported during
+publication still has its own publication semantics and does not by itself prove
+data completion. Expert sessions retain their strict behavior.
+
+For an existing historical target, `MetadataPlan::apply(..., &SourceVersion::Id(...), ...)` applies captured
+values to the **actual destination version ID** and `verify_published` with the same selector checks that historical version.
+Its independent `expected_current_version` argument retains the current-publication
+identity check; the current selector without a publication constraint uses namespace stat. `Metadata::apply_to_version` refuses unsupported adapters before any current
+object mutation. S3 writes tags using `PutObjectTagging?versionId=...`; this creates no
+data version and does not change another version's tags. The caller must retain the
+source-to-target version mapping from transfer outcomes; source and target version
+IDs are different. Missing mappings must not be repaired by silently publishing old
+data over the current object. Metadata writes remain fallible and can have an unknown
+result after timeout/cancellation; retry only the same explicit version and mutation.
+
+### Bounded current-source observations
+
+`storage::read_namespace_entry` accepts an optional `ObservationPlan`. With `None`,
+it only performs stat and returns `NamespaceReadOutcome::Descriptor`, without metadata
+or link calls. With `Some(plan)`, it captures the current descriptor and requested
+attributes as `NamespaceReadOutcome::Observation` under one `NamespaceReadPolicy` and
+cancellation token. Detection deadlines and the first-failure recovery window
+cover stat, required attributes and link observation together; each retry observes
+the current path again. Only the initial stat's typed NotFound returns `entry=None`.
+An attribute/link NotFound stays an error, and unobserved Required attributes fail
+with their family and typed reason. BestEffort still returns readable entry facts
+with failed observations. Recovered failures are logged; no data read, write or
+background task is added. This is a current-path observation, not an atomic
+snapshot, historical inventory or authorization to remove a source.
+
+NFS ordinary GETATTR/LOOKUP/READDIR requests exclude ACLs. The metadata role uses
+the existing explicit ACL accessor only when the observation plan asks for ACLs;
+an omitted ACL is not fetched implicitly and is not evidence of absent support.
+This also prevents an unrelated ACL permission refusal from hiding basic file
+attributes. Explicit ACL failures remain observable while payload delivery can
+continue under the caller's existing metadata-failure policy.
+
+NFS common observations retain the SDK's returned-attribute evidence. Omitted
+mode, size or timestamps remain absent, while a present zero mode or epoch time
+remains valid. Requested missing ownership/timestamps become failed metadata
+families; omitted families remain unrequested. Missing optional metadata does not
+prevent reading a file whose type, size and handle are available. Content-version
+hints are absent when mtime/ctime evidence is incomplete. These facts do not
+authorize source deletion; the caller still handles metadata errors and readiness.
+
+### Publication durability
+
+`TransferRequest` and `ExpertDestinationRequest` accept
+`with_publication_durability(PublicationDurability::Required)`. This requires the
+backend's final persistence barriers without enabling checkpoints or changing
+Direct/Atomic visibility. `PolicyDefault` retains existing behavior; Checkpointed
+still requires durable progress and publication. Ordinary Direct adds no sync calls.
+
+Unix Local Required Direct keeps the opened inode, applies metadata through it and
+coalesces data and metadata into one final `sync_all`. It then confirms the held
+parent still matches the path and synchronizes the directory chain inside the
+configured root, deepest first. A persistence failure returns a typed publication
+failure with the specific I/O phase; it cannot return a successful outcome. Existing
+staged and checkpoint behavior stays unchanged. This does not prove the durability
+of endpoint-root preparation or metadata the caller writes after completion:
+`CallerManaged` callers still own those steps before source cleanup. Source deletion
+is an application decision, separate from this library's successful transfer result.
+
+`Namespace::persist_observed` separately confirms an already verified destination
+entry after its last mutation, including metadata-only changes and directories.
+Unix Local synchronizes the entry and its directory chain, refuses stale identity
+or change evidence, and never reads or republishes the file body. Every barrier
+also checks and synchronizes the configured root and all its ancestors, covering a
+new endpoint root or a root moved between observations. Callers must exclude
+concurrent writers and root renames through source removal. Unanchored Local roles,
+symlinks, Windows and other backends currently return typed Unsupported. Cancellation
+is checked between blocking operations; an in-progress OS fsync cannot be preempted.
+Six real-filesystem tests cover normal files/directories, later chmod, failed file
+and directory sync, cancellation, inode/root replacement and symlink substitution.
+No power-cut, network-mount or whole-job performance result is claimed.
+
+Deterministic real-file tests check zero/default versus one/required final file
+barrier, readonly metadata, nested parent barriers, failed file/directory barriers,
+parent replacement, and explicit expert metadata durability without checkpoints.
+These verify the executed barriers and failure propagation, not device power-cut
+behavior or whole-job throughput/RSS. NFS/CIFS Direct and application integration
+remain separate work.
+
+### Protected NFS source removal
+
+`Namespace::purge_observed` supports Linux-validated NFSv3/v4.1 files, symlinks
+and empty directories. It extends the existing NFS deletion interface with the
+original observation. The adapter freshly resolves the parent from the endpoint
+prefix, looks up the leaf through that parent and checks handle, kind, file size,
+mtime/ctime and captured permissions before one REMOVE/RMDIR. It never recursively
+removes children, cleans hidden transfer artifacts or reissues an uncertain delete
+under a new name/session identity. Directory timestamps may change through the
+caller's own child cleanup; identity, permissions and emptiness still apply.
+
+Missing original change evidence, failed metadata observations, foreign bindings,
+history, markers and named-only permissions are refused. NFSv4.0 and other
+unvalidated dialects remain Unsupported. In-flight cancellation and unconfirmed
+mutations retain Unknown; only authoritative name absence is AlreadyAbsent.
+The caller must confirm destination data, required metadata, verification and
+durability first and exclude concurrent source/ancestor mutation. This is no
+atomic compare-and-unlink, content checksum, ClickHouse acknowledgement or
+application scheduling policy. Timestamp precision remains server-dependent.
+
+### Failed Direct data cleanup
+
+Ordinary `TransferRequest::with_failed_data_cleanup(FailedDataCleanup::RemoveOwned)`
+opts in to retaining a dedicated cleanup handle for Direct Transfer/Verify failures.
+The caller executes `failure.cleanup_for_policy(TransferPolicy::Direct)` after the
+attempt has returned; writer tasks have settled before that return. This is separate
+from unpublished staging/recovery. The default keeps existing Direct behavior.
+Metadata failures, including explicitly published data with failed metadata, and
+unknown publication/persistence failures retain the destination.
+
+Unix Local records create-new versus existing, initial inode/change evidence and
+an independent mutation intent. Cleanup checks the configured canonical root, held
+parent and leaf inode without following symlinks. It removes only a newly created
+or attributable changed output; unchanged/unattributed existing targets remain.
+Missing output is idempotent, with parent synchronization still required. Replacement
+or sync failures retain typed cleanup evidence alongside the original transfer error.
+Callers must exclude concurrent writers from prepare through cleanup; this is not
+an atomic compare-and-unlink primitive. Other adapters currently refuse the new role.
+Eight real-file backend tests and five ordinary engine tests cover ownership, all
+Local writers, replacement/root changes, source aliases, cancellation, metadata
+retention and publication uncertainty. No network-mount or throughput/RSS acceptance
+is claimed. Expert/generated streams do not yet expose this ordinary request option.
+
+### Direct native S3 copy
+
+Direct S3-to-S3 transfers use one server-side `CopyObject` when both endpoints have
+matching native affinity and a regular source fits both the destination's single-PUT
+threshold (8 MiB by default) and native single-copy limit. The copy completes during
+data transfer, before metadata application; metadata failures can therefore report
+completed data under `PublishData`. Quick verification avoids client payload GETs;
+full verification still hashes the selected source and reads the published target.
+This route creates no checkpoint, upload or temporary key. Larger and slash-ended
+sources retain the streamed Direct route. Cancellation or an unresolved copy result
+can leave the final key changed; neither proves successful publication or authorizes
+source deletion. Exact final-data cleanup and task-level network recovery remain
+separate caller/backend contracts. See the owned real-service runner in
+[tests/lab/README.md](tests/lab/README.md).
+
+### Archive transfer policy
+
+`TarRequest.transfer_policy` explicitly selects `Direct` or `AtomicReplace`.
+`Checkpointed` is rejected before destination preparation: generated tar streams
+cannot resume within an archive. Direct archive output is supported by Unix Local
+and S3; other destination adapters must implement `validate_direct_inputs` before
+this generated stream can write. The destination checks every manifest input before
+any data is written. Unix Local compares the opened target inode with input identities,
+including hardlinks in other roots; S3 compares canonical full object locations,
+including different prefixes that reach the same key. The manifest is borrowed through
+an iterator, without another complete manifest buffer. Public expert sessions still
+refuse Direct without this input-protection lifecycle.
+
+Direct may expose partial final content on failure; artifact cleanup does not roll back
+an already written final object. Applications own the decision to clean failed target
+data through protected backend operations. Atomic archive behavior is unchanged.
+The owned real-S3 publication and fault runner is documented in
+[the integration lab](tests/lab/README.md).
+
 ### QoS semantics
 
 `QosManager` limits source-side migration traffic. Payload bytes are charged
@@ -282,6 +475,12 @@ report them adds an `IntegrityIgnored` fact. A DXN NFSv4 endpoint can use
 `IntegrityPlan::default()` to avoid requesting its unsupported ACL and xattr
 families.
 
+Content comparison also checks each stream against its descriptor's known size.
+Premature EOF or excess bytes fail with a side-attributed `Protocol` / `Read`
+failure, even when both streams produce the same incomplete digest. A descriptor
+without a size continues to compare the bytes through EOF. Metadata-only checks
+do not read data or infer stream completeness.
+
 ### Integrity-check timestamp options
 
 `IntegrityOptions` controls modification-time comparison.
@@ -345,6 +544,25 @@ mapping. `smb2_only` and the legacy `CifsStorage` path remain removed (#150).
 `tests/lab/tools/cifs_mount_comparison.rs` and `tests/cifs_policy_contract.rs` read
 `CIFS_REAL_SERVER`, `CIFS_REAL_SECOND_SERVER`, `CIFS_REAL_SHARE`, `CIFS_REAL_USER`,
 and `CIFS_REAL_PASS`.
+
+### Published-object persistence
+
+`Namespace::persist_observed` supports already verified S3 data objects on object buckets.
+It sends one fresh HEAD, selecting the exact version when the descriptor pins one, and checks
+the endpoint binding, identity, size, ETag and any captured Last-Modified. Empty objects and
+nonempty keys ending in `/` use the same contract. Publication durability comes from the
+object store's completed-write contract, not from HEAD readability or an ETag being an MD5.
+The call does no payload GET, PUT, COPY, tag read or mutation. It does not validate content or
+metadata, and callers must exclude concurrent writers until source removal.
+
+The existing `S3BucketCapabilities` distinguishes this contract with
+`durable_object_publication`; object buckets enable it and uncertified NAS buckets refuse it.
+Virtual prefixes, root descriptors, delete markers, incomplete/foreign evidence, an ignored
+version selection, failed HEAD or cancellation cannot confirm persistence. Read retries and
+the overall deadline belong to the caller; protocol errors keep their typed cause. This is
+not a guarantee about a store's cross-region replicas, power-loss behavior or every S3 vendor.
+See the [S3 consistency contract](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)
+and [HEAD semantics](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html).
 
 ### Scan network failures
 

@@ -326,15 +326,17 @@ impl<'a> Writer<'a> {
     }
 
     fn submit_piece(&mut self, offset: u64, expected: u64, piece: Bytes) {
-        let recovery_enabled = self.stage.recovery_enabled();
+        super::direct::mark_mutation(self.stage);
+        let bounded_receipts = self.stage.recovery_enabled()
+            || (self.stage.direct() && self.stage.durable_publication());
         let checkpoint_pending =
             self.stage.deferred_checkpoint().is_some() || self.stage.durable_publication();
-        self.deferred_writes_used |= recovery_enabled || checkpoint_pending;
+        self.deferred_writes_used |= bounded_receipts || checkpoint_pending;
         let write_handle = Arc::clone(self.handle);
         let periodic_checkpoint = self.stage.deferred_checkpoint().is_some();
         self.writes.push(Box::pin(async move {
             // A periodic checkpoint owns COMMIT cadence even once recovery is on.
-            let result = if recovery_enabled && !periodic_checkpoint {
+            let result = if bounded_receipts && !periodic_checkpoint {
                 write_handle.write_deferred_at(offset, piece).await
             } else if checkpoint_pending {
                 write_handle.write_until_checkpoint_at(offset, piece).await

@@ -115,6 +115,7 @@ async fn run_once(
     plan: ObservationPlan,
     order: crate::traversal::TraversalOrder,
 ) -> u64 {
+    let mut traversal_completed = Vec::new();
     let source = StorageTraversalSource::with_roles(
         Arc::clone(namespace) as Arc<dyn Namespace>,
         Arc::new(FakeMetadata),
@@ -129,7 +130,7 @@ async fn run_once(
             .cancel(tokio_util::sync::CancellationToken::new()),
     );
     let mut entries = 0_u64;
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if matches!(item, TraversalItem::Entry(_)) {
             entries += 1;
         }

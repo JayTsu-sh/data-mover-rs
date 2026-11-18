@@ -39,8 +39,8 @@ pub struct NativeStageEvidence {
     pub write: WriteEvidence,
     pub native_bytes: u64,
     pub native_requests: u64,
-    /// Whether the copy is one server-side operation sent at publication (S3: one `CopyObject`
-    /// up to 64 MiB): no intermediate state it could recover from, whatever the policy.
+    /// 是否仅需一次服务端操作；Direct 在填充时发送，其他策略可在发布时发送。
+    /// 单次操作没有可恢复的中间进度。
     pub single_operation: bool,
 }
 
@@ -53,6 +53,11 @@ pub struct NativeStageFailure {
 #[async_trait]
 pub trait NativeEndpoint: Send + Sync {
     fn affinity(&self) -> NativeAffinity;
+
+    /// 此源是否支持在填充阶段完成的 Direct 原生复制，不产生恢复状态。
+    fn supports_direct_native(&self, _source: &super::SourceDescriptor) -> bool {
+        false
+    }
 
     /// Whether this exact source is prepared as a resumable multipart operation.
     fn supports_hash_checkpoint(&self, _source: &super::SourceDescriptor) -> bool {
@@ -87,6 +92,10 @@ pub struct NativePair {
 }
 
 impl NativePair {
+    pub fn supports_direct_native(&self, source: &super::SourceDescriptor) -> bool {
+        self.destination.supports_direct_native(source)
+    }
+
     pub fn supports_hash_checkpoint(&self, source: &super::SourceDescriptor) -> bool {
         self.destination.supports_hash_checkpoint(source)
     }

@@ -52,7 +52,7 @@ pub(super) async fn observe(
     marker: SourceDescriptor,
     plan: ObservationPlan,
 ) -> Result<ObservedEntry, ObservationError> {
-    match observe_io(namespace, metadata, &marker, plan).await {
+    match observe_io(namespace, metadata, &marker, plan, None).await {
         Ok((facts, target)) => {
             let object = assemble(marker, facts, target)?;
             attach(metadata, directory, object, plan)

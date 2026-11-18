@@ -321,6 +321,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             return Ok(false);
         }
         let pin = S3ObjectFacts {
+            delete_marker: false,
             size: version.size,
             etag: version.etag.clone(),
             version_id: Some(version.version_id.clone()),

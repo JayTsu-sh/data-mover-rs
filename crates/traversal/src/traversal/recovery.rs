@@ -112,6 +112,11 @@ pub fn recoverable_traversal(
     policy: TraversalRecoveryPolicy,
     reconnect: TraversalReconnect,
 ) -> Result<(TraversalSession, TraversalRecoveryStatus), ScanSetupError> {
+    if request.consumer_completion_budget.is_some() {
+        return Err(ScanSetupError::Configuration(
+            super::TraversalConfigurationError::ConsumerResumeUnsupported,
+        ));
+    }
     let (source, signal) = ScanFailureSignal::source(initial, policy.operation_timeout)?;
     let failure = ScanFailureSignal::new(initial.kind(), policy.operation_timeout);
     let (state, receiver) = watch::channel(TraversalRecoveryState::Running { recoveries: 0 });

@@ -299,6 +299,7 @@ async fn every_nas_refusal_names_the_profile() {
         | S3ProtocolFailure::Session { diagnostic, .. } => diagnostic.contains("bucket_type=nas"),
     };
     let facts = S3ObjectFacts {
+        delete_marker: false,
         size: 10,
         etag: "\"e\"".into(),
         version_id: None,

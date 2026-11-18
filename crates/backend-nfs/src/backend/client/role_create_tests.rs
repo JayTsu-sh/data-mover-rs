@@ -85,7 +85,7 @@ impl Levels for Path3 {
 
 fn level_of(failure: Option<&NfsProtocolFailure>) -> Option<&str> {
     failure
-        .and_then(|failure| failure.level.as_ref())
+        .and_then(|failure| failure.level.as_deref())
         .map(StoragePath::as_str)
 }
 

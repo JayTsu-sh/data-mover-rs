@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     let scratch = format!("dm-e2e-opt-dir-{nanos}");
     // Only a definite NotFound permits this run to adopt the fresh scratch path.
     let path = StoragePath::new(&scratch)?;
-    match storage.namespace()?.stat(&path).await {
+    match storage.namespace()?.stat(&path, false).await {
         Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {}
         Err(error) => return Err(error.into()),
         Ok(_) => return Err(format!("{scratch} already exists").into()),
@@ -69,7 +69,7 @@ async fn create_twice(url: &str, storage: &Storage, scratch: &str) -> Result<()>
     let rooted = connect(&sub_root_url(url, scratch)).await?;
     let path = StoragePath::new(NESTED)?;
     create_directory_all(&rooted, &path).await?;
-    let entry = rooted.namespace()?.stat(&path).await?;
+    let entry = rooted.namespace()?.stat(&path, false).await?;
     if entry.kind != EntryKind::Directory {
         return Err(format!("{nested} is not a directory").into());
     }

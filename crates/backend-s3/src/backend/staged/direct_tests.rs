@@ -2,6 +2,9 @@
 //! — one `PutObject` up to T, a multipart upload above — never through a temp key, and a failed
 //! write leaves no upload.
 
+#[path = "direct_cleanup_tests.rs"]
+mod cleanup;
+
 use bytes::Bytes;
 use futures::stream;
 use tokio_util::sync::CancellationToken;

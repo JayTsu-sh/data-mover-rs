@@ -317,8 +317,8 @@ impl fmt::Display for FamilyFailure {
 pub struct MetadataApplicationFailure {
     /// Never empty.
     pub(super) failures: Box<[FamilyFailure]>,
-    /// In a failure report `Applied` means written to the stage, not durable: the item fails and
-    /// is not published, so nothing it wrote is claimed durable.
+    /// `Applied` 只证明该类别的写入，不证明整项就绪或持久性。
+    /// 调用方显式选择失败后发布数据时，仍须独立判断数据发布及元数据失败。
     pub(super) report: MetadataApplicationReport,
 }
 

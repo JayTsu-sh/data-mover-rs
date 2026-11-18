@@ -1,15 +1,9 @@
 //! Settling a write to the final key in one request — a `PutObject`, buffered or streamed — whose
 //! reply was lost or late, so it may or may not have committed.
 //!
-//! On a bucket whose `ETag`s are MD5s, the object is ours when it has our size and our MD5 as its
-//! `ETag` (ADR-0006 C14b). On one whose `ETag`s are not (an ONTAP NAS bucket derives them from the
-//! file's mtime and size, P7 §14.2 N0), nothing proves an object ours; instead prepare looked at
-//! the final key once ([`Previous`]), and a final key that still answers exactly that — or is
-//! still missing — is unchanged (decision 5). Anything else reports the final key changed. Since
-//! the store may have the whole body and commit just after a reply was lost, "unchanged" needs
-//! two `HEAD`s a grace period apart (default [`SETTLE_GRACE`]); a commit later than that is still
-//! reported unchanged — a residual risk, bounded by the store committing within milliseconds of
-//! the last byte (N0: 0.04 s) — and the object it committed holds our bytes.
+//! MD5／大小匹配可满足当前数据复制，但可能命中相同旧内容，不能当成创建回执。
+//! 不透明 `ETag` 的桶只依据 prepare 的对象作未改变核对；两次 HEAD 间的 grace 不保证
+//! 服务器此后不会迟提交，现有单写者及设备提交时限前提仍适用。
 
 /// How long settling waits between the two `HEAD`s that find a final key unchanged.
 pub(super) const SETTLE_GRACE: Duration = Duration::from_secs(2);
@@ -21,6 +15,7 @@ use tokio::time::sleep;
 use super::super::source::role_failure;
 use super::super::{S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3WriteFacts};
 use super::S3StagedDestination;
+use super::completion::observed_facts;
 use super::single::{changed, same_etag, unchanged};
 use crate::model::{FailureClass, Operation, StoragePath};
 use crate::storage::{PublicationFailure, StorageRoleFailure};
@@ -76,8 +71,8 @@ pub(super) struct Settling<'a> {
     pub(super) grace: Duration,
 }
 
-/// Settles a write whose outcome is unknown, `failure` being how it failed: published when the key
-/// holds our MD5 (`md5`, given only on a bucket whose `ETag`s are MD5s); unchanged when it still
+/// Settles a write whose outcome is unknown, `failure` being how it failed: content matched when the key
+/// holds the expected MD5 (`md5`, given only on a bucket whose `ETag`s are MD5s); unchanged when it still
 /// holds what prepare found — checked twice, `grace` apart, since the store has the whole body and
 /// may commit just after a lost reply; otherwise changed.
 pub(super) async fn settle_unknown_write<P: S3Protocol + ?Sized>(
@@ -92,10 +87,8 @@ pub(super) async fn settle_unknown_write<P: S3Protocol + ?Sized>(
         && facts.size == settling.size
         && same_etag(&facts.etag, md5)
     {
-        return Ok(S3WriteFacts::new(
-            facts.etag.clone(),
-            facts.version_id.clone(),
-        ));
+        tracing::warn!(path = %path.as_str(), ?failure, "S3 write response unconfirmed; matching data reconciled without a created-version receipt");
+        return Ok(observed_facts(facts.etag.clone(), facts.version_id.clone()));
     }
     let Some(before) = settling.previous else {
         return Err(changed(role_failure(path, Operation::Publish, failure)));

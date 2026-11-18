@@ -126,6 +126,8 @@ pub(super) async fn write(
         .await?;
     let fresh = LocalStagedDestination::take_fresh_write(stage);
     if stage.direct() {
+        #[cfg(unix)]
+        super::direct_cleanup::mark_mutation(stage);
         LocalStagedDestination::sync_written_file(
             Arc::clone(&file),
             0,
@@ -376,7 +378,7 @@ impl<'a> Writer<'a> {
             return Err(error);
         }
         self.sync_finished_file().await?;
-        if self.stage.durable_publication() {
+        if LocalStagedDestination::needs_stage_barrier(self.stage) {
             super::hash_checkpoint::barrier(self.stage, self.completed.prefix).await?;
         }
         if self.stage.recovery_enabled() {
@@ -396,10 +398,10 @@ impl<'a> Writer<'a> {
                 self.completed.prefix,
                 self.stage.final_destination().path(),
                 !self.stage.checkpoint_enabled(),
-                self.stage.durable_publication(),
+                LocalStagedDestination::needs_stage_barrier(self.stage),
             )
             .await?;
-            if self.stage.durable_publication() {
+            if LocalStagedDestination::needs_stage_barrier(self.stage) {
                 super::hash_checkpoint::barrier(self.stage, self.completed.prefix).await?;
             }
             if self.stage.recovery_enabled() {
@@ -412,9 +414,9 @@ impl<'a> Writer<'a> {
     }
 
     async fn sync_finished_file(&mut self) -> Result<(), StorageRoleFailure> {
-        if self.stage.durable_publication() || !self.fresh {
+        if LocalStagedDestination::needs_stage_barrier(self.stage) || !self.fresh {
             #[cfg(any(test, feature = "test-support"))]
-            if self.stage.durable_publication() {
+            if LocalStagedDestination::needs_stage_barrier(self.stage) {
                 self.adapter
                     .write_probe
                     .final_data_sync_calls
@@ -425,7 +427,7 @@ impl<'a> Writer<'a> {
                 self.completed.prefix,
                 self.stage.final_destination().path(),
                 !self.fresh,
-                self.stage.durable_publication(),
+                LocalStagedDestination::needs_stage_barrier(self.stage),
             )
             .await?;
         }

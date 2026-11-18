@@ -42,9 +42,10 @@ async fn run(
     source: &StorageTraversalSource,
     request: TraversalRequest,
 ) -> io::Result<(Vec<TraversalItem>, TraversalOutcome)> {
+    let mut traversal_completed = Vec::new();
     let mut session = source.traverse(request);
     let mut items = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         items.push(item);
     }
     let outcome = session.finish().await.map_err(io::Error::other)?;
@@ -223,6 +224,7 @@ async fn an_unreadable_directory_fails_alone() -> io::Result<()> {
 /// Cancelled part way through a real tree, with the consumer stalled: `Cancelled`, promptly.
 #[tokio::test]
 async fn cancellation_part_way_is_cancelled() -> io::Result<()> {
+    let mut traversal_completed = Vec::new();
     let root = tempfile::tempdir()?;
     tree(root.path())?;
     let (source, _) = source(root.path())?;
@@ -230,10 +232,10 @@ async fn cancellation_part_way_is_cancelled() -> io::Result<()> {
     let mut session =
         source.traverse(request(TraversalOrder::Unordered, 8)?.cancel(cancel.clone()));
     for _ in 0..20 {
-        let _ = session.next_item().await;
+        let _ = session.next_item(&mut traversal_completed).await;
     }
     cancel.cancel();
-    while session.next_item().await.is_some() {}
+    while session.next_item(&mut traversal_completed).await.is_some() {}
     let ended = tokio::time::timeout(std::time::Duration::from_secs(2), session.finish())
         .await
         .map_err(|_| io::Error::other("the cancelled traversal did not end"))?;

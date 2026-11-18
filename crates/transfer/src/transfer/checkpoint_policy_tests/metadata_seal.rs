@@ -169,7 +169,7 @@ async fn leave_s3_final_requested(
     seed_multipart_source(protocol).await?;
     let descriptor = s3_source_descriptor(protocol).await?;
     protocol
-        .put_tags("src/file", tags)
+        .put_tags("src/file", None, tags)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let pointer = artifact_name("file", ArtifactKind::Upload);
@@ -263,7 +263,7 @@ async fn changed_source_tags_with_unchanged_payload_cannot_adopt_the_previous_fi
         old_tags
     );
     protocol
-        .put_tags("src/file", &old_tags)
+        .put_tags("src/file", None, &old_tags)
         .await
         .map_err(|e| format!("{e:?}"))?;
     *protocol.delete_failure.lock().await = None;
@@ -278,7 +278,7 @@ async fn completion_before_tags_cannot_recover_as_success() -> TestResult {
     seed_multipart_source(&protocol).await?;
     let expected = vec![ObjectTag::new("generation", "copied")?];
     protocol
-        .put_tags("src/file", &expected)
+        .put_tags("src/file", None, &expected)
         .await
         .map_err(|e| format!("{e:?}"))?;
     *protocol.tag_write_failure.lock().await = Some(S3ProtocolFailure::session(
@@ -333,7 +333,7 @@ async fn recovered_final_validates_tags_without_reapplying_them() -> TestResult 
         .ok_or("versioned final")?;
     let reversed: Vec<_> = tags.into_iter().rev().collect();
     protocol
-        .put_tags("file", &reversed)
+        .put_tags("file", None, &reversed)
         .await
         .map_err(|e| format!("{e:?}"))?;
     *protocol.delete_failure.lock().await = None;
@@ -372,7 +372,7 @@ async fn change_tags_without_changing_payload(
         .await
         .map_err(|e| format!("{e:?}"))?;
     protocol
-        .put_tags("src/file", tags)
+        .put_tags("src/file", None, tags)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let after = protocol

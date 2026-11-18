@@ -1,13 +1,258 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::super::namespace::{NfsUndescribedChild, undescribed};
+use super::super::protocol::{classify_error, classify_mutation_error};
 use super::*;
 use crate::model::{BackendKind, FailureClass, SourceVersion};
+
+#[test]
+fn sdk_readlink_decode_reason_reaches_entry_failure() -> Result<(), Box<dyn std::error::Error>> {
+    let path = StoragePath::new("link")?;
+    let failed = classify_error(nfs_rs::NfsError::Xdr(
+        "READLINK target is not UTF-8: invalid utf-8 sequence of 1 bytes from index 0".into(),
+    ));
+    assert!(
+        failed.status.is_none(),
+        "a decode error is not a server status"
+    );
+    let StorageRoleFailure::Entry(error) = role_failure(&path, Operation::Observe, failed) else {
+        panic!("READLINK decoding remains entry scoped");
+    };
+    assert_eq!(error.class(), FailureClass::Protocol);
+    assert_eq!(error.transience(), Transience::Unknown);
+    assert!(
+        matches!(error.source().and_then(|cause| cause.downcast_ref()),
+        Some(nfs_rs::NfsError::Xdr(reason)) if reason.contains("READLINK"))
+    );
+    assert!(
+        error.diagnostic().contains("READLINK target is not UTF-8"),
+        "{}",
+        error.diagnostic()
+    );
+    Ok(())
+}
+
+#[test]
+fn sdk_failure_keeps_shared_typed_cause() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<NfsProtocolFailure>();
+    let failure = classify_error(nfs_rs::NfsError::Xdr("READLINK target is not UTF-8".into()));
+    let cloned = failure.clone();
+    let (Some(cause), Some(shared)) = (&failure.cause, &cloned.cause) else {
+        panic!("classified SDK failures keep their cause");
+    };
+    assert!(Arc::ptr_eq(cause, shared));
+    assert!(matches!(cause.as_ref(), nfs_rs::NfsError::Xdr(reason) if reason.contains("READLINK")));
+    assert!(NfsProtocolFailure::protocol().cause.is_none());
+}
+
+#[test]
+fn sdk_listing_decode_keeps_specific_cause_and_entry_scope()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = StoragePath::new("dir/link")?;
+    let detail = "READLINK target is not UTF-8";
+    let failure = undescribed(NfsUndescribedChild {
+        path: path.clone(),
+        failure: classify_error(nfs_rs::NfsError::Xdr(detail.into())),
+        reason: "the child attributes could not be decoded",
+        raw_name: None,
+    });
+    assert_eq!(failure.path(), &path);
+    assert_eq!(failure.operation(), Operation::Traverse);
+    assert_eq!(failure.class(), FailureClass::Protocol);
+    assert_eq!(failure.transience(), Transience::Unknown);
+    assert!(
+        matches!(failure.source().and_then(|cause| cause.downcast_ref()),
+        Some(nfs_rs::NfsError::Xdr(reason)) if reason == detail)
+    );
+    assert!(
+        failure
+            .diagnostic()
+            .contains("child attributes could not be decoded")
+    );
+    assert!(
+        failure.diagnostic().contains(detail),
+        "{}",
+        failure.diagnostic()
+    );
+    Ok(())
+}
+
+#[test]
+fn sdk_listing_keeps_transport_and_server_causes_entry_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (source, class, transience, detail) in [
+        (
+            nfs_rs::NfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "child GETATTR timed out",
+            )),
+            FailureClass::Timeout,
+            Transience::Transient,
+            "child GETATTR timed out",
+        ),
+        (
+            nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_ACCES),
+            FailureClass::PermissionDenied,
+            Transience::Permanent,
+            "NFS3ERR_ACCES",
+        ),
+    ] {
+        let failure = undescribed(NfsUndescribedChild {
+            path: StoragePath::new("dir/child")?,
+            failure: classify_error(source),
+            reason: "the child attributes could not be read",
+            raw_name: None,
+        });
+        assert_eq!(failure.operation(), Operation::Traverse);
+        assert_eq!(failure.class(), class);
+        assert_eq!(failure.transience(), transience);
+        assert!(failure.diagnostic().contains(detail));
+    }
+    Ok(())
+}
+
+#[test]
+fn sdk_transport_reason_reaches_session_failure() -> Result<(), Box<dyn std::error::Error>> {
+    let path = StoragePath::new("file")?;
+    let failure = classify_error(nfs_rs::NfsError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "peer reset while reading response header",
+    )));
+    let StorageRoleFailure::Session(error) = role_failure(&path, Operation::Read, failure) else {
+        panic!("connection reset is session scoped");
+    };
+    assert_eq!(error.class(), FailureClass::Connectivity);
+    assert_eq!(error.transience(), Transience::Transient);
+    assert!(
+        error
+            .diagnostic()
+            .contains("peer reset while reading response header")
+    );
+    Ok(())
+}
+
+#[test]
+fn cloned_role_failure_keeps_uncertain_sdk_transmission_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nfs_rs::{
+        NFSVersion, NfsError, OperationClass, OperationOutcome, OperationOutcomeError,
+        RecoveryAction, RequestContext, RequestTransmission,
+    };
+
+    let cause = NfsError::OperationOutcome(Box::new(OperationOutcomeError::new(
+        OperationOutcome::Uncertain,
+        OperationClass::ReplaySensitive,
+        RecoveryAction::VerifyThenResume,
+        RequestContext {
+            operation: "rename".into(),
+            protocol: NFSVersion::NFSv4p1,
+            request_id: None,
+        },
+        NfsError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "nfs://user:private-password@server/export",
+        )),
+    )));
+    let failure = role_failure(
+        &StoragePath::new("output")?,
+        Operation::Publish,
+        classify_mutation_error(cause),
+    );
+    let cloned = failure.clone();
+    let StorageRoleFailure::Session(session) = &cloned else {
+        panic!("timed-out mutation must be session scoped");
+    };
+    assert_eq!(cloned, failure);
+    let plain = BackendSessionFailure::new(
+        session.operation(),
+        session.class(),
+        session.transience(),
+        session.diagnostic(),
+    )?;
+    assert_eq!(*session, plain);
+    assert!(plain.source().is_none());
+    assert!(!format!("{cloned:?} {cloned} {}", session.diagnostic()).contains("private-password"));
+    let evidence = cloned
+        .source()
+        .and_then(Error::source)
+        .and_then(|source| source.downcast_ref::<NfsError>())
+        .and_then(NfsError::operation_outcome)
+        .unwrap_or_else(|| panic!("role error chain must keep the SDK outcome"));
+    assert_eq!(evidence.outcome, OperationOutcome::Uncertain);
+    assert_eq!(evidence.transmission, RequestTransmission::Sent);
+    assert_eq!(evidence.recovery, RecoveryAction::VerifyThenResume);
+    Ok(())
+}
+
+#[test]
+fn sdk_failure_diagnostic_is_bounded_redacted_and_nul_free()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = StoragePath::new("file")?;
+    for detail in [
+        "READLINK nfs://alice:p/a#ss@server/export and smb://bob:other-secret@host/share"
+            .to_owned(),
+        format!(
+            "READLINK nfs://alice:{}@server/export",
+            "secret".repeat(2000)
+        ),
+        format!("READLINK invalid UTF-8\0{}", "错误🦀".repeat(2000)),
+    ] {
+        let failure = classify_error(nfs_rs::NfsError::Xdr(detail));
+        let StorageRoleFailure::Entry(error) = role_failure(&path, Operation::Observe, failure)
+        else {
+            panic!("decode failures remain entry scoped");
+        };
+        let text = error.diagnostic();
+        assert!(text.starts_with("NFS role failed"));
+        assert!(text.contains("READLINK"));
+        assert!(text.len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(!text.contains('\0'));
+        for secret in ["alice", "p/a#ss", "bob", "other-secret", "secret"] {
+            assert!(!text.contains(secret), "leaked {secret}: {text}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_status_and_long_parent_context_keep_a_valid_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = StoragePath::new(format!("dir/{}", "长".repeat(4000)))?;
+    let parent = StoragePath::new("dir")?;
+    let mut failure =
+        NfsProtocolFailure::new(FailureClass::PermissionDenied, Transience::Permanent);
+    failure.status = Some(Arc::from(format!("NFS4ERR_PERM\0{}", "拒绝".repeat(4000))));
+    for entry in [failure.clone(), failure.at_level(parent.clone())] {
+        let StorageRoleFailure::Entry(error) = role_failure(&path, Operation::Prepare, entry)
+        else {
+            panic!("permission errors remain entry scoped");
+        };
+        assert_eq!(error.class(), FailureClass::PermissionDenied);
+        assert_eq!(error.transience(), Transience::Permanent);
+        assert!(!error.diagnostic().contains('\0'));
+        assert!(error.diagnostic().len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(error.diagnostic().contains("NFS4ERR_PERM"));
+    }
+    let StorageRoleFailure::Entry(error) = entry_scoped(
+        &StoragePath::new("dir/leaf")?,
+        Operation::Prepare,
+        classify_error(nfs_rs::NfsError::Xdr("READLINK target is not UTF-8".into()))
+            .at_level(parent.clone()),
+    ) else {
+        panic!("parent failures remain entry scoped");
+    };
+    assert_eq!(error.path(), &parent);
+    assert!(error.diagnostic().contains("READLINK target is not UTF-8"));
+    Ok(())
+}
 
 struct FakeProtocol {
     payload: Bytes,
     handle: Bytes,
     maximum_read_chunk_bytes: usize,
+    content_version: Option<Bytes>,
     described: AtomicUsize,
     opened: Mutex<usize>,
     active_reads: Arc<AtomicUsize>,
@@ -60,7 +305,7 @@ impl NfsSourceProtocol for FakeProtocol {
             kind: EntryKind::File,
             size: Some(self.payload.len() as u64),
             file_handle: self.handle.clone(),
-            content_version: Bytes::from_static(b"version-1"),
+            content_version: self.content_version.clone(),
         })
     }
 
@@ -99,6 +344,7 @@ async fn one_stream_uses_one_open_cursor_and_exact_ranges() -> Result<(), Box<dy
         payload: Bytes::from(vec![7; 2 * 1024 * 1024 + 3]),
         handle: Bytes::from_static(b"stable-file-handle"),
         maximum_read_chunk_bytes: 1024 * 1024,
+        content_version: Some(Bytes::from_static(b"version-1")),
         described: AtomicUsize::new(0),
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
@@ -149,6 +395,7 @@ async fn shared_budget_bounds_nfs_prefetch_without_serializing_reads()
         payload: Bytes::from(vec![7; 4 * 1024 * 1024]),
         handle: Bytes::from_static(b"stable-file-handle"),
         maximum_read_chunk_bytes: 1024 * 1024,
+        content_version: Some(Bytes::from_static(b"version-1")),
         described: AtomicUsize::new(0),
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
@@ -204,6 +451,7 @@ async fn opened_identity_detects_change_and_precancel_avoids_another_open()
         payload: Bytes::from_static(b"payload"),
         handle: Bytes::from_static(b"current-handle"),
         maximum_read_chunk_bytes: 1024 * 1024,
+        content_version: Some(Bytes::from_static(b"version-1")),
         described: AtomicUsize::new(0),
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
@@ -269,6 +517,7 @@ async fn negotiated_protocol_limit_prevents_internal_read_resplitting()
         payload: Bytes::from_static(b"abcdefgh"),
         handle: Bytes::from_static(b"stable-file-handle"),
         maximum_read_chunk_bytes: 3,
+        content_version: Some(Bytes::from_static(b"version-1")),
         described: AtomicUsize::new(0),
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
@@ -414,6 +663,7 @@ async fn qos_paces_actual_cursor_calls_instead_of_queued_futures()
         payload: Bytes::from_static(b"abcdefghijklmnop"),
         handle: Bytes::from_static(b"handle"),
         maximum_read_chunk_bytes: 4,
+        content_version: Some(Bytes::from_static(b"version-1")),
         described: AtomicUsize::new(0),
         opened: Mutex::new(0),
         active_reads: Arc::new(AtomicUsize::new(0)),
@@ -451,5 +701,47 @@ async fn qos_paces_actual_cursor_calls_instead_of_queued_futures()
     }
     assert_eq!(budget.stats().source_read_operations, 4);
     assert_eq!(budget.stats().client_streamed_shaped_bytes, 16);
+    Ok(())
+}
+
+#[tokio::test]
+async fn absent_metadata_and_content_evidence_do_not_block_payload_reads()
+-> Result<(), Box<dyn std::error::Error>> {
+    let protocol = Arc::new(FakeProtocol {
+        payload: Bytes::from_static(b"payload without optional metadata"),
+        handle: Bytes::from_static(b"stable-file-handle"),
+        maximum_read_chunk_bytes: 1024,
+        content_version: None,
+        described: AtomicUsize::new(0),
+        opened: Mutex::new(0),
+        active_reads: Arc::new(AtomicUsize::new(0)),
+        maximum_active_reads: Arc::new(AtomicUsize::new(0)),
+        read_started: Arc::new(Mutex::new(Vec::new())),
+    });
+    let source = adapter(protocol.clone());
+    let path = StoragePath::new("file")?;
+    let descriptor = source.describe(&path).await?;
+    assert!(descriptor.content_version.is_none());
+    assert!(descriptor.inline_timestamps.is_none());
+    assert!(descriptor.inline_ownership.is_none());
+    let mut stream = source
+        .read(ReadRequest {
+            path,
+            range: None,
+            expected_source: Some(descriptor.source_identity),
+            maximum_chunk_bytes: 1024,
+            read_inflight: 1,
+            read_budget: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            source_qos: None,
+            version: SourceVersion::Current,
+        })
+        .await?;
+    let mut actual = Vec::new();
+    while let Some(chunk) = stream.next().await.transpose()? {
+        actual.extend_from_slice(&chunk);
+    }
+    assert_eq!(actual, protocol.payload);
+    assert_eq!(protocol.active_reads.load(Ordering::SeqCst), 0);
     Ok(())
 }

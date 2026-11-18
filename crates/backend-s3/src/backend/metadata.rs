@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use crate::model::{
     BackendIdentity, FailureClass, MetadataCapabilities, MetadataFamily as F, MetadataObservation,
@@ -191,6 +192,54 @@ impl<P: S3Protocol + 'static> S3Metadata<P> {
     }
 }
 
+impl<P: S3Protocol + 'static> S3Metadata<P> {
+    async fn apply_selected(
+        &self,
+        path: &StoragePath,
+        version_id: Option<&str>,
+        mutation: MetadataMutation,
+        cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        if cancel.is_cancelled() {
+            return Err(cancelled(path, Operation::Metadata));
+        }
+        if version_id.is_some_and(str::is_empty) {
+            return Err(classified_entry(
+                path,
+                Operation::Metadata,
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+                "an explicit metadata target version must not be empty",
+            ));
+        }
+        if matches!(self.tag_support, S3TagSupport::Unsupported)
+            && matches!(mutation, MetadataMutation::Tags(_))
+        {
+            return Err(classified_entry(
+                path,
+                Operation::Metadata,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "object tags are unsupported by this S3 compatibility profile",
+            ));
+        }
+        match mutation {
+            MetadataMutation::Tags(tags) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(cancelled(path, Operation::Metadata)),
+                result = self.protocol.put_tags(path.as_str(), version_id, &tags) => {
+                    result.map_err(|failure| role_failure(path, Operation::Metadata, failure))
+                }
+            },
+            _ => Err(entry(
+                path,
+                Operation::Metadata,
+                "metadata kind is unsupported by S3",
+            )),
+        }
+    }
+}
+
 #[async_trait]
 impl<P: S3Protocol + 'static> Metadata for S3Metadata<P> {
     fn observation_capabilities(&self) -> MetadataCapabilities {
@@ -267,36 +316,22 @@ impl<P: S3Protocol + 'static> Metadata for S3Metadata<P> {
 
     async fn apply(
         &self,
-        path: &crate::model::StoragePath,
+        path: &StoragePath,
         mutation: MetadataMutation,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
-        if cancel.is_cancelled() {
-            return Err(cancelled(path, Operation::Metadata));
-        }
-        if matches!(self.tag_support, S3TagSupport::Unsupported)
-            && matches!(mutation, MetadataMutation::Tags(_))
-        {
-            return Err(super::source::classified_entry(
-                path,
-                Operation::Metadata,
-                FailureClass::Unsupported,
-                Transience::Permanent,
-                "object tags are unsupported by this S3 compatibility profile",
-            ));
-        }
-        match mutation {
-            MetadataMutation::Tags(tags) => self
-                .protocol
-                .put_tags(path.as_str(), &tags)
-                .await
-                .map_err(|e| role_failure(path, Operation::Metadata, e)),
-            _ => Err(entry(
-                path,
-                Operation::Metadata,
-                "metadata kind is unsupported by S3",
-            )),
-        }
+        self.apply_selected(path, None, mutation, cancel).await
+    }
+
+    async fn apply_to_version(
+        &self,
+        path: &StoragePath,
+        version_id: &str,
+        mutation: MetadataMutation,
+        cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        self.apply_selected(path, Some(version_id), mutation, cancel)
+            .await
     }
 }
 

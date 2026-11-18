@@ -25,8 +25,13 @@ pub mod endpoint;
 mod factory;
 mod handle;
 pub mod listing;
+mod namespace_read;
 mod native;
 mod observation;
+pub use namespace_read::{
+    NamespaceReadCause, NamespaceReadFailure, NamespaceReadOutcome, NamespaceReadPolicy,
+    read_namespace_entry,
+};
 mod permissions;
 mod read_range;
 pub use observation::{EntryObservationFailure, observe_descriptor};
@@ -80,12 +85,13 @@ pub use listing::{
 pub use roles::DeferredCheckpoint;
 pub use roles::{
     ByteStream, CaseSensitivity, CheckpointObservation, CreateSymlinkRequest, DeleteMarkerOutcome,
-    FinalDestination, Metadata, MetadataMutation, NameNormalization, NameSemantics, Namespace,
-    NamespaceCapabilities, PositionedByteStream, PositionedChunk, PrepareRequest, PreparedStage,
-    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    ReadBackMethod, ReadRequest, ReadSource, StagedDestination, StagedMetadataApplicationFailure,
-    StorageRoleFailure, UnpinnedReadReason, UploadDigest, UploadDigestGap, VerificationEvidence,
-    VerificationPoint, VerifyRequest, WriteEvidence,
+    FailedDataCleanup, FinalDestination, Metadata, MetadataMutation, NameNormalization,
+    NameSemantics, Namespace, NamespaceCapabilities, PositionedByteStream, PositionedChunk,
+    PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure,
+    PublishRequest, PurgeFailure, PurgeOutcome, ReadBackMethod, ReadRequest, ReadSource,
+    StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, UnpinnedReadReason,
+    UploadDigest, UploadDigestGap, VerificationEvidence, VerificationPoint, VerifyRequest,
+    WriteEvidence,
 };
 
 pub use crate::runtime::read_budget::ReadBudget;

@@ -120,7 +120,9 @@ fn failure_class<T: std::fmt::Debug>(
 #[tokio::test]
 async fn stat_returns_one_descriptor_for_the_requested_path() -> Result {
     let protocol = RecordingProtocol::new(None);
-    let entry = namespace(&protocol)?.stat(&path("file.bin")?).await?;
+    let entry = namespace(&protocol)?
+        .stat(&path("file.bin")?, false)
+        .await?;
     let entries = [entry];
     assert_eq!(entries[0].path.as_str(), "file.bin");
     assert_eq!(entries[0].kind, EntryKind::File);
@@ -503,7 +505,9 @@ async fn an_undescribable_child_fails_alone() -> Result {
 #[tokio::test]
 async fn stat_never_claims_permission_bits() -> Result {
     let protocol = RecordingProtocol::new(None);
-    let entry = namespace(&protocol)?.stat(&path("file.bin")?).await?;
+    let entry = namespace(&protocol)?
+        .stat(&path("file.bin")?, false)
+        .await?;
     assert_eq!(
         entry.inline_mode(),
         None,

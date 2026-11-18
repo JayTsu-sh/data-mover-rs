@@ -56,6 +56,7 @@ pub(super) async fn describe_source(
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
         })?;
+    super::observation::refuse_unreadable(&descriptor)?;
     if let Some(observed) = request.source_observation() {
         super::observation::validate_constraint(source, observed, &descriptor)?;
     }
@@ -77,9 +78,9 @@ pub(super) fn plan_request(
     destination: &dyn StagedDestination,
     descriptor: &SourceDescriptor,
 ) -> Result<(TransferPlan, Option<NativePair>), TransferFailure> {
-    let native_pair = (request.transfer_policy != TransferPolicy::Direct)
-        .then(|| native::eligible_native_pair(request))
-        .flatten();
+    let native_pair = native::eligible_native_pair(request).filter(|pair| {
+        request.transfer_policy != TransferPolicy::Direct || pair.supports_direct_native(descriptor)
+    });
     let mut plan = plan_transfer(
         descriptor,
         source.maximum_read_chunk_bytes(),

@@ -317,6 +317,7 @@ async fn inline_timestamps_replace_the_metadata_round_trip() {
             )
         }
     }
+    let mut traversal_completed = Vec::new();
     let metadata = Arc::new(CountingMetadata::new());
     let source = StorageTraversalSource::with_roles(
         Arc::new(InlineNamespace),
@@ -324,7 +325,7 @@ async fn inline_timestamps_replace_the_metadata_round_trip() {
     );
     let mut session = source.traverse(request(tokio_util::sync::CancellationToken::new()));
     let mut modified = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         if crate::traversal::is_marker(&item) {
             continue;
         }
@@ -451,6 +452,9 @@ async fn a_deferred_observation_failure_still_lists_the_directory() {
     let mut failed = Vec::new();
     for item in &items {
         match item {
+            TraversalItem::ConsumerEntry(_) | TraversalItem::SubtreeReady(_) => {
+                panic!("ordinary scan emitted consumer work")
+            }
             TraversalItem::Entry(entry) => emitted.push(entry.path().as_str().to_owned()),
             TraversalItem::Failure(failure) => failed.push((failure.scope, failure.path.as_str())),
             TraversalItem::DirectoryListed(_)

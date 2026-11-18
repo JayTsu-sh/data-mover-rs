@@ -349,6 +349,7 @@ impl MemoryS3 {
             // An object written before versioning was enabled is version "null".
             let object = self.objects.lock().await.get(key).cloned();
             return Some(object.ok_or_else(not_found).map(|bytes| S3ObjectFacts {
+                delete_marker: false,
                 size: bytes.len() as u64,
                 etag: self.etag_for(&bytes),
                 version_id: Some("null".to_string()),
@@ -364,6 +365,7 @@ impl MemoryS3 {
             .flatten();
         let last_modified = *self.last_modified.lock().await;
         Some(stored.ok_or_else(not_found).map(|bytes| S3ObjectFacts {
+            delete_marker: false,
             size: bytes.len() as u64,
             etag: self.etag_for(&bytes),
             version_id: Some(id),

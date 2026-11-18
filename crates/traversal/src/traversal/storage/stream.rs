@@ -317,7 +317,7 @@ fn prepare_child(
     page: &mut Page,
 ) {
     let kind = descriptor.kind;
-    let plan = shared.policy.observation_plan;
+    let plan = shared.policy.observation_plan_for(&descriptor);
     if let Some((decision, metadata)) = immediate_decision(shared, work, &descriptor) {
         let path = &descriptor.path;
         page.tally(shared, kind, path, work.child_depth, decision, hint);

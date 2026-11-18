@@ -19,10 +19,10 @@ mod version;
 pub use metadata::{Metadata, MetadataMutation};
 pub use namespace::{
     CaseSensitivity, CreateSymlinkRequest, NameNormalization, NameSemantics, Namespace,
-    NamespaceCapabilities,
+    NamespaceCapabilities, PurgeFailure, PurgeOutcome,
 };
 pub use stage::DeferredCheckpoint;
-pub use stage::PreparedStage;
+pub use stage::{FailedDataCleanup, PreparedStage};
 pub use verification::{ReadBackMethod, UnpinnedReadReason, UploadDigest, UploadDigestGap};
 use version::version_unsupported;
 
@@ -173,6 +173,10 @@ pub trait ReadSource: Send + Sync {
     }
     /// Describes one version of `path`. The descriptor pins the version it describes, which a
     /// versioned source resolves from `Current` to the version it found.
+    ///
+    /// 对象存储可描述明确选中的删除标记：`listing_only=true`、`size=None`，history
+    /// 仅携带一个已选记录，且不声称整个 key 历史完整。它不是可读数据，`read` 必须拒绝；
+    /// `Current` 隐藏的删除标记仍按当前对象缺失处理。
     ///
     /// The default serves sources without versions: `Current` is [`ReadSource::describe`], and
     /// `Id` is `Unsupported`.
@@ -451,6 +455,24 @@ pub trait StagedDestination: Send + Sync {
             .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
         ))
     }
+    /// 在首次写入前，确认已打开的 Direct 目标不与生成流的任一源项别名。
+    /// 输入迭代器仅借用清单，不要求缓存所有描述；失败不得修改输入或目标内容。
+    async fn validate_direct_inputs<'inputs>(
+        &self,
+        stage: &PreparedStage,
+        _inputs: Box<dyn Iterator<Item = SourceDescriptor> + Send + 'inputs>,
+    ) -> Result<(), StorageRoleFailure> {
+        Err(StorageRoleFailure::Entry(
+            EntryOperationFailure::new(
+                stage.final_destination().path().clone(),
+                Operation::Prepare,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "generated Direct input protection is unsupported",
+            )
+            .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+        ))
+    }
     /// 是否支持保留未触及区间的原地补丁；不能用会截断文件的 positioned writer 替代。
     fn supports_sparse_patch(&self) -> bool {
         false
@@ -628,13 +650,26 @@ pub trait StagedDestination: Send + Sync {
         Ok(())
     }
     /// Makes the stage the final object. On success nothing of the stage is left at the
-    /// destination — no stage, no pointer — so a verification that fails after publication can
-    /// drop the stage without cleaning anything up.
+    /// destination — no stage, no pointer. Ordinary discard never removes this final object;
+    /// explicitly authorized Direct data failure cleanup may remove only its owned output.
     async fn publish(
         &self,
         stage: &PreparedStage,
         request: PublishRequest,
     ) -> Result<PublicationEvidence, PublicationFailure>;
+    /// 显式授权后的 Direct 数据失败清理。只删除本次拥有的坏输出；不得删除未修改的
+    /// 已有目标、源别名或被替换的无关条目。调用方必须先收束本次写任务，
+    /// 并在准备到清理完成之间排除并发写入；此操作不提供跨协议原子 compare-and-unlink。
+    /// 元数据错误不授予删除权限；未知写入／发布结果必须保留输出并明确返回未确认原因。
+    /// 普通 discard 不授予这种权限。
+    async fn remove_failed_direct(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
+        Err(super::checkpoint_stream::failure(
+            stage.final_destination.path(),
+            FailureClass::Unsupported,
+            "owned Direct data failure cleanup is unsupported",
+        ))
+    }
+
     /// Removes an unpublished stage. A stage kept at the destination removes its pointer
     /// before the staged content, so a clean-up that fails halfway never leaves a pointer that
     /// would resume the stage (ADR-0006).

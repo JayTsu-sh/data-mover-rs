@@ -12,9 +12,56 @@ use super::{
 };
 
 #[cfg(unix)]
+use super::direct_durability::sync as sync_direct_publication;
+#[cfg(unix)]
 use super::{Arc, AtomicBool, Bytes, LocalStageState, OpenOptions, Path};
+#[cfg(unix)]
+use crate::model::{BackendKind, IdentityStrength, SourceIdentity};
+use crate::model::{EntryOperationFailure, StoragePath};
+use crate::storage::SourceDescriptor;
 
 impl LocalStagedDestination {
+    pub(super) async fn check_direct_inputs(
+        &self,
+        stage: &PreparedStage,
+        inputs: Box<dyn Iterator<Item = SourceDescriptor> + Send + '_>,
+    ) -> Result<(), StorageRoleFailure> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let path = stage.final_destination().path();
+            let file = self
+                .open_stage_file_for(stage, Operation::Prepare, false)
+                .await?;
+            let metadata = tokio::task::spawn_blocking(move || file.metadata())
+                .await
+                .map_err(|_| failure(path, Operation::Prepare, FailureClass::Internal))?
+                .map_err(|error| io_failure(path, Operation::Prepare, &error))?;
+            for source in inputs {
+                if source.source_identity.backend().kind() == BackendKind::Local
+                    && source.source_identity
+                        == SourceIdentity::from_u64_pair_le(
+                            source.source_identity.backend().clone(),
+                            IdentityStrength::StableWithinBackend,
+                            metadata.dev(),
+                            metadata.ino(),
+                        )
+                {
+                    return Err(failure(path, Operation::Prepare, FailureClass::Conflict));
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = inputs;
+            Err(failure(
+                stage.final_destination().path(),
+                Operation::Prepare,
+                FailureClass::Unsupported,
+            ))
+        }
+    }
     #[cfg(unix)]
     fn is_held_elsewhere(error: &StorageRoleFailure) -> bool {
         matches!(
@@ -63,7 +110,7 @@ impl LocalStagedDestination {
         let private_creation = request.final_destination.private_creation();
         let source = request.source.source_identity;
         let open_path = path.clone();
-        let (directory, file) = tokio::task::spawn_blocking(move || {
+        let (directory, file, cleanup) = tokio::task::spawn_blocking(move || {
             let fail = |class| failure(&open_path, Operation::Prepare, class);
             if cancel.is_cancelled() {
                 return Err(fail(FailureClass::Cancelled));
@@ -77,13 +124,14 @@ impl LocalStagedDestination {
                 .read(true)
                 .write(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            let file = match create_file(&directory, &name, &options, private_creation) {
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    directory.open_with(&name, &options)
+            let (file, created) =
+                match create_file(&directory, &name, &options, private_creation) {
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => directory
+                        .open_with(&name, &options)
+                        .map(|file| (file, false)),
+                    other => other.map(|file| (file, true)),
                 }
-                other => other,
-            }
-            .map_err(|e| io_failure(&open_path, Operation::Prepare, &e))?;
+                .map_err(|e| io_failure(&open_path, Operation::Prepare, &e))?;
             let metadata = file
                 .metadata()
                 .map_err(|e| io_failure(&open_path, Operation::Prepare, &e))?;
@@ -100,7 +148,9 @@ impl LocalStagedDestination {
                 return Err(fail(FailureClass::Conflict));
             }
             // Truncation is deferred to the writer so subsequent errors carry the direct handle.
-            Ok((Arc::new(directory), Arc::new(file.into_std())))
+            let file = Arc::new(file.into_std());
+            let cleanup = super::direct_cleanup::MutationEvidence::new(created, &metadata);
+            Ok((Arc::new(directory), file, Arc::new(cleanup)))
         })
         .await
         .map_err(|_| failure(&path, Operation::Prepare, FailureClass::Internal))??;
@@ -128,6 +178,7 @@ impl LocalStagedDestination {
             relative,
             name,
             first_write: AtomicBool::new(true),
+            direct_cleanup: Some(cleanup),
             transfer_identity: None,
         })));
         Ok(target)
@@ -174,6 +225,15 @@ impl LocalStagedDestination {
         #[cfg(unix)]
         let name = self.stage_name(target, Operation::Publish).map_err(map)?;
         let path = target.final_destination().path().clone();
+        #[cfg(unix)]
+        let durability = target.durable_publication().then(|| {
+            (
+                Arc::clone(&self.root_dir),
+                Self::stage_relative(target, Operation::Publish),
+                Arc::clone(&self.directory_sync),
+                Arc::clone(&self.write_probe),
+            )
+        });
         tokio::task::spawn_blocking(move || {
             if request.cancel.is_cancelled() {
                 return Err(io::Error::new(
@@ -202,16 +262,44 @@ impl LocalStagedDestination {
                         "direct target was replaced",
                     ));
                 }
+                if let Some((root, relative, sync, probe)) = durability {
+                    sync_direct_publication(
+                        &root,
+                        &file,
+                        &directory,
+                        &relative.map_err(io::Error::other)?,
+                        &sync,
+                        &probe,
+                        &request.cancel,
+                    )?;
+                }
             }
             Ok(())
         })
         .await
         .map_err(|_| map(failure(&path, Operation::Publish, FailureClass::Internal)))?
-        .map_err(|e| map(io_failure(&path, Operation::Publish, &e)))?;
+        .map_err(|e| map(publication_io_failure(&path, &e)))?;
         Ok(PublicationEvidence::new(
             path,
             crate::storage::PublicationDisposition::Published,
             None,
         ))
     }
+}
+
+fn publication_io_failure(path: &StoragePath, error: &io::Error) -> StorageRoleFailure {
+    let original = io_failure(path, Operation::Publish, error);
+    let StorageRoleFailure::Entry(cause) = &original else {
+        return original;
+    };
+    // 角色边界保留操作分类和具体阶段原因；模型拒绝不合法诊断时仍返回原始分类。
+    EntryOperationFailure::new(
+        path.clone(),
+        Operation::Publish,
+        cause.class(),
+        cause.transience(),
+        format!("Direct target publication failed: {error}"),
+    )
+    .map(StorageRoleFailure::Entry)
+    .unwrap_or(original)
 }

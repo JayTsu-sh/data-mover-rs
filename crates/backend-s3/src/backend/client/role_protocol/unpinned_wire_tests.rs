@@ -124,6 +124,7 @@ impl HttpConnector for RangeServer {
 
 fn described() -> S3ObjectFacts {
     S3ObjectFacts {
+        delete_marker: false,
         size: 100,
         etag: "\"nas-1\"".into(),
         version_id: None,

@@ -169,6 +169,7 @@ async fn sdk_listing_body_failures_keep_the_typed_cause_without_replay() {
 async fn sdk_payload_body_timeout_is_a_timeout_without_replay() {
     let (storage, calls) = body_error_storage(ErrorKind::TimedOut);
     let facts = S3ObjectFacts {
+        delete_marker: false,
         size: 1000,
         etag: "\"observed\"".into(),
         version_id: None,
@@ -241,6 +242,7 @@ async fn nas_body_timeout_is_reported_without_a_follow_up_head() {
     storage.options.compat = S3Compatibility::Ontap;
     storage.options.bucket_type = S3BucketType::Nas;
     let facts = S3ObjectFacts {
+        delete_marker: false,
         size: 1000,
         etag: "\"observed\"".into(),
         version_id: None,

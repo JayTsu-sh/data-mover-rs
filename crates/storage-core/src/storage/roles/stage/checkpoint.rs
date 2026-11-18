@@ -125,6 +125,12 @@ impl PreparedStage {
         self.checkpoint_state().data.metadata_binding
     }
 
+    /// 数据单独发布不能留下完整元数据计划的恢复凭据。
+    /// 若最终发布后进程中断，下一请求不能把无此绑定的最终内容当成整项成功。
+    pub fn checkpoint_clear_metadata_binding(&self) {
+        self.checkpoint_state().data.metadata_binding = None;
+    }
+
     /// A recovered final must retain its completed metadata plan. A surviving stage instead
     /// re-enters Receiving before any producer persistence and reapplies the current plan.
     pub fn checkpoint_bind_metadata(&self, binding: [u8; 32]) -> Result<(), CheckpointError> {

@@ -63,6 +63,7 @@ async fn every_skipped_family_is_reported_with_its_reason() {
         .apply(
             &recording(),
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -102,6 +103,7 @@ async fn a_failed_item_still_reports_what_was_skipped() {
                 applied: Mutex::new(Vec::new()),
             },
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -246,6 +248,7 @@ async fn the_copied_plan_keeps_the_reasons() {
         .apply(
             &recording(),
             &StoragePath::new("file").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await
@@ -257,11 +260,12 @@ async fn the_copied_plan_keeps_the_reasons() {
 /// baseline included — because of the destination, without the source having been read.
 #[tokio::test]
 async fn a_destination_that_stores_nothing_skips_everything_asked_for() {
-    let plan = compile_nothing_stored_plan(
+    let plan = compile_unavailable_plan(
         MetadataPolicies::default()
             .with_ownership_mode(MetadataPolicy::AllowKnownLoss)
             .with_timestamps(MetadataPolicy::AllowKnownLoss)
             .with_acl(MetadataPolicy::BestEffort),
+        RefusalCause::DestinationCannotStore,
     );
     let skipped = |family| SkippedFamily {
         family,
@@ -278,6 +282,7 @@ async fn a_destination_that_stores_nothing_skips_everything_asked_for() {
         .apply(
             &recording(),
             &StoragePath::new("object").unwrap(),
+            &SourceVersion::Current,
             CancellationToken::new(),
         )
         .await

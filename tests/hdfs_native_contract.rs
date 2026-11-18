@@ -5,6 +5,7 @@ use data_mover::storage::{
     BackendConfig, HdfsBackendConfig, Storage, StorageRoleFailure, connect_backend,
 };
 use data_mover::storage::{HdfsConfig, build_hdfs_client};
+use data_mover::transfer::TransferPolicy;
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSource,
 };
@@ -50,7 +51,7 @@ fn validated_hdfs_lab_root_with_config(
     if location[authority_end..].contains("//") {
         return Err("HDFS lab root must not contain empty path components".to_string());
     }
-    let parsed = data_mover::storage::HdfsLocation::parse_configured(location, config)
+    let parsed = data_mover::storage::HdfsLocation::parse(location, config)
         .map_err(|error| error.to_string())?;
     let components = parsed
         .root()
@@ -302,6 +303,7 @@ async fn client_can_be_built_from_explicit_inputs_only() -> Result<(), Box<dyn s
 fn simple_location_contract_is_platform_independent() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = data_mover::storage::HdfsLocation::parse(
         "hdfs://migration%20user@127.0.0.1:9000/warehouse/%E7%9B%AE%E5%BD%95/",
+        &HdfsConfig::default(),
     )?;
     assert_eq!(parsed.user(), "migration user");
     assert_eq!(parsed.endpoint(), "hdfs://127.0.0.1:9000");
@@ -316,7 +318,7 @@ fn simple_location_contract_is_platform_independent() -> Result<(), Box<dyn std:
         ..Default::default()
     };
     assert!(
-        data_mover::storage::HdfsLocation::parse_configured(
+        data_mover::storage::HdfsLocation::parse(
             "hdfs://migration@127.0.0.1:9000/warehouse",
             &kerberos,
         )
@@ -384,6 +386,7 @@ async fn nightly_lab_cleanup_confined_run_root() -> Result<(), Box<dyn std::erro
 #[ignore = "requires the nightly lab HDFS cluster"]
 async fn nightly_lab_streams_recursive_scan_with_depth_limit()
 -> Result<(), Box<dyn std::error::Error>> {
+    let mut traversal_completed = Vec::new();
     let (hdfs, roles) = fixture("scan").await?;
     for directory in ["甲", "甲/乙", "甲/乙/丙", "并列"] {
         let path = hdfs.path(directory);
@@ -400,7 +403,7 @@ async fn nightly_lab_streams_recursive_scan_with_depth_limit()
         .max_inflight_operations(NonZeroUsize::new(3).ok_or("nonzero")?);
     let mut session = StorageTraversalSource::new(&roles)?.traverse(request.clone());
     let mut paths = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => {
                 paths.push(std::path::PathBuf::from(entry.path().as_str()));
@@ -428,7 +431,7 @@ async fn nightly_lab_streams_recursive_scan_with_depth_limit()
         DslTraversalFilter::parse(Some("extension == \"txt\""), None)?,
     )));
     let mut filtered = Vec::new();
-    while let Some(item) = session.next_item().await {
+    while let Some(item) = session.next_item(&mut traversal_completed).await {
         match item {
             TraversalItem::Entry(entry) => {
                 filtered.push(std::path::PathBuf::from(entry.path().as_str()));
@@ -470,7 +473,11 @@ async fn nightly_lab_validates_factory_root_lifecycle() -> TestResult {
     assert!(connect_backend(config(false)).await.is_err());
     let storage = connect_backend(config(true)).await?;
     assert_eq!(
-        storage.namespace()?.stat(&StoragePath::root()).await?.kind,
+        storage
+            .namespace()?
+            .stat(&StoragePath::root(), false)
+            .await?
+            .kind,
         EntryKind::Directory
     );
     raw.delete(parsed.root(), true).await?;
@@ -510,7 +517,9 @@ async fn nightly_lab_lists_exactly_one_directory() -> TestResult {
         names.sort();
         assert_eq!(names, expected);
     }
-    let file = namespace.stat(&StoragePath::new("混合/file.txt")?).await?;
+    let file = namespace
+        .stat(&StoragePath::new("混合/file.txt")?, false)
+        .await?;
     assert_eq!(file.kind, EntryKind::File);
     assert_eq!(file.size, Some(7));
     let mut invalid = namespace.list(ListRequest::new(file.path, CancellationToken::new()));
@@ -551,7 +560,7 @@ async fn nightly_lab_namespace_rename_delete_and_artifacts() -> TestResult {
     assert_eq!(raw_read(&raw, "tree/target").await?, b"new"[..]);
     assert!(
         namespace
-            .stat(&StoragePath::new("tree/nested/file")?)
+            .stat(&StoragePath::new("tree/nested/file")?, false)
             .await
             .is_err()
     );
@@ -775,6 +784,7 @@ async fn nightly_lab_role_tar_write() -> TestResult {
         final_path: StoragePath::new("empty.tar")?,
         cancel: CancellationToken::new(),
         source_qos: None,
+        transfer_policy: TransferPolicy::AtomicReplace,
     })
     .await?;
     assert_eq!(outcome.transferred_bytes, 1024);
@@ -874,7 +884,7 @@ async fn nightly_lab_confines_independent_roots_and_cleanup() -> TestResult {
     let escape = StoragePath::new("../confine-right/sentinel")?;
     let sentinel = StoragePath::new("sentinel")?;
     let attempts = [
-        namespace.stat(&escape).await.map(|_| ()),
+        namespace.stat(&escape, false).await.map(|_| ()),
         namespace.delete(&escape).await,
         namespace.rename(&escape, &sentinel).await,
         namespace.rename(&sentinel, &escape).await,

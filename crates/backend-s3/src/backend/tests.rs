@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -79,6 +80,8 @@ pub struct MemoryS3State {
     /// Deleting this key — by version or not — fails with this failure (every time, until
     /// cleared), deleting nothing.
     pub delete_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
+    /// 受控模拟服务端确认删除但列表始终不推进；永久清理必须保留当前记录并报错。
+    pub ignore_version_deletes: AtomicBool,
     pub copy_commits_then_fails: Mutex<bool>,
     pub native_copies: Mutex<u64>,
     pub native_failure: Mutex<Option<S3ProtocolFailure>>,
@@ -427,6 +430,7 @@ impl S3Protocol for MemoryS3 {
             )
         })?;
         Ok(S3ObjectFacts {
+            delete_marker: false,
             size: self
                 .declared_size
                 .lock()
@@ -455,13 +459,23 @@ impl S3Protocol for MemoryS3 {
             .get(&(key.to_string(), version_id.to_string()))
             .cloned();
         let bytes = match stored {
-            Some(stored) => stored.ok_or_else(not_found)?,
+            Some(Some(bytes)) => bytes,
+            Some(None) => {
+                return Ok(S3ObjectFacts {
+                    delete_marker: true,
+                    size: 0,
+                    etag: String::new(),
+                    version_id: Some(version_id.to_owned()),
+                    last_modified: *self.last_modified.lock().await,
+                });
+            }
             None if self.version.lock().await.as_deref() == Some(version_id) => {
                 return self.head(relative_key).await;
             }
             None => return Err(not_found()),
         };
         Ok(S3ObjectFacts {
+            delete_marker: false,
             size: bytes.len() as u64,
             etag: self.etag_for(&bytes),
             version_id: Some(version_id.to_string()),
@@ -766,6 +780,9 @@ impl S3Protocol for MemoryS3 {
     }
     async fn delete_version(&self, key: &str, version_id: &str) -> S3Result<()> {
         self.injected_delete_failure(key).await?;
+        if self.ignore_version_deletes.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         self.delete_one_version(key, version_id).await
     }
     async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>> {
@@ -840,14 +857,35 @@ impl S3Protocol for MemoryS3 {
         }
         Ok(self.tags.lock().await.get(key).cloned().unwrap_or_default())
     }
-    async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()> {
+    async fn put_tags(
+        &self,
+        key: &str,
+        version_id: Option<&str>,
+        tags: &[ObjectTag],
+    ) -> S3Result<()> {
         if let Some(failure) = self.tag_write_failure.lock().await.clone() {
             return Err(failure);
         }
-        self.tags
-            .lock()
-            .await
-            .insert(key.to_string(), tags.to_vec());
+        let full_key = self.full_key(key);
+        if let Some(version) = version_id {
+            if !matches!(
+                self.versions
+                    .lock()
+                    .await
+                    .get(&(full_key.clone(), version.to_owned())),
+                Some(Some(_))
+            ) {
+                return Err(not_found());
+            }
+            self.tagged_versions
+                .lock()
+                .await
+                .insert((full_key.clone(), version.to_owned()), tags.to_vec());
+            if self.head(key).await?.version_id.as_deref() != Some(version) {
+                return Ok(());
+            }
+        }
+        self.tags.lock().await.insert(full_key, tags.to_vec());
         Ok(())
     }
 }

@@ -154,6 +154,17 @@ pub trait Metadata: Send + Sync {
         mutation: MetadataMutation,
         cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure>;
+
+    /// 只修改指定的既有对象版本；不支持版本的适配器必须拒绝，不能退回当前对象。
+    async fn apply_to_version(
+        &self,
+        path: &StoragePath,
+        _version_id: &str,
+        _mutation: MetadataMutation,
+        _cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        Err(version_unsupported(path, Operation::Metadata))
+    }
 }
 
 fn permission_facts(
