@@ -4,14 +4,15 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 
 use super::at_destination::Fence;
 use super::source::{classify, entry_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath};
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::{
-    ByteStream, CheckpointObservation, Metadata, MetadataMutation, PreparedStage,
-    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
+    ByteStream, CheckpointObservation, Metadata, MetadataBatchFailure, MetadataMutation,
+    PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
     StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
@@ -88,6 +89,13 @@ pub(super) struct CifsStagedDestination {
     pub(super) write_inflight: usize,
 }
 
+enum StageMetadataFailure {
+    // Preserve the per-mutation result through preparation and the mutation itself.
+    BeforePersistence(StorageRoleFailure),
+    // The mutation ran, but the stage or its checkpoint could not be confirmed.
+    Persistence(StorageRoleFailure),
+}
+
 impl CifsStagedDestination {
     pub(super) fn new<P>(protocol: Arc<P>, identity: BackendIdentity) -> Self
     where
@@ -154,6 +162,79 @@ impl CifsStagedDestination {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(token);
+    }
+
+    async fn apply_stage_metadata(
+        &self,
+        stage: &PreparedStage,
+        mutation: MetadataMutation,
+        cancel: CancellationToken,
+    ) -> Result<(), StageMetadataFailure> {
+        let path = self
+            .stage_path(stage)
+            .map_err(StageMetadataFailure::BeforePersistence)?;
+        // Metadata preceded the rename whose checkpoint this recovery is reconciling.
+        if stage.recovered_publication().is_some() {
+            return Ok(());
+        }
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            StageMetadataFailure::BeforePersistence(entry_failure(
+                stage.final_destination().path(),
+                Operation::Metadata,
+                FailureClass::Unsupported,
+            ))
+        })?;
+        let checkpoint_acl =
+            stage.checkpoint_enabled() && matches!(&mutation, MetadataMutation::Acl(_));
+        if checkpoint_acl {
+            super::checkpoint_acl::before_payload_acl(
+                self,
+                stage,
+                metadata.as_ref(),
+                &mutation,
+                cancel.clone(),
+            )
+            .await
+            .map_err(StageMetadataFailure::BeforePersistence)?;
+        }
+        metadata
+            .apply(&path, mutation, cancel.clone())
+            .await
+            .map_err(StageMetadataFailure::BeforePersistence)?;
+        if checkpoint_acl {
+            super::checkpoint_acl::refresh(self, stage, &path)
+                .await
+                .map_err(StageMetadataFailure::Persistence)?;
+        }
+        if stage.durable_publication() {
+            self.persist_stage_metadata(&path, &cancel)
+                .await
+                .map_err(StageMetadataFailure::Persistence)?;
+        }
+        Ok(())
+    }
+
+    async fn persist_stage_metadata(
+        &self,
+        path: &StoragePath,
+        cancel: &CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        if cancel.is_cancelled() {
+            return Err(entry_failure(
+                path,
+                Operation::Metadata,
+                FailureClass::Cancelled,
+            ));
+        }
+        let file = self
+            .protocol
+            .open(path)
+            .await
+            .map_err(|error| classify(path, Operation::Metadata, &error))?;
+        let flushed = file.flush().await;
+        let closed = file.close().await;
+        flushed.map_err(|error| classify(path, Operation::Metadata, &error))?;
+        closed.map_err(|error| classify(path, Operation::Metadata, &error))
     }
 
     async fn hash(
@@ -431,53 +512,51 @@ impl StagedDestination for CifsStagedDestination {
         &self,
         stage: &PreparedStage,
         mutation: MetadataMutation,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
-        let path = self.stage_path(stage)?;
-        // Metadata preceded the rename whose checkpoint this recovery is reconciling.
-        if stage.recovered_publication().is_some() {
-            return Ok(());
-        }
-        let metadata = self.metadata.as_ref().ok_or_else(|| {
-            entry_failure(
-                stage.final_destination().path(),
-                Operation::Metadata,
-                FailureClass::Unsupported,
-            )
-        })?;
-        let checkpoint_acl =
-            stage.checkpoint_enabled() && matches!(&mutation, MetadataMutation::Acl(_));
-        if checkpoint_acl {
-            super::checkpoint_acl::before_payload_acl(
-                self,
-                stage,
-                metadata.as_ref(),
-                &mutation,
-                cancel.clone(),
-            )
-            .await?;
-        }
-        metadata.apply(&path, mutation, cancel.clone()).await?;
-        if checkpoint_acl {
-            super::checkpoint_acl::refresh(self, stage, &path).await?;
-        }
-        if stage.durable_publication() {
+        self.apply_stage_metadata(stage, mutation, cancel)
+            .await
+            .map_err(|failure| match failure {
+                StageMetadataFailure::BeforePersistence(error)
+                | StageMetadataFailure::Persistence(error) => error,
+            })
+    }
+
+    async fn apply_metadata_batch(
+        &self,
+        stage: &PreparedStage,
+        mutations: Vec<MetadataMutation>,
+        cancel: CancellationToken,
+    ) -> Result<(), MetadataBatchFailure> {
+        let len = mutations.len();
+        for (completed, mutation) in mutations.into_iter().enumerate() {
             if cancel.is_cancelled() {
-                return Err(entry_failure(
-                    &path,
-                    Operation::Metadata,
-                    FailureClass::Cancelled,
-                ));
+                return Err(MetadataBatchFailure {
+                    failed_index: completed,
+                    completed,
+                    error: None,
+                });
             }
-            let file = self
-                .protocol
-                .open(&path)
+            match self
+                .apply_stage_metadata(stage, mutation, cancel.clone())
                 .await
-                .map_err(|error| classify(&path, Operation::Metadata, &error))?;
-            let flushed = file.flush().await;
-            let closed = file.close().await;
-            flushed.map_err(|error| classify(&path, Operation::Metadata, &error))?;
-            closed.map_err(|error| classify(&path, Operation::Metadata, &error))?;
+            {
+                Ok(()) => {}
+                Err(StageMetadataFailure::BeforePersistence(error)) => {
+                    return Err(MetadataBatchFailure {
+                        failed_index: completed,
+                        completed,
+                        error: Some(error),
+                    });
+                }
+                Err(StageMetadataFailure::Persistence(error)) => {
+                    return Err(MetadataBatchFailure::whole_batch(
+                        len,
+                        completed + 1,
+                        Some(error),
+                    ));
+                }
+            }
         }
         Ok(())
     }

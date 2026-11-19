@@ -56,17 +56,24 @@ async fn metadata_flush_obeys_publication_policy_and_closes_on_failure()
         protocol.fail_flush.store(fail_flush, Ordering::SeqCst);
         let closes = protocol.closes.load(Ordering::SeqCst);
         let result = destination
-            .apply_metadata(
+            .apply_metadata_batch(
                 &stage,
-                MetadataMutation::Timestamps(TimestampMetadata {
+                vec![MetadataMutation::Timestamps(TimestampMetadata {
                     accessed: None,
                     modified: None,
                     created: None,
-                }),
+                })],
                 tokio_util::sync::CancellationToken::new(),
             )
             .await;
-        assert_eq!(result.is_err(), fail_flush);
+        if fail_flush {
+            let failure = result.err().ok_or("FLUSH failure was ignored")?;
+            assert_eq!(failure.failed_index, 1, "FLUSH failed the whole batch");
+            assert_eq!(failure.completed, 1, "the mutation ran before FLUSH");
+            assert!(matches!(failure.error, Some(StorageRoleFailure::Entry(_))));
+        } else {
+            assert_eq!(result, Ok(()));
+        }
         assert_eq!(metadata.applied.load(Ordering::SeqCst), 1);
         assert_eq!(
             protocol.flushes.load(Ordering::SeqCst),
