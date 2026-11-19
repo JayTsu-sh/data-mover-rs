@@ -1418,6 +1418,7 @@ dependencies = [
  "data-mover-storage-core",
  "futures",
  "smb",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",

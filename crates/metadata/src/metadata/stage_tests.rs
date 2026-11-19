@@ -35,6 +35,7 @@ enum Refusal {
     SessionLost,
     DirectoryReplaced,
     DirectoryWriteUnconfirmed,
+    StageWriteUnconfirmed,
     DirectoryCancelledAfterBatch,
     /// Applies the whole batch and then fails its persistence barrier, as Local's durable
     /// `sync_all` can: no single mutation failed, the batch did.
@@ -98,6 +99,7 @@ impl ScriptedStage {
                 .unwrap(),
             )),
             Refusal::DirectoryReplaced => Some(refusal(FailureClass::Conflict)),
+            Refusal::StageWriteUnconfirmed => Some(refusal(FailureClass::PermissionDenied)),
             Refusal::DirectoryWriteUnconfirmed => Some(StorageRoleFailure::Entry(
                 EntryOperationFailure::new(
                     StoragePath::new("file").unwrap(),
@@ -152,6 +154,7 @@ fn batch_failure(
     MetadataBatchFailure {
         failed_index,
         completed,
+        write_unconfirmed: false,
         error,
     }
 }
@@ -282,7 +285,9 @@ impl StagedDestination for ScriptedStage {
             .lock()
             .unwrap()
             .extend(mutations.into_iter().take(completed));
-        Err(batch_failure(index, completed, self.refusal_error(&cancel)))
+        let mut failure = batch_failure(index, completed, self.refusal_error(&cancel));
+        failure.write_unconfirmed = matches!(self.refusal, Refusal::StageWriteUnconfirmed);
+        Err(failure)
     }
 
     async fn prepare_at_destination(
@@ -607,6 +612,46 @@ async fn a_failure_of_the_whole_batch_stops_application() {
                 .all(|value| value.outcome != ApplicationOutcome::Applied),
             "{refusal:?}: {:?}",
             failure.report()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_staged_unconfirmed_write_preserves_the_prefix_and_stops_later_families() {
+    let ordered = [
+        MetadataFamily::OwnershipMode,
+        MetadataFamily::Acl,
+        MetadataFamily::Xattrs,
+        MetadataFamily::Tags,
+        MetadataFamily::Timestamps,
+    ];
+    for failed_index in [2, 4] {
+        let family = ordered[failed_index];
+        let uncertain: &'static [MetadataFamily] = match family {
+            MetadataFamily::Timestamps => &[MetadataFamily::Timestamps],
+            _ => &[MetadataFamily::Xattrs],
+        };
+        let target = ScriptedStage::refusing(Refusal::StageWriteUnconfirmed, uncertain);
+        let failure = plan(all_exact())
+            .apply_to_stage(&target, &stage(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(failed_families(&failure), [family]);
+        assert_eq!(failure.kind(), ApplicationFailureKind::WriteUnconfirmed);
+        assert!(
+            matches!(failure.storage_error(), Some(StorageRoleFailure::Entry(error))
+            if error.class() == FailureClass::PermissionDenied)
+        );
+        assert_eq!(target.applied_families(), ordered[..failed_index]);
+        for applied in &ordered[..failed_index] {
+            assert_eq!(
+                outcome_for(failure.report(), *applied),
+                ApplicationOutcome::Applied
+            );
+        }
+        assert_eq!(
+            outcome_for(failure.report(), family),
+            ApplicationOutcome::Failed
         );
     }
 }

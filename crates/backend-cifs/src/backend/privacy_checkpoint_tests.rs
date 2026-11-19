@@ -1,6 +1,7 @@
 use super::*;
-use crate::model::{AclEncoding, AclMetadata, MetadataObservations, ObservationPlan};
-use crate::storage::{Metadata, MetadataMutation};
+use crate::model::{AclEncoding, AclMetadata};
+use crate::storage::MetadataMutation;
+use crate::storage::backends::cifs::metadata::{CifsMetadataWriter, MetadataWriteFailure};
 
 #[derive(Default)]
 struct RecordingMetadata {
@@ -8,20 +9,13 @@ struct RecordingMetadata {
 }
 
 #[async_trait]
-impl Metadata for RecordingMetadata {
-    async fn observe(
-        &self,
-        _: &StoragePath,
-        _: ObservationPlan,
-    ) -> Result<MetadataObservations, StorageRoleFailure> {
-        unreachable!("metadata mutation fixture")
-    }
-    async fn apply(
+impl CifsMetadataWriter for RecordingMetadata {
+    async fn apply_checked(
         &self,
         path: &StoragePath,
         _: MetadataMutation,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<(), StorageRoleFailure> {
+    ) -> Result<(), MetadataWriteFailure> {
         self.paths
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

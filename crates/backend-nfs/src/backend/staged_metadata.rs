@@ -19,6 +19,7 @@ impl NfsStagedDestinationAdapter {
             return Err(MetadataBatchFailure {
                 failed_index: 0,
                 completed: 0,
+                write_unconfirmed: false,
                 error: None,
             });
         }
@@ -51,6 +52,7 @@ impl NfsStagedDestinationAdapter {
                 return Err(MetadataBatchFailure {
                     failed_index: completed,
                     completed,
+                    write_unconfirmed: false,
                     error: None,
                 });
             }
@@ -58,6 +60,7 @@ impl NfsStagedDestinationAdapter {
                 return Err(MetadataBatchFailure {
                     failed_index: completed,
                     completed,
+                    write_unconfirmed: false,
                     error: Some(error),
                 });
             }

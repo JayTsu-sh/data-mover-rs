@@ -49,6 +49,7 @@ pub(super) async fn apply(
             |(index, error)| MetadataBatchFailure {
                 failed_index: index,
                 completed: index,
+                write_unconfirmed: false,
                 error: error.map(|failure| {
                     if failure.cancelled {
                         let transience = if failure.changed {

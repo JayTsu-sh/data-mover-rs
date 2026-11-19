@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -270,15 +271,20 @@ pub(super) fn classify(
     operation: Operation,
     error: &smb_domain::Error,
 ) -> StorageRoleFailure {
-    // The facade's `Display` carries the NT status or the transport reason and never the
-    // credentials, so it can ride along as the redacted diagnostic; without it a `Protocol`
-    // fallback is undiagnosable from the caller's side.
-    // `required` rejects NUL, and a few facade variants carry server-derived strings.
+    // The facade's display carries the status or transport reason and never credentials.
     let diagnostic = format!("CIFS {operation:?} failed: {error}").replace('\0', "\\0");
+    let (class, transience) = smb_error_class(error, operation);
+    classified_failure(path, operation, class, transience, diagnostic)
+}
+
+pub(super) fn smb_error_class(
+    error: &SmbError,
+    operation: Operation,
+) -> (FailureClass, Transience) {
     if let Some(class) = network_class(error, operation) {
-        return session_failure(operation, class, Transience::Transient, diagnostic);
+        return (class, Transience::Transient);
     }
-    let (class, transience) = match error {
+    match error {
         smb_domain::Error::ReceivedErrorMessage(status, _)
         | smb_domain::Error::UnexpectedMessageStatus(status) => classify_status(*status),
         smb_domain::Error::NotFound(_) => (FailureClass::NotFound, Transience::Permanent),
@@ -294,11 +300,23 @@ pub(super) fn classify(
         smb_domain::Error::Cancelled(_) => (FailureClass::Cancelled, Transience::Transient),
         SmbError::RuntimeTerminated => (FailureClass::Internal, Transience::Unknown),
         _ => (FailureClass::Protocol, Transience::Unknown),
-    };
+    }
+}
+
+pub(super) fn classified_failure(
+    path: &StoragePath,
+    operation: Operation,
+    class: FailureClass,
+    transience: Transience,
+    diagnostic: impl Into<Box<dyn StdError + Send + Sync>>,
+) -> StorageRoleFailure {
     if matches!(class, FailureClass::Connectivity | FailureClass::Timeout) {
         return session_failure(operation, class, transience, diagnostic);
     }
-    entry_failure_with_transience(path, operation, class, transience, &diagnostic)
+    StorageRoleFailure::Entry(
+        EntryOperationFailure::new(path.clone(), operation, class, transience, diagnostic)
+            .unwrap_or_else(|_| unreachable!("prefixed, NUL-free diagnostic is valid")),
+    )
 }
 
 fn network_class(error: &smb_domain::Error, operation: Operation) -> Option<FailureClass> {
@@ -322,7 +340,7 @@ fn session_failure(
     operation: Operation,
     class: FailureClass,
     transience: Transience,
-    diagnostic: String,
+    diagnostic: impl Into<Box<dyn StdError + Send + Sync>>,
 ) -> StorageRoleFailure {
     StorageRoleFailure::Session(
         BackendSessionFailure::new(operation, class, transience, diagnostic)

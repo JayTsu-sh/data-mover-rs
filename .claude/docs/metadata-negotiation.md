@@ -179,24 +179,26 @@ set-id 也去掉，尽管 uid 实际留住了；内核还允许 chgrp 到文件*
    （Local 的预校验就是，`completed = 0` 而 `failed_index > 0`），那样前面的族会被静默跳过。
    也不是把被拒的族挪到队尾凑成一批 —— 那会让 ownership 跑到 ACL 后面，重新制造第 1 条要防的
    静默覆盖。
-   `MetadataBatchFailure` 的三条字段约定（`src/storage/roles.rs`）就是这条的前提。
+   `MetadataBatchFailure` 的字段约定（`src/storage/roles.rs`）就是这条的前提。
    由 `src/metadata/stage_tests.rs` 看守。
 
 **应用期失败的规则**（用户，2026-09-23）：**任何一族写失败都意味着该文件拷贝失败**，但一个文件的
 所有族都先应用完，再把失败一次性报出（`MetadataApplicationFailure::failures()`，Display 逐条列出）。
-只有三种情况立即停止，因为之后的写要么不可能成功、要么不可信：
+以下情况立即停止，因为后续写入无法成功或结果不可信。
 - **取消** —— token 已触发，或 backend 报 `Cancelled`（含服务端的 `STATUS_CANCELLED`）；被打断的请求
   可能报成别的类别，所以两者任一即算。该族保持规划期结果，不记 `Failed`。
+- **写入结果未确认** —— 取消优先。否则报告 `WriteUnconfirmed`，以 `failed_index` 标记失败项，
+  保留 `completed` 条已确认的前缀，并停止重发或发送后续变更。
 - **会话级失败**（`StorageRoleFailure::Session`）—— 会话断了，后面每一次写都会跟着失败。
 - **整批失败** —— backend 用 `MetadataBatchFailure::whole_batch(len, completed, error)`
   报告，即 `failed_index == len`：不归属任何一条 mutation。Local 的 stage 打不开、`spawn_blocking`
   丢失、以及 durable **屏障 `sync_all` 失败**走这里。记在**最后一条已应用但未落盘**的族上
   （`completed - 1`；一条都没应用时记第一条），该批次一个都不标 `Applied`。
 
-其余（Entry 级、非取消，`is_refusal`）都是「目的端拒绝这一次写入」：记下，续发剩下的族。
+明确拒绝的变更（`is_refusal`）会计入失败，剩余的族按顺序续发。
 
 `MetadataFailurePolicy::PublishData` 仅在元数据错误归类为 `Refused` 时继续校验和发布暂存内容。
-后端报告整批失败、会话丢失或取消时，传输引擎停止发布暂存内容。
+后端报告单项结果未确认、整批失败、会话丢失或取消时，传输引擎停止发布暂存内容。
 Direct 已写至最终位置，非取消错误下仍可校验数据并报告数据完成。整项仍报元数据失败。
 
 **已发布目录的身份绑定写入**由 `MetadataPlan::apply_bound_directory` 调用后端。
@@ -214,9 +216,11 @@ NFS 使用文件句柄。绑定写入仅在属性明确被拒时继续，身份�
 `a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not`（NFS 的拒绝必须是 Entry 级，
 否则会被当成会话失败而提前停止）。
 
-**CIFS** 仍按顺序逐条写入属性。需要持久化时，每条写入后执行 open、FLUSH、close。
+**CIFS** 仍按顺序逐条写入属性。时间戳 SET 结果未知或写入句柄未确认关闭时，`MetadataBatchFailure` 保留
+已确认前缀及时间戳的失败索引，标记 `write_unconfirmed`。元数据引擎报告 `WriteUnconfirmed`，
+停止后续写入并阻止暂存发布。SET 明确拒绝且句柄已关闭时沿用既有失败策略。需要持久化时，每条
+成功写入后执行 open、FLUSH、close。
 这三步或写入后的 checkpoint ACL 刷新失败，适配器报告整批失败并保留具体原因。
-单次属性写入的明确拒绝仍按单项处理。
 
 ## 报错
 

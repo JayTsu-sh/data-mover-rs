@@ -224,7 +224,7 @@ pub enum ApplicationFailureKind {
     /// The batch failed as a whole, for example because the target could not be bound or a
     /// stage durability barrier did not complete.
     BatchFailed,
-    /// A bound directory mutation may have applied partially or could not be confirmed.
+    /// The result of a specific mutation could not be confirmed.
     WriteUnconfirmed,
     /// The destination session was lost.
     SessionLost,

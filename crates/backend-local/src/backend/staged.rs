@@ -1284,6 +1284,7 @@ impl StagedDestination for LocalStagedDestination {
         .map_err(|(failed_index, completed, error)| MetadataBatchFailure {
             failed_index,
             completed,
+            write_unconfirmed: false,
             error: error.map(|error| io_failure(&path, Operation::Metadata, &error)),
         })
     }
@@ -1415,6 +1416,7 @@ fn refuse_before_applying(
         return Err(MetadataBatchFailure {
             failed_index: 0,
             completed: 0,
+            write_unconfirmed: false,
             error: None,
         });
     }
@@ -1425,6 +1427,7 @@ fn refuse_before_applying(
         Some(index) => Err(MetadataBatchFailure {
             failed_index: index,
             completed: 0,
+            write_unconfirmed: false,
             error: Some(failure(
                 stage.final_destination().path(),
                 Operation::Metadata,

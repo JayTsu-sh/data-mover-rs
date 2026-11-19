@@ -566,6 +566,7 @@ impl Metadata for NfsMetadataAdapter {
                 return Err(MetadataBatchFailure {
                     failed_index: index,
                     completed: index,
+                    write_unconfirmed: false,
                     error: None,
                 });
             }
@@ -580,6 +581,7 @@ impl Metadata for NfsMetadataAdapter {
                 return Err(MetadataBatchFailure {
                     failed_index: index,
                     completed: index,
+                    write_unconfirmed: false,
                     error: Some(super::source::role_failure(
                         path,
                         Operation::Metadata,

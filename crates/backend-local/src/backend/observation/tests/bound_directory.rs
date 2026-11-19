@@ -286,6 +286,7 @@ async fn bound_directory_metadata_reports_partial_xattrs_and_stops_batch() -> io
                 Err(MetadataBatchFailure {
                     failed_index: 0,
                     completed: 0,
+                    write_unconfirmed: false,
                     error: Some(StorageRoleFailure::Entry(ref error)),
                 }) if error.class() == FailureClass::InvalidInput && error.transience() == transience
             ),
@@ -343,6 +344,7 @@ async fn bound_directory_metadata_refuses_replacement_and_symlink() -> io::Resul
             Err(MetadataBatchFailure {
                 failed_index: 2,
                 completed: 0,
+                write_unconfirmed: false,
                 error: Some(StorageRoleFailure::Entry(error)),
             }) if error.class() == FailureClass::Conflict
         ));
@@ -389,6 +391,7 @@ async fn bound_directory_metadata_validates_empty_root_and_reports_prefix() -> i
         Err(MetadataBatchFailure {
             failed_index: 1,
             completed: 0,
+            write_unconfirmed: false,
             error: None
         })
     ));
@@ -409,6 +412,7 @@ async fn bound_directory_metadata_validates_empty_root_and_reports_prefix() -> i
         Err(MetadataBatchFailure {
             failed_index: 1,
             completed: 1,
+            write_unconfirmed: false,
             error: Some(StorageRoleFailure::Entry(error)),
         }) if error.class() == FailureClass::Unsupported
     ));
