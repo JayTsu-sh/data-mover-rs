@@ -106,3 +106,49 @@ async fn acl_tightening_reaches_pointer_first_and_legacy_sends_no_security_calls
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn checkpoint_acl_refresh_failure_stops_the_batch_after_payload_acl() -> TestResult {
+    let (protocol, backend) = share()?;
+    let metadata = Arc::new(RecordingMetadata::default());
+    let destination = adapter(&protocol, &backend).with_metadata(metadata.clone());
+    let stage = destination
+        .prepare_at_destination(hash_request(&backend, 6)?)
+        .await?;
+    arm(&stage, b"abcdef")?;
+    destination.persist_hash_checkpoint(&stage).await?;
+    protocol
+        .fail_checkpoint_protection
+        .store(true, Ordering::SeqCst);
+    let acl = AclMetadata::new(AclEncoding::WindowsSecurityDescriptor, vec![1])?;
+    let failure = destination
+        .apply_metadata_batch(
+            &stage,
+            vec![
+                MetadataMutation::Acl(acl.clone()),
+                MetadataMutation::Acl(acl),
+            ],
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .err()
+        .ok_or("checkpoint ACL refresh failure was ignored")?;
+    assert_eq!(failure.failed_index, 2);
+    assert_eq!(failure.completed, 1);
+    assert!(
+        matches!(failure.error, Some(StorageRoleFailure::Entry(error))
+        if error.class() == FailureClass::Unsupported)
+    );
+    assert_eq!(
+        *metadata
+            .paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        [
+            name(ArtifactKind::Pointer, false),
+            name(ArtifactKind::Stage, false)
+        ]
+    );
+    assert_pointer_handles_closed(&protocol);
+    Ok(())
+}

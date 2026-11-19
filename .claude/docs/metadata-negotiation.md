@@ -214,9 +214,9 @@ NFS 使用文件句柄。绑定写入仅在属性明确被拒时继续，身份�
 `a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not`（NFS 的拒绝必须是 Entry 级，
 否则会被当成会话失败而提前停止）。
 
-**已知缺口：CIFS。** 逐条 `apply_metadata` 在 durable 时 apply 后再 open/flush/close。
-若 FLUSH 失败归类为非取消的 Entry 错误，元数据引擎仍按单项拒绝处理。
-这类失败在 `PublishData` 下仍允许发布数据。CIFS 需要在适配器中保留整批屏障失败的语义。
+**CIFS** 仍按顺序逐条写入属性。需要持久化时，每条写入后执行 open、FLUSH、close。
+这三步或写入后的 checkpoint ACL 刷新失败，适配器报告整批失败并保留具体原因。
+单次属性写入的明确拒绝仍按单项处理。
 
 ## 报错
 
