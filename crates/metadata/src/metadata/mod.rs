@@ -565,8 +565,8 @@ impl MetadataPlan {
 /// A family the destination refuses is recorded and everything not yet applied is sent again, so
 /// the item fails once with every reason. Resuming rather than reordering is deliberate: the order
 /// families are applied in is itself an invariant (a mode written after an ACL rewrites it).
-/// Cancellation, a lost session, and a batch that failed as a whole stop application: later
-/// writes either cannot succeed or would not be trustworthy.
+/// Cancellation, a lost session, an unconfirmed mutation, and a whole-batch failure stop
+/// application. Later writes either cannot succeed or would not be trustworthy.
 fn resume_after<'a>(
     pending: &[&'a (MetadataFamily, MetadataMutation)],
     failure: MetadataBatchFailure,
@@ -604,23 +604,22 @@ fn resume_after<'a>(
     }
     let error = failure.error.as_ref();
     let refusal = error.is_some_and(|error| target.is_refusal(error));
-    let kind = match target {
-        BatchApplicationTarget::Directory { .. }
-            if !cancelled
-                && !whole_batch
+    let write_unconfirmed = !whole_batch
+        && (failure.write_unconfirmed
+            || (matches!(target, BatchApplicationTarget::Directory { .. })
                 && !refusal
-                && matches!(error, Some(StorageRoleFailure::Entry(_))) =>
-        {
-            ApplicationFailureKind::WriteUnconfirmed
-        }
-        _ => ApplicationFailureKind::of(error, cancelled, whole_batch),
+                && matches!(error, Some(StorageRoleFailure::Entry(_)))));
+    let kind = if !cancelled && write_unconfirmed {
+        ApplicationFailureKind::WriteUnconfirmed
+    } else {
+        ApplicationFailureKind::of(error, cancelled, whole_batch)
     };
     failures.push(FamilyFailure {
         family,
         kind,
         error: failure.error.map(Box::new),
     });
-    if cancelled || whole_batch || !refusal {
+    if cancelled || whole_batch || write_unconfirmed || !refusal {
         return None;
     }
     Some(

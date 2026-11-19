@@ -85,6 +85,10 @@ pub struct MetadataBatchFailure {
     /// a backend that rejects the batch before touching it reports zero, and the mutations
     /// between the two are then resent in order.
     pub completed: usize,
+    /// The result of the mutation at `failed_index` could not be confirmed.
+    /// Stop application without replaying that mutation or sending later mutations.
+    /// The confirmed prefix is still reported by `completed`. Whole-batch failures use `false`.
+    pub write_unconfirmed: bool,
     /// `None` means the batch stopped because it was cancelled.
     pub error: Option<StorageRoleFailure>,
 }
@@ -101,6 +105,7 @@ impl MetadataBatchFailure {
         Self {
             failed_index: len,
             completed: completed.min(len),
+            write_unconfirmed: false,
             error,
         }
     }
@@ -635,6 +640,7 @@ pub trait StagedDestination: Send + Sync {
                 return Err(MetadataBatchFailure {
                     failed_index: completed,
                     completed,
+                    write_unconfirmed: false,
                     error: None,
                 });
             }
@@ -642,6 +648,7 @@ pub trait StagedDestination: Send + Sync {
                 return Err(MetadataBatchFailure {
                     failed_index: completed,
                     completed,
+                    write_unconfirmed: false,
                     error: Some(error),
                 });
             }

@@ -19,6 +19,7 @@ bytes = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
 tracing = { workspace = true }
 smb-domain = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 url = { workspace = true }

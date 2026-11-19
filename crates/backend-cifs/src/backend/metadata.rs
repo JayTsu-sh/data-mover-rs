@@ -1,10 +1,16 @@
+use std::error::Error as StdError;
+use std::fmt;
 use std::io::Cursor;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use binrw::{BinRead as _, BinWrite as _};
+use tokio_util::sync::CancellationToken;
 
-use super::source::{CifsSourceFacts, classify, descriptor_from_facts, entry_failure};
+use super::source::{
+    CifsSourceFacts, classified_failure, classify, descriptor_from_facts, entry_failure,
+    smb_error_class,
+};
 use crate::model::{
     AclEncoding, AclMetadata, BackendIdentity, FailureClass, MetadataCapabilities,
     MetadataFamily as F, MetadataObservation, MetadataObservations, MetadataProvenance,
@@ -30,6 +36,43 @@ pub(super) struct CifsInlineMetadata {
     pub(super) reparse_point: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum TimestampWriteFailure {
+    #[error("timestamps SET_INFO was refused or skipped: {0}")]
+    Unchanged(#[source] smb_domain::Error),
+    #[error("timestamps SET_INFO failed: {0}")]
+    Set(#[source] smb_domain::Error),
+    #[error("timestamps CLOSE failed: {error}")]
+    Close {
+        #[source]
+        error: smb_domain::Error,
+        set_error: Option<Box<smb_domain::Error>>,
+    },
+}
+
+pub(super) enum MetadataWriteFailure {
+    Refused(StorageRoleFailure),
+    Unconfirmed(StorageRoleFailure),
+}
+
+impl MetadataWriteFailure {
+    fn into_error(self) -> StorageRoleFailure {
+        match self {
+            Self::Refused(error) | Self::Unconfirmed(error) => error,
+        }
+    }
+}
+
+#[async_trait]
+pub(super) trait CifsMetadataWriter: Send + Sync {
+    async fn apply_checked(
+        &self,
+        path: &StoragePath,
+        mutation: MetadataMutation,
+        cancel: CancellationToken,
+    ) -> Result<(), MetadataWriteFailure>;
+}
+
 #[async_trait]
 pub(super) trait CifsMetadataProtocol: Send + Sync {
     async fn metadata(&self, path: &StoragePath) -> smb_domain::Result<CifsInlineMetadata>;
@@ -37,7 +80,8 @@ pub(super) trait CifsMetadataProtocol: Send + Sync {
         &self,
         path: &StoragePath,
         value: TimestampMetadata,
-    ) -> smb_domain::Result<()>;
+        cancel: &CancellationToken,
+    ) -> Result<(), TimestampWriteFailure>;
     async fn get_acl(
         &self,
         path: &StoragePath,
@@ -178,30 +222,107 @@ impl Metadata for CifsMetadata {
         &self,
         path: &StoragePath,
         mutation: MetadataMutation,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
+        self.apply_mutation(path, mutation, cancel)
+            .await
+            .map_err(MetadataWriteFailure::into_error)
+    }
+}
+
+#[async_trait]
+impl CifsMetadataWriter for CifsMetadata {
+    async fn apply_checked(
+        &self,
+        path: &StoragePath,
+        mutation: MetadataMutation,
+        cancel: CancellationToken,
+    ) -> Result<(), MetadataWriteFailure> {
+        self.apply_mutation(path, mutation, cancel).await
+    }
+}
+
+impl CifsMetadata {
+    async fn apply_mutation(
+        &self,
+        path: &StoragePath,
+        mutation: MetadataMutation,
+        cancel: CancellationToken,
+    ) -> Result<(), MetadataWriteFailure> {
         if cancel.is_cancelled() {
-            return Err(entry_failure(
+            return Err(MetadataWriteFailure::Refused(entry_failure(
                 path,
                 Operation::Metadata,
                 FailureClass::Cancelled,
-            ));
+            )));
         }
-        if let MetadataMutation::Timestamps(value) = mutation {
-            return self
+        match mutation {
+            MetadataMutation::Timestamps(value) => self
                 .protocol
-                .set_timestamps(path, value)
+                .set_timestamps(path, value, &cancel)
                 .await
-                .map_err(|error| classify(path, Operation::Metadata, &error));
-        }
-        let MetadataMutation::Acl(value) = mutation else {
-            return Err(entry_failure(
+                .map_err(|failure| classify_timestamp_failure(path, failure)),
+            MetadataMutation::Acl(value) => self
+                .apply_acl(path, &value)
+                .await
+                .map_err(MetadataWriteFailure::Refused),
+            _ => Err(MetadataWriteFailure::Refused(entry_failure(
                 path,
                 Operation::Metadata,
                 FailureClass::Unsupported,
-            ));
+            ))),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TimestampWriteDiagnostic(TimestampWriteFailure);
+
+impl fmt::Display for TimestampWriteDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match &self.0 {
+            TimestampWriteFailure::Close {
+                set_error: Some(cause),
+                ..
+            } => format!(
+                "CIFS Metadata {} (previous SET_INFO error: {cause})",
+                self.0
+            ),
+            _ => format!("CIFS Metadata {}", self.0),
         };
-        self.apply_acl(path, &value).await
+        formatter.write_str(&text.replace('\0', "\\0"))
+    }
+}
+
+impl StdError for TimestampWriteDiagnostic {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn classify_timestamp_failure(
+    path: &StoragePath,
+    failure: TimestampWriteFailure,
+) -> MetadataWriteFailure {
+    let error = match &failure {
+        TimestampWriteFailure::Unchanged(error) | TimestampWriteFailure::Set(error) => error,
+        // Preserve the original SET classification when both operations failed.
+        // The unresolved CLOSE still stops a staged batch.
+        TimestampWriteFailure::Close { error, set_error } => set_error.as_deref().unwrap_or(error),
+    };
+    let (class, transience) = smb_error_class(error, Operation::Metadata);
+    let refused = matches!(failure, TimestampWriteFailure::Unchanged(_));
+    let role = classified_failure(
+        path,
+        Operation::Metadata,
+        class,
+        transience,
+        TimestampWriteDiagnostic(failure),
+    );
+    if refused {
+        MetadataWriteFailure::Refused(role)
+    } else {
+        MetadataWriteFailure::Unconfirmed(role)
     }
 }
 
@@ -456,7 +577,8 @@ mod tests {
             &self,
             _path: &StoragePath,
             value: TimestampMetadata,
-        ) -> smb_domain::Result<()> {
+            _cancel: &CancellationToken,
+        ) -> Result<(), TimestampWriteFailure> {
             self.sets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -486,6 +608,38 @@ mod tests {
         ) -> smb_domain::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn server_cancellation_and_unconfirmed_close_keep_both_native_causes()
+    -> Result<(), Box<dyn StdError>> {
+        let cancelled = smb_domain::protocol::Status::Cancelled as u32;
+        let path = StoragePath::new("stage")?;
+        let failure = classify_timestamp_failure(
+            &path,
+            TimestampWriteFailure::Close {
+                error: smb_domain::Error::OutcomeUnknown,
+                set_error: Some(Box::new(smb_domain::Error::UnexpectedMessageStatus(
+                    cancelled,
+                ))),
+            },
+        );
+        let MetadataWriteFailure::Unconfirmed(StorageRoleFailure::Entry(error)) = failure else {
+            panic!("expected an unconfirmed entry failure");
+        };
+        assert_eq!(error.class(), FailureClass::Cancelled);
+        let cause = error
+            .source()
+            .and_then(|cause| cause.downcast_ref::<TimestampWriteFailure>());
+        assert!(matches!(
+            cause,
+            Some(TimestampWriteFailure::Close {
+                error: smb_domain::Error::OutcomeUnknown,
+                set_error: Some(set_error),
+            }) if matches!(**set_error, smb_domain::Error::UnexpectedMessageStatus(code)
+                            if code == cancelled)
+        ));
+        Ok(())
     }
 
     #[tokio::test]

@@ -7,11 +7,14 @@
 //! Payload ACL tightening is applied to the retained pointer first. The two files
 //! cannot change ACL atomically; callers still require exclusive ownership of the key.
 
-use super::{at_destination, metadata::CifsMetadataProtocol};
+use super::{
+    at_destination,
+    metadata::{CifsMetadataProtocol, CifsMetadataWriter, MetadataWriteFailure},
+};
 use super::{source::classify, staged::CifsStagedDestination};
 use crate::model::{Operation, StoragePath};
 use crate::storage::artifacts::ArtifactKind;
-use crate::storage::{Metadata, MetadataMutation, PreparedStage, StorageRoleFailure};
+use crate::storage::{MetadataMutation, PreparedStage, StorageRoleFailure};
 
 pub(super) async fn copy<P: CifsMetadataProtocol + ?Sized>(
     protocol: &P,
@@ -33,18 +36,23 @@ pub(super) async fn copy<P: CifsMetadataProtocol + ?Sized>(
 pub(super) async fn before_payload_acl(
     adapter: &CifsStagedDestination,
     stage: &PreparedStage,
-    metadata: &dyn Metadata,
+    metadata: &dyn CifsMetadataWriter,
     mutation: &MetadataMutation,
     cancel: tokio_util::sync::CancellationToken,
-) -> Result<(), StorageRoleFailure> {
+) -> Result<(), MetadataWriteFailure> {
     let _guard = stage.checkpoint_guard().await;
-    at_destination::before_publication(adapter, stage).await?;
+    at_destination::before_publication(adapter, stage)
+        .await
+        .map_err(MetadataWriteFailure::Refused)?;
     let pointer = at_destination::artifact_path(
         stage.final_destination().path(),
         ArtifactKind::Pointer,
         false,
-    )?;
-    metadata.apply(&pointer, mutation.clone(), cancel).await
+    )
+    .map_err(MetadataWriteFailure::Refused)?;
+    metadata
+        .apply_checked(&pointer, mutation.clone(), cancel)
+        .await
 }
 
 pub(super) async fn refresh(

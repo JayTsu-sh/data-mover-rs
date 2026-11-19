@@ -7,12 +7,13 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::at_destination::Fence;
+use super::metadata::{CifsMetadataWriter, MetadataWriteFailure};
 use super::source::{classify, entry_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath};
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::{
-    ByteStream, CheckpointObservation, Metadata, MetadataBatchFailure, MetadataMutation,
-    PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
+    ByteStream, CheckpointObservation, MetadataBatchFailure, MetadataMutation, PreparedStage,
+    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
     StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
@@ -85,15 +86,25 @@ pub(super) struct CifsStagedDestination {
     pub(super) protocol: Arc<dyn CifsStagedProtocol>,
     identity: BackendIdentity,
     owned: Mutex<HashSet<Bytes>>,
-    metadata: Option<Arc<dyn Metadata>>,
+    metadata: Option<Arc<dyn CifsMetadataWriter>>,
     pub(super) write_inflight: usize,
 }
 
 enum StageMetadataFailure {
     // Preserve the per-mutation result through preparation and the mutation itself.
     BeforePersistence(StorageRoleFailure),
+    UnconfirmedMutation(StorageRoleFailure),
     // The mutation ran, but the stage or its checkpoint could not be confirmed.
     Persistence(StorageRoleFailure),
+}
+
+impl From<MetadataWriteFailure> for StageMetadataFailure {
+    fn from(failure: MetadataWriteFailure) -> Self {
+        match failure {
+            MetadataWriteFailure::Refused(error) => Self::BeforePersistence(error),
+            MetadataWriteFailure::Unconfirmed(error) => Self::UnconfirmedMutation(error),
+        }
+    }
 }
 
 impl CifsStagedDestination {
@@ -115,7 +126,7 @@ impl CifsStagedDestination {
         self
     }
 
-    pub(super) fn with_metadata(mut self, metadata: Arc<dyn Metadata>) -> Self {
+    pub(super) fn with_metadata(mut self, metadata: Arc<dyn CifsMetadataWriter>) -> Self {
         self.metadata = Some(metadata);
         self
     }
@@ -194,13 +205,11 @@ impl CifsStagedDestination {
                 &mutation,
                 cancel.clone(),
             )
-            .await
-            .map_err(StageMetadataFailure::BeforePersistence)?;
+            .await?;
         }
         metadata
-            .apply(&path, mutation, cancel.clone())
-            .await
-            .map_err(StageMetadataFailure::BeforePersistence)?;
+            .apply_checked(&path, mutation, cancel.clone())
+            .await?;
         if checkpoint_acl {
             super::checkpoint_acl::refresh(self, stage, &path)
                 .await
@@ -518,6 +527,7 @@ impl StagedDestination for CifsStagedDestination {
             .await
             .map_err(|failure| match failure {
                 StageMetadataFailure::BeforePersistence(error)
+                | StageMetadataFailure::UnconfirmedMutation(error)
                 | StageMetadataFailure::Persistence(error) => error,
             })
     }
@@ -534,6 +544,7 @@ impl StagedDestination for CifsStagedDestination {
                 return Err(MetadataBatchFailure {
                     failed_index: completed,
                     completed,
+                    write_unconfirmed: false,
                     error: None,
                 });
             }
@@ -546,6 +557,15 @@ impl StagedDestination for CifsStagedDestination {
                     return Err(MetadataBatchFailure {
                         failed_index: completed,
                         completed,
+                        write_unconfirmed: false,
+                        error: Some(error),
+                    });
+                }
+                Err(StageMetadataFailure::UnconfirmedMutation(error)) => {
+                    return Err(MetadataBatchFailure {
+                        failed_index: completed,
+                        completed,
+                        write_unconfirmed: true,
                         error: Some(error),
                     });
                 }

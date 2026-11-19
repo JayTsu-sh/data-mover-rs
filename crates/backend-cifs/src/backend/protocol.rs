@@ -4,14 +4,20 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::StreamExt as _;
+use smb_domain::protocol::Status;
+use tokio_util::sync::CancellationToken;
 
 use super::directory::DomainDirectory;
-use super::metadata::{CifsInlineMetadata, CifsMetadataProtocol};
+use super::metadata::{CifsInlineMetadata, CifsMetadataProtocol, TimestampWriteFailure};
 use super::namespace::{CifsDirectory, CifsNamespaceProtocol};
 use super::source::{CifsReadCursor, CifsSourceFacts, CifsSourceProtocol};
 use super::staged::{CifsStageFile, CifsStagedProtocol};
 use crate::model::{EntryKind, StoragePath};
 
+// The pinned client does not list these statuses in its Status enum.
+const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_MEDIA_WRITE_PROTECTED: u32 = 0xC000_00A2;
+const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
 const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
@@ -542,23 +548,31 @@ impl CifsMetadataProtocol for SmbDomainProtocol {
         &self,
         path: &StoragePath,
         value: crate::model::TimestampMetadata,
-    ) -> smb_domain::Result<()> {
-        let update = super::metadata::timestamp_update(value)?;
+        cancel: &CancellationToken,
+    ) -> Result<(), TimestampWriteFailure> {
+        let update =
+            super::metadata::timestamp_update(value).map_err(TimestampWriteFailure::Unchanged)?;
         if update == smb_domain::MetadataUpdate::default() {
             return Ok(());
         }
-        let path = self.share_path(path)?;
+        let path = self
+            .share_path(path)
+            .map_err(TimestampWriteFailure::Unchanged)?;
         let resource = self
             .share
             .open_metadata(
                 &path,
                 smb_domain::MetadataOpenOptions::default().write_attributes(true),
             )
-            .await?;
-        let applied = resource.set_metadata(update).await;
+            .await
+            .map_err(TimestampWriteFailure::Unchanged)?;
+        let applied = if cancel.is_cancelled() {
+            Err(smb_domain::Error::Cancelled("CIFS metadata SET"))
+        } else {
+            resource.set_metadata(update).await
+        };
         let close = close_resource(resource).await;
-        applied?;
-        close
+        settle_metadata_write(applied, close)
     }
 
     async fn get_acl(
@@ -602,6 +616,56 @@ impl CifsMetadataProtocol for SmbDomainProtocol {
         applied?;
         close
     }
+}
+
+fn settle_metadata_write(
+    applied: smb_domain::Result<()>,
+    close: smb_domain::Result<()>,
+) -> Result<(), TimestampWriteFailure> {
+    if let Err(error) = close {
+        return Err(TimestampWriteFailure::Close {
+            error,
+            set_error: applied.err().map(Box::new),
+        });
+    }
+    applied.map_err(|error| {
+        if metadata_set_refused(&error) {
+            TimestampWriteFailure::Unchanged(error)
+        } else {
+            TimestampWriteFailure::Set(error)
+        }
+    })
+}
+
+// These FileBasicInformation rejections occur before an attribute change. Other failures
+// remain unconfirmed, even when they appear as a generic entry-scoped protocol error.
+fn metadata_set_refused(error: &smb_domain::Error) -> bool {
+    matches!(
+        error,
+        smb_domain::Error::Cancelled(_)
+            | smb_domain::Error::MissingPermissions(_)
+            | smb_domain::Error::InvalidArgument(_)
+            | smb_domain::Error::UnsupportedOperation(_)
+    ) || matches!(
+        error_status(error),
+        Some(STATUS_INVALID_HANDLE | STATUS_MEDIA_WRITE_PROTECTED | STATUS_PRIVILEGE_NOT_HELD)
+    ) || matches!(
+        error_status(error).and_then(|status| Status::try_from(status).ok()),
+        Some(
+            Status::AccessDenied
+                | Status::InvalidInfoClass
+                | Status::InvalidDeviceRequest0
+                | Status::InfoLengthMismatch
+                | Status::FileClosed
+                | Status::Cancelled
+                | Status::InvalidParameter
+                | Status::ObjectNameNotFound
+                | Status::ObjectPathNotFound
+                | Status::NotImplemented
+                | Status::NotSupported
+                | Status::DeviceFeatureNotSupported
+        )
+    )
 }
 
 fn require_confirmed_close(outcome: smb_domain::CloseOutcome) -> smb_domain::Result<()> {
@@ -824,4 +888,64 @@ fn put_time(output: &mut BytesMut, value: std::time::SystemTime) {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     output.extend_from_slice(&nanos.to_be_bytes());
+}
+
+#[cfg(test)]
+mod metadata_write_tests {
+    use smb_domain::error::NetworkFailure;
+
+    use super::{
+        STATUS_INVALID_HANDLE, STATUS_MEDIA_WRITE_PROTECTED, STATUS_PRIVILEGE_NOT_HELD, Status,
+        TimestampWriteFailure, settle_metadata_write,
+    };
+
+    #[test]
+    fn definitive_status_refuses_set_only_when_the_handle_is_closed() {
+        for status in [
+            Status::AccessDenied as u32,
+            Status::InvalidInfoClass as u32,
+            Status::InvalidDeviceRequest0 as u32,
+            Status::InfoLengthMismatch as u32,
+            Status::FileClosed as u32,
+            STATUS_INVALID_HANDLE,
+            STATUS_MEDIA_WRITE_PROTECTED,
+            STATUS_PRIVILEGE_NOT_HELD,
+        ] {
+            let refusal = || smb_domain::Error::UnexpectedMessageStatus(status);
+            assert!(matches!(
+                settle_metadata_write(Err(refusal()), Ok(())),
+                Err(TimestampWriteFailure::Unchanged(
+                    smb_domain::Error::UnexpectedMessageStatus(code)
+                )) if code == status
+            ));
+            assert!(matches!(
+                settle_metadata_write(Err(refusal()), Err(smb_domain::Error::OutcomeUnknown)),
+                Err(TimestampWriteFailure::Close {
+                    error: smb_domain::Error::OutcomeUnknown,
+                    set_error: Some(cause),
+                }) if matches!(*cause, smb_domain::Error::UnexpectedMessageStatus(code)
+                               if code == status)
+            ));
+        }
+    }
+
+    #[test]
+    fn ambiguous_set_and_close_remain_unconfirmed() {
+        for error in [
+            smb_domain::Error::NetworkOutcomeUnknown(NetworkFailure::TimedOut),
+            smb_domain::Error::RuntimeTerminated,
+        ] {
+            assert!(matches!(
+                settle_metadata_write(Err(error), Ok(())),
+                Err(TimestampWriteFailure::Set(_))
+            ));
+        }
+        assert!(matches!(
+            settle_metadata_write(Ok(()), Err(smb_domain::Error::OutcomeUnknown)),
+            Err(TimestampWriteFailure::Close {
+                error: smb_domain::Error::OutcomeUnknown,
+                set_error: None,
+            })
+        ));
+    }
 }

@@ -31,7 +31,8 @@ impl CifsMetadataProtocol for Protocol {
         &self,
         _: &StoragePath,
         _: TimestampMetadata,
-    ) -> smb_domain::Result<()> {
+        _: &tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<(), TimestampWriteFailure> {
         unreachable!("ACL-only fixture")
     }
     async fn get_acl(&self, _: &StoragePath) -> smb_domain::Result<smb_domain::SecurityDescriptor> {

@@ -1,6 +1,6 @@
 use super::*;
 use crate::model::TimestampMetadata;
-use crate::storage::backends::cifs::metadata::CifsInlineMetadata;
+use crate::storage::backends::cifs::metadata::{CifsInlineMetadata, TimestampWriteFailure};
 use async_trait::async_trait;
 use smb_domain::{
     SecurityDescriptor,
@@ -39,7 +39,8 @@ impl CifsMetadataProtocol for Protocol {
         &self,
         _: &StoragePath,
         _: TimestampMetadata,
-    ) -> smb_domain::Result<()> {
+        _: &tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<(), TimestampWriteFailure> {
         unreachable!("security-only fixture")
     }
     async fn get_acl(&self, path: &StoragePath) -> smb_domain::Result<SecurityDescriptor> {
