@@ -86,7 +86,8 @@ pub enum MetadataFailurePolicy {
     /// 保持严格顺序，元数据失败时不继续发布暂存内容。
     #[default]
     StopBeforePublication,
-    /// 非取消错误时继续校验和发布数据，返回失败及单独的数据完成事实。
+    /// 元数据失败归类为 `Refused` 时继续校验和发布暂存内容。
+    /// Direct 已写入最终位置，非取消错误下仍可校验并返回单独的数据完成事实。
     /// 这不能证明元数据成功，也不能授权删除源端。
     PublishData,
 }
@@ -518,7 +519,7 @@ impl TransferRequest {
         self.metadata_plan.is_some() || self.metadata_mode.private_creation(carries_mode)
     }
 
-    /// 显式允许元数据应用失败后发布已复制数据；失败仍通过 Err 返回。
+    /// 选择元数据失败后的发布策略，见 [`MetadataFailurePolicy::PublishData`]。
     #[must_use]
     pub const fn with_metadata_failure_policy(mut self, policy: MetadataFailurePolicy) -> Self {
         self.metadata_failure_policy = policy;

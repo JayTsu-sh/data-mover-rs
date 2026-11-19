@@ -11,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
 use crate::metadata::{
-    AclTarget, MetadataPlan, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget,
-    OwnershipTarget, TimestampTargetCapability, ValueTarget, compile_metadata_plan,
+    AclTarget, ApplicationFailureKind, MetadataPlan, MetadataPlanRequest, MetadataPolicies,
+    MetadataPolicy, MetadataTarget, OwnershipTarget, TimestampTargetCapability, ValueTarget,
+    compile_metadata_plan,
 };
 use crate::model::{
     EntryOperationFailure, FailureClass, MetadataObservations, ObservationMode, ObservationPlan,
@@ -24,9 +25,9 @@ use crate::storage::Storage;
 use crate::storage::backends::local::test_destination_storage_with_role;
 use crate::storage::backends::local::{test_destination_storage, test_source_storage};
 use crate::storage::{Metadata, MetadataMutation, StorageBuilder, StorageRoleFailure};
-use crate::transfer::{MetadataTransferMode, TransferPolicy, TransferRequest, transfer};
 #[cfg(unix)]
-use crate::transfer::{PublicationDurability, TransferPhase};
+use crate::transfer::{MetadataFailurePolicy, PublicationDurability, TransferPhase};
+use crate::transfer::{MetadataTransferMode, TransferPolicy, TransferRequest, transfer};
 
 struct FailingMetadata(Arc<AtomicUsize>);
 
@@ -274,6 +275,19 @@ async fn an_explicit_metadata_mode_replaces_a_previously_supplied_plan()
 #[tokio::test]
 async fn a_failed_captured_metadata_barrier_releases_the_plan_and_preserves_source_and_old_target()
 -> Result<(), Box<dyn std::error::Error>> {
+    for policy in [
+        MetadataFailurePolicy::StopBeforePublication,
+        MetadataFailurePolicy::PublishData,
+    ] {
+        assert_failed_metadata_barrier_preserves_target(policy).await?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn assert_failed_metadata_barrier_preserves_target(
+    policy: MetadataFailurePolicy,
+) -> Result<(), Box<dyn std::error::Error>> {
     let source_root = tempfile::tempdir()?;
     let target_root = tempfile::tempdir()?;
     std::fs::write(source_root.path().join("file"), b"source payload")?;
@@ -299,6 +313,7 @@ async fn a_failed_captured_metadata_barrier_releases_the_plan_and_preserves_sour
         )
         .with_transfer_policy(TransferPolicy::Checkpointed)
         .with_publication_durability(PublicationDurability::Required)
+        .with_metadata_failure_policy(policy)
         .with_metadata_plan(Arc::clone(&plan)),
     )
     .await;
@@ -306,8 +321,12 @@ async fn a_failed_captured_metadata_barrier_releases_the_plan_and_preserves_sour
         .err()
         .ok_or("metadata persistence failure was accepted")?;
     assert_eq!(failure.phase(), TransferPhase::Metadata);
-    assert!(failure.metadata_failure().is_some());
-    assert!(!failure.final_destination_changed());
+    let metadata = failure
+        .metadata_failure()
+        .ok_or("missing metadata failure")?;
+    assert_eq!(metadata.kind(), ApplicationFailureKind::BatchFailed);
+    assert!(failure.published_data().is_none(), "{policy:?}");
+    assert!(!failure.final_destination_changed(), "{policy:?}");
     assert_eq!(Arc::strong_count(&plan), 1);
     assert_eq!(reads.load(Ordering::Relaxed), 0);
     assert_eq!(

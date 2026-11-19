@@ -147,8 +147,9 @@ deletion. Real-file tests cover all three transfer policies, source-metadata ref
 shared-plan release and a failed metadata persistence barrier.
 
 An ordinary request can explicitly select
-`with_metadata_failure_policy(MetadataFailurePolicy::PublishData)` to retain
-successfully copied data at the final path after a metadata application failure.
+`with_metadata_failure_policy(MetadataFailurePolicy::PublishData)` to publish
+staged data after a metadata failure classified as `Refused`, or to verify and
+report data that Direct wrote at the final path before a non-cancellation metadata failure.
 The result remains `Err`: `metadata_failure()` retains every failed family, and
 `published_data()` exposes only the completed data publication and selected data
 verification, with no successful metadata report. It cannot authorize source
