@@ -1,5 +1,7 @@
 use super::*;
 
+use std::collections::HashSet;
+
 use crate::model::{AclEncoding, AclMetadata, MetadataProvenance};
 use crate::storage::SourceDescriptor;
 
@@ -27,6 +29,78 @@ pub(super) fn manual_runner(
         Runner::new(shared, consumer, output, source.identity.clone()),
         session,
     )
+}
+
+#[tokio::test]
+async fn wide_deep_tree_completes_under_directory_budget_without_relisting() {
+    let root = tempfile::tempdir().assert_value("bounded branch fixture");
+    let branches = 256;
+    let depth = 8;
+    let long_name = "nested-".repeat(16);
+    for index in 0..branches {
+        let mut path = root.path().join(format!("{index}-{long_name}"));
+        for _ in 1..depth {
+            path.push(&long_name);
+        }
+        std::fs::create_dir_all(&path).assert_value("bounded branch fixture");
+        std::fs::write(path.join("file"), b"kept").assert_value("bounded branch fixture");
+    }
+    let (storage, namespace, metadata) =
+        test_traversal_storage(root.path(), "controlled-branch-budget")
+            .assert_value("bounded branch fixture");
+    let namespace = Arc::new(ReadOnlyNamespace::new(namespace));
+    let source = StorageTraversalSource::with_roles(namespace.clone(), metadata)
+        .identified(storage.identity().clone());
+    let mut request = configured();
+    request.consumer_completion_budget = NonZeroUsize::new(384 * 1024);
+    let (items, outcome) = tokio::time::timeout(
+        Duration::from_secs(15),
+        acknowledge(source.traverse(request)),
+    )
+    .await
+    .assert_value("bounded branch traversal");
+    assert!(
+        matches!(outcome, Ok(TraversalOutcome::Completed(ref done))
+            if done.totals.emitted == (branches * (depth + 1)) as u64),
+        "bounded deep branches: {outcome:?}"
+    );
+    assert_branch_phases(items, branches, depth, &long_name);
+    let listings = namespace.calls.lock();
+    assert_eq!(listings.len(), branches * depth + 1);
+    assert_eq!(
+        listings.iter().collect::<HashSet<_>>().len(),
+        listings.len()
+    );
+}
+
+fn assert_branch_phases(items: Vec<TraversalItem>, branches: usize, depth: usize, long_name: &str) {
+    let mut prepared = HashSet::new();
+    let mut finalized = HashSet::new();
+    let mut files = HashSet::new();
+    for item in items {
+        match item {
+            TraversalItem::ConsumerEntry(work) if work.1.kind() == EntryKind::File => {
+                assert!(files.insert(work.1.path().as_str().to_owned()));
+            }
+            TraversalItem::ConsumerEntry(work) => {
+                assert_eq!(work.1.kind(), EntryKind::Directory);
+                assert!(prepared.insert(work.1.path().as_str().to_owned()));
+            }
+            TraversalItem::SubtreeReady(work) => {
+                let path = work.1.path().as_str();
+                if path.matches('/').count() + 1 == depth {
+                    assert!(files.contains(&format!("{path}/file")));
+                } else {
+                    assert!(finalized.contains(&format!("{path}/{long_name}")));
+                }
+                assert!(finalized.insert(path.to_owned()));
+            }
+            other => panic!("unexpected branch work: {other:?}"),
+        }
+    }
+    assert_eq!(files.len(), branches);
+    assert_eq!(finalized.len(), branches * depth);
+    assert_eq!(prepared, finalized);
 }
 
 #[test]

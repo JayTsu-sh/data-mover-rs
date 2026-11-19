@@ -56,6 +56,9 @@ impl Runner {
     }
 
     fn directory(&mut self, parent: Key) -> Result<bool, TraversalTerminalFailure> {
+        if !self.allow_child(parent)? {
+            return Ok(false);
+        }
         let node = self
             .nodes
             .get(parent)
@@ -148,6 +151,9 @@ impl Runner {
     }
 
     pub(super) fn hidden(&mut self, parent: Key) -> Result<bool, TraversalTerminalFailure> {
+        if !self.allow_child(parent)? {
+            return Ok(false);
+        }
         let work = self
             .nodes
             .get(parent)
@@ -174,6 +180,17 @@ impl Runner {
         self.nodes.queue(parent, false);
         self.nodes.queue(key, false);
         Ok(true)
+    }
+
+    fn allow_child(&mut self, parent: Key) -> Result<bool, TraversalTerminalFailure> {
+        let limit = self.shared.request.consumer_max_inflight.get();
+        if self.nodes.can_add_child(parent, limit)? {
+            return Ok(true);
+        }
+        // Keep the unconsumed page with its parent. Descendants remain runnable and
+        // completing one can make room for the next sibling.
+        self.nodes.queue(parent, false);
+        Ok(false)
     }
 
     pub(super) fn finalize(&mut self, key: Key) -> Result<bool, TraversalTerminalFailure> {

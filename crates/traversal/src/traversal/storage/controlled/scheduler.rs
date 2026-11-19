@@ -344,13 +344,7 @@ impl Runner {
         debug_assert!(matches!(node.boundary, Boundary::PolicyBoundary));
         self.totals.absorb(&node.counts);
         debug_assert!(node.charge.bytes() >= super::arena::storage_bytes());
-        if let Some(parent) = live.parent
-            && let Some(live) = self.nodes.get_mut(parent)
-        {
-            live.children = live
-                .children
-                .checked_sub(1)
-                .ok_or(TraversalTerminalFailure::Internal)?;
+        if let Some(parent) = live.parent {
             self.nodes.queue(parent, true);
         }
         drop(node);

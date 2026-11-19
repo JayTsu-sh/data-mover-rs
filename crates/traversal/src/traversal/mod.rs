@@ -225,8 +225,9 @@ pub struct TraversalRequest {
     /// accounting: opaque stream state/read-ahead and a newly returned oversized value can
     /// exist before it is measured and rejected. See `docs/design/consumer-completed-traversal.md`.
     pub consumer_completion_budget: Option<NonZeroUsize>,
-    /// Issued consumer phases not yet acknowledged, independent of listing concurrency and
-    /// directory state waiting between prepare and finalize. Defaults to 64.
+    /// Maximum unacknowledged consumer phases, and maximum simultaneously active directory
+    /// branches in a controlled traversal. Each branch may include multiple ancestor directories,
+    /// which are separately limited by the directory byte budget. Defaults to 64.
     pub consumer_max_inflight: NonZeroUsize,
     /// Observations requested by the caller. A filter dependency must be enabled here;
     /// `InlineOnly` uses listed information without additional metadata I/O.

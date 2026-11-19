@@ -47,6 +47,7 @@ pub(super) struct Arena {
     ready: VecDeque<Key>,
     blocked: Vec<Key>,
     count: usize,
+    leaves: usize,
 }
 
 impl Arena {
@@ -87,11 +88,17 @@ impl Arena {
             blocked: false,
         });
         self.count += 1;
-        if let Some(parent) = parent {
-            self.get_mut(parent)
-                .ok_or(TraversalTerminalFailure::Internal)?
-                .children += 1;
-        }
+        let opens_branch = if let Some(parent) = parent {
+            let parent = self
+                .get_mut(parent)
+                .ok_or(TraversalTerminalFailure::Internal)?;
+            let opens_branch = parent.children != 0;
+            parent.children += 1;
+            opens_branch
+        } else {
+            true
+        };
+        self.leaves += usize::from(opens_branch);
         Ok(key)
     }
 
@@ -112,14 +119,36 @@ impl Arena {
     }
 
     pub(super) fn remove(&mut self, key: Key) -> Option<Live> {
+        let live = self.get(key)?;
+        if live.children != 0 {
+            return None;
+        }
+        let closes_branch = if let Some(parent) = live.parent {
+            let parent = self.get_mut(parent)?;
+            parent.children = parent.children.checked_sub(1)?;
+            parent.children != 0
+        } else {
+            true
+        };
         let slot = self
             .slots
             .get_mut(key.index)
             .filter(|slot| slot.generation == key.generation)?;
         let live = slot.live.take()?;
         self.count -= 1;
+        self.leaves -= usize::from(closes_branch);
         self.free.push(key.index);
         Some(live)
+    }
+
+    pub(super) fn can_add_child(
+        &self,
+        parent: Key,
+        branch_limit: usize,
+    ) -> Result<bool, TraversalTerminalFailure> {
+        let parent = self.get(parent).ok_or(TraversalTerminalFailure::Internal)?;
+        // A first child extends the parent's branch; a sibling opens another one.
+        Ok(parent.children == 0 || self.leaves < branch_limit)
     }
 
     pub(super) fn queue(&mut self, key: Key, priority: bool) {
