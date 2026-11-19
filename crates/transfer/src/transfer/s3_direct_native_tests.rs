@@ -4,6 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
+use crate::metadata::ApplicationFailureKind;
 use crate::model::{FailureClass, ObjectTag, StoragePath, Transience};
 use crate::storage::backends::s3::tests::{
     MemoryS3, Versioning, endpoint_of, native_context, source_storage,
@@ -83,45 +84,76 @@ async fn direct_native_tag_failure_keeps_completed_verified_data_and_source() ->
         ReadBackVerification::Disabled,
         ReadBackVerification::Enabled,
     ] {
-        let protocol = Arc::new(MemoryS3::default());
-        let payload = Bytes::from_static(b"data survives failed metadata");
-        protocol
-            .objects
-            .lock()
-            .await
-            .insert("src/file".into(), payload.clone());
-        *protocol.tag_write_failure.lock().await = Some(S3ProtocolFailure::entry(
-            FailureClass::PermissionDenied,
-            Transience::Permanent,
-            "injected target tags refusal",
-        ));
-        let failure = transfer(
-            request(&protocol, verify)?
-                .with_failed_data_cleanup(FailedDataCleanup::RemoveOwned)
-                .with_metadata_failure_policy(MetadataFailurePolicy::PublishData),
+        assert_direct_tag_failure_preserves_data(
+            verify,
+            S3ProtocolFailure::entry(
+                FailureClass::PermissionDenied,
+                Transience::Permanent,
+                "injected target tags refusal",
+            ),
+            ApplicationFailureKind::Refused,
         )
+        .await?;
+        assert_direct_tag_failure_preserves_data(
+            verify,
+            S3ProtocolFailure::session(
+                FailureClass::Timeout,
+                Transience::Transient,
+                "injected target tags timeout",
+            ),
+            ApplicationFailureKind::SessionLost,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn assert_direct_tag_failure_preserves_data(
+    verify: ReadBackVerification,
+    tag_failure: S3ProtocolFailure,
+    expected: ApplicationFailureKind,
+) -> Result {
+    let protocol = Arc::new(MemoryS3::default());
+    let payload = Bytes::from_static(b"data survives failed metadata");
+    protocol
+        .objects
+        .lock()
         .await
-        .err()
-        .ok_or("failed metadata unexpectedly succeeded")?;
-        assert_eq!(failure.phase(), TransferPhase::Metadata);
-        let data = failure
-            .published_data()
-            .ok_or("completed data evidence missing")?;
-        assert_eq!(data.route, TransferRoute::Native);
-        assert_eq!(data.transferred_bytes, payload.len() as u64);
-        assert_eq!(protocol.objects.lock().await.get("file"), Some(&payload));
-        assert_eq!(
-            protocol.objects.lock().await.get("src/file"),
-            Some(&payload)
-        );
-        assert_eq!(*protocol.native_copies.lock().await, 1);
-        let failure = failure.cleanup_for_policy(TransferPolicy::Direct).await;
-        assert!(failure.cleanup_failure().is_none());
-        assert!(!failure.has_failed_data_cleanup());
-        assert_eq!(protocol.objects.lock().await.get("file"), Some(&payload));
-        if verify == ReadBackVerification::Enabled {
-            assert!(protocol.range_dispatches.lock().await.len() >= 2);
-        }
+        .insert("src/file".into(), payload.clone());
+    *protocol.tag_write_failure.lock().await = Some(tag_failure);
+    let failure = transfer(
+        request(&protocol, verify)?
+            .with_failed_data_cleanup(FailedDataCleanup::RemoveOwned)
+            .with_metadata_failure_policy(MetadataFailurePolicy::PublishData),
+    )
+    .await
+    .err()
+    .ok_or("failed metadata unexpectedly succeeded")?;
+    assert_eq!(failure.phase(), TransferPhase::Metadata);
+    assert_eq!(
+        failure
+            .metadata_failure()
+            .ok_or("metadata cause missing")?
+            .kind(),
+        expected
+    );
+    let data = failure
+        .published_data()
+        .ok_or("completed data evidence missing")?;
+    assert_eq!(data.route, TransferRoute::Native);
+    assert_eq!(data.transferred_bytes, payload.len() as u64);
+    assert_eq!(protocol.objects.lock().await.get("file"), Some(&payload));
+    assert_eq!(
+        protocol.objects.lock().await.get("src/file"),
+        Some(&payload)
+    );
+    assert_eq!(*protocol.native_copies.lock().await, 1);
+    let failure = failure.cleanup_for_policy(TransferPolicy::Direct).await;
+    assert!(failure.cleanup_failure().is_none());
+    assert!(!failure.has_failed_data_cleanup());
+    assert_eq!(protocol.objects.lock().await.get("file"), Some(&payload));
+    if verify == ReadBackVerification::Enabled {
+        assert!(protocol.range_dispatches.lock().await.len() >= 2);
     }
     Ok(())
 }

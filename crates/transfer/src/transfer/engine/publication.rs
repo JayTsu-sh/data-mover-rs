@@ -179,7 +179,7 @@ async fn apply_metadata(
         Err(error)
             if policy == MetadataFailurePolicy::PublishData
                 && !cancel.is_cancelled()
-                && error.kind() != ApplicationFailureKind::Cancelled =>
+                && allows_data_only_publication(error.kind(), transferred.stage.direct()) =>
         {
             // 失去完整元数据绑定的最终内容不能在崩溃恢复中被接受为整项成功。
             transferred.stage.checkpoint_clear_metadata_binding();
@@ -190,6 +190,15 @@ async fn apply_metadata(
             TransferFailure::metadata(error),
             source_qos,
         )),
+    }
+}
+
+fn allows_data_only_publication(kind: ApplicationFailureKind, direct: bool) -> bool {
+    match kind {
+        ApplicationFailureKind::Refused => true,
+        ApplicationFailureKind::Cancelled => false,
+        // Direct data was written at the final path. It can still be verified and reported.
+        _ => direct,
     }
 }
 

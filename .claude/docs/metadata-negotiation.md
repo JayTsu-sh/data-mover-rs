@@ -195,13 +195,17 @@ set-id 也去掉，尽管 uid 实际留住了；内核还允许 chgrp 到文件*
 
 其余（Entry 级、非取消，`is_refusal`）都是「目的端拒绝这一次写入」：记下，续发剩下的族。
 
+`MetadataFailurePolicy::PublishData` 仅在元数据错误归类为 `Refused` 时继续校验和发布暂存内容。
+后端报告整批失败、会话丢失或取消时，传输引擎停止发布暂存内容。
+Direct 已写至最终位置，非取消错误下仍可校验数据并报告数据完成。整项仍报元数据失败。
+
 **已发布目录的身份绑定写入**由 `MetadataPlan::apply_bound_directory` 调用后端。
 后端解析当前目录名，并使用通过身份检查的同一对象引用写入。Local Unix 使用文件描述符，
 NFS 使用文件句柄。绑定写入仅在属性明确被拒时继续，身份冲突、取消和结果不明会停止整项，
 保留已确认的写入前缀。调用方用 `verify_published` 再核对当前路径和结果。
 
-**Local 在拒绝处不跑屏障**（`apply_local_batch`）：任何拒绝都让文件失败、不会发布，续发的批次以屏障
-结束、覆盖整个文件；若在拒绝处跑屏障且它失败，整批失败会**盖掉拒绝本身** —— 调用方要处置的原因。
+**Local 在拒绝处不跑屏障**（`apply_local_batch`）：任何拒绝都让文件失败，默认停止发布。
+续发的批次以屏障结束并覆盖整个文件。若在拒绝处跑屏障且它失败，调用方会收到整批失败，丢失该次拒绝。
 （`7dec6c7` 曾为「被容忍的拒绝落在最后一条」而在拒绝前跑屏障；应用期不再有容忍，这个理由不在了。）
 
 看守：`src/metadata/stage_tests.rs`（续发、二次拒绝、整批失败三形态、会话断、取消）、
@@ -210,9 +214,9 @@ NFS 使用文件句柄。绑定写入仅在属性明确被拒时继续，身份�
 `a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not`（NFS 的拒绝必须是 Entry 级，
 否则会被当成会话失败而提前停止）。
 
-**已知缺口：CIFS。** 它没有批量实现，逐条 `apply_metadata` 在 durable 时 apply 后再 open/flush/close，
-flush 失败经 `classify` 成 Entry 级，被当成那一条的拒绝 —— 文件照样失败，但报成「拒绝」而不是
-「整批失败」，且不会提前停止。要改得让逐条接口也能表达「屏障失败」。
+**已知缺口：CIFS。** 逐条 `apply_metadata` 在 durable 时 apply 后再 open/flush/close。
+若 FLUSH 失败归类为非取消的 Entry 错误，元数据引擎仍按单项拒绝处理。
+这类失败在 `PublishData` 下仍允许发布数据。CIFS 需要在适配器中保留整批屏障失败的语义。
 
 ## 报错
 
