@@ -212,7 +212,10 @@ impl<'a> Progress<'a> {
     }
 
     fn notify_checkpoint(&mut self, number: i32, length: u64) {
-        let Some(stage) = self.stage.filter(|stage| stage.write_observer().is_some()) else {
+        let Some(stage) = self
+            .stage
+            .filter(|stage| !stage.direct() && stage.write_observer().is_some())
+        else {
             return;
         };
         self.completed.insert(number, length);

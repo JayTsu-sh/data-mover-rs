@@ -2,15 +2,15 @@
 //! is written at its final key inside `write`, read back after publication, and never staged.
 
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, StoragePath, Transience};
-use crate::storage::PrepareFact;
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, endpoint_of, source_storage};
 use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect};
+use crate::storage::{PrepareFact, WriteProgress, WriteProgressObserver};
 use crate::transfer::{
     EffectiveRecovery, FailedDataCleanup, MetadataTransferMode, TransferPhase, TransferPolicy,
     TransferRequest, TransferRoute, transfer,
@@ -160,7 +160,15 @@ async fn a_large_direct_transfer_is_one_upload_on_the_final_key() -> TestResult 
     protocol
         .put_version("final", "v1", Bytes::from_static(b"old"))
         .await;
-    let outcome = transfer(direct_request(&protocol)?).await?;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let observer = WriteProgressObserver::new(move |event| {
+        captured
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(event);
+    });
+    let outcome = transfer(direct_request(&protocol)?.with_write_observer(observer)).await?;
     assert!(outcome.blake3.is_some());
     let version = outcome
         .destination_version
@@ -171,6 +179,28 @@ async fn a_large_direct_transfer_is_one_upload_on_the_final_key() -> TestResult 
     assert_eq!(*protocol.puts.lock().await, 0);
     assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
     assert!(leaves_nothing_behind(&protocol).await?);
+    let mut events = events.lock().map_err(|error| error.to_string())?;
+    assert_eq!(
+        events.pop(),
+        Some(WriteProgress::Published {
+            newly_written_bytes: payload.len() as u64,
+        })
+    );
+    let mut ranges: Vec<_> = events
+        .iter()
+        .filter_map(|event| match *event {
+            WriteProgress::Confirmed { offset, bytes } => Some((offset, bytes)),
+            _ => None,
+        })
+        .collect();
+    ranges.sort_unstable();
+    assert!(ranges.len() > 1);
+    let mut end = 0;
+    for (offset, length) in ranges {
+        assert_eq!(offset, end);
+        end += length;
+    }
+    assert_eq!(end, payload.len() as u64);
     Ok(())
 }
 

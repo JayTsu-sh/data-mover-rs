@@ -377,6 +377,11 @@ pub(super) async fn publish_transferred(
                 .with_source_qos(source_qos));
         }
     };
+    if let Some(observer) = transferred.stage.write_observer() {
+        observer.published(
+            expected_size.saturating_sub(transferred.stage.prepare_fact().reused_bytes()),
+        );
+    }
     let transferred = record_published(transferred, source_qos).await?;
     Ok((evidence, transferred))
 }

@@ -112,7 +112,7 @@ async fn local_notifies_before_input_finishes_and_distinguishes_checkpoints() ->
             .iter()
             .filter_map(|event| match event {
                 WriteProgress::Confirmed { offset, bytes } => Some((*offset, *bytes)),
-                WriteProgress::Checkpoint { .. } => None,
+                WriteProgress::Checkpoint { .. } | WriteProgress::Published { .. } => None,
             })
             .collect();
         confirmed.sort_unstable();
@@ -353,6 +353,12 @@ async fn ordinary_transfer_reports_confirmed_destination_writes() -> TestResult 
             payload
         );
         let observed = events.lock().map_err(|error| error.to_string())?;
+        assert_eq!(
+            observed.last(),
+            Some(&WriteProgress::Published {
+                newly_written_bytes: payload.len() as u64,
+            })
+        );
         assert_eq!(
             observed.iter().find_map(|event| match *event {
                 WriteProgress::Confirmed { offset: 0, bytes } => Some(bytes),

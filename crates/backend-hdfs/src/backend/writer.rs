@@ -38,11 +38,15 @@ pub(super) async fn write(
     // After process loss, the last hsync is the minimum durable prefix; HDFS lease
     // recovery may also retain a longer acknowledged tail.
     let closed = writer.close().await;
-    let offset = result?;
+    let (offset, confirmed_prefix) = result?;
     closed?;
     let observed = adapter.protocol.stat(&path).await?;
     if observed.size != Some(offset) {
         return Err(invalid(stage));
+    }
+    if offset > confirmed_prefix {
+        // Direct has no intermediate sync; a successful close is its first usable receipt.
+        stage.confirmed_write(confirmed_prefix, offset - confirmed_prefix);
     }
     if stage.checkpoint_enabled() {
         // The pinned replicated writer closes with an acknowledged sync-marked last packet.
@@ -61,13 +65,14 @@ async fn consume(
     writer: &mut dyn super::protocol::HdfsWriteSession,
     input: &mut Input,
     expected: u64,
-) -> Result<u64, StorageRoleFailure> {
+) -> Result<(u64, u64), StorageRoleFailure> {
     let maximum = adapter.protocol.maximum_write_chunk_bytes().max(1);
     let interval = stage
         .deferred_checkpoint()
         .as_ref()
         .map(|value| value.interval_bytes);
     let mut offset = stage.write_offset();
+    let mut confirmed_prefix = offset;
     let mut next_checkpoint = interval.map(|step| offset.saturating_add(step).min(expected));
 
     while offset < expected {
@@ -98,13 +103,15 @@ async fn consume(
         if written != count {
             return Err(invalid(stage));
         }
-        stage.confirmed_write(offset, count as u64);
         offset = offset
             .checked_add(count as u64)
             .ok_or_else(|| invalid(stage))?;
 
         if next_checkpoint == Some(offset) && offset < expected {
             writer.hsync().await?;
+            // write() may only queue packets. hsync waits for the DataNode pipeline.
+            stage.confirmed_write(confirmed_prefix, offset - confirmed_prefix);
+            confirmed_prefix = offset;
             record_durable_prefix(adapter, stage, offset).await?;
             next_checkpoint = interval.map(|step| offset.saturating_add(step).min(expected));
         }
@@ -121,7 +128,7 @@ async fn consume(
         }
         input.exhausted = true;
     }
-    Ok(offset)
+    Ok((offset, confirmed_prefix))
 }
 
 async fn record_durable_prefix(

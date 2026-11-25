@@ -550,11 +550,12 @@ impl TransferRequest {
         self
     }
 
-    /// Observes destination write and checkpoint evidence as the selected backend confirms it.
+    /// Observes destination write, checkpoint and publication evidence as it is confirmed.
     ///
     /// Confirmed ranges can be out of order or repeated. Reuse discovered during prepare
     /// does not produce newly confirmed writes. A backend may confirm a single operation
-    /// only after the whole operation completes. The observer does not control transfer,
+    /// only after the whole operation completes. A publication event can precede read-back
+    /// verification and checkpoint cleanup. The observer does not control transfer,
     /// recovery or publication, and must return promptly without panicking.
     #[must_use]
     pub fn with_write_observer(mut self, observer: WriteProgressObserver) -> Self {

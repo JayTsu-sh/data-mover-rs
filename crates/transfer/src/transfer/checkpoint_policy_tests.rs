@@ -22,7 +22,8 @@ use crate::storage::{
     DestinationPrepareRequest, PositionedByteStream, PrepareRequest, PreparedStage,
     PublicationEvidence, PublicationFailure, PublishRequest, ReadRequest, ReadSource,
     SourceDescriptor, StagedDestination, Storage, StorageRoleFailure, UnsupportedReason,
-    VerificationEvidence, VerificationPoint, VerifyRequest, WriteEvidence,
+    VerificationEvidence, VerificationPoint, VerifyRequest, WriteEvidence, WriteProgress,
+    WriteProgressObserver,
 };
 use crate::transfer::{
     EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession,
@@ -670,13 +671,23 @@ async fn expert_resume_preserves_its_full_ordered_source_hash_pass() -> TestResu
 async fn failing_to_persist_ready_never_publishes_the_stage() -> TestResult {
     let fixture = Fixture::new(4 * CHUNK + 17, INTERVAL, true)?;
     fixture.faults.ready.store(true, Ordering::SeqCst);
-    let failure = transfer(fixture.request(TransferPolicy::Checkpointed)?)
+    let published = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&published);
+    let request = fixture
+        .request(TransferPolicy::Checkpointed)?
+        .with_write_observer(WriteProgressObserver::new(move |event| {
+            if matches!(event, WriteProgress::Published { .. }) {
+                observed.store(true, Ordering::Relaxed);
+            }
+        }));
+    let failure = transfer(request)
         .await
         .err()
         .ok_or("expected ready failure")?;
     assert_eq!(failure.phase(), TransferPhase::Publish);
     assert!(failure.has_unpublished_stage());
     assert!(!failure.final_destination_changed());
+    assert!(!published.load(Ordering::Relaxed));
     let calls = fixture.calls.snapshot();
     assert!(
         calls.contains(&Call::HashPhase(CheckpointPhase::ReadyToPublish)),
@@ -698,7 +709,23 @@ async fn postpublication_persistence_and_release_failures_keep_cleanup() -> Test
             .faults
             .published_record
             .store(fail_record, Ordering::SeqCst);
-        let failure = transfer(fixture.request(TransferPolicy::Checkpointed)?)
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&published);
+        let observer = WriteProgressObserver::new(move |event| {
+            if let WriteProgress::Published {
+                newly_written_bytes,
+            } = event
+            {
+                captured
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(newly_written_bytes);
+            }
+        });
+        let request = fixture
+            .request(TransferPolicy::Checkpointed)?
+            .with_write_observer(observer);
+        let failure = transfer(request)
             .await
             .err()
             .ok_or("expected postpublication failure")?;
@@ -706,6 +733,10 @@ async fn postpublication_persistence_and_release_failures_keep_cleanup() -> Test
         assert!(failure.final_destination_changed());
         assert!(failure.has_pending_cleanup());
         assert!(!failure.has_unpublished_stage());
+        assert_eq!(
+            *published.lock().map_err(|error| error.to_string())?,
+            [fixture.expected.len() as u64]
+        );
         let calls = fixture.calls.snapshot();
         assert!(calls.contains(&Call::Publish), "{calls:?}");
         assert_eq!(
