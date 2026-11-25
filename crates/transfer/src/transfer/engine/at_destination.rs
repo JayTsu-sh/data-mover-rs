@@ -96,6 +96,7 @@ pub(super) async fn prepare(
     };
     let mut stage = prepare_with(destination, prepare, &spec, lease).await?;
     stage.set_failed_data_cleanup(request.failed_data_cleanup);
+    stage.set_write_observer(request.write_observer.clone());
     Ok(stage)
 }
 

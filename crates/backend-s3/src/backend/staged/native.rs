@@ -102,6 +102,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             }
         }?;
         // 仅在最终数据已确认后记录完整字节，失败或取消不能把源绑定当作写入进度。
+        if let Some(observer) = stage.write_observer() {
+            observer.confirmed(0, source.size);
+        }
         single.set_native_source(source.clone());
         Ok(S3NativeCopyEvidence {
             bytes: source.size,

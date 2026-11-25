@@ -1004,6 +1004,9 @@ impl StagedDestination for LocalStagedDestination {
             )
         })?
         .map_err(|error| io_failure(stage.final_destination().path(), Operation::Write, &error))?;
+        if let Some(observer) = stage.write_observer() {
+            observer.confirmed(0, written);
+        }
         Ok(WriteEvidence {
             persisted_bytes: written,
         })
