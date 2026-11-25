@@ -14,7 +14,7 @@ use crate::model::{
     StoragePath, Transience,
 };
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
-use crate::storage::backends::local::test_destination_storage;
+use crate::storage::backends::local::{test_destination_storage, test_source_storage};
 use crate::storage::backends::s3::{
     S3Protocol, connect, connect_at_destination,
     tests::{MemoryS3, endpoint_of},
@@ -24,7 +24,7 @@ use crate::storage::{
 };
 use crate::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, TransferFailure,
-    TransferPolicy,
+    TransferPolicy, TransferRequest, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -112,7 +112,7 @@ async fn local_notifies_before_input_finishes_and_distinguishes_checkpoints() ->
             .iter()
             .filter_map(|event| match event {
                 WriteProgress::Confirmed { offset, bytes } => Some((*offset, *bytes)),
-                WriteProgress::Checkpoint { .. } => None,
+                WriteProgress::Checkpoint { .. } | WriteProgress::Published { .. } => None,
             })
             .collect();
         confirmed.sort_unstable();
@@ -323,5 +323,49 @@ fn assert_write_cancellation(failure: &TransferFailure) -> TestResult {
     assert_eq!(cause.class(), FailureClass::Cancelled);
     assert_eq!(cause.operation(), Operation::Write);
     assert_eq!(cause.transience(), Transience::Transient);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_transfer_reports_confirmed_destination_writes() -> TestResult {
+    let source_root = tempfile::tempdir()?;
+    let destination_root = tempfile::tempdir()?;
+    let payload = b"progress evidence";
+    tokio::fs::write(source_root.path().join("source"), payload).await?;
+    let (source, _) = test_source_storage(source_root.path(), "ordinary-progress-source")?;
+    let destination =
+        test_destination_storage(destination_root.path(), "ordinary-progress-target")?;
+    for policy in [TransferPolicy::Direct, TransferPolicy::Checkpointed] {
+        let events = Events::default();
+        transfer(
+            TransferRequest::new(
+                source.clone(),
+                StoragePath::new("source")?,
+                destination.clone(),
+                CancellationToken::new(),
+            )
+            .with_transfer_policy(policy)
+            .with_write_observer(observer(&events, None)),
+        )
+        .await?;
+        assert_eq!(
+            tokio::fs::read(destination_root.path().join("source")).await?,
+            payload
+        );
+        let observed = events.lock().map_err(|error| error.to_string())?;
+        assert_eq!(
+            observed.last(),
+            Some(&WriteProgress::Published {
+                newly_written_bytes: payload.len() as u64,
+            })
+        );
+        assert_eq!(
+            observed.iter().find_map(|event| match *event {
+                WriteProgress::Confirmed { offset: 0, bytes } => Some(bytes),
+                _ => None,
+            }),
+            Some(payload.len() as u64)
+        );
+    }
     Ok(())
 }

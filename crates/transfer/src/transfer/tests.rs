@@ -1,6 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::engine::{TransferDataPath, TransferPhase, TransferSide, run_until_transferred};
@@ -27,7 +27,10 @@ use crate::storage::backends::local::{
 };
 use crate::storage::checkpoint::CheckpointData;
 use crate::storage::pointer::DestinationPointer;
-use crate::storage::{PrepareFact, PublicationDisposition, RestartReason, StorageRoleFailure};
+use crate::storage::{
+    PrepareFact, PublicationDisposition, RestartReason, StorageRoleFailure, WriteProgress,
+    WriteProgressObserver,
+};
 
 fn observed<T>(value: T) -> MetadataObservation<T> {
     MetadataObservation::Value {
@@ -664,6 +667,16 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     let (resume_source, resume_reader) =
         test_source_storage(source_root.path(), "transfer-source")?;
 
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let probe = Arc::clone(&writes);
+    let observer = WriteProgressObserver::new(move |event| {
+        if let WriteProgress::Confirmed { offset, bytes } = event {
+            probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((offset, bytes));
+        }
+    });
     let outcome = transfer(
         recoverable_request(
             derived_transfer_request(
@@ -673,7 +686,8 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
             )?,
             None,
         )
-        .with_source_qos(qos),
+        .with_source_qos(qos)
+        .with_write_observer(observer),
     )
     .await?;
     assert_eq!(outcome.transferred_bytes, payload.len() as u64);
@@ -697,6 +711,15 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     let mut observed_reads = resume_reader.read_completion_order();
     observed_reads.sort_unstable();
     assert_eq!(observed_reads, expected_reads);
+    let mut acknowledged = writes.lock().map_err(|error| error.to_string())?.clone();
+    acknowledged.sort_unstable();
+    assert_eq!(
+        acknowledged,
+        expected_reads
+            .into_iter()
+            .map(|offset| (offset, 64 * 1024))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
         payload

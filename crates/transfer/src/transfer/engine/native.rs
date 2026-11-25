@@ -56,6 +56,7 @@ async fn prepare_native_stage(
     }
     stage.set_exclusive(Some(Box::new(lease)));
     stage.set_failed_data_cleanup(request.failed_data_cleanup);
+    stage.set_write_observer(request.write_observer.clone());
     if request
         .publication_durability
         .required(request.transfer_policy)

@@ -320,6 +320,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                     upload.lock().parts.push((number, etag.clone()));
                 }
                 stage.checkpoint_barrier(0);
+            } else if let Some(observer) = stage.write_observer() {
+                let offset = u64::try_from(number - 1).unwrap_or(0) * upload.part_size as u64;
+                observer.confirmed(offset, length);
             }
             self.native_checkpoint(stage, upload, copied.bytes);
         }

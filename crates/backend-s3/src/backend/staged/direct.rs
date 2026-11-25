@@ -200,6 +200,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             single::send(self, path, single, single.expected_size())
                 .await
                 .map_err(|failure| failure.error)?;
+            stage.confirmed_write(0, written.persisted_bytes);
             return Ok(written);
         }
         let upload = upload_of(stage).ok_or_else(|| not_written(path, Operation::Write))?;
@@ -212,7 +213,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         }
         let upload_id = self.begin_direct_upload(path, upload).await?;
         match self
-            .fill_direct_upload(path, upload, &upload_id, input)
+            .fill_direct_upload(stage, upload, &upload_id, input)
             .await
         {
             Ok(evidence) => Ok(evidence),
@@ -254,13 +255,14 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
 
     async fn fill_direct_upload(
         &self,
-        path: &StoragePath,
+        stage: &PreparedStage,
         upload: &DirectUpload,
         upload_id: &str,
         input: ByteStream,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
+        let path = stage.final_destination().path();
         let target = PartTarget {
-            stage: None,
+            stage: Some(stage),
             path,
             key: path.as_str(),
             upload_id,
@@ -285,9 +287,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         let facts = self
             .complete_direct(path, upload, upload_id, &sent, size)
             .await?;
-        let mut state = upload.lock();
-        state.open = None;
-        state.written = Some((size, facts));
+        let mut upload_state = upload.lock();
+        upload_state.open = None;
+        upload_state.written = Some((size, facts));
         Ok(WriteEvidence {
             persisted_bytes: size,
         })

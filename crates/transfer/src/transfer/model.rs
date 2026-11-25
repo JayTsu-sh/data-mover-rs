@@ -6,7 +6,7 @@ use crate::metadata::MetadataPlan;
 use crate::model::{
     EntryKind, ObservedEntry, SourceIdentity, SourceVersion, StoragePath, StorageTimestamp,
 };
-use crate::storage::{FailedDataCleanup, SourceQosGroup, Storage};
+use crate::storage::{FailedDataCleanup, SourceQosGroup, Storage, WriteProgressObserver};
 
 use super::TransferIdentity;
 
@@ -109,6 +109,7 @@ pub struct TransferRequest {
     pub(crate) transfer_policy: TransferPolicy,
     pub(crate) publication_durability: PublicationDurability,
     pub(crate) source_qos: Option<SourceQosGroup>,
+    pub(crate) write_observer: Option<WriteProgressObserver>,
     pub(crate) read_back: ReadBackVerification,
     pub(crate) copied_metadata: CopiedMetadataRequest,
     pub(crate) metadata_mode: MetadataTransferMode,
@@ -345,6 +346,7 @@ impl TransferRequest {
             transfer_policy: TransferPolicy::default(),
             publication_durability: PublicationDurability::default(),
             source_qos: None,
+            write_observer: None,
             read_back: ReadBackVerification::default(),
             copied_metadata: CopiedMetadataRequest::default(),
             metadata_mode: MetadataTransferMode::Automatic,
@@ -545,6 +547,19 @@ impl TransferRequest {
     #[must_use]
     pub const fn with_publication_durability(mut self, durability: PublicationDurability) -> Self {
         self.publication_durability = durability;
+        self
+    }
+
+    /// Observes destination write, checkpoint and publication evidence as it is confirmed.
+    ///
+    /// Confirmed ranges can be out of order or repeated. Reuse discovered during prepare
+    /// does not produce newly confirmed writes. A backend may confirm a single operation
+    /// only after the whole operation completes. A publication event can precede read-back
+    /// verification and checkpoint cleanup. The observer does not control transfer,
+    /// recovery or publication, and must return promptly without panicking.
+    #[must_use]
+    pub fn with_write_observer(mut self, observer: WriteProgressObserver) -> Self {
+        self.write_observer = Some(observer);
         self
     }
 

@@ -1,4 +1,4 @@
-//! Notifications from destination write and recovery boundaries.
+//! Notifications from destination write, recovery and publication boundaries.
 
 use std::{fmt, sync::Arc};
 
@@ -11,6 +11,9 @@ pub enum WriteProgress {
     /// The destination has recorded this contiguous prefix for recovery. Notifications may
     /// repeat. A later process must still rediscover and validate destination-owned state.
     Checkpoint { durable_prefix: u64 },
+    /// An ordinary transfer confirmed publication. Only bytes written by this request are
+    /// counted. Later verification and cleanup can still fail.
+    Published { newly_written_bytes: u64 },
 }
 
 /// A cheap optional destination callback. It may run concurrently on runtime or blocking
@@ -31,6 +34,12 @@ impl WriteProgressObserver {
 
     pub fn checkpoint(&self, durable_prefix: u64) {
         (self.0)(WriteProgress::Checkpoint { durable_prefix });
+    }
+
+    pub fn published(&self, newly_written_bytes: u64) {
+        (self.0)(WriteProgress::Published {
+            newly_written_bytes,
+        });
     }
 }
 

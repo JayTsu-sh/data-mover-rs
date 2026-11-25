@@ -1,8 +1,11 @@
 //! Armed ordinary-transfer behavior, separate from the legacy expert protocol tests.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use super::*;
 use crate::storage::checkpoint::{CheckpointData, CheckpointPhase};
 use crate::storage::range_hash::RangeHash;
+use crate::storage::{WriteProgress, WriteProgressObserver};
 
 fn checkpoint_request(
     recoverable: bool,
@@ -122,13 +125,21 @@ async fn hsync_and_final_close_record_durable_data_with_source_intent() -> TestR
 async fn lease_recovered_tail_preserves_hash_intent_across_unarmed_takeover() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     let first = adapter(&protocol)?;
-    let stage = first
+    let mut stage = first
         .prepare_at_destination(checkpoint_request(false)?)
         .await?;
+    let confirmed = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&confirmed);
+    stage.set_write_observer(Some(WriteProgressObserver::new(move |event| {
+        if matches!(event, WriteProgress::Confirmed { .. }) {
+            observed.store(true, Ordering::Relaxed);
+        }
+    })));
     arm(&stage)?;
     first.persist_hash_checkpoint(&stage).await?;
     let intent = checkpoint(&pointer(&protocol).await?)?.hash;
     assert!(first.write(&stage, input(&PAYLOAD[..4])).await.is_err());
+    assert!(!confirmed.load(Ordering::Relaxed));
     assert_eq!(pointer(&protocol).await?.durable_prefix, Some(0));
     drop(stage);
     protocol
